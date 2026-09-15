@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle } from 'lucide-react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
+import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
 const DEFAULT_EXPLORER_COLUMNS = [
@@ -54,7 +54,37 @@ const COLUMN_ALIASES = {
   'Fund Code': 'Fund Code',
   'fund_code': 'Fund Code',
   'Old Code': 'Old Code',
-  'old_code': 'Old Code'
+  'old_code': 'Old Code',
+  'Code': 'Code',
+  'code': 'Code',
+  'Country': 'Project Country',
+  'Zakat Eligibility': 'Zakat'
+};
+
+const SEARCH_TARGET_OPTIONS = [
+  { id: 'all', label: 'All Fields', title: 'Search across all fields' },
+  { id: 'campaigns', label: 'Campaigns', title: 'Search Campaign Name' },
+  { id: 'community', label: 'Community', title: 'Search Community Name' },
+  { id: 'name', label: 'Donor Name', title: 'Search First, Last, and Display Name' },
+  { id: 'email', label: 'Email', title: 'Search Email Address' },
+  { id: 'donation_id', label: 'Donation ID', title: 'Search Donation ID, Donor ID, Transfer ID' },
+  { id: 'fundraiser', label: 'Fundraiser', title: 'Search Fundraiser Name' },
+  { id: 'code', label: 'Code', title: 'Search Project/Allocation Code' }
+];
+
+const ALL_SEARCH_FIELD_IDS = ['campaigns', 'community', 'name', 'email', 'donation_id', 'fundraiser', 'code'];
+
+const getStoredSearchTargets = () => {
+  try {
+    const saved = localStorage.getItem('explorer_search_targets');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch (e) {}
+  return ['all'];
 };
 
 const getFundraiserColumn = (cols = []) => {
@@ -105,6 +135,62 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
   const [sortBy, setSortBy] = useState(null);
   const [sortOrder, setSortOrder] = useState('asc');
 
+  // Scoped Search Targets State
+  const [searchTargets, setSearchTargets] = useState(() => getStoredSearchTargets());
+
+  const isAllActive = useMemo(() => {
+    return searchTargets.includes('all') || ALL_SEARCH_FIELD_IDS.every(id => searchTargets.includes(id));
+  }, [searchTargets]);
+
+  const searchPlaceholder = useMemo(() => {
+    if (isAllActive) {
+      return '🔍 Search all fields (Name, Campaign, Community, Email, ID...)';
+    }
+    const activeLabels = SEARCH_TARGET_OPTIONS
+      .filter(opt => opt.id !== 'all' && searchTargets.includes(opt.id))
+      .map(opt => opt.label);
+    if (activeLabels.length === 1) {
+      return `🔍 Searching only in ${activeLabels[0]}...`;
+    }
+    return `🔍 Searching in ${activeLabels.join(', ')}...`;
+  }, [isAllActive, searchTargets]);
+
+  const handleToggleAll = () => {
+    setSearchTargets(['all']);
+    try { localStorage.setItem('explorer_search_targets', JSON.stringify(['all'])); } catch(e) {}
+    setCurrentPage(1);
+  };
+
+  const handleToggleTarget = (fieldId) => {
+    let newTargets;
+    if (isAllActive) {
+      // If all were active, clicking a specific field isolates to ONLY this field (user said "for example i want to search only in campaigns")
+      newTargets = [fieldId];
+    } else if (searchTargets.includes(fieldId)) {
+      // If it's active, toggle it off
+      const remaining = searchTargets.filter(id => id !== fieldId && id !== 'all');
+      newTargets = remaining.length > 0 ? remaining : ['all'];
+    } else {
+      // If it's inactive, add it
+      const updated = [...searchTargets.filter(id => id !== 'all'), fieldId];
+      if (ALL_SEARCH_FIELD_IDS.every(id => updated.includes(id))) {
+        newTargets = ['all'];
+      } else {
+        newTargets = updated;
+      }
+    }
+    setSearchTargets(newTargets);
+    try { localStorage.setItem('explorer_search_targets', JSON.stringify(newTargets)); } catch(e) {}
+    setCurrentPage(1);
+  };
+
+  const handleTargetContextMenu = (e, fieldId) => {
+    e.preventDefault();
+    setSearchTargets([fieldId]);
+    try { localStorage.setItem('explorer_search_targets', JSON.stringify([fieldId])); } catch(e) {}
+    setCurrentPage(1);
+  };
+
   // Inline Cell Editing State
   const [editingCell, setEditingCell] = useState(null); // { rowIdx, colName, value }
   const [cellMessage, setCellMessage] = useState('');
@@ -133,7 +219,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
 
   const canEdit = user?.role === 'super_admin' || user?.can_edit_donors === 1;
 
-  // Load Campaign Codes lookup and Code Map on mount
+  // Load Campaign Codes lookup, Code Map on mount
   useEffect(() => {
     fetch(`${API_BASE_URL}/api/classifications/campaign-codes`)
       .then(r => r.json())
@@ -148,10 +234,12 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
 
   const loadDonors = () => {
     setLoading(true);
+    const searchFieldsParam = isAllActive ? 'all' : searchTargets.join(',');
     const params = new URLSearchParams({
       page: currentPage,
       page_size: pageSize,
-      search: search
+      search: search,
+      search_fields: searchFieldsParam
     });
 
     if (sortBy) {
@@ -174,6 +262,9 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       if (filters.gift_aid) params.append('gift_aid', filters.gift_aid);
       if (filters.start_date) params.append('start_date', filters.start_date);
       if (filters.end_date) params.append('end_date', filters.end_date);
+      if (filters.campaign && filters.campaign !== 'All Campaigns') {
+        params.append('campaign', filters.campaign);
+      }
     }
 
     fetch(`${API_BASE_URL}/api/donors?${params.toString()}`)
@@ -220,7 +311,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
 
   useEffect(() => {
     loadDonors();
-  }, [currentPage, pageSize, search, filters, sortBy, sortOrder]);
+  }, [currentPage, pageSize, search, searchTargets, filters, sortBy, sortOrder]);
 
   const handleToggleColumn = (col) => {
     setSelectedColumns(prev => {
@@ -426,6 +517,8 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       return;
     }
 
+    const searchFieldsParam = isAllActive ? 'all' : searchTargets.join(',');
+
     fetch(`${API_BASE_URL}/api/donors/bulk-edit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -434,6 +527,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
         target_columns,
         new_values,
         filter_search: search,
+        filter_search_fields: searchFieldsParam,
         filter_payment_type: filters?.payment_type,
         filter_tier: filters?.tier,
         filter_source: filters?.source,
@@ -445,6 +539,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
         filter_zakat: filters?.zakat,
         filter_donor_country: filters?.donor_country,
         filter_campaign_search: filters?.campaign_search,
+        filter_campaign: (filters?.campaign && filters.campaign !== 'All Campaigns') ? filters.campaign : null,
         filter_gift_aid: filters?.gift_aid,
         filter_start_date: filters?.start_date,
         filter_end_date: filters?.end_date
@@ -485,9 +580,11 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
   };
 
   const handleExportDonors = (format, exportAll = false) => {
+    const searchFieldsParam = isAllActive ? 'all' : searchTargets.join(',');
     const params = new URLSearchParams({
       format: format,
-      search: search
+      search: search,
+      search_fields: searchFieldsParam
     });
 
     if (filters) {
@@ -502,6 +599,9 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       if (filters.zakat) params.append('zakat', filters.zakat);
       if (filters.donor_country) params.append('donor_country', filters.donor_country);
       if (filters.campaign_search) params.append('campaign_search', filters.campaign_search);
+      if (filters.campaign && filters.campaign !== 'All Campaigns') {
+        params.append('campaign', filters.campaign);
+      }
       if (filters.gift_aid) params.append('gift_aid', filters.gift_aid);
       if (filters.start_date) params.append('start_date', filters.start_date);
       if (filters.end_date) params.append('end_date', filters.end_date);
@@ -836,37 +936,111 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       )}
 
       {/* Control Toolbar */}
-      <div className="glass-panel p-4 flex flex-wrap items-center justify-between gap-4">
-        {/* Search */}
-        <div className="relative min-w-[340px]">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
-          <input 
-            type="text"
-            placeholder="🔍 Quick Search (Name, Email, Campaign, or Donation ID(s)...)"
-            value={search}
-            onChange={e => { setSearch(e.target.value); setCurrentPage(1); }}
-            className="w-full bg-slate-900/90 border border-white/10 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition-all"
-          />
+      <div className="glass-panel p-4 flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          {/* Quick Search */}
+          <div className="relative min-w-[280px] max-w-lg flex-1">
+            <Search className="w-4 h-4 text-cyan-400 absolute left-3.5 top-3" />
+            <input 
+              type="text"
+              placeholder={searchPlaceholder}
+              value={search}
+              onChange={e => { setSearch(e.target.value); setCurrentPage(1); }}
+              className="w-full bg-slate-900/90 border border-white/10 rounded-xl pl-10 pr-9 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition-all shadow-inner"
+            />
+            {search && (
+              <button
+                type="button"
+                onClick={() => { setSearch(''); setCurrentPage(1); }}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-1 rounded-md transition-colors"
+                title="Clear search text"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Page Size & Record Count */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400 font-bold">Page Size:</span>
+              <select 
+                value={pageSize} 
+                onChange={e => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
+                className="bg-slate-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500 cursor-pointer"
+              >
+                <option value={50}>50 rows</option>
+                <option value={100}>100 rows</option>
+                <option value={250}>250 rows</option>
+                <option value={500}>500 rows</option>
+              </select>
+            </div>
+
+            <span className="text-xs text-slate-400 hidden sm:inline">
+              Total: <span className="font-bold text-white">{data.total_records?.toLocaleString()}</span> records
+            </span>
+          </div>
         </div>
 
-        {/* Page Size */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400 font-bold">Page Size:</span>
-          <select 
-            value={pageSize} 
-            onChange={e => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
-            className="bg-slate-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
+        {/* Search Field Scope Toggles */}
+        <div className="flex items-center gap-1.5 flex-wrap pt-2 border-t border-white/5">
+          <span className="text-[11px] font-bold text-slate-400 mr-1 flex items-center gap-1.5">
+            <Filter className="w-3.5 h-3.5 text-cyan-400" /> Search in:
+          </span>
+
+          {/* All Fields Button */}
+          <button
+            type="button"
+            onClick={handleToggleAll}
+            className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
+              isAllActive
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/50 shadow-sm font-bold'
+                : 'bg-slate-900/80 text-slate-400 border border-white/5 hover:text-slate-200 hover:border-white/10'
+            }`}
+            title="Search across all fields"
           >
-            <option value={50}>50 rows</option>
-            <option value={100}>100 rows</option>
-            <option value={250}>250 rows</option>
-            <option value={500}>500 rows</option>
-          </select>
+            <span className={`w-1.5 h-1.5 rounded-full ${isAllActive ? 'bg-cyan-400 shadow-glow' : 'bg-slate-500'}`} />
+            All Fields
+          </button>
+
+          {/* Individual Field Toggle Pills */}
+          {SEARCH_TARGET_OPTIONS.filter(opt => opt.id !== 'all').map(target => {
+            const isTargetActive = !isAllActive && searchTargets.includes(target.id);
+            return (
+              <button
+                key={target.id}
+                type="button"
+                onClick={() => handleToggleTarget(target.id)}
+                onContextMenu={(e) => handleTargetContextMenu(e, target.id)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer select-none ${
+                  isTargetActive
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/50 shadow-sm font-bold'
+                    : isAllActive
+                    ? 'bg-slate-900/60 text-slate-400 border border-white/5 hover:text-slate-200 hover:border-white/10'
+                    : 'bg-slate-900/40 text-slate-500 border border-white/5 hover:text-slate-300 hover:border-white/10 opacity-70 hover:opacity-100'
+                }`}
+                title={`${target.title} (Click to toggle on/off, Right-click to isolate)`}
+              >
+                {isTargetActive && <Check className="w-3 h-3 text-cyan-400" />}
+                <span>{target.label}</span>
+              </button>
+            );
+          })}
+
+          {!isAllActive && (
+            <button
+              type="button"
+              onClick={handleToggleAll}
+              className="text-[11px] text-slate-400 hover:text-cyan-400 underline ml-2 transition-colors cursor-pointer"
+            >
+              Reset to All
+            </button>
+          )}
         </div>
 
         {/* Cell Message Banner */}
         {cellMessage && (
-          <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-bold flex items-center gap-2 animate-fade-in">
+          <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-bold flex items-center gap-2 animate-fade-in w-full">
             <Check className="w-4 h-4 text-cyan-400" />
             <span>{cellMessage}</span>
           </div>

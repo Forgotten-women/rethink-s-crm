@@ -30,6 +30,7 @@ class BulkEditDonorsRequest(BaseModel):
     target_columns: List[str]
     new_values: List[str]
     filter_search: Optional[str] = ""
+    filter_search_fields: Optional[str] = None
     filter_payment_type: Optional[str] = None
     filter_tier: Optional[str] = None
     filter_source: Optional[str] = None
@@ -41,6 +42,7 @@ class BulkEditDonorsRequest(BaseModel):
     filter_zakat: Optional[str] = None
     filter_donor_country: Optional[str] = None
     filter_campaign_search: Optional[str] = None
+    filter_campaign: Optional[str] = None
     filter_gift_aid: Optional[str] = None
     filter_start_date: Optional[str] = None
     filter_end_date: Optional[str] = None
@@ -194,12 +196,13 @@ def bulk_edit_donors(payload: BulkEditDonorsRequest):
         payload.filter_gift_aid,
         payload.filter_start_date,
         payload.filter_end_date,
-        programme_fund=payload.filter_programme_fund
+        programme_fund=payload.filter_programme_fund,
+        campaign=payload.filter_campaign
     )
 
     # 2. Apply search filter with multi-Donation ID support
     if payload.filter_search and str(payload.filter_search).strip():
-        filtered_df = _apply_search_to_df(filtered_df, payload.filter_search)
+        filtered_df = _apply_search_to_df(filtered_df, payload.filter_search, search_fields=payload.filter_search_fields)
 
     matching_indices = filtered_df.index
     if len(matching_indices) == 0:
@@ -280,31 +283,50 @@ def _parse_search_query(search_str: str):
     return id_tokens, s
 
 
-def _apply_search_to_df(df: pd.DataFrame, search_str: str) -> pd.DataFrame:
-    """Applies multi-Donation ID and universal text search across all relevant fields."""
+def _apply_search_to_df(df: pd.DataFrame, search_str: str, search_fields: str = None) -> pd.DataFrame:
+    """Applies multi-Donation ID and targeted or universal text search across scoped fields."""
     if not search_str or not str(search_str).strip() or df.empty:
         return df
 
     id_tokens, raw_text = _parse_search_query(search_str)
     mask = pd.Series(False, index=df.index)
 
+    active_targets = set([f.strip().lower() for f in search_fields.split(",") if f.strip()]) if search_fields else set()
+    search_all = not active_targets or "all" in active_targets
+
     # 1. Multi Donation ID match
-    if id_tokens:
+    if (search_all or "donation_id" in active_targets or "id" in active_targets) and id_tokens:
         for id_col in ["Donation ID", "Donor ID", "Transaction ID", "ID", "Transfer ID"]:
             if id_col in df.columns:
                 id_series = df[id_col].astype(str).str.strip().str.lstrip('#')
                 mask |= id_series.isin(id_tokens)
 
-    # 2. General text match across names, email, campaign, community, code
+    # 2. General text match across selected targets
     term = raw_text.strip().lower()
-    search_cols = [c for c in ["First Name", "Last Name", "Display Name", "Email", "Campaign Name", "Community Name", "Code", "Donation ID", "Donor ID"] if c in df.columns]
+    target_cols = []
+    if search_all or "name" in active_targets or "donor" in active_targets:
+        target_cols.extend(["First Name", "Last Name", "Display Name"])
+    if search_all or "campaign" in active_targets or "campaigns" in active_targets:
+        target_cols.extend(["Campaign Name"])
+    if search_all or "community" in active_targets:
+        target_cols.extend(["Community Name"])
+    if search_all or "email" in active_targets:
+        target_cols.extend(["Email"])
+    if search_all or "fundraiser" in active_targets:
+        target_cols.extend(["fundraiser_name", "Fundraiser Name"])
+    if search_all or "code" in active_targets:
+        target_cols.extend(["Code"])
+    if search_all:
+        target_cols.extend(["Donation ID", "Donor ID", "Transfer ID"])
+
+    search_cols = [c for c in dict.fromkeys(target_cols) if c in df.columns]
     for sc in search_cols:
         mask |= df[sc].astype(str).str.lower().str.contains(term, na=False, regex=False)
 
     return df.loc[mask]
 
 
-def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, subheading=None, country=None, code=None, zakat=None, donor_country=None, campaign_search=None, gift_aid=None, start_date=None, end_date=None, programme_fund=None):
+def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, subheading=None, country=None, code=None, zakat=None, donor_country=None, campaign_search=None, gift_aid=None, start_date=None, end_date=None, programme_fund=None, campaign=None):
     if df is None or df.empty:
         return df
 
@@ -312,6 +334,9 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
 
     if isinstance(programme_fund, str) and programme_fund.strip() and programme_fund != "All Programme Funds" and "Programme Fund" in df.columns:
         mask &= (df["Programme Fund"].astype(str).str.strip().str.lower() == programme_fund.strip().lower())
+
+    if isinstance(campaign, str) and campaign.strip() and campaign != "All Campaigns" and "Campaign Name" in df.columns:
+        mask &= (df["Campaign Name"].astype(str).str.strip().str.lower() == campaign.strip().lower())
 
     if isinstance(payment_type, str) and payment_type.strip() and payment_type != "All Payment Types" and "Payment Frequency" in df.columns:
         norm_type = payment_type.strip()
@@ -393,6 +418,7 @@ def get_donors_paginated(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=1000),
     search: Optional[str] = "",
+    search_fields: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = "asc",
     payment_type: Optional[str] = None,
@@ -406,12 +432,13 @@ def get_donors_paginated(
     zakat: Optional[str] = None,
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
+    campaign: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
     """
-    Ultra-fast SQL Paginated Endpoint (< 100ms) with multi-Donation ID and universal text search.
+    Ultra-fast SQL Paginated Endpoint (< 100ms) with multi-Donation ID and scoped field text search.
     Strictly queries donations data without payout records.
     """
     target_table = "donations"
@@ -502,9 +529,13 @@ def get_donors_paginated(
                     if cs_col in avail_cols:
                         c_clauses.append(f'"{cs_col}" LIKE ?')
                         c_params.append(c_term)
-                if c_clauses:
-                    where_clauses.append(f"({' OR '.join(c_clauses)})")
-                    params.extend(c_params)
+                    if c_clauses:
+                        where_clauses.append(f"({' OR '.join(c_clauses)})")
+                        params.extend(c_params)
+
+            if campaign and str(campaign).strip() and campaign != "All Campaigns" and "Campaign Name" in avail_cols:
+                where_clauses.append('LOWER("Campaign Name") = ?')
+                params.append(campaign.strip().lower())
 
             if gift_aid and gift_aid != "All Gift Aid Status":
                 where_clauses.append('("Gift Aid (yes or no)" LIKE ? OR "is_giftaid" = ?)')
@@ -523,8 +554,15 @@ def get_donors_paginated(
                 search_parts = []
                 search_subparams = []
 
+                search_all = True
+                active_targets = []
+                if search_fields and str(search_fields).strip():
+                    active_targets = [t.strip().lower() for t in search_fields.split(",") if t.strip()]
+                    if "all" not in active_targets:
+                        search_all = False
+
                 # Multi-Donation ID match
-                if id_tokens:
+                if id_tokens and (search_all or "donation_id" in active_targets or "id" in active_targets):
                     id_placeholders = ','.join(['?'] * len(id_tokens))
                     id_cols = [c for c in ['"Donation ID"', '"Donor ID"', '"Transfer ID"'] if c.strip('"') in avail_cols]
                     if id_cols:
@@ -532,12 +570,28 @@ def get_donors_paginated(
                         search_parts.append(f"({id_clause})")
                         search_subparams.extend(id_tokens * len(id_cols))
 
-                # General text match across name, email, campaign, etc.
+                # General text match across selected target columns
                 text_term = f"%{raw_text.strip()}%"
-                for col in ['"First Name"', '"Last Name"', '"Display Name"', '"Email"', '"Campaign Name"', '"Community Name"', '"Code"', '"Transfer ID"']:
-                    if col.strip('"') in avail_cols:
-                        search_parts.append(f"{col} LIKE ?")
-                        search_subparams.append(text_term)
+                target_cols = []
+                if search_all or "name" in active_targets or "donor" in active_targets:
+                    target_cols.extend(['"First Name"', '"Last Name"', '"Display Name"'])
+                if search_all or "campaign" in active_targets or "campaigns" in active_targets:
+                    target_cols.extend(['"Campaign Name"'])
+                if search_all or "community" in active_targets:
+                    target_cols.extend(['"Community Name"'])
+                if search_all or "email" in active_targets:
+                    target_cols.extend(['"Email"'])
+                if search_all or "fundraiser" in active_targets:
+                    target_cols.extend(['"fundraiser_name"', '"Fundraiser Name"'])
+                if search_all or "code" in active_targets:
+                    target_cols.extend(['"Code"'])
+                if search_all or "donation_id" in active_targets:
+                    target_cols.extend(['"Donation ID"', '"Donor ID"', '"Transfer ID"'])
+
+                search_cols = [col for col in dict.fromkeys(target_cols) if col.strip('"') in avail_cols]
+                for col in search_cols:
+                    search_parts.append(f"{col} LIKE ?")
+                    search_subparams.append(text_term)
 
                 if search_parts:
                     where_clauses.append(f"({' OR '.join(search_parts)})")
@@ -598,8 +652,8 @@ def get_donors_paginated(
             "records": []
         }
 
-    filtered_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund)
-    display_df = _apply_search_to_df(filtered_df, search)
+    filtered_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=campaign)
+    display_df = _apply_search_to_df(filtered_df, search, search_fields=search_fields)
 
     total_records = len(display_df)
     total_pages = max(1, math.ceil(total_records / page_size))
@@ -631,6 +685,7 @@ def get_donors_paginated(
 def export_donors(
     format: str = Query("csv", pattern="^(csv|xlsx)$"),
     search: Optional[str] = "",
+    search_fields: Optional[str] = None,
     columns: Optional[str] = None,
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
@@ -643,11 +698,12 @@ def export_donors(
     zakat: Optional[str] = None,
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
+    campaign: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
-    """Exports filtered donor rows with date range, multi-Donation ID, and universal search support."""
+    """Exports filtered donor rows with date range, multi-Donation ID, and scoped search support."""
     df_raw = load_data()
     if df_raw.empty:
         raise HTTPException(status_code=400, detail="No donor data available to export.")
@@ -670,9 +726,10 @@ def export_donors(
         gift_aid=gift_aid,
         start_date=start_date,
         end_date=end_date,
-        programme_fund=programme_fund
+        programme_fund=programme_fund,
+        campaign=campaign
     )
-    display_df = _apply_search_to_df(filtered_df, search)
+    display_df = _apply_search_to_df(filtered_df, search, search_fields=search_fields)
 
     # Column selection: filter to requested columns if provided, otherwise drop all-empty columns
     if columns:
@@ -1100,3 +1157,26 @@ def get_donor_history_paginated(
         "total_pages": total_pages,
         "records": records
     }
+
+
+@router.get("/campaigns")
+def get_campaigns_list():
+    """Returns sorted unique list of campaign names for fast dropdown filtering in Data Explorer."""
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT [Campaign Name]
+            FROM donations
+            WHERE [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != ''
+            ORDER BY [Campaign Name] COLLATE NOCASE ASC
+        """)
+        campaigns = [r[0].strip() for r in cur.fetchall() if r[0] and str(r[0]).strip()]
+        conn.close()
+        return {"campaigns": campaigns}
+    except Exception as e:
+        df = load_data()
+        if not df.empty and "Campaign Name" in df.columns:
+            campaigns = sorted([str(c).strip() for c in df["Campaign Name"].dropna().unique() if str(c).strip()])
+            return {"campaigns": campaigns}
+        return {"campaigns": []}

@@ -19,6 +19,7 @@ def get_filter_options(
     zakat: Optional[str] = None,
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
+    campaign: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
@@ -37,11 +38,12 @@ def get_filter_options(
             "tiers": [],
             "payment_types": [],
             "donor_countries": [],
+            "campaigns": [],
             "gift_aid_options": ["All Gift Aid Status"]
         }
 
     # 1. Sources (Platforms): filter by all active criteria EXCEPT source
-    s_df = _apply_filters(df_raw, payment_type, tier, None, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund)
+    s_df = _apply_filters(df_raw, payment_type, tier, None, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=campaign)
     sources = []
     if "Platform" in s_df.columns:
         sources = sorted([str(p).strip() for p in s_df["Platform"].dropna().unique() if str(p).strip() not in ["", "nan", "None", "LaunchGood Payout", "launchgood payout"]])
@@ -153,6 +155,12 @@ def get_filter_options(
     if len(gift_aid_options) == 1:
         gift_aid_options = ["All Gift Aid Status", "Yes", "No"]
 
+    # 12. Campaigns: filter by all active criteria EXCEPT campaign itself
+    camp_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=None)
+    campaigns = []
+    if "Campaign Name" in camp_df.columns:
+        campaigns = sorted([str(c).strip() for c in camp_df["Campaign Name"].dropna().unique() if str(c).strip() not in ["", "nan", "None", "Unassigned"]])
+
     return {
         "sources": sources,
         "programme_funds": programme_funds,
@@ -164,6 +172,7 @@ def get_filter_options(
         "tiers": tiers,
         "payment_types": payment_types,
         "donor_countries": donor_countries,
+        "campaigns": campaigns,
         "gift_aid_options": gift_aid_options
     }
 

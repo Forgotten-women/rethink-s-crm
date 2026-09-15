@@ -155,6 +155,12 @@ def sync_discovered_fundraisers_internal() -> int:
     return len(new_fundraisers)
 
 
+try:
+    sync_discovered_fundraisers_internal()
+except Exception as _sync_err:
+    pass
+
+
 class CampaignAssignment(BaseModel):
     campaign_name: str
     code: Optional[str] = "ALL"
@@ -932,9 +938,44 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
     try:
         cur.execute("SELECT name FROM fundraisers WHERE id = ?", (fundraiser_id,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Fundraiser not found.")
-        old_name = row[0]
+        
+        old_name = None
+        if row:
+            old_name = row[0]
+        else:
+            # Check if fundraiser exists by name in fundraisers table
+            cur.execute("SELECT id, name FROM fundraisers WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))", (new_name,))
+            row_by_name = cur.fetchone()
+            if row_by_name:
+                fundraiser_id = row_by_name[0]
+                old_name = row_by_name[1]
+            else:
+                # Check if this is an auto-discovered fundraiser from donations
+                cur.execute("SELECT DISTINCT fundraiser_name FROM donations WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''")
+                don_names = [r[0] for r in cur.fetchall() if r[0]]
+                for d_name in don_names:
+                    synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, d_name.strip().lower()).hex[:16]}"
+                    if synth_id == fundraiser_id or d_name.strip().lower() == fundraiser_id.lower() or d_name.strip().lower() == new_name.lower():
+                        old_name = d_name.strip()
+                        break
+
+                if not old_name:
+                    old_name = new_name
+
+                # Auto-insert into fundraisers table so it is officially registered and persisted
+                cur.execute("""
+                    INSERT INTO fundraisers (id, name, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (
+                    fundraiser_id,
+                    new_name,
+                    payload.email.strip() if payload.email else "",
+                    payload.phone.strip() if payload.phone else "",
+                    float(payload.target_goal or 0.0),
+                    payload.start_date.strip() if payload.start_date else "",
+                    payload.status.strip().upper() if payload.status else "ACTIVE",
+                    payload.notes.strip() if payload.notes else ""
+                ))
 
         # Get existing assigned campaigns for diffing
         cur.execute("SELECT campaign_name, code FROM fundraiser_campaigns WHERE fundraiser_id = ?", (fundraiser_id,))
@@ -1116,8 +1157,19 @@ def delete_fundraiser(fundraiser_id: str, user_role: str = "guest", can_edit_don
         cur.execute("SELECT name FROM fundraisers WHERE id = ?", (fundraiser_id,))
         row = cur.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Fundraiser not found.")
-        f_name = row[0]
+            cur.execute("SELECT DISTINCT fundraiser_name FROM donations WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''")
+            don_names = [r[0] for r in cur.fetchall() if r[0]]
+            matched = None
+            for d_name in don_names:
+                synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, d_name.strip().lower()).hex[:16]}"
+                if synth_id == fundraiser_id or d_name.strip().lower() == fundraiser_id.lower():
+                    matched = d_name.strip()
+                    break
+            if not matched:
+                raise HTTPException(status_code=404, detail="Fundraiser not found.")
+            f_name = matched
+        else:
+            f_name = row[0]
 
         cur.execute("DELETE FROM fundraiser_campaigns WHERE fundraiser_id = ?", (fundraiser_id,))
         cur.execute("DELETE FROM fundraisers WHERE id = ?", (fundraiser_id,))
