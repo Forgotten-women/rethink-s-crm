@@ -162,7 +162,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         legacy_zakat_code: '',
         old_codes: '',
         description: '',
-        is_active: 1
+        is_active: 1,
+        project_status: 'Continuing'
       }
     });
     setMasterCodeModalMsg('');
@@ -184,10 +185,40 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         legacy_zakat_code: rule.legacy_zakat_code || rule['Legacy Zakat GL Code'] || '',
         old_codes: rule.old_codes || rule['Old Code(s)'] || '',
         description: rule.description || rule['Description'] || '',
-        is_active: rule.is_active !== undefined ? rule.is_active : 1
+        is_active: rule.is_active !== undefined ? rule.is_active : 1,
+        project_status: rule.project_status || rule['Project Status'] || 'Continuing'
       }
     });
     setMasterCodeModalMsg('');
+  };
+
+  const handleQuickUpdateStatus = async (code, newStatus, newActive) => {
+    if (!isSuperAdmin) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/classifications/master-codes/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_role: user?.role,
+          company_id: activeCompany,
+          code: code,
+          project_status: newStatus,
+          is_active: newActive
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data?.status === 'success') {
+        setSaveNotification({
+          type: 'success',
+          title: 'Status Updated',
+          message: `Code '${code}' status set to '${newStatus}'.`,
+          timestamp: new Date().toLocaleTimeString()
+        });
+        loadMatrixData();
+      }
+    } catch (err) {
+      console.error('Error updating status:', err);
+    }
   };
 
   const handleSaveMasterCodeSubmit = async (e) => {
@@ -215,7 +246,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           legacy_zakat_code: masterCodeModal.data.legacy_zakat_code || '',
           old_codes: masterCodeModal.data.old_codes || '',
           description: masterCodeModal.data.description || '',
-          is_active: masterCodeModal.data.is_active || 1
+          is_active: masterCodeModal.data.is_active !== undefined ? masterCodeModal.data.is_active : 1,
+          project_status: masterCodeModal.data.project_status || 'Continuing'
         })
       });
 
@@ -314,7 +346,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             'Description': cleanText(r.description || ''),
             'Campaign Count': r.campaign_count || 0,
             'Total Raised': r.total_raised || 0,
-            'is_active': r.is_active
+            'is_active': r.is_active,
+            'Project Status': cleanText(r.project_status || 'Continuing')
           }));
 
           setMatrixData({
@@ -1468,6 +1501,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                     <th className="w-32 text-left">Zakat Status</th>
                     <th className="min-w-[150px] text-left">Legacy GL (Non-Z / Z)</th>
                     <th className="min-w-[140px] text-left">Old Code(s)</th>
+                    <th className="w-36 text-center">Status</th>
                     <th className="w-28 text-center">Campaigns</th>
                     <th className="w-32 text-right pr-4">Total Raised</th>
                     {isSuperAdmin && <th className="text-center w-24">Action</th>}
@@ -1476,7 +1510,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 <tbody>
                   {paginatedRules.length === 0 ? (
                     <tr>
-                      <td colSpan={13} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={14} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No master project codes match the active search.
                       </td>
                     </tr>
@@ -1544,6 +1578,42 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                             </span>
                           ) : (
                             <span className="text-slate-400 italic text-[11px]">—</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 w-36 text-center">
+                          {isSuperAdmin ? (
+                            <select
+                              value={r['Project Status'] || 'Continuing'}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                const act = ['ended', 'susbended'].includes(val.toLowerCase()) ? 0 : 1;
+                                handleQuickUpdateStatus(r['Code'], val, act);
+                              }}
+                              className={`text-[11px] font-bold px-2 py-1 rounded-lg border outline-none cursor-pointer transition-all ${
+                                ['ended', 'susbended'].includes((r['Project Status'] || '').toLowerCase())
+                                  ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300 border-rose-300 dark:border-rose-800'
+                                  : (r['Project Status'] || '').toLowerCase().includes('active')
+                                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border-emerald-300 dark:border-emerald-800'
+                                  : 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 border-blue-300 dark:border-blue-800'
+                              }`}
+                            >
+                              <option value="Continuing">Continuing</option>
+                              <option value="New / Active">New / Active</option>
+                              <option value="Active">Active</option>
+                              <option value="Hasn't started">Hasn't started</option>
+                              <option value="Ended">Ended</option>
+                              <option value="Susbended">Suspended</option>
+                              <option value="NA">NA</option>
+                              <option value="??">??</option>
+                            </select>
+                          ) : (
+                            <span className={`text-[11px] font-bold px-2 py-0.5 rounded-lg border ${
+                              ['ended', 'susbended'].includes((r['Project Status'] || '').toLowerCase())
+                                ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300 border-rose-300 dark:border-rose-800'
+                                : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border-emerald-300 dark:border-emerald-800'
+                            }`}>
+                              {r['Project Status'] || 'Continuing'}
+                            </span>
                           )}
                         </td>
                         <td className="py-3 px-3 w-28 text-center">
@@ -2238,6 +2308,52 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                     placeholder="e.g. EM-PAL-23, EM-PAL-22"
                     className="bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-white/10 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:border-emerald-500"
                   />
+                </div>
+
+                {/* Project Status */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-slate-700 dark:text-slate-300 font-bold uppercase tracking-wider text-[10px]">
+                    Project Status
+                  </label>
+                  <select
+                    value={masterCodeModal.data.project_status || 'Continuing'}
+                    onChange={e => {
+                      const val = e.target.value;
+                      const act = ['ended', 'susbended'].includes(val.toLowerCase()) ? 0 : 1;
+                      setMasterCodeModal(prev => ({
+                        ...prev,
+                        data: { ...prev.data, project_status: val, is_active: act }
+                      }));
+                    }}
+                    className="bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-white/10 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-semibold focus:outline-none focus:border-emerald-500"
+                  >
+                    <option value="Continuing">Continuing</option>
+                    <option value="New / Active">New / Active</option>
+                    <option value="Active">Active</option>
+                    <option value="Hasn't started">Hasn't started</option>
+                    <option value="Ended">Ended</option>
+                    <option value="Susbended">Suspended</option>
+                    <option value="NA">NA</option>
+                    <option value="??">??</option>
+                  </select>
+                </div>
+
+                {/* Active Toggle */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-slate-700 dark:text-slate-300 font-bold uppercase tracking-wider text-[10px]">
+                    Registry Active State
+                  </label>
+                  <select
+                    value={masterCodeModal.data.is_active !== undefined ? masterCodeModal.data.is_active : 1}
+                    onChange={e => setMasterCodeModal(prev => ({
+                      ...prev,
+                      data: { ...prev.data, is_active: Number(e.target.value) }
+                    }))}
+                    className="bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-white/10 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-semibold focus:outline-none focus:border-emerald-500"
+                  >
+                    <option value={1}>Active (Visible in Dropdowns)</option>
+                    <option value={0}>Inactive (Archived)</option>
+                  </select>
                 </div>
               </div>
 

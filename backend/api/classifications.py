@@ -97,11 +97,20 @@ class MasterProjectCodeRequest(BaseModel):
     zakat_eligibility: Optional[str] = "Zakat"
     description: Optional[str] = ""
     is_active: Optional[int] = 1
+    project_status: Optional[str] = "Continuing"
     programme_fund: Optional[str] = ""
     fund_code: Optional[str] = ""
     legacy_non_zakat_code: Optional[str] = ""
     legacy_zakat_code: Optional[str] = ""
     old_codes: Optional[str] = ""
+
+
+class UpdateMasterCodeStatusRequest(BaseModel):
+    user_role: Optional[str] = "super_admin"
+    code: str
+    company_id: Optional[str] = "rethink"
+    is_active: Optional[int] = None
+    project_status: Optional[str] = None
 
 
 class DeleteMasterCodeRequest(BaseModel):
@@ -195,6 +204,7 @@ def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
                 zakat_eligibility, 
                 COALESCE(description, '') AS description, 
                 COALESCE(is_active, 1) AS is_active,
+                COALESCE(project_status, 'Continuing') AS project_status,
                 COALESCE(programme_fund, '') AS programme_fund,
                 COALESCE(fund_code, '') AS fund_code,
                 COALESCE(legacy_non_zakat_code, '') AS legacy_non_zakat_code,
@@ -254,6 +264,7 @@ def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
                 "zakat_eligibility": sanitize_text(r["zakat_eligibility"]),
                 "description": sanitize_text(r.get("description", "")),
                 "is_active": int(r.get("is_active", 1)),
+                "project_status": sanitize_text(r.get("project_status", "Continuing")),
                 "programme_fund": sanitize_text(r.get("programme_fund", "")),
                 "fund_code": sanitize_text(r.get("fund_code", "")),
                 "legacy_non_zakat_code": sanitize_text(r.get("legacy_non_zakat_code", "")),
@@ -307,6 +318,7 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
     non_zkt_gl = sanitize_text((payload.legacy_non_zakat_code or "").strip())
     zkt_gl = sanitize_text((payload.legacy_zakat_code or "").strip())
     old_cds = sanitize_text((payload.old_codes or "").strip())
+    proj_status = sanitize_text((payload.project_status or "Continuing").strip())
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=30.0)
@@ -316,9 +328,9 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                     INSERT INTO master_project_codes (
                         code, department, office, portfolio, country, zakat_eligibility, 
                         description, is_active, programme_fund, fund_code, 
-                        legacy_non_zakat_code, legacy_zakat_code, old_codes, updated_at, company_id
+                        legacy_non_zakat_code, legacy_zakat_code, old_codes, project_status, updated_at, company_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                     ON CONFLICT(company_id, code) DO UPDATE SET
                         department = excluded.department,
                         office = excluded.office,
@@ -332,8 +344,9 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                         legacy_non_zakat_code = excluded.legacy_non_zakat_code,
                         legacy_zakat_code = excluded.legacy_zakat_code,
                         old_codes = excluded.old_codes,
+                        project_status = excluded.project_status,
                         updated_at = CURRENT_TIMESTAMP;
-                """, (clean_code, dept, off, port, cntry, zkt, desc, act, prog_fund, f_code, non_zkt_gl, zkt_gl, old_cds, comp))
+                """, (clean_code, dept, off, port, cntry, zkt, desc, act, prog_fund, f_code, non_zkt_gl, zkt_gl, old_cds, proj_status, comp))
         finally:
             conn.close()
 
@@ -345,8 +358,6 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
     try:
         df_raw = load_data(force_reload=True)
         if not df_raw.empty and "Code" in df_raw.columns:
-            if "company_id" not in df_raw.columns:
-                df_raw["company_id"] = "rethink"
             comp_mask = (df_raw["company_id"].astype(str).str.lower() == comp)
             mask = comp_mask & (df_raw["Code"].astype(str).str.strip().str.upper() == clean_code)
             if mask.any():
@@ -386,6 +397,59 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
     return {
         "status": "success",
         "message": f"Successfully saved master project code '{clean_code}'."
+    }
+
+
+@router.post("/master-codes/status")
+def update_master_code_status(payload: UpdateMasterCodeStatusRequest):
+    """Allows updating project_status and/or is_active directly from the table or modal."""
+    if payload.user_role != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Managing master project codes is restricted to Super Admin accounts."
+        )
+
+    comp = str(payload.company_id or "rethink").lower().strip()
+    clean_code = str(payload.code).strip().upper()
+    if not clean_code:
+        raise HTTPException(status_code=400, detail="A valid Code string is required.")
+
+    updates = []
+    params = []
+    if payload.is_active is not None:
+        updates.append("is_active = ?")
+        params.append(int(payload.is_active))
+    if payload.project_status is not None:
+        updates.append("project_status = ?")
+        params.append(str(payload.project_status).strip())
+        if payload.is_active is None:
+            if str(payload.project_status).strip().lower() in ["ended", "susbended"]:
+                updates.append("is_active = 0")
+            elif str(payload.project_status).strip().lower() in ["continuing", "active", "new / active"]:
+                updates.append("is_active = 1")
+
+    if not updates:
+        return {"status": "success", "message": "No updates requested."}
+
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+    params.extend([clean_code, comp])
+
+    with _DB_LOCK:
+        conn = get_db_connection(timeout=30.0)
+        try:
+            with conn:
+                conn.execute(f"""
+                    UPDATE master_project_codes
+                    SET {", ".join(updates)}
+                    WHERE UPPER(code) = ? AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                """, params)
+        finally:
+            conn.close()
+
+    get_code_to_classification_map(force_reload=True, company_id=comp)
+    return {
+        "status": "success",
+        "message": f"Successfully updated status for code '{clean_code}'."
     }
 
 
