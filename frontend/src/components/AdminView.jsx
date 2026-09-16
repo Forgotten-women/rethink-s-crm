@@ -1,8 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { Database, HardDrive, Server, Trash2, Edit, ShieldCheck, UserCheck, Key, Check, X, ShieldAlert, Sparkles, Mail, Save, Upload, FileSpreadsheet, RefreshCw } from 'lucide-react';
+import { 
+  Database, HardDrive, Server, Trash2, Edit, ShieldCheck, UserCheck, Key, 
+  Check, X, ShieldAlert, Sparkles, Mail, Save, Upload, FileSpreadsheet, 
+  RefreshCw, Building, Image, FileUp, Palette, Plus, Eye 
+} from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function AdminView({ user, onDataChange }) {
+export default function AdminView({ user, onDataChange, activeCompany = 'rethink', companies = [], onCompaniesChange }) {
   const [status, setStatus] = useState(null);
   const [tags, setTags] = useState([]);
   const [usersList, setUsersList] = useState([]);
@@ -21,8 +25,19 @@ export default function AdminView({ user, onDataChange }) {
   const [uploadFile, setUploadFile] = useState(null);
   const [uploadPlatform, setUploadPlatform] = useState('auto');
   const [uploadMode, setUploadMode] = useState('merge');
+  const [uploadTargetCompany, setUploadTargetCompany] = useState(activeCompany !== 'all' ? activeCompany : 'rethink');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
+
+  // Multi-Company & Brand Settings State
+  const [companiesList, setCompaniesList] = useState(companies || []);
+  const [companyModal, setCompanyModal] = useState(null); // { isEdit: bool, data: { id, name, short_code, accent_color, is_active } }
+  const [savingCompany, setSavingCompany] = useState(false);
+  const [uploadLogoModal, setUploadLogoModal] = useState(null); // { companyId, companyName }
+  const [logoFile, setLogoFile] = useState(null);
+  const [logoPreview, setLogoPreview] = useState(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  const [companyMsg, setCompanyMsg] = useState('');
 
   // Purge Database State
   const [purgeConfirm, setPurgeConfirm] = useState(false);
@@ -124,6 +139,7 @@ export default function AdminView({ user, onDataChange }) {
     formData.append('user_role', user?.role || 'admin');
     formData.append('upload_mode', uploadMode);
     formData.append('platform', uploadPlatform);
+    formData.append('company_id', uploadTargetCompany);
     formData.append('file', uploadFile);
 
     fetch(`${API_BASE_URL}/api/admin/upload-data`, {
@@ -148,20 +164,22 @@ export default function AdminView({ user, onDataChange }) {
       });
   };
 
-  const loadAdminData = () => {
+  const loadAdminData = (company = activeCompany) => {
     setLoading(true);
+    const compQuery = company ? `?company_id=${encodeURIComponent(company)}` : '';
 
-    fetch(`${API_BASE_URL}/api/admin/status`)
+    fetch(`${API_BASE_URL}/api/admin/status${compQuery}`)
       .then(r => r.ok ? r.json() : null)
       .then(stData => { if (stData) setStatus(stData); })
       .catch(err => console.error('Status fetch error:', err));
 
-    fetch(`${API_BASE_URL}/api/admin/tags`)
+    fetch(`${API_BASE_URL}/api/admin/tags${compQuery}`)
       .then(r => r.ok ? r.json() : [])
       .then(tagData => {
         if (Array.isArray(tagData)) {
           setTags(tagData);
           if (tagData.length > 0) setOldTag(tagData[0].source_tag);
+          else setOldTag('');
         }
       })
       .catch(err => console.error('Tags fetch error:', err));
@@ -178,13 +196,105 @@ export default function AdminView({ user, onDataChange }) {
       .then(expSettings => {
         if (expSettings?.approval_email) setApprovalEmail(expSettings.approval_email);
       })
-      .catch(err => console.error('Settings fetch error:', err))
+      .catch(err => console.error('Settings fetch error:', err));
+
+    fetch(`${API_BASE_URL}/api/admin/companies`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d?.companies && Array.isArray(d.companies)) {
+          setCompaniesList(d.companies);
+        }
+      })
+      .catch(err => console.error('Companies fetch error:', err))
       .finally(() => setLoading(false));
   };
 
+  const loadCompanies = () => {
+    fetch(`${API_BASE_URL}/api/admin/companies`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d?.companies && Array.isArray(d.companies)) {
+          setCompaniesList(d.companies);
+        }
+      })
+      .catch(err => console.error('Error fetching companies:', err));
+  };
+
+  const handleSaveCompany = async (e) => {
+    e.preventDefault();
+    if (!isSuperAdmin || !companyModal?.data) return;
+    setSavingCompany(true);
+    setCompanyMsg('');
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/companies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_role: user?.role,
+          id: companyModal.data.id.trim().toLowerCase(),
+          name: companyModal.data.name.trim(),
+          short_code: companyModal.data.short_code.trim().toUpperCase(),
+          accent_color: companyModal.data.accent_color.trim(),
+          is_active: companyModal.data.is_active !== undefined ? companyModal.data.is_active : 1
+        })
+      });
+      const data = await res.json();
+      setSavingCompany(false);
+      if (res.ok && data?.status === 'success') {
+        setCompanyMsg(`✅ ${data.message || 'Company saved successfully.'}`);
+        setCompanyModal(null);
+        loadCompanies();
+        if (onCompaniesChange) onCompaniesChange();
+        if (onDataChange) onDataChange();
+      } else {
+        setCompanyMsg(`❌ ${data?.detail || 'Failed to save company.'}`);
+      }
+    } catch (err) {
+      setSavingCompany(false);
+      setCompanyMsg(`❌ Error: ${err.message}`);
+    }
+  };
+
+  const handleUploadLogo = async (e) => {
+    e.preventDefault();
+    if (!isSuperAdmin || !uploadLogoModal?.companyId || !logoFile) return;
+    setUploadingLogo(true);
+    setCompanyMsg('');
+
+    const formData = new FormData();
+    formData.append('file', logoFile);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/companies/${uploadLogoModal.companyId}/logo?user_role=${encodeURIComponent(user?.role)}`, {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      setUploadingLogo(false);
+      if (res.ok && data?.status === 'success') {
+        setCompanyMsg(`✅ ${data.message || 'Brand logo uploaded successfully.'}`);
+        setUploadLogoModal(null);
+        setLogoFile(null);
+        setLogoPreview(null);
+        loadCompanies();
+        if (onCompaniesChange) onCompaniesChange();
+        if (onDataChange) onDataChange();
+      } else {
+        setCompanyMsg(`❌ ${data?.detail || 'Failed to upload brand logo.'}`);
+      }
+    } catch (err) {
+      setUploadingLogo(false);
+      setCompanyMsg(`❌ Error: ${err.message}`);
+    }
+  };
+
   useEffect(() => {
-    loadAdminData();
-  }, []);
+    loadAdminData(activeCompany);
+    if (activeCompany !== 'all') {
+      setUploadTargetCompany(activeCompany);
+    }
+  }, [activeCompany]);
 
   const handleTogglePermission = (u, field) => {
     if (!isSuperAdmin) return;
@@ -397,6 +507,127 @@ export default function AdminView({ user, onDataChange }) {
         </div>
       </div>
 
+      {/* 🏢 Multi-Company Partitioning & Brand Identity Settings Card */}
+      {isSuperAdmin && (
+        <div className="glass-panel p-5 border-l-4 border-cyan-500 flex flex-col gap-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h3 className="text-sm font-extrabold text-white flex items-center gap-2">
+                <Building className="w-5 h-5 text-cyan-400" /> Multi-Company & Brand Identity Settings
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Manage organization partitions, brand accent colors, and custom brand logos displayed in the top navbar and sidebar navigation.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setCompanyModal({ isEdit: false, data: { id: '', name: '', short_code: '', accent_color: '#06B6D4', is_active: 1 } })}
+                className="btn-primary text-xs flex items-center gap-1.5 px-3.5 py-1.5 shadow-md shadow-cyan-500/20 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" /> Add Company
+              </button>
+            </div>
+          </div>
+
+          {companyMsg && (
+            <div className={`text-xs font-bold p-2.5 rounded-lg border ${
+              companyMsg.includes('✅') ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-400'
+            }`}>
+              {companyMsg}
+            </div>
+          )}
+
+          {/* Companies Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {companiesList.map(comp => (
+              <div 
+                key={comp.id}
+                className="bg-slate-900/80 border border-white/10 rounded-2xl p-4 flex flex-col justify-between gap-4 transition-all hover:border-white/20 shadow-lg"
+                style={{ borderTop: `4px solid ${comp.accent_color || '#06B6D4'}` }}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    {comp.logo_url ? (
+                      <div className="w-12 h-12 rounded-xl bg-white/5 border border-white/10 p-1.5 flex items-center justify-center shrink-0 overflow-hidden shadow-inner">
+                        <img 
+                          src={comp.logo_url.startsWith('http') ? comp.logo_url : `${API_BASE_URL}${comp.logo_url}`} 
+                          alt={comp.name} 
+                          className="w-full h-full object-contain"
+                          onError={(e) => { e.target.style.display = 'none'; }}
+                        />
+                      </div>
+                    ) : (
+                      <div 
+                        className="w-12 h-12 rounded-xl flex items-center justify-center font-black text-sm text-white shrink-0 shadow-md"
+                        style={{ backgroundColor: comp.accent_color || '#06B6D4' }}
+                      >
+                        {comp.short_code || comp.id.slice(0, 3).toUpperCase()}
+                      </div>
+                    )}
+                    <div>
+                      <div className="font-extrabold text-white text-sm flex items-center gap-1.5">
+                        {comp.name}
+                        {comp.id === activeCompany && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded font-bold uppercase bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">Active</span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-slate-400 font-mono mt-0.5">
+                        ID: <span className="text-cyan-400">{comp.id}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                    comp.is_active ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/15 text-rose-400 border border-rose-500/30'
+                  }`}>
+                    {comp.is_active ? 'Active' : 'Inactive'}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between pt-2 border-t border-white/5 text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-400 text-[11px]">Brand Color:</span>
+                    <span className="w-3.5 h-3.5 rounded-full border border-white/20 inline-block" style={{ backgroundColor: comp.accent_color || '#06B6D4' }}></span>
+                    <span className="font-mono text-[10px] text-slate-300">{comp.accent_color || '#06B6D4'}</span>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => {
+                        setUploadLogoModal({ companyId: comp.id, companyName: comp.name });
+                        setLogoFile(null);
+                        setLogoPreview(comp.logo_url ? (comp.logo_url.startsWith('http') ? comp.logo_url : `${API_BASE_URL}${comp.logo_url}`) : null);
+                        setCompanyMsg('');
+                      }}
+                      className="btn-secondary text-[11px] px-2.5 py-1 text-cyan-400 hover:bg-cyan-500/10 flex items-center gap-1 cursor-pointer"
+                      title="Upload custom brand logo"
+                    >
+                      <Image className="w-3 h-3" /> Logo
+                    </button>
+                    <button
+                      onClick={() => setCompanyModal({
+                        isEdit: true,
+                        data: {
+                          id: comp.id,
+                          name: comp.name,
+                          short_code: comp.short_code || comp.id.toUpperCase(),
+                          accent_color: comp.accent_color || '#06B6D4',
+                          is_active: comp.is_active !== undefined ? comp.is_active : 1
+                        }
+                      })}
+                      className="btn-secondary text-[11px] px-2.5 py-1 text-slate-300 hover:bg-white/10 flex items-center gap-1 cursor-pointer"
+                      title="Edit Company Details"
+                    >
+                      <Edit className="w-3 h-3" /> Edit
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Expense Approval Notification Email Settings Card */}
       {isSuperAdmin && (
         <div className="glass-panel p-5 border-l-4 border-cyan-400 flex flex-col gap-4">
@@ -436,7 +667,9 @@ export default function AdminView({ user, onDataChange }) {
             <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
               <Upload className="w-4 h-4 text-emerald-400" /> Raw Data Ingestion & File Upload
             </h3>
-            <p className="text-xs text-slate-400">Upload raw transaction datasets (.csv, .xlsx, .xls) for LaunchGood, GiveBright, Paysuite, or Rethink Website.</p>
+            <p className="text-xs text-slate-400">
+              Upload raw transaction datasets (.csv, .xlsx, .xls) for {uploadTargetCompany === 'iqra' ? 'GiveBrite or Madinah' : 'LaunchGood, GiveBright, Paysuite, or Rethink Website'}.
+            </p>
           </div>
           {uploadMsg && (
             <div className={`text-xs font-bold ${uploadMsg.includes('✅') ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -445,7 +678,7 @@ export default function AdminView({ user, onDataChange }) {
           )}
         </div>
 
-        <form onSubmit={handleUploadData} className="grid grid-cols-1 md:grid-cols-4 gap-3 bg-slate-900/60 p-4 rounded-xl border border-white/10">
+        <form onSubmit={handleUploadData} className="grid grid-cols-1 md:grid-cols-5 gap-3 bg-slate-900/60 p-4 rounded-xl border border-white/10">
           {/* File Input */}
           <div className="flex flex-col gap-1 md:col-span-2">
             <label className="text-[11px] font-bold text-slate-300">Select Dataset File (.csv, .xlsx)</label>
@@ -458,6 +691,28 @@ export default function AdminView({ user, onDataChange }) {
             />
           </div>
 
+          {/* Target Company Selector */}
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] font-bold text-slate-300">Target Company Partition</label>
+            <select
+              value={uploadTargetCompany}
+              onChange={e => {
+                const target = e.target.value;
+                setUploadTargetCompany(target);
+                if (target === 'iqra' && !['auto', 'givebright', 'madinah'].includes(uploadPlatform)) {
+                  setUploadPlatform('auto');
+                }
+              }}
+              className="bg-slate-900 border border-white/15 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-emerald-400 cursor-pointer"
+            >
+              {companiesList.map(c => (
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.id})
+                </option>
+              ))}
+            </select>
+          </div>
+
           {/* Platform Platform Selector */}
           <div className="flex flex-col gap-1">
             <label className="text-[11px] font-bold text-slate-300">Data Platform Source</label>
@@ -467,11 +722,20 @@ export default function AdminView({ user, onDataChange }) {
               className="bg-slate-900 border border-white/15 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-emerald-400 cursor-pointer"
             >
               <option value="auto">Auto-Detect Platform</option>
-              <option value="launchgood">LaunchGood (Raw Donations)</option>
-              <option value="launchgood payout">LaunchGood Payout Settlement</option>
-              <option value="givebright">GiveBright</option>
-              <option value="paysuite">Paysuite</option>
-              <option value="website">Rethink Website</option>
+              {uploadTargetCompany === 'iqra' ? (
+                <>
+                  <option value="givebright">GiveBrite</option>
+                  <option value="madinah">Madinah</option>
+                </>
+              ) : (
+                <>
+                  <option value="launchgood">LaunchGood (Raw Donations)</option>
+                  <option value="launchgood payout">LaunchGood Payout Settlement</option>
+                  <option value="givebright">GiveBright</option>
+                  <option value="paysuite">Paysuite</option>
+                  <option value="website">Rethink Website</option>
+                </>
+              )}
             </select>
           </div>
 
@@ -489,7 +753,7 @@ export default function AdminView({ user, onDataChange }) {
           </div>
 
           {/* Submit Button */}
-          <div className="md:col-span-4 flex justify-end pt-1">
+          <div className="md:col-span-5 flex justify-end pt-1">
             <button
               type="submit"
               disabled={uploading || !uploadFile}
@@ -858,6 +1122,201 @@ export default function AdminView({ user, onDataChange }) {
               {purging ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
               <span>{purging ? 'Purging Database...' : '🔥 Purge All Data'}</span>
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* 🏢 Create / Edit Company Modal */}
+      {companyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
+          <div className="glass-panel max-w-md w-full p-6 rounded-2xl border border-cyan-500/30 shadow-2xl bg-slate-900 text-white flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-white/10 pb-3">
+              <h3 className="text-sm font-extrabold flex items-center gap-2">
+                <Building className="w-4 h-4 text-cyan-400" />
+                {companyModal.isEdit ? `Edit Company: ${companyModal.data.name}` : 'Register New Company Partition'}
+              </h3>
+              <button onClick={() => setCompanyModal(null)} className="text-slate-400 hover:text-white cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCompany} className="flex flex-col gap-3">
+              <div>
+                <label className="text-xs font-bold text-slate-300 block mb-1">Company ID (Unique Slug)</label>
+                <input
+                  type="text"
+                  required
+                  disabled={companyModal.isEdit}
+                  placeholder="e.g. iqra, sp, charity_uk"
+                  value={companyModal.data.id}
+                  onChange={e => setCompanyModal({
+                    ...companyModal,
+                    data: { ...companyModal.data, id: e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '') }
+                  })}
+                  className="w-full bg-slate-950 border border-white/15 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-400 disabled:opacity-50 font-mono"
+                />
+                <span className="text-[10px] text-slate-500">Lowercase letters, numbers, hyphens, or underscores only.</span>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-300 block mb-1">Display Name</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Iqra International"
+                  value={companyModal.data.name}
+                  onChange={e => setCompanyModal({
+                    ...companyModal,
+                    data: { ...companyModal.data, name: e.target.value }
+                  })}
+                  className="w-full bg-slate-950 border border-white/15 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-400"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-300 block mb-1">Short Code / Badge</label>
+                  <input
+                    type="text"
+                    required
+                    maxLength={6}
+                    placeholder="e.g. IQRA"
+                    value={companyModal.data.short_code}
+                    onChange={e => setCompanyModal({
+                      ...companyModal,
+                      data: { ...companyModal.data, short_code: e.target.value.toUpperCase() }
+                    })}
+                    className="w-full bg-slate-950 border border-white/15 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-400 font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-slate-300 block mb-1">Brand Accent Color</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="color"
+                      value={companyModal.data.accent_color || '#06B6D4'}
+                      onChange={e => setCompanyModal({
+                        ...companyModal,
+                        data: { ...companyModal.data, accent_color: e.target.value }
+                      })}
+                      className="w-8 h-8 rounded-lg border-0 bg-transparent cursor-pointer"
+                    />
+                    <input
+                      type="text"
+                      value={companyModal.data.accent_color || '#06B6D4'}
+                      onChange={e => setCompanyModal({
+                        ...companyModal,
+                        data: { ...companyModal.data, accent_color: e.target.value }
+                      })}
+                      className="w-full bg-slate-950 border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-400 font-mono"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 pt-2">
+                <label className="flex items-center gap-2 text-xs font-bold text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={companyModal.data.is_active === 1}
+                    onChange={e => setCompanyModal({
+                      ...companyModal,
+                      data: { ...companyModal.data, is_active: e.target.checked ? 1 : 0 }
+                    })}
+                    className="rounded border-white/20 text-cyan-500 focus:ring-cyan-500 cursor-pointer"
+                  />
+                  <span>Active & Accessible in Company Switcher</span>
+                </label>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-white/10 mt-2">
+                <button
+                  type="button"
+                  onClick={() => setCompanyModal(null)}
+                  className="btn-secondary text-xs px-4 py-2 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingCompany}
+                  className="btn-primary text-xs px-5 py-2 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {savingCompany ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                  <span>{savingCompany ? 'Saving...' : 'Save Company'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 🖼️ Upload Brand Logo Modal */}
+      {uploadLogoModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
+          <div className="glass-panel max-w-md w-full p-6 rounded-2xl border border-cyan-500/30 shadow-2xl bg-slate-900 text-white flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-white/10 pb-3">
+              <h3 className="text-sm font-extrabold flex items-center gap-2">
+                <Image className="w-4 h-4 text-cyan-400" />
+                Upload Brand Logo for {uploadLogoModal.companyName}
+              </h3>
+              <button onClick={() => setUploadLogoModal(null)} className="text-slate-400 hover:text-white cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleUploadLogo} className="flex flex-col gap-4">
+              <p className="text-xs text-slate-400">
+                Upload a transparent PNG, SVG, or high-res JPG/WebP logo. It will automatically update the CRM top navbar and sidebar.
+              </p>
+
+              {logoPreview && (
+                <div className="p-4 rounded-xl bg-slate-950/60 border border-white/10 flex flex-col items-center justify-center gap-2">
+                  <span className="text-[10px] text-slate-500 uppercase font-black">Logo Preview</span>
+                  <div className="w-32 h-16 flex items-center justify-center p-2 rounded-lg bg-white/5 border border-white/10">
+                    <img src={logoPreview} alt="Preview" className="max-h-full max-w-full object-contain" />
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="text-xs font-bold text-slate-300 block mb-1.5">Select Image File</label>
+                <input
+                  type="file"
+                  required
+                  accept="image/png, image/jpeg, image/svg+xml, image/webp"
+                  onChange={e => {
+                    const f = e.target.files[0];
+                    setLogoFile(f || null);
+                    if (f) {
+                      const reader = new FileReader();
+                      reader.onload = (re) => setLogoPreview(re.target.result);
+                      reader.readAsDataURL(f);
+                    }
+                  }}
+                  className="text-xs text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-cyan-600 file:text-white hover:file:bg-cyan-700 cursor-pointer"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-white/10">
+                <button
+                  type="button"
+                  onClick={() => setUploadLogoModal(null)}
+                  className="btn-secondary text-xs px-4 py-2 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={uploadingLogo || !logoFile}
+                  className="btn-primary text-xs px-5 py-2 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {uploadingLogo ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
+                  <span>{uploadingLogo ? 'Uploading...' : 'Save & Apply Logo'}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -37,12 +37,35 @@ const INITIAL_FILTERS = {
   end_date: ''
 };
 
+const DEFAULT_COMPANIES_FALLBACK = [
+  { id: 'rethink', name: 'Rethink Charity', short_code: 'Rethink', accent_color: 'cyan', logo_url: '', is_active: 1 },
+  { id: 'iqra', name: 'Iqra', short_code: 'Iqra', accent_color: 'emerald', logo_url: '', is_active: 1 }
+];
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('overview');
   const [selectedDonor, setSelectedDonor] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [filters, setFilters] = useState(INITIAL_FILTERS);
+  
+  // Multi-Company State
+  const [companies, setCompanies] = useState(() => {
+    try {
+      const cached = localStorage.getItem('crm_companies');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        return parsed.filter(c => c.id !== 'sp');
+      }
+    } catch (e) {}
+    return DEFAULT_COMPANIES_FALLBACK;
+  });
+
+  const [activeCompany, setActiveCompany] = useState(() => {
+    const saved = localStorage.getItem('crm_active_company') || 'rethink';
+    return saved === 'sp' ? 'rethink' : saved;
+  });
+
   const [accentColor, setAccentColor] = useState(() => {
     return localStorage.getItem('crm_accent') || 'cyan';
   });
@@ -51,11 +74,62 @@ export default function App() {
   const [showFilters, setShowFilters] = useState(true);
   const [metricsExpanded, setMetricsExpanded] = useState(true);
   const [filtersHovered, setFiltersHovered] = useState(false);
+  const [dataVersion, setDataVersion] = useState(0);
+
+  const fetchCompanies = () => {
+    fetch(`${API_BASE_URL}/api/admin/companies`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === 'success' && data.companies?.length > 0) {
+          setCompanies(data.companies);
+          try {
+            localStorage.setItem('crm_companies', JSON.stringify(data.companies));
+          } catch (e) {}
+        }
+      })
+      .catch(err => console.warn('Could not fetch registered companies:', err));
+  };
+
+  useEffect(() => {
+    fetchCompanies();
+  }, [dataVersion]);
+
+  // If previous session had a removed company (such as 'sp') or invalid tenant, auto-reset to rethink
+  useEffect(() => {
+    if (activeCompany !== 'all' && companies.length > 0) {
+      const exists = companies.some(c => c.id === activeCompany);
+      if (!exists || activeCompany === 'sp') {
+        setActiveCompany('rethink');
+        try {
+          localStorage.setItem('crm_active_company', 'rethink');
+        } catch (e) {}
+      }
+    }
+  }, [companies, activeCompany]);
+
+  const handleSwitchCompany = (newCompanyId) => {
+    const cid = String(newCompanyId).toLowerCase().trim();
+    setActiveCompany(cid);
+    try {
+      localStorage.setItem('crm_active_company', cid);
+    } catch (e) {}
+    
+    // Auto-align accent color if switching to a company with specific branding
+    if (cid !== 'all') {
+      const comp = companies.find(c => c.id === cid);
+      if (comp && comp.accent_color) {
+        setAccentColor(comp.accent_color);
+        try {
+          localStorage.setItem('crm_accent', comp.accent_color);
+        } catch (e) {}
+      }
+    }
+    setDataVersion(v => v + 1);
+  };
 
   // Auto-collapse sidebar after 3 seconds of switching tab
   const handleSetActiveTab = (tabId) => {
     setActiveTab(tabId);
-    // "also side panel must be collapsable after few seconds of clicking"
     setTimeout(() => {
       setSidebarCollapsed(true);
     }, 3000);
@@ -79,7 +153,7 @@ export default function App() {
       try {
         const parsed = JSON.parse(savedUser);
         
-        // 1. Check Session Expiry (24 hours = 86400000 ms)
+        // Check Session Expiry (24 hours = 86400000 ms)
         const EXPIRY_MS = 24 * 60 * 60 * 1000;
         if (parsed.login_timestamp && (Date.now() - parsed.login_timestamp > EXPIRY_MS)) {
           console.warn("Session expired after 24 hours.");
@@ -87,10 +161,9 @@ export default function App() {
           return;
         }
 
-        // Set user immediately for offline responsiveness
         setUser(parsed);
 
-        // 2. Real-time verification & permission sync with backend
+        // Real-time verification & permission sync with backend
         fetch(`${API_BASE_URL}/api/auth/me?user_identity=${parsed.email || parsed.username}`)
           .then(res => {
             if (res.status === 401 || res.status === 404) {
@@ -138,16 +211,16 @@ export default function App() {
     setTheme(prev => (prev === 'dark' ? 'light' : 'dark'));
   };
 
-  const [dataVersion, setDataVersion] = useState(0);
-
   const handleDataChange = () => {
     setDataVersion(v => v + 1);
   };
 
-  // Fetch Live Summary Metrics
+  // Fetch Live Summary Metrics with company_id
   useEffect(() => {
     if (!user) return;
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
+
     if (filters) {
       if (filters.payment_type) params.append('payment_type', filters.payment_type);
       if (filters.tier) params.append('tier', filters.tier);
@@ -169,7 +242,7 @@ export default function App() {
       .then(res => res.json())
       .then(data => setMetrics(data))
       .catch(err => console.error('Error fetching metrics summary:', err));
-  }, [user, filters, dataVersion]);
+  }, [user, filters, dataVersion, activeCompany]);
 
   const handleFilterChange = (key, value) => {
     setFilters(prev => ({ ...prev, [key]: value }));
@@ -192,18 +265,14 @@ export default function App() {
     return <LoginView theme={theme} onToggleTheme={handleToggleTheme} onLoginSuccess={handleLoginSuccess} />;
   }
 
-  const tabs = [
-    { id: 'overview', label: 'Overview', icon: TrendingUp },
-    { id: 'ltv', label: 'Lifetime LTV', icon: Crown },
-    { id: 'kanban', label: 'Kanban Pipeline', icon: Columns },
-    { id: 'explorer', label: 'Data Explorer', icon: Table },
-    { id: 'tracker', label: 'Sponsorship Tracker', icon: Target },
-    { id: 'classifications', label: 'Classifications', icon: Shield },
-    { id: 'expenses', label: 'Expenses', icon: CreditCard },
-    { id: 'admin', label: 'Admin & Data', icon: Database },
-  ];
-
   const showFiltersForTab = ['overview', 'ltv', 'kanban', 'explorer', 'tracker'].includes(activeTab);
+  const currentCompany = companies.find(c => c.id === activeCompany) || {
+    id: activeCompany,
+    name: activeCompany === 'all' ? 'All Companies (Consolidated)' : 'Rethink Charity',
+    short_code: activeCompany === 'all' ? 'All' : 'Rethink',
+    accent_color: accentColor,
+    logo_url: ''
+  };
 
   return (
     <div className="h-screen w-full flex overflow-hidden bg-slate-50 dark:bg-slate-900 transition-colors">
@@ -214,11 +283,14 @@ export default function App() {
         setActiveTab={handleSetActiveTab} 
         accentColor={accentColor}
         setAccentColor={setAccentColor}
+        activeCompany={activeCompany}
+        currentCompany={currentCompany}
+        companies={companies}
       />
 
       {/* Main Right Area */}
       <div className="flex-1 flex flex-col h-screen min-w-0 overflow-hidden relative">
-        {/* Top Navbar */}
+        {/* Top Navbar with Company Switcher */}
         <Navbar 
           user={user} 
           theme={theme} 
@@ -227,14 +299,16 @@ export default function App() {
           accentColor={accentColor}
           setAccentColor={setAccentColor}
           metrics={metrics}
+          activeCompany={activeCompany}
+          onSwitchCompany={handleSwitchCompany}
+          companies={companies}
+          currentCompany={currentCompany}
         />
 
         {/* Scrollable Main Workspace */}
         <main className="flex-1 overflow-y-auto px-5 py-5 pb-24 custom-scrollbar">
           <div className="max-w-[1680px] w-full mx-auto flex flex-col gap-5">
             
-
-
             {/* Horizontal Filter Pills Bar */}
             {showFiltersForTab && (
               <HorizontalFilters 
@@ -242,23 +316,102 @@ export default function App() {
                 onFilterChange={handleFilterChange} 
                 onResetFilters={handleResetFilters} 
                 accentColor={accentColor}
+                activeCompany={activeCompany}
               />
             )}
 
             {/* Active Tab Main Content */}
             <div className="w-full min-w-0">
-              {activeTab === 'overview' && <OverviewView key={dataVersion} filters={filters} user={user} metrics={metrics} accentColor={accentColor} />}
-              {activeTab === 'ltv' && <LtvView key={dataVersion} filters={filters} />}
-              {activeTab === 'kanban' && <KanbanBoard key={dataVersion} filters={filters} onSelectDonor={setSelectedDonor} />}
-              {activeTab === 'explorer' && <ExplorerView key={dataVersion} user={user} filters={filters} onSelectDonor={setSelectedDonor} onDataChange={handleDataChange} />}
-              {activeTab === 'fundraisers' && <FundraiserView key={dataVersion} user={user} accentColor={accentColor} />}
-              {activeTab === 'payouts' && <PayoutsView key={dataVersion} user={user} accentColor={accentColor} onDataChange={handleDataChange} />}
-              {activeTab === 'tracker' && <TrackerView key={dataVersion} user={user} filters={filters} onSelectDonor={setSelectedDonor} accentColor={accentColor} />}
-              {activeTab === 'classifications' && <ClassificationView key={dataVersion} user={user} onDataChange={handleDataChange} />}
-              {activeTab === 'expenses' && <ExpenseView key={dataVersion} user={user} />}
-              {activeTab === 'admin' && <AdminView key={dataVersion} user={user} onDataChange={handleDataChange} />}
+              {activeTab === 'overview' && (
+                <OverviewView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  filters={filters} 
+                  user={user} 
+                  metrics={metrics} 
+                  accentColor={accentColor} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'ltv' && (
+                <LtvView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  filters={filters} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'kanban' && (
+                <KanbanBoard 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  filters={filters} 
+                  onSelectDonor={setSelectedDonor} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'explorer' && (
+                <ExplorerView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  filters={filters} 
+                  onSelectDonor={setSelectedDonor} 
+                  onDataChange={handleDataChange} 
+                  activeCompany={activeCompany}
+                  companies={companies}
+                />
+              )}
+              {activeTab === 'fundraisers' && (
+                <FundraiserView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  accentColor={accentColor} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'payouts' && (
+                <PayoutsView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  accentColor={accentColor} 
+                  onDataChange={handleDataChange} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'tracker' && (
+                <TrackerView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  filters={filters} 
+                  onSelectDonor={setSelectedDonor} 
+                  accentColor={accentColor} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'classifications' && (
+                <ClassificationView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  onDataChange={handleDataChange} 
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'expenses' && (
+                <ExpenseView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  activeCompany={activeCompany}
+                  companies={companies}
+                />
+              )}
+              {activeTab === 'admin' && (
+                <AdminView 
+                  key={`${activeCompany}-${dataVersion}`} 
+                  user={user} 
+                  onDataChange={handleDataChange} 
+                  activeCompany={activeCompany}
+                  companies={companies}
+                  onCompaniesChange={fetchCompanies}
+                />
+              )}
             </div>
-
 
           </div>
         </main>

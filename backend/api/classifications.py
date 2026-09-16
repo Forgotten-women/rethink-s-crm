@@ -65,8 +65,9 @@ def sanitize_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
 
 class SaveRulesRequest(BaseModel):
     user_role: str
-    platform: str  # "launchgood", "givebright", or "paysuite"
+    platform: str  # "launchgood", "givebright", "paysuite", or "website"
     rules: List[dict]
+    company_id: Optional[str] = "rethink"
     can_edit_matrix: Optional[bool] = False
 
 
@@ -74,6 +75,7 @@ class DeleteRuleRequest(BaseModel):
     user_role: str
     platform: str
     campaign_name: str
+    company_id: Optional[str] = "rethink"
     code: Optional[str] = None
     community_name: Optional[str] = None
 
@@ -81,6 +83,7 @@ class DeleteRuleRequest(BaseModel):
 class ClearPlatformRequest(BaseModel):
     user_role: str
     platform: str
+    company_id: Optional[str] = "rethink"
 
 
 class MasterProjectCodeRequest(BaseModel):
@@ -88,6 +91,7 @@ class MasterProjectCodeRequest(BaseModel):
     code: str
     department: str
     office: str
+    company_id: Optional[str] = "rethink"
     portfolio: Optional[str] = ""
     country: str
     zakat_eligibility: Optional[str] = "Zakat"
@@ -103,6 +107,7 @@ class MasterProjectCodeRequest(BaseModel):
 class DeleteMasterCodeRequest(BaseModel):
     user_role: str
     code: str
+    company_id: Optional[str] = "rethink"
 
 
 def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
@@ -166,9 +171,10 @@ def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @router.get("/master-codes")
-def get_master_project_codes():
-    """Returns all master project codes with Department, Office, Portfolio, linked campaigns count, and total gross raised."""
+def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
+    """Returns all master project codes with Department, Office, Portfolio, linked campaigns count, and total gross raised for a company."""
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    comp = str(company_id or "rethink").lower().strip()
     try:
         cur = conn.cursor()
         # Verify master_project_codes table exists
@@ -176,7 +182,10 @@ def get_master_project_codes():
         if not cur.fetchone():
             return {"status": "success", "total_codes": 0, "codes": []}
 
-        codes_df = pd.read_sql_query("""
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+
+        codes_df = pd.read_sql_query(f"""
             SELECT 
                 code, 
                 department, 
@@ -192,19 +201,23 @@ def get_master_project_codes():
                 COALESCE(legacy_zakat_code, '') AS legacy_zakat_code,
                 COALESCE(old_codes, '') AS old_codes,
                 created_at,
-                updated_at
+                updated_at,
+                COALESCE(company_id, 'rethink') AS company_id
             FROM master_project_codes
+            {where_clause}
             ORDER BY code ASC
-        """, conn)
+        """, conn, params=params)
 
         # Count linked campaigns per code across platform_campaign_mappings
         links_map = {}
         try:
-            links_df = pd.read_sql_query("""
+            links_where = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+            links_df = pd.read_sql_query(f"""
                 SELECT UPPER(TRIM(code)) as code, COUNT(DISTINCT campaign_name) as campaign_count
                 FROM platform_campaign_mappings
+                {links_where}
                 GROUP BY UPPER(TRIM(code))
-            """, conn)
+            """, conn, params=params)
             links_map = dict(zip(links_df["code"], links_df["campaign_count"]))
         except Exception:
             pass
@@ -212,12 +225,13 @@ def get_master_project_codes():
         # Sum total donations raised per code
         raised_map = {}
         try:
-            raised_df = pd.read_sql_query("""
+            raised_where = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND Code IS NOT NULL AND TRIM(Code) != ''" if comp != "all" else " WHERE Code IS NOT NULL AND TRIM(Code) != ''"
+            raised_df = pd.read_sql_query(f"""
                 SELECT UPPER(TRIM(Code)) as code, SUM("Total Online Donations Net Amount in Settled Currency") as total_raised
                 FROM donations
-                WHERE Code IS NOT NULL AND TRIM(Code) != ''
+                {raised_where}
                 GROUP BY UPPER(TRIM(Code))
-            """, conn)
+            """, conn, params=params)
             raised_map = dict(zip(raised_df["code"], raised_df["total_raised"].fillna(0).round(2)))
         except Exception:
             pass
@@ -263,11 +277,18 @@ def get_master_project_codes():
 
 @router.post("/master-codes")
 def save_master_project_code(payload: MasterProjectCodeRequest):
-    """Creates or updates a Master Project Code and immediately cascades updates to matching donations."""
+    """Creates or updates a Master Project Code and immediately cascades updates to matching donations for a company."""
     if payload.user_role != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Managing master project codes is restricted to Super Admin accounts."
+        )
+
+    comp = str(payload.company_id or "rethink").lower().strip()
+    if comp == "all":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Modifications are disabled in consolidated 'All Companies' mode. Please select a specific company."
         )
 
     clean_code = str(payload.code).strip().upper()
@@ -295,10 +316,10 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                     INSERT INTO master_project_codes (
                         code, department, office, portfolio, country, zakat_eligibility, 
                         description, is_active, programme_fund, fund_code, 
-                        legacy_non_zakat_code, legacy_zakat_code, old_codes, updated_at
+                        legacy_non_zakat_code, legacy_zakat_code, old_codes, updated_at, company_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(code) DO UPDATE SET
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                    ON CONFLICT(company_id, code) DO UPDATE SET
                         department = excluded.department,
                         office = excluded.office,
                         portfolio = excluded.portfolio,
@@ -312,19 +333,22 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                         legacy_zakat_code = excluded.legacy_zakat_code,
                         old_codes = excluded.old_codes,
                         updated_at = CURRENT_TIMESTAMP;
-                """, (clean_code, dept, off, port, cntry, zkt, desc, act, prog_fund, f_code, non_zkt_gl, zkt_gl, old_cds))
+                """, (clean_code, dept, off, port, cntry, zkt, desc, act, prog_fund, f_code, non_zkt_gl, zkt_gl, old_cds, comp))
         finally:
             conn.close()
 
     # Invalidate cached code map
-    get_code_to_classification_map(force_reload=True)
+    get_code_to_classification_map(force_reload=True, company_id=comp)
     invalidate_payouts_cache()
 
-    # Live cascade: sync changes for this code to all matching donations in SQLite and Parquet
+    # Live cascade: sync changes for this code to matching donations in SQLite and Parquet for this company
     try:
-        df_raw = load_data()
+        df_raw = load_data(force_reload=True)
         if not df_raw.empty and "Code" in df_raw.columns:
-            mask = df_raw["Code"].astype(str).str.strip().str.upper() == clean_code
+            if "company_id" not in df_raw.columns:
+                df_raw["company_id"] = "rethink"
+            comp_mask = (df_raw["company_id"].astype(str).str.lower() == comp)
+            mask = comp_mask & (df_raw["Code"].astype(str).str.strip().str.upper() == clean_code)
             if mask.any():
                 for col_name, col_val in [
                     ("Department", dept),
@@ -344,7 +368,9 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                 df_raw = sanitize_df_dtypes_for_parquet(df_raw)
                 df_raw.to_parquet(PARQUET_PATH, index=False)
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-                df_raw.to_sql("donations", con=conn, if_exists="replace", index=False)
+                conn.execute("DELETE FROM donations WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
+                df_raw[comp_mask].to_sql("donations", con=conn, if_exists="append", index=False, chunksize=5000)
+                conn.commit()
                 conn.close()
     except Exception as e:
         print(f"Error cascading master code to donations: {e}")
@@ -353,7 +379,7 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
         from backend.api.expenses import clear_expenses_cache
         clear_expenses_cache()
         from backend.api.events import broadcast_event_sync
-        broadcast_event_sync("MASTER_CODES_UPDATED", {"code": clean_code})
+        broadcast_event_sync("MASTER_CODES_UPDATED", {"code": clean_code, "company_id": comp})
     except Exception:
         pass
 
@@ -364,7 +390,7 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
 
 
 @router.delete("/master-codes/{code}")
-def delete_master_project_code(code: str, user_role: Optional[str] = Query("super_admin")):
+def delete_master_project_code(code: str, user_role: Optional[str] = Query("super_admin"), company_id: Optional[str] = Query("rethink")):
     """Deletes a Master Project Code if confirmed by Super Admin."""
     if user_role != "super_admin":
         raise HTTPException(
@@ -372,16 +398,23 @@ def delete_master_project_code(code: str, user_role: Optional[str] = Query("supe
             detail="Deleting master project codes is restricted to Super Admin accounts."
         )
 
+    comp = str(company_id or "rethink").lower().strip()
+    if comp == "all":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Deleting master project codes is disabled in consolidated 'All Companies' mode."
+        )
+
     clean_code = str(code).strip().upper()
     with _DB_LOCK:
         conn = get_db_connection(timeout=30.0)
         try:
             with conn:
-                conn.execute("DELETE FROM master_project_codes WHERE UPPER(code) = ?", (clean_code,))
+                conn.execute("DELETE FROM master_project_codes WHERE UPPER(code) = ? AND LOWER(COALESCE(company_id, 'rethink')) = ?", (clean_code, comp))
         finally:
             conn.close()
 
-    get_code_to_classification_map(force_reload=True)
+    get_code_to_classification_map(force_reload=True, company_id=comp)
     return {
         "status": "success",
         "message": f"Successfully deleted master project code '{clean_code}'."
@@ -389,7 +422,7 @@ def delete_master_project_code(code: str, user_role: Optional[str] = Query("supe
 
 
 @router.get("/campaign-codes")
-def get_campaign_codes_lookup(platform: str = "all"):
+def get_campaign_codes_lookup(platform: str = "all", company_id: Optional[str] = Query("rethink")):
     """
     Returns a fast lookup mapping every Campaign Name to its list of valid code variant objects:
     { "ashbal orphanage": [ { "code": "GAZ-SPN-ORP", "department": "Sponsorships", "office": "Gaza Orphan Sponsorship", "portfolio": "", "heading": "Sponsorships", "sub_heading": "Gaza Orphan Sponsorship", "country": "Palestine", "zakat_eligibility": "Zakat", "is_primary": true } ] }
@@ -405,11 +438,16 @@ def get_campaign_codes_lookup(platform: str = "all"):
     elif platform.lower() in ["website", "rethink_website"]:
         tables = ["rethink_website_classifications"]
 
+    comp = (company_id or "rethink").strip().lower()
     lookup = {}
     try:
         for tbl in tables:
             try:
-                df = pd.read_sql_query(f"SELECT * FROM {tbl}", conn)
+                if comp != "all":
+                    df = pd.read_sql_query(f"SELECT * FROM {tbl} WHERE company_id = ?", conn, params=(comp,))
+                else:
+                    df = pd.read_sql_query(f"SELECT * FROM {tbl}", conn)
+
                 for _, r in df.iterrows():
                     c_name = sanitize_text(r.get("campaign_name", ""))
                     c_code = sanitize_text(r.get("code", "Unassigned"))
@@ -451,9 +489,10 @@ def get_campaign_codes_lookup(platform: str = "all"):
 
 
 @router.get("/code-map")
-def get_code_map():
+def get_code_map(company_id: Optional[str] = Query("rethink")):
     """Returns the central mapping of Code -> {Department, Office, Portfolio, Heading, Sub-Heading, Country, Zakat Eligibility, Programme Fund, Fund Code}."""
-    raw_map = get_code_to_classification_map()
+    comp = (company_id or "rethink").strip().lower()
+    raw_map = get_code_to_classification_map(company_id=comp)
     clean_map = {}
     for code, info in raw_map.items():
         dept = sanitize_text(info.get("Department") or info.get("Heading", "Unassigned"))
@@ -477,11 +516,12 @@ def get_code_map():
 
 
 @router.get("/launchgood")
-def get_launchgood_matrix():
+def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns LaunchGood classification matrix rules with (Campaign Name, Code) granularity."""
+    comp = (company_id or "rethink").strip().lower()
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        df = pd.read_sql_query("""
+        query = """
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -494,19 +534,26 @@ def get_launchgood_matrix():
                 COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary"
+                COALESCE(is_primary, 0) as "is_primary",
+                company_id
             FROM campaign_classifications
-        """, conn)
+        """
+        if comp != "all":
+            query += " WHERE company_id = ?"
+            df = pd.read_sql_query(query, conn, params=(comp,))
+        else:
+            df = pd.read_sql_query(query, conn)
         conn.close()
     except Exception as e:
         print(f"[LaunchGood Matrix Query Notice]: {e}")
-        df = get_classification_matrix().fillna("Unassigned")
+        df = get_classification_matrix(company_id=comp).fillna("Unassigned")
 
     df = sanitize_matrix_df(df)
     df = _enrich_rules_metadata(df)
     unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
     return {
         "platform": "LaunchGood",
+        "company_id": comp,
         "total_campaigns": len(df),
         "classified_campaigns": int(len(df) - unassigned_count),
         "unassigned_campaigns": int(unassigned_count),
@@ -515,11 +562,12 @@ def get_launchgood_matrix():
 
 
 @router.get("/givebright")
-def get_givebright_matrix():
+def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns GiveBright classification matrix rules with (Campaign Name, Code) granularity."""
+    comp = (company_id or "rethink").strip().lower()
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        df = pd.read_sql_query("""
+        query = """
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -531,16 +579,22 @@ def get_givebright_matrix():
                 COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary"
+                COALESCE(is_primary, 0) as "is_primary",
+                company_id
             FROM givebright_classifications
-        """, conn)
+        """
+        if comp != "all":
+            query += " WHERE company_id = ?"
+            df = pd.read_sql_query(query, conn, params=(comp,))
+        else:
+            df = pd.read_sql_query(query, conn)
         conn.close()
     except Exception as e:
         print(f"[GiveBright Matrix Query Notice]: {e}")
-        df = get_givebright_classification_matrix().fillna("Unassigned")
+        df = get_givebright_classification_matrix(company_id=comp).fillna("Unassigned")
 
     # Strict mapping: Code -> Department, Office, Portfolio, Country, Zakat Eligibility
-    code_map = get_code_to_classification_map()
+    code_map = get_code_to_classification_map(company_id=comp)
     if code_map and "Code" in df.columns:
         code_clean = df["Code"].astype(str).str.strip().str.lower()
         for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"]:
@@ -557,6 +611,7 @@ def get_givebright_matrix():
     unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
     return {
         "platform": "GiveBright",
+        "company_id": comp,
         "total_campaigns": len(df),
         "classified_campaigns": int(len(df) - unassigned_count),
         "unassigned_campaigns": int(unassigned_count),
@@ -565,11 +620,12 @@ def get_givebright_matrix():
 
 
 @router.get("/paysuite")
-def get_paysuite_matrix():
+def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns Paysuite classification matrix rules with (Campaign Name, Code) granularity."""
+    comp = (company_id or "rethink").strip().lower()
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        df = pd.read_sql_query("""
+        query = """
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -583,19 +639,26 @@ def get_paysuite_matrix():
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(donor_name, '') as "Donor Name",
                 COALESCE(donor_email, '') as "Donor Email",
-                COALESCE(is_primary, 0) as "is_primary"
+                COALESCE(is_primary, 0) as "is_primary",
+                company_id
             FROM paysuite_classifications
-        """, conn)
+        """
+        if comp != "all":
+            query += " WHERE company_id = ?"
+            df = pd.read_sql_query(query, conn, params=(comp,))
+        else:
+            df = pd.read_sql_query(query, conn)
         conn.close()
     except Exception as e:
         print(f"[Paysuite Matrix Query Notice]: {e}")
-        df = get_paysuite_classification_matrix().fillna("Unassigned")
+        df = get_paysuite_classification_matrix(company_id=comp).fillna("Unassigned")
 
     df = sanitize_matrix_df(df)
     df = _enrich_rules_metadata(df)
     unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
     return {
         "platform": "Paysuite",
+        "company_id": comp,
         "total_campaigns": len(df),
         "classified_campaigns": int(len(df) - unassigned_count),
         "unassigned_campaigns": int(unassigned_count),
@@ -604,11 +667,12 @@ def get_paysuite_matrix():
 
 
 @router.get("/website")
-def get_rethink_website_matrix():
-    """Returns Rethink Website classification matrix rules with (Campaign Name, Code) granularity."""
+def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
+    """Returns Website classification matrix rules with (Campaign Name, Code) granularity."""
+    comp = (company_id or "rethink").strip().lower()
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        df = pd.read_sql_query("""
+        query = """
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -620,19 +684,84 @@ def get_rethink_website_matrix():
                 COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary"
+                COALESCE(is_primary, 0) as "is_primary",
+                company_id
             FROM rethink_website_classifications
-        """, conn)
+        """
+        if comp != "all":
+            query += " WHERE company_id = ?"
+            df = pd.read_sql_query(query, conn, params=(comp,))
+        else:
+            df = pd.read_sql_query(query, conn)
         conn.close()
     except Exception as e:
         print(f"[Website Matrix Query Notice]: {e}")
-        df = get_rethink_website_classification_matrix().fillna("Unassigned")
+        df = get_rethink_website_classification_matrix(company_id=comp).fillna("Unassigned")
 
     df = sanitize_matrix_df(df)
     df = _enrich_rules_metadata(df)
     unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
     return {
         "platform": "Rethink Website",
+        "company_id": comp,
+        "total_campaigns": len(df),
+        "classified_campaigns": int(len(df) - unassigned_count),
+        "unassigned_campaigns": int(unassigned_count),
+        "rules": df.to_dict(orient="records")
+    }
+
+
+@router.get("/madinah")
+def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
+    """Returns Madinah classification matrix rules with (Campaign Name, Code) granularity for Iqra."""
+    comp = (company_id or "iqra").strip().lower()
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+        query = """
+            SELECT 
+                campaign_name as "Campaign Name",
+                COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(campaign_url, '') as "Campaign URL",
+                COALESCE(department, heading, 'Unassigned') as "Department",
+                COALESCE(office, sub_heading, 'Unassigned') as "Office",
+                COALESCE(portfolio, '') as "Portfolio",
+                COALESCE(heading, department, 'Unassigned') as "Heading",
+                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
+                COALESCE(country, 'Unassigned') as "Country",
+                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
+                COALESCE(is_primary, 0) as "is_primary",
+                company_id
+            FROM madinah_classifications
+        """
+        if comp != "all":
+            query += " WHERE company_id = ?"
+            df = pd.read_sql_query(query, conn, params=(comp,))
+        else:
+            df = pd.read_sql_query(query, conn)
+        conn.close()
+    except Exception as e:
+        print(f"[Madinah Matrix Query Notice]: {e}")
+        df = pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL", "Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "is_primary", "company_id"])
+
+    # Strict mapping: Code -> Department, Office, Portfolio, Country, Zakat Eligibility
+    code_map = get_code_to_classification_map(company_id=comp)
+    if code_map and "Code" in df.columns:
+        code_clean = df["Code"].astype(str).str.strip().str.lower()
+        for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"]:
+            if tc in df.columns:
+                target_map = {k: v[tc] for k, v in code_map.items() if tc in v and v[tc] != "Unassigned"}
+                mask_unassigned = df[tc].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
+                mapped_vals = code_clean.map(target_map)
+                fill_mask = mask_unassigned & mapped_vals.notna()
+                if fill_mask.any():
+                    df.loc[fill_mask, tc] = mapped_vals[fill_mask]
+
+    df = sanitize_matrix_df(df)
+    df = _enrich_rules_metadata(df)
+    unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
+    return {
+        "platform": "Madinah",
+        "company_id": comp,
         "total_campaigns": len(df),
         "classified_campaigns": int(len(df) - unassigned_count),
         "unassigned_campaigns": int(unassigned_count),
@@ -642,26 +771,29 @@ def get_rethink_website_matrix():
 
 @router.get("/export")
 def export_classifications(
-    platform: str = Query("launchgood", pattern="^(launchgood|givebright|paysuite|website|rethink_website|master)$"),
-    format: str = Query("csv", pattern="^(csv|xlsx)$")
+    platform: str = Query("launchgood", pattern="^(launchgood|givebright|madinah|paysuite|website|rethink_website|master)$"),
+    format: str = Query("csv", pattern="^(csv|xlsx)$"),
+    company_id: Optional[str] = Query("rethink")
 ):
     """Exports active campaign classification matrix rules or master project codes to CSV or Excel (.xlsx)."""
     p_clean = platform.lower().strip()
+    comp = (company_id or "rethink").strip().lower()
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if p_clean == "master":
-        res = get_master_project_codes()
+        res = get_master_project_codes(company_id=comp)
         matrix_df = pd.DataFrame(res.get("codes", []))
         if matrix_df.empty:
             raise HTTPException(status_code=400, detail="No master project codes available to export.")
         export_cols = [
-            "code", "programme_fund", "fund_code", "department", "office", "portfolio", 
+            "code", "company_id", "programme_fund", "fund_code", "department", "office", "portfolio", 
             "country", "zakat_eligibility", "legacy_non_zakat_code", "legacy_zakat_code", 
             "old_codes", "description", "is_active", "campaign_count", "total_raised"
         ]
         matrix_df = matrix_df[[c for c in export_cols if c in matrix_df.columns]]
         matrix_df = matrix_df.rename(columns={
             "code": "Code",
+            "company_id": "Company",
             "programme_fund": "Programme Fund",
             "fund_code": "Fund Code",
             "department": "Department",
@@ -679,13 +811,15 @@ def export_classifications(
         })
     else:
         if p_clean == "givebright":
-            res = get_givebright_matrix()
+            res = get_givebright_matrix(company_id=comp)
+        elif p_clean == "madinah":
+            res = get_madinah_matrix(company_id=comp)
         elif p_clean == "paysuite":
-            res = get_paysuite_matrix()
+            res = get_paysuite_matrix(company_id=comp)
         elif p_clean in ["website", "rethink_website", "rethink website"]:
-            res = get_rethink_website_matrix()
+            res = get_rethink_website_matrix(company_id=comp)
         else:
-            res = get_launchgood_matrix()
+            res = get_launchgood_matrix(company_id=comp)
 
         matrix_df = pd.DataFrame(res.get("rules", []))
         if matrix_df.empty:
@@ -705,21 +839,19 @@ def export_classifications(
         if p_clean == "paysuite":
             cols = ["Direct Debit Ref (Bank Ref)", "Platform Source", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility", "Donor Name", "Donor Email"]
             matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
-        elif p_clean == "givebright":
+        elif p_clean in ["givebright", "madinah"]:
             cols = ["Campaign Name", "Campaign URL", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility"]
             matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
         else:
             cols = ["Campaign Name", "Community Name", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility"]
             matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
 
-    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     if format.lower() == "xlsx":
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             matrix_df.to_excel(writer, index=False, sheet_name=f"{platform.capitalize()} Rules")
         buffer.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="classifications_{platform}_{date_str}.xlsx"'}
+        headers = {"Content-Disposition": f'attachment; filename="classifications_{platform}_{comp}_{date_str}.xlsx"'}
         return Response(
             content=buffer.getvalue(),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -727,7 +859,7 @@ def export_classifications(
         )
     else:
         csv_bytes = matrix_df.to_csv(index=False).encode('utf-8-sig')
-        headers = {"Content-Disposition": f'attachment; filename="classifications_{platform}_{date_str}.csv"'}
+        headers = {"Content-Disposition": f'attachment; filename="classifications_{platform}_{comp}_{date_str}.csv"'}
         return Response(
             content=csv_bytes,
             media_type="text/csv",
@@ -737,14 +869,21 @@ def export_classifications(
 
 @router.post("/save")
 def save_matrix_rules(payload: SaveRulesRequest):
-    if payload.user_role != "super_admin":
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Modifications cannot be performed in 'All Companies (Consolidated)' mode. Please select a specific company to save classification rules."
+        )
+
+    if payload.user_role not in ["super_admin", "admin"] and not payload.can_edit_matrix:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Modifying campaign classification matrix rules is restricted to Super Admin accounts."
+            detail="Modifying campaign classification matrix rules is restricted."
         )
 
     # 1. Collect non-unassigned classification metadata for every Code from submitted payload and existing map
-    code_map = get_code_to_classification_map(force_reload=True).copy()
+    code_map = get_code_to_classification_map(force_reload=True, company_id=comp).copy()
     
     for r in payload.rules:
         code_str = str(r.get("Code") or r.get("code") or "").strip().lower()
@@ -825,29 +964,36 @@ def save_matrix_rules(payload: SaveRulesRequest):
     if plat in ["website", "rethink_website", "rethink website"]:
         plat = "website"
 
-    n_saved = save_platform_matrix_rules(plat, matrix_df)
+    n_saved = save_platform_matrix_rules(plat, matrix_df, company_id=comp)
 
     # Reload central code dictionary after save
-    get_code_to_classification_map(force_reload=True)
+    get_code_to_classification_map(force_reload=True, company_id=comp)
     invalidate_payouts_cache()
 
     try:
         from backend.api.expenses import clear_expenses_cache
         clear_expenses_cache()
         from backend.api.events import broadcast_event_sync
-        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform})
+        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "company_id": comp})
     except Exception:
         pass
 
     return {
         "status": "success",
-        "message": f"Successfully saved {n_saved:,} {payload.platform} classification rules and updated matching records in real time!"
+        "message": f"Successfully saved {n_saved:,} {payload.platform} classification rules for {comp.upper()} and updated matching records in real time!"
     }
 
 
 @router.post("/delete-rule")
 def delete_single_rule(payload: DeleteRuleRequest):
     """Deletes a single classification rule (Super Admin only)."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Deleting classification rules cannot be performed in 'All Companies' mode. Please select a specific company."
+        )
+
     if payload.user_role != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -857,31 +1003,48 @@ def delete_single_rule(payload: DeleteRuleRequest):
     cname = sanitize_text(payload.campaign_name.strip())
     code = sanitize_text(payload.code.strip()) if payload.code else None
     platform = payload.platform.lower()
-
-    tbl = (
-        "givebright_classifications" if platform == "givebright" else
-        "paysuite_classifications" if platform == "paysuite" else
-        "rethink_website_classifications" if platform in ["website", "rethink_website", "rethink website"] else
-        "campaign_classifications"
-    )
+    plat_db = "givebright" if platform == "givebright" else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=60.0)
         try:
             with conn:
                 if code:
-                    conn.execute(f"DELETE FROM {tbl} WHERE campaign_name = ? AND code = ?", (cname, code))
+                    conn.execute(
+                        "DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ? AND LOWER(code) = ?",
+                        (comp, plat_db, cname.lower(), code.lower())
+                    )
                 else:
-                    conn.execute(f"DELETE FROM {tbl} WHERE campaign_name = ?", (cname,))
+                    conn.execute(
+                        "DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ?",
+                        (comp, plat_db, cname.lower())
+                    )
+
+                # Reset matching donations in DB for this company
+                sql_update = """
+                    UPDATE donations 
+                    SET department='Unassigned', office='Unassigned', portfolio='', 
+                        heading='Unassigned', sub_heading='Unassigned', country='Unassigned', 
+                        code='Unassigned', zakat_eligibility='Unassigned' 
+                    WHERE company_id = ? AND LOWER(campaign_name) = ?
+                """
+                params = [comp, cname.lower()]
+                if code:
+                    sql_update += " AND LOWER(code) = ?"
+                    params.append(code.lower())
+                conn.execute(sql_update, tuple(params))
         finally:
             conn.close()
 
-    # Reset donor records matching this rule to Unassigned
+    # Reset donor records matching this rule in parquet for this company
     if os.path.exists(PARQUET_PATH):
         try:
             df = pd.read_parquet(PARQUET_PATH)
             if not df.empty and "Campaign Name" in df.columns:
+                comp_col = "company_id" if "company_id" in df.columns else None
                 mask = df["Campaign Name"].astype(str).str.strip().str.lower() == cname.lower()
+                if comp_col:
+                    mask = mask & (df[comp_col].astype(str).str.strip().str.lower() == comp)
                 if code and "Code" in df.columns:
                     mask = mask & (df["Code"].astype(str).str.strip().str.lower() == code.lower())
                 if payload.community_name and "Community Name" in df.columns:
@@ -892,30 +1055,34 @@ def delete_single_rule(payload: DeleteRuleRequest):
                         df.loc[mask, f] = "Unassigned" if f != "Portfolio" else ""
                 
                 df.to_parquet(PARQUET_PATH, index=False)
-                conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-                df.to_sql("donations", con=conn, if_exists="replace", index=False)
-                conn.close()
         except Exception as e:
-            print(f"Error updating donors on delete: {e}")
+            print(f"Error updating donors parquet on delete: {e}")
 
     invalidate_payouts_cache()
     try:
         from backend.api.expenses import clear_expenses_cache
         clear_expenses_cache()
         from backend.api.events import broadcast_event_sync
-        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "action": "delete"})
+        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "action": "delete", "company_id": comp})
     except Exception:
         pass
 
     return {
         "status": "success",
-        "message": f"Successfully deleted rule for '{cname}' ({code or 'all codes'})"
+        "message": f"Successfully deleted rule for '{cname}' ({code or 'all codes'}) in {comp.upper()}"
     }
 
 
 @router.post("/clear-platform")
 def clear_platform_rules(payload: ClearPlatformRequest):
     """Completely wipes classification rules for a platform (Super Admin only)."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Clearing platform rules cannot be performed in 'All Companies' mode. Please select a specific company."
+        )
+
     if payload.user_role != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -923,37 +1090,40 @@ def clear_platform_rules(payload: ClearPlatformRequest):
         )
 
     platform = payload.platform.lower()
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-    try:
-        if platform == "givebright":
-            conn.execute("DELETE FROM givebright_classifications;")
-        elif platform == "paysuite":
-            conn.execute("DELETE FROM paysuite_classifications;")
-        elif platform in ["website", "rethink_website", "rethink website"]:
-            conn.execute("DELETE FROM rethink_website_classifications;")
-        else:
-            conn.execute("DELETE FROM campaign_classifications;")
-        conn.commit()
-    finally:
-        conn.close()
+    plat_db = "givebright" if platform == "givebright" else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
 
-    # Reset platform donor records to Unassigned
+    with _DB_LOCK:
+        conn = get_db_connection(timeout=30.0)
+        try:
+            with conn:
+                conn.execute("DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ?;", (comp, plat_db))
+                conn.execute("""
+                    UPDATE donations 
+                    SET department='Unassigned', office='Unassigned', portfolio='', 
+                        heading='Unassigned', sub_heading='Unassigned', country='Unassigned', 
+                        code='Unassigned', zakat_eligibility='Unassigned' 
+                    WHERE company_id = ? AND LOWER(platform) = ?
+                """, (comp, plat_db))
+        finally:
+            conn.close()
+
+    # Reset platform donor records to Unassigned in parquet for this company
     if os.path.exists(PARQUET_PATH):
         try:
             df = pd.read_parquet(PARQUET_PATH)
             if not df.empty and "Platform" in df.columns:
+                comp_col = "company_id" if "company_id" in df.columns else None
                 p_mask = df["Platform"].astype(str).str.lower() == platform
                 if platform == "launchgood":
                     p_mask = p_mask | (df["Platform"].astype(str).str.lower().isin(["", "none", "nan"]))
+                if comp_col:
+                    p_mask = p_mask & (df[comp_col].astype(str).str.lower() == comp)
                 
                 for f in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
                     if f in df.columns:
                         df.loc[p_mask, f] = "Unassigned" if f != "Portfolio" else ""
                 
                 df.to_parquet(PARQUET_PATH, index=False)
-                conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-                df.to_sql("donations", con=conn, if_exists="replace", index=False)
-                conn.close()
         except Exception as e:
             print(f"Error resetting donors on clear: {e}")
 
@@ -962,13 +1132,13 @@ def clear_platform_rules(payload: ClearPlatformRequest):
         from backend.api.expenses import clear_expenses_cache
         clear_expenses_cache()
         from backend.api.events import broadcast_event_sync
-        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "action": "clear"})
+        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "action": "clear", "company_id": comp})
     except Exception:
         pass
 
     return {
         "status": "success",
-        "message": f"Successfully wiped all classification rules and reset matching donor records for platform: {payload.platform}"
+        "message": f"Successfully wiped all classification rules for {payload.platform} in {comp.upper()}"
     }
 
 
@@ -976,10 +1146,18 @@ def clear_platform_rules(payload: ClearPlatformRequest):
 async def import_classification_file(
     file: UploadFile = File(...),
     platform: str = Form("launchgood"),
+    company_id: str = Form("rethink"),
     user_role: str = Form("admin"),
     mode: str = Form("merge")
 ):
     """Bulk uploads and applies a classification file (.csv or .xlsx) (Super Admin only)."""
+    comp = company_id.strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Bulk import cannot be performed in 'All Companies' mode. Please select a specific company."
+        )
+
     if user_role != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1001,20 +1179,24 @@ async def import_classification_file(
 
     if mode == "merge":
         if platform_clean == "givebright":
-            existing = get_givebright_classification_matrix().fillna("Unassigned")
+            existing = get_givebright_classification_matrix(company_id=comp).fillna("Unassigned")
+            merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name"], keep="last")
+        elif platform_clean == "madinah":
+            existing_res = get_madinah_matrix(company_id=comp).get("rules", [])
+            existing = pd.DataFrame(existing_res).fillna("Unassigned") if existing_res else pd.DataFrame()
             merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name"], keep="last")
         elif platform_clean == "paysuite":
-            existing = get_paysuite_classification_matrix().fillna("Unassigned")
+            existing = get_paysuite_classification_matrix(company_id=comp).fillna("Unassigned")
             merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name", "Community Name"], keep="last")
         else:
-            existing = get_classification_matrix().fillna("Unassigned")
+            existing = get_classification_matrix(company_id=comp).fillna("Unassigned")
             merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name", "Community Name"], keep="last")
     else:
         merged = norm_df
 
-    if platform_clean == "givebright":
+    if platform_clean in ["givebright", "madinah"]:
         # Strict mapping: Code -> Heading, Sub-Heading, Country, Zakat
-        code_map = get_code_to_classification_map()
+        code_map = get_code_to_classification_map(company_id=comp)
         for idx, row in merged.iterrows():
             code = str(row.get("Code") or "").strip().lower()
             if code and code not in ["unassigned", "nan", "none", "n/a", ""]:
@@ -1024,18 +1206,19 @@ async def import_classification_file(
                         merged.at[idx, tc] = sanitize_text(c_info[tc])
 
         merged = merged.drop_duplicates(subset=["Campaign Name"], keep="last")
-        n_saved = save_givebright_classification_matrix(merged)
+        n_saved = save_platform_matrix_rules(platform_clean, merged, company_id=comp)
     elif platform_clean == "paysuite":
-        n_saved = save_paysuite_classification_matrix(merged)
-        sync_matrix_classifications_to_donors(merged)
+        n_saved = save_paysuite_classification_matrix(merged, company_id=comp)
+        sync_matrix_classifications_to_donors(merged, company_id=comp)
     else:
-        n_saved = save_classification_matrix(merged)
-        sync_matrix_classifications_to_donors(merged)
+        n_saved = save_classification_matrix(merged, company_id=comp)
+        sync_matrix_classifications_to_donors(merged, company_id=comp)
 
     invalidate_payouts_cache()
 
     return {
         "status": "success",
         "count": n_saved,
-        "message": f"Successfully imported and applied {n_saved:,} {platform.capitalize()} classification rules!"
+        "message": f"Successfully imported and applied {n_saved:,} {platform.capitalize()} classification rules for {comp.upper()}!"
     }
+

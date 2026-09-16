@@ -42,7 +42,8 @@ import {
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function PayoutsView({ user, accentColor, onDataChange }) {
+export default function PayoutsView({ user, accentColor, onDataChange, activeCompany = 'rethink', companies = [] }) {
+  const isConsolidated = activeCompany === 'all';
   const currency = 'GBP'; // Unified GBP (£) settlement
   const [selectedPlatform, setSelectedPlatform] = useState('launchgood'); // 'launchgood' | 'paysuite'
   const [statusFilter, setStatusFilter] = useState('ALL'); // 'ALL' | 'Paid' | 'Unpaid'
@@ -167,24 +168,25 @@ export default function PayoutsView({ user, accentColor, onDataChange }) {
     const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
     const batchParam = batchVal && batchVal !== 'ALL' ? `&batch=${encodeURIComponent(batchVal)}` : '';
     const statusParam = st && st !== 'ALL' ? `&status=${encodeURIComponent(st)}` : '';
+    const companyParam = `&company_id=${encodeURIComponent(activeCompany)}`;
     
     Promise.all([
-      fetch(`${API_BASE_URL}/api/payouts/summary?platform=${plat}&currency=${currency}${batchParam}${statusParam}`).then(r => r.json()),
-      fetch(`${API_BASE_URL}/api/payouts/batches?platform=${plat}&currency=${currency}&page=${currentPage}&page_size=${pageSize}${searchParam}`).then(r => r.json()),
-      fetch(`${API_BASE_URL}/api/payouts/campaign-breakdown?platform=${plat}&currency=${currency}${batchParam}${searchParam}${statusParam}`).then(r => r.json()),
-      fetch(`${API_BASE_URL}/api/payouts/ledger-breakdown?platform=${plat}&currency=${currency}${batchParam}${statusParam}`).then(r => r.json())
+      fetch(`${API_BASE_URL}/api/payouts/summary?platform=${plat}&currency=${currency}${batchParam}${statusParam}${companyParam}`).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/batches?platform=${plat}&currency=${currency}&page=${currentPage}&page_size=${pageSize}${searchParam}${companyParam}`).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/campaign-breakdown?platform=${plat}&currency=${currency}${batchParam}${searchParam}${statusParam}${companyParam}`).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/ledger-breakdown?platform=${plat}&currency=${currency}${batchParam}${statusParam}${companyParam}`).then(r => r.ok ? r.json() : {})
     ])
-      .then(([sumRes, batchRes, campRes, ledgerRes]) => {
+      .then(([sumRes = {}, batchRes = {}, campRes = {}, ledgerRes = {}]) => {
         setSummary({
           ...sumRes,
-          disbursement_summary: sumRes.disbursement_summary || ledgerRes?.disbursement_summary || {},
-          ledger_breakdown: sumRes.ledger_breakdown || ledgerRes?.ledger || []
+          disbursement_summary: sumRes?.disbursement_summary || ledgerRes?.disbursement_summary || {},
+          ledger_breakdown: sumRes?.ledger_breakdown || ledgerRes?.ledger || []
         });
-        setBatchesData(batchRes);
-        setCampaignData(campRes.campaigns || []);
-        setCodeGroups(campRes.code_groups || []);
-        setHeadingGroups(campRes.heading_groups || []);
-        setCountryGroups(campRes.country_groups || []);
+        setBatchesData(batchRes || { total_batches: 0, page: 1, page_size: 25, batches: [] });
+        setCampaignData(campRes?.campaigns || []);
+        setCodeGroups(campRes?.code_groups || []);
+        setHeadingGroups(campRes?.heading_groups || []);
+        setCountryGroups(campRes?.country_groups || []);
         setLoading(false);
       })
       .catch(err => {
@@ -200,8 +202,9 @@ export default function PayoutsView({ user, accentColor, onDataChange }) {
     const codeParam = donorCodeFilter && donorCodeFilter !== 'ALL' ? `&code=${encodeURIComponent(donorCodeFilter)}` : '';
     const statusParam = st && st !== 'ALL' ? `&status=${encodeURIComponent(st)}` : '';
     const sortParam = `&sort_by=${encodeURIComponent(donorSortBy)}&sort_order=${encodeURIComponent(donorSortOrder)}`;
+    const companyParam = `&company_id=${encodeURIComponent(activeCompany)}`;
     
-    fetch(`${API_BASE_URL}/api/payouts/donors?platform=${plat}&currency=${currency}&page=${pageNum}&page_size=${pSize}${sortParam}${batchParam}${searchParam}${codeParam}${statusParam}`)
+    fetch(`${API_BASE_URL}/api/payouts/donors?platform=${plat}&currency=${currency}&page=${pageNum}&page_size=${pSize}${sortParam}${batchParam}${searchParam}${codeParam}${statusParam}${companyParam}`)
       .then(r => r.json())
       .then(res => {
         setDonorsData(res || { total_records: 0, page: 1, page_size: 25, total_pages: 1, records: [], summary: {} });
@@ -215,13 +218,13 @@ export default function PayoutsView({ user, accentColor, onDataChange }) {
 
   useEffect(() => {
     fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter);
-  }, [currentPage, pageSize, debouncedSearch, selectedBatch, selectedPlatform, statusFilter]);
+  }, [currentPage, pageSize, debouncedSearch, selectedBatch, selectedPlatform, statusFilter, activeCompany]);
 
   useEffect(() => {
     if (activeTab === 'donors') {
       fetchDonorsData(debouncedSearch, selectedBatch, donorPage, donorPageSize, selectedPlatform, statusFilter);
     }
-  }, [activeTab, donorPage, donorPageSize, donorSortBy, donorSortOrder, donorCodeFilter, debouncedSearch, selectedBatch, selectedPlatform, statusFilter]);
+  }, [activeTab, donorPage, donorPageSize, donorSortBy, donorSortOrder, donorCodeFilter, debouncedSearch, selectedBatch, selectedPlatform, statusFilter, activeCompany]);
 
   const handleCopyId = (id) => {
     if (!id) return;
@@ -352,6 +355,7 @@ export default function PayoutsView({ user, accentColor, onDataChange }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          company_id: activeCompany,
           user_role: user?.role || 'admin',
           campaign_name: editingClassification.campaign_name,
           code: editingClassification.code,
@@ -436,7 +440,8 @@ export default function PayoutsView({ user, accentColor, onDataChange }) {
       const statusParam = statusFilter && statusFilter !== 'ALL' ? `&status=${encodeURIComponent(statusFilter)}` : '';
       const searchParam = (debouncedSearch || search) ? `&search=${encodeURIComponent(debouncedSearch || search)}` : '';
       const codeParam = donorCodeFilter && donorCodeFilter !== 'ALL' ? `&code=${encodeURIComponent(donorCodeFilter)}` : '';
-      const res = await fetch(`${API_BASE_URL}/api/payouts/export?platform=${selectedPlatform}&currency=${currency}${batchParam}${statusParam}${searchParam}${codeParam}`);
+      const companyParam = `&company_id=${encodeURIComponent(activeCompany)}`;
+      const res = await fetch(`${API_BASE_URL}/api/payouts/export?platform=${selectedPlatform}&currency=${currency}${batchParam}${statusParam}${searchParam}${codeParam}${companyParam}`);
       if (!res.ok) throw new Error('Failed to generate export file');
       
       const blob = await res.blob();

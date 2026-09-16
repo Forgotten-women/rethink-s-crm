@@ -18,15 +18,23 @@ def clear_tracker_cache():
 class UpdateTargetsRequest(BaseModel):
     user_role: str
     targets: Dict[str, float]
+    company_id: Optional[str] = "rethink"
 
 @router.get("/targets")
-def get_targets():
+def get_targets(company_id: Optional[str] = Query("rethink")):
     """Returns the current target values for each of the 4 sponsorships."""
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets")
+        if comp != "all":
+            cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets WHERE company_id = ?", (comp,))
+        else:
+            cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets")
         rows = cur.fetchall()
+        if not rows:
+            # Fallback defaults
+            return {"Hafiz": 240.0, "Orphan": 480.0, "Widow": 1080.0, "Ex-Prisoner": 1080.0}
         return {r[0]: r[1] for r in rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -41,18 +49,25 @@ def update_targets(payload: UpdateTargetsRequest):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Updating target values is restricted to Super Admin accounts."
         )
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot set sponsorship targets in All Companies mode. Please select a specific company."
+        )
     
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
         for s_type, val in payload.targets.items():
             cur.execute("""
-                INSERT OR REPLACE INTO sponsorship_targets (sponsorship_type, target_value)
-                VALUES (?, ?)
-            """, (s_type, float(val)))
+                INSERT INTO sponsorship_targets (sponsorship_type, target_value, company_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(sponsorship_type, company_id) DO UPDATE SET target_value = excluded.target_value
+            """, (s_type, float(val), comp))
         conn.commit()
         clear_tracker_cache()
-        return {"status": "success", "message": "Successfully updated targets!"}
+        return {"status": "success", "message": f"Successfully updated targets for {comp.upper()}!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -75,10 +90,12 @@ def get_tracker_stats(
     campaign_search: Optional[str] = Query(None),
     gift_aid: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None)
+    end_date: Optional[str] = Query(None),
+    company_id: Optional[str] = Query("rethink")
 ):
     """Computes high-speed real-time donor target progress stats filtered by criteria."""
     global _FILTER_CACHE, _LAST_DATA_MTIME
+    comp = (company_id or "rethink").strip().lower()
 
     # Check cache invalidation
     from core.data_processor import _CACHE_MTIME
@@ -88,7 +105,7 @@ def get_tracker_stats(
 
     filter_key = (
         payment_type, tier, source, heading, subheading, country, code,
-        zakat, donor_country, campaign_search, gift_aid, start_date, end_date
+        zakat, donor_country, campaign_search, gift_aid, start_date, end_date, comp
     )
     if filter_key in _FILTER_CACHE:
         return _FILTER_CACHE[filter_key]
@@ -97,7 +114,10 @@ def get_tracker_stats(
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets")
+        if comp != "all":
+            cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets WHERE company_id = ?", (comp,))
+        else:
+            cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets")
         for r in cur.fetchall():
             targets[r[0]] = float(r[1])
     except Exception:
@@ -105,7 +125,7 @@ def get_tracker_stats(
     finally:
         conn.close()
 
-    df = load_data()
+    df = load_data(company_id=comp)
     if df.empty:
         res = {s: {"target": t, "total_raised": 0.0, "above_count": 0, "near_count": 0, "above": [], "near": []} for s, t in targets.items()}
         return res

@@ -12,6 +12,14 @@ PARQUET_PATH = os.path.join(BASE_DIR, "donations_cache.parquet")
 PAYOUTS_PARQUET_PATH = os.path.join(BASE_DIR, "payouts_cache.parquet")
 PAYSUITE_PAYOUTS_PARQUET_PATH = os.path.join(BASE_DIR, "paysuite_payouts_cache.parquet")
 CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
+LOGOS_DIR = os.path.join(CACHE_DIR, "logos")
+os.makedirs(LOGOS_DIR, exist_ok=True)
+
+# Default Multi-Company Registry
+DEFAULT_COMPANIES = {
+    "rethink": {"id": "rethink", "name": "Rethink Charity", "short_code": "Rethink", "accent_color": "cyan", "logo_url": ""},
+    "iqra": {"id": "iqra", "name": "Iqra", "short_code": "Iqra", "accent_color": "emerald", "logo_url": ""},
+}
 
 # Database Connection URLs
 LOCAL_DB_URL = f"sqlite:///{LOCAL_DB_PATH}"

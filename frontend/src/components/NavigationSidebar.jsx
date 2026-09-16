@@ -14,7 +14,15 @@ const tabs = [
   { id: 'admin', label: 'Admin & Data', icon: Database },
 ];
 
-export default function NavigationSidebar({ activeTab, setActiveTab, accentColor = 'cyan', setAccentColor }) {
+export default function NavigationSidebar({ 
+  activeTab, 
+  setActiveTab, 
+  accentColor = 'cyan', 
+  setAccentColor,
+  activeCompany = 'rethink',
+  currentCompany,
+  companies = []
+}) {
   const [isHovered, setIsHovered] = useState(false);
   const showExpanded = isHovered;
 
@@ -48,6 +56,8 @@ export default function NavigationSidebar({ activeTab, setActiveTab, accentColor
     setIsHovered(false);
   };
 
+  const displayName = currentCompany?.name || (activeCompany === 'all' ? 'All Companies' : 'Rethink Charity');
+
   return (
     <div 
       onMouseEnter={handleMouseEnter}
@@ -56,19 +66,33 @@ export default function NavigationSidebar({ activeTab, setActiveTab, accentColor
     >
       {/* Brand / Logo Area */}
       <div className="h-20 flex items-center px-4 md:px-5 border-b border-slate-100 dark:border-white/5 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 transition-colors duration-300">
-        <div className="flex items-center gap-3 group cursor-pointer overflow-hidden" aria-label="RC Charity Home">
-          {/* Softer icon container with subtle gradient background */}
-          <div className={`p-2 rounded-xl bg-slate-500/10 transition-transform group-hover:scale-105 shrink-0`}>
-            <Diamond 
-              className={`w-5 h-5 ${accentClasses[accentColor].split(' ')[0]} fill-current`} 
-              aria-hidden="true"
-            />
+        <div className="flex items-center gap-3 group cursor-pointer overflow-hidden" aria-label="CRM Workspace">
+          {/* Logo container with brand logo image or icon */}
+          <div className="w-10 h-10 rounded-xl bg-slate-500/10 dark:bg-white/5 border border-slate-200 dark:border-white/10 flex items-center justify-center transition-transform group-hover:scale-105 shrink-0 overflow-hidden shadow-sm">
+            {currentCompany?.logo_url ? (
+              <img 
+                src={currentCompany.logo_url} 
+                alt={displayName} 
+                className="w-full h-full object-contain p-1 rounded-lg"
+                onError={(e) => { e.target.style.display = 'none'; }}
+              />
+            ) : (
+              <Diamond 
+                className={`w-5 h-5 ${accentClasses[accentColor].split(' ')[0]} fill-current`} 
+                aria-hidden="true"
+              />
+            )}
           </div>
           
           {showExpanded && (
-            <span className="text-lg font-bold tracking-tight text-slate-700 dark:text-slate-100 group-hover:text-slate-900 dark:group-hover:text-white transition-colors truncate">
-              Rethink Charity
-            </span>
+            <div className="flex flex-col min-w-0">
+              <span className="text-base font-black tracking-tight text-slate-700 dark:text-slate-100 group-hover:text-slate-900 dark:group-hover:text-white transition-colors truncate">
+                {displayName}
+              </span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                {currentCompany?.short_code || 'Tenant'}
+              </span>
+            </div>
           )}
         </div>
       </div>

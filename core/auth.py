@@ -65,31 +65,54 @@ def init_user_db():
         print(f"User DB init notice: {e}")
 
 
+import json
+
 def get_all_users():
-    """Returns list of all registered users with their roles and granular permissions."""
+    """Returns list of all registered users with their roles, granular permissions, and allowed companies."""
     init_user_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, created_at FROM users")
+    cursor.execute("SELECT id, username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies, created_at FROM users")
     rows = cursor.fetchall()
-    users = [dict(r) for r in rows]
+    users = []
+    for r in rows:
+        u = dict(r)
+        raw_comp = u.get("allowed_companies") or '["ALL"]'
+        try:
+            u["allowed_companies"] = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
+        except Exception:
+            u["allowed_companies"] = ["ALL"]
+        users.append(u)
     conn.close()
     return users
 
 
-def update_user_permissions(email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data):
-    """Updates user role and granular permissions in SQLite."""
+def update_user_permissions(email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies=None):
+    """Updates user role, granular permissions, and allowed companies in SQLite."""
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-    conn.execute("""
-        UPDATE users SET
-            role = ?,
-            can_edit_donors = ?,
-            can_edit_matrix = ?,
-            can_manage_tags = ?,
-            can_purge_data = ?
-        WHERE email = ? OR username = ?
-    """, (role, int(can_edit_donors), int(can_edit_matrix), int(can_manage_tags), int(can_purge_data), email, email))
+    if allowed_companies is not None:
+        comp_json = json.dumps(allowed_companies)
+        conn.execute("""
+            UPDATE users SET
+                role = ?,
+                can_edit_donors = ?,
+                can_edit_matrix = ?,
+                can_manage_tags = ?,
+                can_purge_data = ?,
+                allowed_companies = ?
+            WHERE email = ? OR username = ?
+        """, (role, int(can_edit_donors), int(can_edit_matrix), int(can_manage_tags), int(can_purge_data), comp_json, email, email))
+    else:
+        conn.execute("""
+            UPDATE users SET
+                role = ?,
+                can_edit_donors = ?,
+                can_edit_matrix = ?,
+                can_manage_tags = ?,
+                can_purge_data = ?
+            WHERE email = ? OR username = ?
+        """, (role, int(can_edit_donors), int(can_edit_matrix), int(can_manage_tags), int(can_purge_data), email, email))
     conn.commit()
     conn.close()
     return True
@@ -145,12 +168,18 @@ def authenticate_user(email_or_username, password):
         cur = conn.cursor()
         hashed = _hash_pwd(password)
         cur.execute("""
-            SELECT username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data FROM users
+            SELECT username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies FROM users
             WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) AND password_hash = ?
         """, (user_identity, user_identity, hashed))
         row = cur.fetchone()
         if row:
             is_super = (row[2] == "super_admin")
+            raw_comp = row[7] if len(row) > 7 and row[7] else '["ALL"]'
+            try:
+                allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
+            except Exception:
+                allowed_comp = ["ALL"]
+
             return {
                 "username": row[0],
                 "email": row[1],
@@ -159,6 +188,7 @@ def authenticate_user(email_or_username, password):
                 "can_edit_matrix": 1 if (is_super or row[4]) else 0,
                 "can_manage_tags": 1 if (is_super or row[5]) else 0,
                 "can_purge_data": 1 if (is_super or row[6]) else 0,
+                "allowed_companies": allowed_comp,
                 "provider": "local"
             }
     except Exception as e:
@@ -181,15 +211,27 @@ def get_user_by_identity(user_identity):
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT username, email, role FROM users
+            SELECT username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies FROM users
             WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
         """, (ident, ident))
         row = cur.fetchone()
         if row:
+            is_super = (row[2] == "super_admin")
+            raw_comp = row[7] if len(row) > 7 and row[7] else '["ALL"]'
+            try:
+                allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
+            except Exception:
+                allowed_comp = ["ALL"]
+
             return {
                 "username": row[0],
                 "email": row[1],
                 "role": row[2],
+                "can_edit_donors": 1 if (is_super or row[3]) else 0,
+                "can_edit_matrix": 1 if (is_super or row[4]) else 0,
+                "can_manage_tags": 1 if (is_super or row[5]) else 0,
+                "can_purge_data": 1 if (is_super or row[6]) else 0,
+                "allowed_companies": allowed_comp,
                 "provider": "local"
             }
     except Exception as e:

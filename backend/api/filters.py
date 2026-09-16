@@ -22,9 +22,11 @@ def get_filter_options(
     campaign: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink")
 ):
-    df_raw = load_data()
+    comp = (company_id or "rethink").strip().lower()
+    df_raw = load_data(company_id=comp)
 
     if df_raw.empty:
         return {

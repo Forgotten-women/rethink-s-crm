@@ -2,13 +2,15 @@ import React, { useEffect, useState } from 'react';
 import { Columns, User, DollarSign, Layers, ChevronRight, Hash } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function KanbanBoard({ filters, onSelectDonor }) {
+export default function KanbanBoard({ filters, onSelectDonor, activeCompany = 'rethink' }) {
   const [kanbanData, setKanbanData] = useState({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
+
     if (filters) {
       if (filters.payment_type) params.append('payment_type', filters.payment_type);
       if (filters.tier) params.append('tier', filters.tier);
@@ -33,7 +35,7 @@ export default function KanbanBoard({ filters, onSelectDonor }) {
         console.error('Error fetching Kanban pipeline:', err);
         setLoading(false);
       });
-  }, [filters]);
+  }, [filters, activeCompany]);
 
   const tierColors = {
     'Super High': 'border-pink-500/50 bg-pink-500/10 text-pink-400',

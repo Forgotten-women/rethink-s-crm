@@ -5,7 +5,11 @@ import pandas as pd
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.pool import NullPool
-from config.settings import DATABASE_URL, LOCAL_DB_PATH, LOCAL_DB_URL
+from config.settings import (
+    DATABASE_URL, LOCAL_DB_PATH, LOCAL_DB_URL,
+    PARQUET_PATH, PAYOUTS_PARQUET_PATH, PAYSUITE_PAYOUTS_PARQUET_PATH,
+    DEFAULT_COMPANIES
+)
 
 _DB_LOCK = threading.RLock()
 
@@ -47,11 +51,11 @@ except Exception as e:
 # Setup Cloud Database Engine (Supabase PostgreSQL)
 try:
     if "postgres" in DATABASE_URL:
-        connect_args = {"options": "-c statement_timeout=30000"}
+        connect_args = {"options": "-c statement_timeout=30000", "connect_timeout": 3}
         cloud_engine = create_engine(
             DATABASE_URL, 
             connect_args=connect_args,
-            pool_pre_ping=True
+            pool_pre_ping=False
         )
     else:
         cloud_engine = None
@@ -128,9 +132,130 @@ def seed_database_if_empty():
         print(f"[DB Auto-Seed Fatal Safe Notice]: {e}")
 
 
+def init_companies_table():
+    """Ensures companies table exists and is seeded with Rethink, Iqra, and SP."""
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS companies (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                short_code TEXT NOT NULL,
+                accent_color TEXT DEFAULT 'cyan',
+                logo_url TEXT DEFAULT '',
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM companies")
+        if cursor.fetchone()[0] == 0:
+            defaults = [
+                ('rethink', 'Rethink Charity', 'Rethink', 'cyan', '', 1),
+                ('iqra', 'Iqra', 'Iqra', 'emerald', '', 1),
+            ]
+            cursor.executemany("""
+                INSERT OR IGNORE INTO companies (id, name, short_code, accent_color, logo_url, is_active)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, defaults)
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Companies Init Notice]: {e}")
+
+
+def _ensure_parquet_has_company_id():
+    """Ensures donations_cache.parquet, payouts_cache.parquet, and paysuite_payouts_cache.parquet have company_id='rethink'."""
+    import os
+    for p_path in [PARQUET_PATH, PAYOUTS_PARQUET_PATH, PAYSUITE_PAYOUTS_PARQUET_PATH]:
+        if os.path.exists(p_path):
+            try:
+                df = pd.read_parquet(p_path)
+                if not df.empty and "company_id" not in df.columns:
+                    df["company_id"] = "rethink"
+                    df.to_parquet(p_path, index=False)
+                    print(f"[Multi-Tenancy] Backfilled company_id='rethink' into {os.path.basename(p_path)}")
+                elif not df.empty and df["company_id"].isna().any():
+                    df["company_id"] = df["company_id"].fillna("rethink").replace({"": "rethink"})
+                    df.to_parquet(p_path, index=False)
+            except Exception as e:
+                print(f"[Parquet Multi-Tenancy Notice] {p_path}: {e}")
+
+
+def migrate_db_for_multitenancy():
+    """
+    Safely adds company_id columns with default 'rethink', builds B-tree indexes,
+    seeds companies table, and ensures complete backward-compatibility without data loss.
+    """
+    init_companies_table()
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
+        cursor = conn.cursor()
+
+        target_tables = [
+            "donations",
+            "master_project_codes",
+            "platform_campaign_mappings",
+            "fundraisers",
+            "fundraiser_campaigns",
+            "expense_requests",
+            "code_transfers",
+            "payout_settlements",
+            "paysuite_payout_settlements",
+            "sponsorship_targets",
+        ]
+
+        for table in target_tables:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            if not cursor.fetchone():
+                continue
+            cursor.execute(f'PRAGMA table_info("{table}")')
+            existing_cols = [r[1] for r in cursor.fetchall()]
+            if "company_id" not in existing_cols:
+                try:
+                    cursor.execute(f'ALTER TABLE "{table}" ADD COLUMN company_id TEXT NOT NULL DEFAULT \'rethink\';')
+                    print(f"[Multi-Tenancy] Added company_id to table {table}")
+                except Exception as e:
+                    print(f"[Multi-Tenancy Notice] {table} add column: {e}")
+
+            # Backfill any null or empty company_id to 'rethink'
+            try:
+                cursor.execute(f'UPDATE "{table}" SET company_id = \'rethink\' WHERE company_id IS NULL OR TRIM(company_id) = \'\'')
+            except Exception:
+                pass
+
+            # Build B-Tree index on company_id
+            try:
+                cursor.execute(f'CREATE INDEX IF NOT EXISTS "idx_{table}_company_id" ON "{table}"(company_id);')
+            except Exception:
+                pass
+
+        # Check users table for allowed_companies column
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        if cursor.fetchone():
+            cursor.execute('PRAGMA table_info("users")')
+            user_cols = [r[1] for r in cursor.fetchall()]
+            if "allowed_companies" not in user_cols:
+                try:
+                    cursor.execute('ALTER TABLE "users" ADD COLUMN allowed_companies TEXT DEFAULT \'["ALL"]\';')
+                    cursor.execute('UPDATE "users" SET allowed_companies = \'["ALL"]\' WHERE allowed_companies IS NULL;')
+                    print("[Multi-Tenancy] Added allowed_companies to users table")
+                except Exception as e:
+                    print(f"[Multi-Tenancy Notice] users add column: {e}")
+
+        conn.commit()
+        conn.close()
+
+        _ensure_parquet_has_company_id()
+    except Exception as e:
+        print(f"[Multi-Tenancy Migration Fatal Safe Notice]: {e}")
+
+
 def ensure_database_indexes():
-    """Builds B-Tree indexes on SQLite donations table for high-speed lookups."""
+    """Builds B-Tree indexes on SQLite donations table for high-speed lookups and runs multi-tenancy migration."""
     seed_database_if_empty()
+    migrate_db_for_multitenancy()
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=20.0)
         cursor = conn.cursor()
@@ -142,6 +267,7 @@ def ensure_database_indexes():
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_tier ON donations("Lifetime Donor Classification");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_heading ON donations("Heading");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_created_date ON donations("Created Date (UTC)");')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_company_id ON donations("company_id");')
             conn.commit()
         conn.close()
     except Exception as e:

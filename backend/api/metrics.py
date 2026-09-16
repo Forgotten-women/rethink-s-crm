@@ -9,6 +9,7 @@ router = APIRouter(prefix="/api/metrics", tags=["Metrics"])
 
 @router.get("/summary")
 def get_metrics_summary(
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -24,8 +25,8 @@ def get_metrics_summary(
     end_date: Optional[str] = None,
     programme_fund: Optional[str] = None
 ):
-    df_raw = load_data()
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund)
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, company_id=company_id)
 
     if df.empty:
         return {

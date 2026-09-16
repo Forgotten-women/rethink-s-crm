@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { TrendingUp, PieChart, Award, Tag, Calendar, CheckCircle, Clock, FileText, Gift, Layers, DollarSign, MoreHorizontal } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function OverviewView({ filters, user, metrics, accentColor }) {
+export default function OverviewView({ filters, user, metrics, accentColor, activeCompany = 'rethink' }) {
   const [timeline, setTimeline] = useState([]);
   const [headings, setHeadings] = useState([]);
   const [campaigns, setCampaigns] = useState([]);
@@ -12,6 +12,8 @@ export default function OverviewView({ filters, user, metrics, accentColor }) {
   useEffect(() => {
     setLoading(true);
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
+
     if (filters) {
       if (filters.payment_type) params.append('payment_type', filters.payment_type);
       if (filters.tier) params.append('tier', filters.tier);
@@ -44,7 +46,7 @@ export default function OverviewView({ filters, user, metrics, accentColor }) {
       console.error('Error loading overview data:', err);
       setLoading(false);
     });
-  }, [filters]);
+  }, [filters, activeCompany]);
 
   if (loading) {
     return (

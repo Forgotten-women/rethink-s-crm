@@ -29,6 +29,7 @@ class BulkEditDonorsRequest(BaseModel):
     user_role: str
     target_columns: List[str]
     new_values: List[str]
+    company_id: Optional[str] = "rethink"
     filter_search: Optional[str] = ""
     filter_search_fields: Optional[str] = None
     filter_payment_type: Optional[str] = None
@@ -51,6 +52,7 @@ class BulkEditDonorsRequest(BaseModel):
 
 class UpdateSingleDonorRequest(BaseModel):
     user_role: str
+    company_id: Optional[str] = "rethink"
     row_id: Optional[int] = None
     donation_id: Optional[str] = None
     donor_identifier: Optional[str] = None
@@ -62,6 +64,12 @@ class UpdateSingleDonorRequest(BaseModel):
 
 @router.post("/update-record")
 def update_single_donor_record(payload: UpdateSingleDonorRequest):
+    if payload.company_id and str(payload.company_id).strip().lower() == "all":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Modifications are disabled in consolidated 'All Companies' mode. Please select a specific company to edit records."
+        )
+
     if payload.user_role != "super_admin" and not payload.can_edit_donors:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -169,6 +177,12 @@ def update_single_donor_record(payload: UpdateSingleDonorRequest):
 
 @router.post("/bulk-edit")
 def bulk_edit_donors(payload: BulkEditDonorsRequest):
+    if payload.company_id and str(payload.company_id).strip().lower() == "all":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bulk edits are disabled in consolidated 'All Companies' mode. Please select a specific company to edit records."
+        )
+
     if payload.user_role != "super_admin" and not payload.can_edit_donors:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -176,7 +190,7 @@ def bulk_edit_donors(payload: BulkEditDonorsRequest):
         )
 
     is_payout_bulk = bool(payload.filter_source and str(payload.filter_source).strip().lower() in ["launchgood payout", "payout", "payouts"])
-    df_raw = load_payouts_data() if is_payout_bulk else load_data()
+    df_raw = load_payouts_data(company_id=payload.company_id) if is_payout_bulk else load_data(company_id=payload.company_id)
     if df_raw.empty:
         raise HTTPException(status_code=400, detail="Target dataset is empty.")
 
@@ -197,7 +211,8 @@ def bulk_edit_donors(payload: BulkEditDonorsRequest):
         payload.filter_start_date,
         payload.filter_end_date,
         programme_fund=payload.filter_programme_fund,
-        campaign=payload.filter_campaign
+        campaign=payload.filter_campaign,
+        company_id=payload.company_id
     )
 
     # 2. Apply search filter with multi-Donation ID support
@@ -326,11 +341,14 @@ def _apply_search_to_df(df: pd.DataFrame, search_str: str, search_fields: str = 
     return df.loc[mask]
 
 
-def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, subheading=None, country=None, code=None, zakat=None, donor_country=None, campaign_search=None, gift_aid=None, start_date=None, end_date=None, programme_fund=None, campaign=None):
+def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, subheading=None, country=None, code=None, zakat=None, donor_country=None, campaign_search=None, gift_aid=None, start_date=None, end_date=None, programme_fund=None, campaign=None, company_id=None):
     if df is None or df.empty:
         return df
 
     mask = pd.Series(True, index=df.index)
+
+    if company_id and str(company_id).strip().lower() != "all" and "company_id" in df.columns:
+        mask &= (df["company_id"].astype(str).str.strip().str.lower() == str(company_id).strip().lower())
 
     if isinstance(programme_fund, str) and programme_fund.strip() and programme_fund != "All Programme Funds" and "Programme Fund" in df.columns:
         mask &= (df["Programme Fund"].astype(str).str.strip().str.lower() == programme_fund.strip().lower())
@@ -421,6 +439,7 @@ def get_donors_paginated(
     search_fields: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = "asc",
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -439,9 +458,10 @@ def get_donors_paginated(
 ):
     """
     Ultra-fast SQL Paginated Endpoint (< 100ms) with multi-Donation ID and scoped field text search.
-    Strictly queries donations data without payout records.
+    Strictly queries donations data without payout records, partitioned by company_id.
     """
     target_table = "donations"
+    comp = str(company_id or "rethink").lower().strip()
 
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -456,6 +476,11 @@ def get_donors_paginated(
 
             where_clauses = []
             params = []
+
+            # Partition by company_id
+            if comp != "all" and "company_id" in avail_cols:
+                where_clauses.append('LOWER(COALESCE("company_id", \'rethink\')) = ?')
+                params.append(comp)
 
             # Exclude any accidental payout settlement records from Data Explorer
             if "Platform" in avail_cols:
@@ -642,7 +667,7 @@ def get_donors_paginated(
     except Exception as e:
         print(f"SQL Pagination fallback notice: {e}")
 
-    df_raw = load_payouts_data() if is_payout_query else load_data()
+    df_raw = load_payouts_data(company_id=comp) if is_payout_query else load_data(company_id=comp)
     if df_raw.empty:
         return {
             "total_records": 0,
@@ -652,7 +677,7 @@ def get_donors_paginated(
             "records": []
         }
 
-    filtered_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=campaign)
+    filtered_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=campaign, company_id=comp)
     display_df = _apply_search_to_df(filtered_df, search, search_fields=search_fields)
 
     total_records = len(display_df)
@@ -687,6 +712,7 @@ def export_donors(
     search: Optional[str] = "",
     search_fields: Optional[str] = None,
     columns: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -704,7 +730,7 @@ def export_donors(
     end_date: Optional[str] = None
 ):
     """Exports filtered donor rows with date range, multi-Donation ID, and scoped search support."""
-    df_raw = load_data()
+    df_raw = load_data(company_id=company_id)
     if df_raw.empty:
         raise HTTPException(status_code=400, detail="No donor data available to export.")
 
@@ -727,7 +753,8 @@ def export_donors(
         start_date=start_date,
         end_date=end_date,
         programme_fund=programme_fund,
-        campaign=campaign
+        campaign=campaign,
+        company_id=company_id
     )
     display_df = _apply_search_to_df(filtered_df, search, search_fields=search_fields)
 
@@ -782,11 +809,12 @@ def get_donors_kanban(
     zakat: Optional[str] = None,
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
-    gift_aid: Optional[str] = None
+    gift_aid: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink")
 ):
     """Returns donor cards grouped by LTV Tier for the Kanban Pipeline Board with column total sums."""
-    df_raw = load_data()
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, programme_fund=programme_fund)
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, programme_fund=programme_fund, company_id=company_id)
 
     if df.empty or "Lifetime Donor Classification" not in df.columns:
         return {}
@@ -996,9 +1024,9 @@ def _get_donor_matching_mask(df: pd.DataFrame, donor_id_or_email: str) -> pd.Ser
 
 
 @router.get("/profile/{donor_id_or_email:path}")
-def get_donor_360_profile(donor_id_or_email: str):
+def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Query("rethink")):
     """Returns complete 360° Donor Profile payload with all donor details, dual classifications, and full transaction history."""
-    df = load_data()
+    df = load_data(company_id=company_id)
     if df.empty:
         raise HTTPException(status_code=404, detail="Donor dataset is empty.")
 
@@ -1107,10 +1135,11 @@ def get_donor_360_profile(donor_id_or_email: str):
 def get_donor_history_paginated(
     donor_id: str = Query(...),
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=500)
+    page_size: int = Query(20, ge=1, le=500),
+    company_id: Optional[str] = Query("rethink")
 ):
-    """Paginated transaction history for a donor to handle large transaction counts (e.g., 28,000+ transactions) smoothly."""
-    df = load_data()
+    """Paginated transaction history for a donor to handle large transaction counts smoothly."""
+    df = load_data(company_id=company_id)
     if df.empty:
         raise HTTPException(status_code=404, detail="Donor dataset is empty.")
 
@@ -1160,22 +1189,25 @@ def get_donor_history_paginated(
 
 
 @router.get("/campaigns")
-def get_campaigns_list():
+def get_campaigns_list(company_id: Optional[str] = Query("rethink")):
     """Returns sorted unique list of campaign names for fast dropdown filtering in Data Explorer."""
+    comp = str(company_id or "rethink").lower().strip()
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         cur = conn.cursor()
-        cur.execute("""
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != ''" if comp != "all" else " WHERE [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != ''"
+        params = [comp] if comp != "all" else []
+        cur.execute(f"""
             SELECT DISTINCT [Campaign Name]
             FROM donations
-            WHERE [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != ''
+            {where_clause}
             ORDER BY [Campaign Name] COLLATE NOCASE ASC
-        """)
+        """, params)
         campaigns = [r[0].strip() for r in cur.fetchall() if r[0] and str(r[0]).strip()]
         conn.close()
         return {"campaigns": campaigns}
     except Exception as e:
-        df = load_data()
+        df = load_data(company_id=company_id)
         if not df.empty and "Campaign Name" in df.columns:
             campaigns = sorted([str(c).strip() for c in df["Campaign Name"].dropna().unique() if str(c).strip()])
             return {"campaigns": campaigns}

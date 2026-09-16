@@ -37,18 +37,25 @@ from core.database import get_db_connection, _DB_LOCK
 router = APIRouter(prefix="/api/payouts", tags=["Payouts Reconciliation"])
 
 
-_CLASSIFIED_PAYOUTS_CACHE = None
-_CLASSIFIED_PAYSUITE_CACHE = None
-_CLASSIFICATION_MATRIX_CACHE = None
-_PAYSUITE_MATRIX_CACHE = None
+_CLASSIFIED_PAYOUTS_CACHE = {}
+_CLASSIFIED_PAYSUITE_CACHE = {}
+_CLASSIFICATION_MATRIX_CACHE = {}
+_PAYSUITE_MATRIX_CACHE = {}
 
-def invalidate_payouts_cache():
+def invalidate_payouts_cache(company_id: Optional[str] = None):
     """Invalidates the in-memory cache for payout reconciliation."""
     global _CLASSIFIED_PAYOUTS_CACHE, _CLASSIFIED_PAYSUITE_CACHE, _CLASSIFICATION_MATRIX_CACHE, _PAYSUITE_MATRIX_CACHE
-    _CLASSIFIED_PAYOUTS_CACHE = None
-    _CLASSIFIED_PAYSUITE_CACHE = None
-    _CLASSIFICATION_MATRIX_CACHE = None
-    _PAYSUITE_MATRIX_CACHE = None
+    if company_id:
+        cid = str(company_id).strip().lower()
+        _CLASSIFIED_PAYOUTS_CACHE.pop(cid, None)
+        _CLASSIFIED_PAYSUITE_CACHE.pop(cid, None)
+        _CLASSIFICATION_MATRIX_CACHE.pop(cid, None)
+        _PAYSUITE_MATRIX_CACHE.pop(cid, None)
+    else:
+        _CLASSIFIED_PAYOUTS_CACHE = {}
+        _CLASSIFIED_PAYSUITE_CACHE = {}
+        _CLASSIFICATION_MATRIX_CACHE = {}
+        _PAYSUITE_MATRIX_CACHE = {}
     _core_invalidate_payouts_cache()
     _core_invalidate_paysuite_payouts_cache()
 
@@ -63,19 +70,26 @@ def _clean_str(val: Any, default: str = "") -> str:
         return default
     return str(val).strip()
 
-def _get_classification_matrix_dict(platform: str = "launchgood") -> Dict[Any, Dict[str, str]]:
+def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Optional[str] = "rethink") -> Dict[Any, Dict[str, str]]:
     global _CLASSIFICATION_MATRIX_CACHE, _PAYSUITE_MATRIX_CACHE
     p_clean = _clean_str(platform, "launchgood").lower()
+    cid = _clean_str(company_id, "rethink").lower()
     
     if p_clean == "paysuite":
-        if _PAYSUITE_MATRIX_CACHE is not None:
-            return _PAYSUITE_MATRIX_CACHE
+        if cid in _PAYSUITE_MATRIX_CACHE:
+            return _PAYSUITE_MATRIX_CACHE[cid]
         try:
             conn = get_db_connection(timeout=10.0)
-            matrix_df = pd.read_sql_query("""
-                SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
-                FROM paysuite_classifications
-            """, conn)
+            if cid == "all":
+                matrix_df = pd.read_sql_query("""
+                    SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
+                    FROM paysuite_classifications
+                """, conn)
+            else:
+                matrix_df = pd.read_sql_query("""
+                    SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
+                    FROM paysuite_classifications WHERE company_id = ?
+                """, conn, params=(cid,))
             conn.close()
             if not matrix_df.empty:
                 for c in ["campaign_name", "heading", "sub_heading", "country", "code", "zakat_eligibility"]:
@@ -89,20 +103,26 @@ def _get_classification_matrix_dict(platform: str = "launchgood") -> Dict[Any, D
                         cache[(c_clean, code_clean)] = r.to_dict()
                         if c_clean not in cache or bool(r.get("is_primary") in [1, True, "1", "true"]):
                             cache[c_clean] = r.to_dict()
-                _PAYSUITE_MATRIX_CACHE = cache
-                return _PAYSUITE_MATRIX_CACHE
+                _PAYSUITE_MATRIX_CACHE[cid] = cache
+                return _PAYSUITE_MATRIX_CACHE[cid]
         except Exception as e:
             print(f"[Paysuite Matrix Overlay Notice]: {e}")
         return {}
     else:
-        if _CLASSIFICATION_MATRIX_CACHE is not None:
-            return _CLASSIFICATION_MATRIX_CACHE
+        if cid in _CLASSIFICATION_MATRIX_CACHE:
+            return _CLASSIFICATION_MATRIX_CACHE[cid]
         try:
             conn = get_db_connection(timeout=10.0)
-            matrix_df = pd.read_sql_query("""
-                SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
-                FROM campaign_classifications
-            """, conn)
+            if cid == "all":
+                matrix_df = pd.read_sql_query("""
+                    SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
+                    FROM campaign_classifications
+                """, conn)
+            else:
+                matrix_df = pd.read_sql_query("""
+                    SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
+                    FROM campaign_classifications WHERE company_id = ?
+                """, conn, params=(cid,))
             conn.close()
             if not matrix_df.empty:
                 for c in ["campaign_name", "heading", "sub_heading", "country", "code", "zakat_eligibility"]:
@@ -116,27 +136,31 @@ def _get_classification_matrix_dict(platform: str = "launchgood") -> Dict[Any, D
                         cache[(c_clean, code_clean)] = r.to_dict()
                         if c_clean not in cache or bool(r.get("is_primary") in [1, True, "1", "true"]):
                             cache[c_clean] = r.to_dict()
-                _CLASSIFICATION_MATRIX_CACHE = cache
-                return _CLASSIFICATION_MATRIX_CACHE
+                _CLASSIFICATION_MATRIX_CACHE[cid] = cache
+                return _CLASSIFICATION_MATRIX_CACHE[cid]
         except Exception as e:
             print(f"[LaunchGood Matrix Overlay Notice]: {e}")
         return {}
 
 
-def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = False):
+def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = False, company_id: Optional[str] = "rethink"):
     global _CLASSIFIED_PAYOUTS_CACHE, _CLASSIFIED_PAYSUITE_CACHE
     p_clean = _clean_str(platform, "launchgood").lower()
+    cid = _clean_str(company_id, "rethink").lower()
 
     if p_clean == "paysuite":
-        if not force_reload and _CLASSIFIED_PAYSUITE_CACHE is not None and not _CLASSIFIED_PAYSUITE_CACHE.empty:
-            return _CLASSIFIED_PAYSUITE_CACHE
+        if not force_reload and cid in _CLASSIFIED_PAYSUITE_CACHE and not _CLASSIFIED_PAYSUITE_CACHE[cid].empty:
+            return _CLASSIFIED_PAYSUITE_CACHE[cid]
 
         try:
-            df_p = load_paysuite_payouts_data(force_reload=force_reload)
+            df_p = load_paysuite_payouts_data(force_reload=force_reload, company_id=cid)
             if df_p is None or df_p.empty:
                 conn = get_db_connection(timeout=10.0)
                 try:
-                    df_p = pd.read_sql_query("SELECT * FROM paysuite_payout_settlements", conn)
+                    if cid == "all":
+                        df_p = pd.read_sql_query("SELECT * FROM paysuite_payout_settlements", conn)
+                    else:
+                        df_p = pd.read_sql_query("SELECT * FROM paysuite_payout_settlements WHERE company_id = ?", conn, params=(cid,))
                 except Exception:
                     df_p = pd.DataFrame()
                 finally:
@@ -186,7 +210,7 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["Platform"] = "Paysuite"
 
                 # Overlay matrix classifications
-                rule_dict = _get_classification_matrix_dict("paysuite")
+                rule_dict = _get_classification_matrix_dict("paysuite", company_id=cid)
                 if rule_dict:
                     c_keys = df["campaign_name"].astype(str).str.strip().str.lower().tolist()
                     code_keys = df["code"].astype(str).str.strip().str.lower().tolist()
@@ -204,23 +228,23 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                         if mask_valid.any():
                             df.loc[mask_valid, f] = series_updated[mask_valid]
 
-                _CLASSIFIED_PAYSUITE_CACHE = df
-                return _CLASSIFIED_PAYSUITE_CACHE
+                _CLASSIFIED_PAYSUITE_CACHE[cid] = df
+                return _CLASSIFIED_PAYSUITE_CACHE[cid]
 
-            _CLASSIFIED_PAYSUITE_CACHE = pd.DataFrame()
-            return _CLASSIFIED_PAYSUITE_CACHE
+            _CLASSIFIED_PAYSUITE_CACHE[cid] = pd.DataFrame()
+            return _CLASSIFIED_PAYSUITE_CACHE[cid]
         except Exception as e:
             print(f"[Error] Reading cached paysuite payout data: {e}")
-            _CLASSIFIED_PAYSUITE_CACHE = pd.DataFrame()
-            return _CLASSIFIED_PAYSUITE_CACHE
+            _CLASSIFIED_PAYSUITE_CACHE[cid] = pd.DataFrame()
+            return _CLASSIFIED_PAYSUITE_CACHE[cid]
 
     else:
         # LaunchGood Payouts
-        if not force_reload and _CLASSIFIED_PAYOUTS_CACHE is not None and not _CLASSIFIED_PAYOUTS_CACHE.empty:
-            return _CLASSIFIED_PAYOUTS_CACHE
+        if not force_reload and cid in _CLASSIFIED_PAYOUTS_CACHE and not _CLASSIFIED_PAYOUTS_CACHE[cid].empty:
+            return _CLASSIFIED_PAYOUTS_CACHE[cid]
 
         try:
-            df_p = load_payouts_data(force_reload=force_reload)
+            df_p = load_payouts_data(force_reload=force_reload, company_id=cid)
             if df_p is not None and not df_p.empty:
                 df = df_p.copy()
                 c_name = df.get("Campaign Name", pd.Series("Unassigned Campaign", index=df.index)).fillna("Unassigned Campaign").apply(fix_mojibake)
@@ -249,7 +273,7 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["Settlement Currency"] = df["settlement_currency"]
                 df["Platform"] = "LaunchGood"
 
-                rule_dict = _get_classification_matrix_dict("launchgood")
+                rule_dict = _get_classification_matrix_dict("launchgood", company_id=cid)
                 if rule_dict:
                     c_keys = df["campaign_name"].astype(str).str.strip().str.lower().tolist()
                     code_keys = df["code"].astype(str).str.strip().str.lower().tolist()
@@ -267,15 +291,15 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                         if mask_valid.any():
                             df.loc[mask_valid, f] = series_updated[mask_valid]
 
-                _CLASSIFIED_PAYOUTS_CACHE = df
-                return _CLASSIFIED_PAYOUTS_CACHE
+                _CLASSIFIED_PAYOUTS_CACHE[cid] = df
+                return _CLASSIFIED_PAYOUTS_CACHE[cid]
 
-            _CLASSIFIED_PAYOUTS_CACHE = pd.DataFrame()
-            return _CLASSIFIED_PAYOUTS_CACHE
+            _CLASSIFIED_PAYOUTS_CACHE[cid] = pd.DataFrame()
+            return _CLASSIFIED_PAYOUTS_CACHE[cid]
         except Exception as e:
             print(f"[Error] Reading cached launchgood payout data: {e}")
-            _CLASSIFIED_PAYOUTS_CACHE = pd.DataFrame()
-            return _CLASSIFIED_PAYOUTS_CACHE
+            _CLASSIFIED_PAYOUTS_CACHE[cid] = pd.DataFrame()
+            return _CLASSIFIED_PAYOUTS_CACHE[cid]
 
 
 def _generate_disbursement_summary(df_curr: pd.DataFrame, currency_name: str, platform: str = "launchgood") -> Dict[str, Any]:
@@ -454,6 +478,7 @@ def _generate_ledger_breakdown(df: pd.DataFrame, platform: str = "launchgood") -
 
 @router.get("/summary")
 def get_payouts_summary(
+    company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
     currency: Optional[str] = Query("GBP", description="Filter by settlement currency: GBP, USD, or ALL"),
     batch: Optional[str] = Query("ALL", description="Filter by specific Transfer ID / Batch"),
@@ -470,7 +495,7 @@ def get_payouts_summary(
     status_filter = _clean_str(status, "ALL").capitalize()
 
     try:
-        df_all = _get_payout_data_from_db(platform=plat)
+        df_all = _get_payout_data_from_db(platform=plat, company_id=company_id)
         if df_all.empty:
             return {
                 "platform": plat,
@@ -484,12 +509,8 @@ def get_payouts_summary(
                 "settled_donations_count": 0,
                 "paid_count": 0,
                 "unpaid_count": 0,
-                "paid_amount": 0.0,
-                "unpaid_amount": 0.0,
-                "collection_rate": 100.0,
                 "disbursement_summary": {},
-                "ledger_breakdown": [],
-                "available_currencies": ["GBP"] if plat == "paysuite" else ["GBP", "USD", "ALL"]
+                "ledger_breakdown": []
             }
 
         df = df_all.copy()
@@ -612,6 +633,7 @@ def get_payouts_summary(
 
 @router.get("/batches")
 def get_payout_batches(
+    company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
     currency: Optional[str] = Query("GBP", description="Filter by settlement currency"),
     status: Optional[str] = Query("ALL", description="Filter by status"),
@@ -627,7 +649,7 @@ def get_payout_batches(
     ps_val = int(_clean_str(page_size, "25")) if _clean_str(page_size, "25").isdigit() else 25
 
     try:
-        df = _get_payout_data_from_db(platform=plat)
+        df = _get_payout_data_from_db(platform=plat, company_id=company_id)
         if df.empty:
             return {"platform": plat, "total_batches": 0, "page": p_val, "page_size": ps_val, "batches": [], "currency": curr_selected}
 
@@ -717,8 +739,25 @@ def get_payout_batches(
         return {"platform": plat, "total_batches": 0, "page": 1, "page_size": 25, "batches": [], "currency": "GBP"}
 
 
+@router.get("/ledger-breakdown")
+def get_payout_ledger_breakdown(
+    company_id: Optional[str] = Query("rethink"),
+    platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
+    currency: Optional[str] = Query("GBP", description="Filter by settlement currency"),
+    batch: Optional[str] = Query("ALL", description="Filter by specific Transfer ID / Batch"),
+    status: Optional[str] = Query("ALL", description="Filter by status")
+):
+    """Returns finance disbursement summary and accounting ledger breakdown."""
+    sum_data = get_payouts_summary(company_id=company_id, platform=platform, currency=currency, batch=batch, status=status)
+    return {
+        "disbursement_summary": sum_data.get("disbursement_summary", {}),
+        "ledger": sum_data.get("ledger_breakdown", [])
+    }
+
+
 @router.get("/campaign-breakdown")
 def get_campaign_payout_breakdown(
+    company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
     currency: Optional[str] = Query("GBP", description="Filter by settlement currency"),
     batch: Optional[str] = Query("ALL", description="Filter by specific Transfer ID / Batch"),
@@ -733,7 +772,7 @@ def get_campaign_payout_breakdown(
     search_val = _clean_str(search).lower()
 
     try:
-        df = _get_payout_data_from_db(platform=plat)
+        df = _get_payout_data_from_db(platform=plat, company_id=company_id)
         if df.empty:
             return {
                 "platform": plat,
@@ -1046,6 +1085,7 @@ def get_campaign_payout_breakdown(
 
 @router.get("/donors")
 def get_payout_donors(
+    company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
     currency: Optional[str] = Query("GBP", description="Filter by settlement currency"),
     batch: Optional[str] = Query("ALL", description="Filter by specific Transfer ID / Batch"),
@@ -1076,7 +1116,7 @@ def get_payout_donors(
     ps_val = int(_clean_str(page_size, "25")) if _clean_str(page_size, "25").isdigit() else 25
 
     try:
-        df_all = _get_payout_data_from_db(platform=plat)
+        df_all = _get_payout_data_from_db(platform=plat, company_id=company_id)
         if df_all.empty:
             return {
                 "platform": plat,
@@ -1271,6 +1311,7 @@ def get_payout_donors(
 
 @router.get("/ledger")
 def get_payout_ledger(
+    company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
     currency: Optional[str] = Query("GBP", description="Filter by settlement currency"),
     batch: Optional[str] = Query("ALL", description="Filter by specific Transfer ID / Batch"),
@@ -1294,7 +1335,7 @@ def get_payout_ledger(
     ps_val = int(_clean_str(page_size, "25")) if _clean_str(page_size, "25").isdigit() else 25
 
     try:
-        df = _get_payout_data_from_db(platform=plat)
+        df = _get_payout_data_from_db(platform=plat, company_id=company_id)
         if df.empty:
             return {"platform": plat, "total_records": 0, "page": p_val, "page_size": ps_val, "total_pages": 1, "records": []}
 
@@ -1364,6 +1405,7 @@ class UpdatePayoutClassificationRequest(BaseModel):
     user_role: str
     campaign_name: str
     code: str
+    company_id: Optional[str] = "rethink"
     heading: Optional[str] = "Unassigned"
     sub_heading: Optional[str] = "Unassigned"
     country: Optional[str] = "Unassigned"
@@ -1377,12 +1419,19 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
     """
     Updates classification for a campaign / Direct Debit from Payouts and synchronizes across all tables and caches in real time.
     """
+    if payload.company_id and str(payload.company_id).strip().lower() == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Modifications are disabled in consolidated 'All Companies' mode. Please select a specific company to update classifications."
+        )
+
     if payload.user_role not in ["super_admin", "admin"]:
         raise HTTPException(
             status_code=403,
             detail="Classification edits are restricted to authorized accounts."
         )
 
+    target_cid = _clean_str(payload.company_id, "rethink").lower()
     plat = _clean_str(payload.platform, "launchgood").lower()
     cname = fix_mojibake(payload.campaign_name).strip()
     code = str(payload.code).strip().upper()
@@ -1394,7 +1443,7 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
     if not cname or not code:
         raise HTTPException(status_code=400, detail="Campaign Name / Bank Ref and Code are required.")
 
-    code_map = get_code_to_classification_map()
+    code_map = get_code_to_classification_map(company_id=target_cid)
     if code_map and code.lower() in code_map:
         cm = code_map[code.lower()]
         if heading in ["", "Unassigned"] and cm.get("Heading"):
@@ -1406,143 +1455,60 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
         if zakat in ["", "Unassigned", "Non-Zakat"] and cm.get("Zakat Eligibility"):
             zakat = cm["Zakat Eligibility"]
 
+    # 1. Update SQLite platform_campaign_mappings
+    with _DB_LOCK:
+        conn = get_db_connection(timeout=60.0)
+        try:
+            with conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO platform_campaign_mappings (company_id, platform, campaign_name, code, community_name, is_primary)
+                    VALUES (?, ?, ?, ?, 'Payouts', 1)
+                    ON CONFLICT(company_id, platform, campaign_name, code) DO UPDATE SET
+                        is_primary = 1,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (target_cid, plat, cname, code))
+        finally:
+            conn.close()
+
+    # 2. Synchronize to donations and payout settlements
     if plat == "paysuite":
-        # 1. Update SQLite paysuite_classifications
-        with _DB_LOCK:
-            conn = get_db_connection(timeout=60.0)
-            try:
-                with conn:
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT rowid FROM paysuite_classifications 
-                        WHERE LOWER(campaign_name) = ? AND UPPER(code) = ?
-                    """, (cname.lower(), code))
-                    existing = cur.fetchone()
-                    if existing:
-                        conn.execute("""
-                            UPDATE paysuite_classifications 
-                            SET heading = ?, sub_heading = ?, country = ?, zakat_eligibility = ?, code = ?
-                            WHERE rowid = ?
-                        """, (heading, sub_heading, country, zakat, code, existing[0]))
-                    else:
-                        cur.execute("""
-                            SELECT rowid FROM paysuite_classifications 
-                            WHERE LOWER(campaign_name) = ?
-                        """, (cname.lower(),))
-                        c_exist = cur.fetchone()
-                        if c_exist:
-                            conn.execute("""
-                                UPDATE paysuite_classifications 
-                                SET code = ?, heading = ?, sub_heading = ?, country = ?, zakat_eligibility = ?, is_primary = 1
-                                WHERE rowid = ?
-                            """, (code, heading, sub_heading, country, zakat, c_exist[0]))
-                        else:
-                            conn.execute("""
-                                INSERT INTO paysuite_classifications 
-                                (campaign_name, code, community_name, heading, sub_heading, country, zakat_eligibility, is_primary)
-                                VALUES (?, ?, 'Paysuite', ?, ?, ?, ?, 1)
-                            """, (cname, code, heading, sub_heading, country, zakat))
-            finally:
-                conn.close()
-
-        # 2. Synchronize to Paysuite donations and payout settlements
-        ps_matrix = get_paysuite_classification_matrix()
-        sync_matrix_classifications_to_donors(ps_matrix)
-
-        # 3. Invalidate caches
-        invalidate_payouts_cache()
-        invalidate_data_cache()
-        get_code_to_classification_map(force_reload=True)
-
-        try:
-            from backend.api.events import broadcast_event_sync
-            broadcast_event_sync("MATRIX_UPDATED", {"platform": "paysuite", "campaign": cname})
-        except Exception:
-            pass
-
-        return {
-            "status": "success",
-            "message": f"Successfully updated Paysuite Direct Debit classification for '{cname}' ({code}) and synchronized across Payouts, Donations, and Paysuite Matrix!",
-            "updated_rule": {
-                "campaign_name": cname,
-                "code": code,
-                "heading": heading,
-                "sub_heading": sub_heading,
-                "country": country,
-                "zakat_eligibility": zakat,
-                "platform": "paysuite"
-            }
-        }
-
+        ps_matrix = get_paysuite_classification_matrix(company_id=target_cid)
+        sync_matrix_classifications_to_donors(ps_matrix, company_id=target_cid)
     else:
-        # LaunchGood Payouts
-        with _DB_LOCK:
-            conn = get_db_connection(timeout=60.0)
-            try:
-                with conn:
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT rowid FROM campaign_classifications 
-                        WHERE LOWER(campaign_name) = ? AND UPPER(code) = ?
-                    """, (cname.lower(), code))
-                    existing = cur.fetchone()
-                    if existing:
-                        conn.execute("""
-                            UPDATE campaign_classifications 
-                            SET heading = ?, sub_heading = ?, country = ?, zakat_eligibility = ?, code = ?
-                            WHERE rowid = ?
-                        """, (heading, sub_heading, country, zakat, code, existing[0]))
-                    else:
-                        cur.execute("""
-                            SELECT rowid FROM campaign_classifications 
-                            WHERE LOWER(campaign_name) = ?
-                        """, (cname.lower(),))
-                        c_exist = cur.fetchone()
-                        if c_exist:
-                            conn.execute("""
-                                UPDATE campaign_classifications 
-                                SET code = ?, heading = ?, sub_heading = ?, country = ?, zakat_eligibility = ?, is_primary = 1
-                                WHERE rowid = ?
-                            """, (code, heading, sub_heading, country, zakat, c_exist[0]))
-                        else:
-                            conn.execute("""
-                                INSERT INTO campaign_classifications 
-                                (campaign_name, code, heading, sub_heading, country, zakat_eligibility, is_primary)
-                                VALUES (?, ?, ?, ?, ?, ?, 1)
-                            """, (cname, code, heading, sub_heading, country, zakat))
-            finally:
-                conn.close()
+        matrix_df = get_classification_matrix(company_id=target_cid)
+        sync_matrix_classifications_to_donors(matrix_df, company_id=target_cid)
 
-        matrix_df = get_classification_matrix()
-        sync_matrix_classifications_to_donors(matrix_df)
+    # 3. Invalidate caches
+    invalidate_payouts_cache(company_id=target_cid)
+    invalidate_data_cache(company_id=target_cid)
+    get_code_to_classification_map(force_reload=True, company_id=target_cid)
 
-        invalidate_payouts_cache()
-        invalidate_data_cache()
-        get_code_to_classification_map(force_reload=True)
+    try:
+        from backend.api.events import broadcast_event_sync
+        broadcast_event_sync("MATRIX_UPDATED", {"platform": plat, "campaign": cname, "company_id": target_cid})
+    except Exception:
+        pass
 
-        try:
-            from backend.api.events import broadcast_event_sync
-            broadcast_event_sync("MATRIX_UPDATED", {"platform": "launchgood", "campaign": cname})
-        except Exception:
-            pass
-
-        return {
-            "status": "success",
-            "message": f"Successfully updated classification for '{cname}' ({code}) and synchronized across Payouts, Donations, and Classification Matrix!",
-            "updated_rule": {
-                "campaign_name": cname,
-                "code": code,
-                "heading": heading,
-                "sub_heading": sub_heading,
-                "country": country,
-                "zakat_eligibility": zakat,
-                "platform": "launchgood"
-            }
+    return {
+        "status": "success",
+        "message": f"Successfully updated classification for '{cname}' ({code}) for company '{target_cid}' and synchronized across Payouts, Donations, and Classification Matrix!",
+        "updated_rule": {
+            "campaign_name": cname,
+            "code": code,
+            "heading": heading,
+            "sub_heading": sub_heading,
+            "country": country,
+            "zakat_eligibility": zakat,
+            "platform": plat,
+            "company_id": target_cid
         }
+    }
 
 
 @router.get("/export")
 def export_payouts_excel(
+    company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
     currency: Optional[str] = Query("ALL", description="Currency filter"),
     batch: Optional[str] = Query("ALL", description="Filter by Transfer ID / Batch"),
@@ -1559,11 +1525,11 @@ def export_payouts_excel(
     code_val = _clean_str(code)
 
     try:
-        summary_data = get_payouts_summary(platform=plat, currency=curr_selected, batch=target_batch, status=status_filter)
-        camp_data = get_campaign_payout_breakdown(platform=plat, currency=curr_selected, batch=target_batch, status=status_filter, search=search_val)
+        summary_data = get_payouts_summary(platform=plat, company_id=company_id, currency=curr_selected, batch=target_batch, status=status_filter)
+        camp_data = get_campaign_payout_breakdown(platform=plat, company_id=company_id, currency=curr_selected, batch=target_batch, status=status_filter, search=search_val)
         
         # Batches
-        batch_data = get_payout_batches(platform=plat, currency=curr_selected, status=status_filter, search=search_val, page_size=1000)
+        batch_data = get_payout_batches(platform=plat, company_id=company_id, currency=curr_selected, status=status_filter, search=search_val, page_size=1000)
         batches_list = batch_data.get("batches", [])
         if target_batch and target_batch.upper() != "ALL":
             target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()

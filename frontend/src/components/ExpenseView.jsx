@@ -4,7 +4,8 @@ import { API_BASE_URL } from '../config';
 import TransferFundsModal from './TransferFundsModal';
 import TransferHistoryModal from './TransferHistoryModal';
 
-export default function ExpenseView({ user }) {
+export default function ExpenseView({ user, activeCompany = 'rethink', companies = [] }) {
+  const isConsolidated = activeCompany === 'all';
   const formatDate = (val) => {
     if (!val) return 'N/A';
     try {
@@ -153,7 +154,7 @@ export default function ExpenseView({ user }) {
 
   const loadCodes = (force = false) => {
     setCodesLoading(true);
-    fetch(`${API_BASE_URL}/api/expenses/codes${force ? '?force_reload=true' : ''}`)
+    fetch(`${API_BASE_URL}/api/expenses/codes?company_id=${encodeURIComponent(activeCompany)}${force ? '&force_reload=true' : ''}`)
       .then(res => res.json())
       .then(data => { setCodes(Array.isArray(data) ? data : []); setCodesLoading(false); })
       .catch(err => { console.error('Error fetching project codes:', err); setCodesLoading(false); });
@@ -161,7 +162,7 @@ export default function ExpenseView({ user }) {
 
   const loadExpenses = () => {
     setLoading(true);
-    fetch(`${API_BASE_URL}/api/expenses/requests?status_filter=${statusFilter}`)
+    fetch(`${API_BASE_URL}/api/expenses/requests?status_filter=${statusFilter}&company_id=${encodeURIComponent(activeCompany)}`)
       .then(res => res.json())
       .then(data => {
         setExpensesData(data);
@@ -181,12 +182,12 @@ export default function ExpenseView({ user }) {
     // WebSocket real-time events listener with HTTP polling fallback for Vercel Serverless
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsHost = API_BASE_URL
-      ? API_BASE_URL.replace(/^https?/, API_BASE_URL.startsWith('https') ? 'wss' : 'ws')
-      : `${wsProtocol}//localhost:8000`;
-    const wsUrl = `${wsHost}/ws/events`;
+      ? API_BASE_URL.replace(/^https?:\/\//, '')
+      : window.location.host;
+    const wsUrl = `${wsProtocol}//${wsHost}/ws/events`;
 
-    let socket;
-    let fallbackInterval;
+    let socket = null;
+    let fallbackInterval = null;
 
     const startPollingFallback = () => {
       if (!fallbackInterval) {
@@ -215,6 +216,9 @@ export default function ExpenseView({ user }) {
       socket.onerror = () => {
         startPollingFallback();
       };
+      socket.onclose = () => {
+        startPollingFallback();
+      };
     } catch (e) {
       startPollingFallback();
     }
@@ -226,15 +230,15 @@ export default function ExpenseView({ user }) {
     window.addEventListener('focus', handleFocus);
 
     return () => {
-      if (socket) socket.close();
+      if (socket) {
+        socket.onclose = null;
+        socket.onerror = null;
+        try { socket.close(); } catch (e) {}
+      }
       if (fallbackInterval) clearInterval(fallbackInterval);
       window.removeEventListener('focus', handleFocus);
     };
-  }, []);
-
-  useEffect(() => {
-    loadExpenses();
-  }, [statusFilter]);
+  }, [statusFilter, activeCompany]);
 
   // Handle Code Selection & Auto-Fill Heading, Sub-Heading, Country
   const handleCodeSelect = (e) => {
@@ -262,6 +266,10 @@ export default function ExpenseView({ user }) {
 
   const handleSubmitExpense = (e) => {
     e.preventDefault();
+    if (isConsolidated) {
+      setFormMsg('❌ Submitting expenses is disabled in Consolidated (All Companies) mode. Please switch to a specific company.');
+      return;
+    }
     if (!selectedCode || !amount || !title) {
       setFormMsg('❌ Please fill in all required fields (Code, Title, Amount).');
       return;
@@ -273,6 +281,7 @@ export default function ExpenseView({ user }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        company_id: activeCompany,
         code: selectedCode,
         title: title,
         vendor: vendor || 'Unassigned Vendor',
@@ -440,23 +449,54 @@ export default function ExpenseView({ user }) {
 
           {isSuperAdmin && (
             <button
-              onClick={() => { setTransferInitialSource(''); setShowTransferModal(true); loadCodes(true); }}
-              className="btn-primary text-xs flex items-center gap-1.5 shadow-lg shadow-purple-500/20"
-              style={{ background: 'linear-gradient(135deg, #8B5CF6, #06B6D4)' }}
-              title="Transfer funds between project codes"
+              onClick={() => { 
+                if (isConsolidated) {
+                  alert('Transferring funds is disabled in Consolidated (All Companies) mode. Please select a specific company.');
+                  return;
+                }
+                setTransferInitialSource(''); 
+                setShowTransferModal(true); 
+                loadCodes(true); 
+              }}
+              disabled={isConsolidated}
+              className={`btn-primary text-xs flex items-center gap-1.5 shadow-lg ${
+                isConsolidated ? 'opacity-60 cursor-not-allowed bg-slate-600' : 'shadow-purple-500/20'
+              }`}
+              style={isConsolidated ? {} : { background: 'linear-gradient(135deg, #8B5CF6, #06B6D4)' }}
+              title={isConsolidated ? "Transfers disabled in consolidated mode" : "Transfer funds between project codes"}
             >
               <ArrowRightLeft className="w-3.5 h-3.5" /> Transfer Funds
             </button>
           )}
 
           <button 
-            onClick={() => { setShowSubmitModal(true); loadCodes(true); }}
-            className="btn-primary text-xs flex items-center gap-1.5 shadow-lg shadow-cyan-500/20"
+            onClick={() => { 
+              if (isConsolidated) {
+                alert('Submitting expenses is disabled in Consolidated (All Companies) mode. Please select a specific company.');
+                return;
+              }
+              setShowSubmitModal(true); 
+              loadCodes(true); 
+            }}
+            disabled={isConsolidated}
+            className={`btn-primary text-xs flex items-center gap-1.5 shadow-lg ${
+              isConsolidated ? 'opacity-60 cursor-not-allowed bg-slate-600' : 'shadow-cyan-500/20'
+            }`}
+            title={isConsolidated ? "Submissions disabled in consolidated mode" : "Submit Expense Request"}
           >
             <PlusCircle className="w-4 h-4" /> Submit Expense Request
           </button>
         </div>
       </div>
+
+      {isConsolidated && (
+        <div className="flex items-center gap-3 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-900 dark:text-amber-200 animate-fadeIn">
+          <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0" />
+          <div className="text-xs">
+            <span className="font-bold">Consolidated Mode (All Companies):</span> Showing aggregated expenses and fund balances across all organizations. Expense claims and fund transfers can only be submitted when a specific company is selected.
+          </div>
+        </div>
+      )}
 
       {reviewMsg && <div className="text-xs font-bold text-emerald-400 bg-emerald-500/10 p-3 rounded-lg border border-emerald-500/20">{reviewMsg}</div>}
 
@@ -872,7 +912,7 @@ export default function ExpenseView({ user }) {
         {/* Download CSV / Excel Export */}
         <div className="flex items-center gap-2">
           <a
-            href={`${API_BASE_URL}/api/expenses/export?status_filter=${statusFilter}&format=csv`}
+            href={`${API_BASE_URL}/api/expenses/export?status_filter=${statusFilter}&format=csv&company_id=${encodeURIComponent(activeCompany)}`}
             download
             className="px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all cursor-pointer"
             title="Export filtered expense claims as CSV"
@@ -880,7 +920,7 @@ export default function ExpenseView({ user }) {
             <Download className="w-3.5 h-3.5" /> CSV
           </a>
           <a
-            href={`${API_BASE_URL}/api/expenses/export?status_filter=${statusFilter}&format=xlsx`}
+            href={`${API_BASE_URL}/api/expenses/export?status_filter=${statusFilter}&format=xlsx&company_id=${encodeURIComponent(activeCompany)}`}
             download
             className="px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all cursor-pointer"
             title="Export filtered expense claims as Excel (.xlsx)"
@@ -1464,6 +1504,7 @@ export default function ExpenseView({ user }) {
         }}
         user={user}
         isSuperAdmin={isSuperAdmin}
+        activeCompany={activeCompany}
       />
 
       <TransferHistoryModal
@@ -1475,6 +1516,7 @@ export default function ExpenseView({ user }) {
         user={user}
         isSuperAdmin={isSuperAdmin}
         filterCode={historyFilterCode}
+        activeCompany={activeCompany}
         onTransfersUpdated={() => {
           loadCodes(true);
           loadExpenses();

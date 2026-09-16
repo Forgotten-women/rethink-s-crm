@@ -11,7 +11,8 @@ import {
 import { API_BASE_URL } from '../config';
 import FundraiserFormModal from './FundraiserFormModal';
 
-export default function FundraiserView({ user, accentColor = 'cyan' }) {
+export default function FundraiserView({ user, accentColor = 'cyan', activeCompany = 'rethink', companies = [] }) {
+  const isConsolidated = activeCompany === 'all';
   // Strictly enforce that only Super Admin accounts can manage fundraisers
   const isSuperAdmin = user?.role?.toLowerCase() === 'super_admin';
 
@@ -25,8 +26,12 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
 
   // Sync & Discover new fundraisers from live transaction data
   const handleSyncDiscovered = () => {
+    if (isConsolidated) {
+      alert('Syncing fundraisers is disabled in Consolidated (All Companies) mode. Please select a specific company.');
+      return;
+    }
     setSyncing(true);
-    fetch(`${API_BASE_URL}/api/fundraisers/sync-discovered`, { method: 'POST' })
+    fetch(`${API_BASE_URL}/api/fundraisers/sync-discovered?company_id=${encodeURIComponent(activeCompany)}`, { method: 'POST' })
       .then(r => r.json())
       .then(res => {
         setSyncing(false);
@@ -149,6 +154,7 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
     setRefreshing(true);
 
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
     if (appliedStartDate) params.append('start_date', appliedStartDate);
     if (appliedEndDate) params.append('end_date', appliedEndDate);
     if (statusFilter !== 'ALL') params.append('status_filter', statusFilter);
@@ -169,7 +175,7 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
 
   // Load available campaigns for assignment
   const loadCampaignsList = () => {
-    fetch(`${API_BASE_URL}/api/fundraisers/campaigns-list`)
+    fetch(`${API_BASE_URL}/api/fundraisers/campaigns-list?company_id=${encodeURIComponent(activeCompany)}`)
       .then(res => res.json())
       .then(data => setAvailableCampaigns(data || []))
       .catch(err => console.error('Error fetching campaigns list:', err));
@@ -180,6 +186,7 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
     if (!fid) return;
     setLoadingDrilldown(true);
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
     if (sDate) params.append('start_date', sDate);
     if (eDate) params.append('end_date', eDate);
 
@@ -205,14 +212,24 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
     loadFundraisers();
     loadCampaignsList();
 
-    // Build WS URL: use API_BASE_URL if set, otherwise assume FastAPI is on :8000 in dev
+    // Build WS URL: use API_BASE_URL if set, otherwise use window.location.host
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsBase = API_BASE_URL
-      ? API_BASE_URL.replace(/^https?/, API_BASE_URL.startsWith('https') ? 'wss' : 'ws')
-      : `${wsProtocol}//localhost:8000`;
-    const wsUrl = `${wsBase}/ws/events`;
+    const wsHost = API_BASE_URL
+      ? API_BASE_URL.replace(/^https?:\/\//, '')
+      : window.location.host;
+    const wsUrl = `${wsProtocol}//${wsHost}/ws/events`;
 
-    let socket;
+    let socket = null;
+    let fallbackInterval = null;
+
+    const startPollingFallback = () => {
+      if (!fallbackInterval) {
+        fallbackInterval = setInterval(() => {
+          loadFundraisers(true);
+        }, 30000);
+      }
+    };
+
     try {
       socket = new WebSocket(wsUrl);
       socket.onmessage = (event) => {
@@ -224,7 +241,15 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
           }
         } catch (e) {}
       };
-    } catch (e) {}
+      socket.onerror = () => {
+        startPollingFallback();
+      };
+      socket.onclose = () => {
+        startPollingFallback();
+      };
+    } catch (e) {
+      startPollingFallback();
+    }
 
     const handleFocus = () => {
       loadFundraisers(true);
@@ -232,10 +257,15 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
     window.addEventListener('focus', handleFocus);
 
     return () => {
-      if (socket) socket.close();
+      if (socket) {
+        socket.onclose = null;
+        socket.onerror = null;
+        try { socket.close(); } catch (e) {}
+      }
+      if (fallbackInterval) clearInterval(fallbackInterval);
       window.removeEventListener('focus', handleFocus);
     };
-  }, [appliedStartDate, appliedEndDate, statusFilter]);
+  }, [appliedStartDate, appliedEndDate, statusFilter, activeCompany]);
 
   // Open Create Modal
   const handleOpenCreateModal = () => {
@@ -258,7 +288,7 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
     if (!isSuperAdmin) return;
     setDeleting(true);
 
-    fetch(`${API_BASE_URL}/api/fundraisers/${fid}?user_role=${user?.role}`, {
+    fetch(`${API_BASE_URL}/api/fundraisers/${fid}?user_role=${user?.role}&company_id=${encodeURIComponent(activeCompany)}`, {
       method: 'DELETE'
     })
       .then(r => r.json())
@@ -652,14 +682,34 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
 
           {isSuperAdmin && (
             <button
-              onClick={handleOpenCreateModal}
-              className="btn-primary text-xs flex items-center gap-1.5 shadow-md shadow-cyan-500/20 px-3.5 py-1.5"
+              onClick={() => {
+                if (isConsolidated) {
+                  alert('Adding fundraisers is disabled in Consolidated (All Companies) mode. Please select a specific company.');
+                  return;
+                }
+                handleOpenCreateModal();
+              }}
+              disabled={isConsolidated}
+              className={`btn-primary text-xs flex items-center gap-1.5 px-3.5 py-1.5 ${
+                isConsolidated ? 'opacity-60 cursor-not-allowed bg-slate-600' : 'shadow-md shadow-cyan-500/20'
+              }`}
+              title={isConsolidated ? "Disabled in consolidated mode" : "Add Fundraiser"}
             >
               <PlusCircle className="w-3.5 h-3.5" /> Add Fundraiser
             </button>
           )}
         </div>
       </div>
+
+      {/* Consolidated Mode Alert */}
+      {isConsolidated && (
+        <div className="flex items-center gap-3 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-900 dark:text-amber-200 animate-fadeIn">
+          <AlertCircle className="w-5 h-5 text-amber-500 shrink-0" />
+          <div className="text-xs">
+            <span className="font-bold">Consolidated Mode (All Companies):</span> Showing aggregated fundraisers and performance metrics across all organizations. Creating, editing, syncing, and deleting fundraisers is disabled in consolidated view. Switch to a specific company to make changes.
+          </div>
+        </div>
+      )}
 
       {/* ── Sync Notification Toast ───────────────────────────────── */}
       {syncToast && (
@@ -1375,6 +1425,7 @@ export default function FundraiserView({ user, accentColor = 'cyan' }) {
         }}
         isSuperAdmin={isSuperAdmin}
         user={user}
+        activeCompany={activeCompany}
       />
 
       {/* ── Super Admin: Delete Confirmation Modal ──────────────── */}

@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { ChevronDown, RotateCcw, Search, Filter, Calendar } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function HorizontalFilters({ filters, onFilterChange, onResetFilters, accentColor = 'cyan' }) {
+export default function HorizontalFilters({ filters, onFilterChange, onResetFilters, accentColor = 'cyan', activeCompany = 'rethink' }) {
   const [filterOptions, setFilterOptions] = useState({
     sources: [],
     programme_funds: [],
@@ -21,6 +21,8 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
   // Fetch options dynamically based on current filters
   useEffect(() => {
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
+
     if (filters) {
       if (filters.payment_type) params.append('payment_type', filters.payment_type);
       if (filters.tier) params.append('tier', filters.tier);
@@ -52,7 +54,7 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
         }));
       })
       .catch(err => console.error('Error loading filter options:', err));
-  }, [filters]);
+  }, [filters, activeCompany]);
 
   // Close dropdown when clicking outside
   useEffect(() => {

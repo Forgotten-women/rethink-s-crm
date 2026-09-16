@@ -2,7 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { Target, ShieldAlert, CheckCircle2, AlertCircle, Edit3, Save, UserCheck, Flame, HeartHandshake } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function TrackerView({ user, filters, onSelectDonor }) {
+export default function TrackerView({ user, filters, onSelectDonor, activeCompany = 'rethink', companies = [] }) {
+  const isConsolidated = activeCompany === 'all';
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
   
@@ -20,6 +21,7 @@ export default function TrackerView({ user, filters, onSelectDonor }) {
   const loadTrackerData = () => {
     setLoading(true);
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
     if (filters) {
       if (filters.payment_type) params.append('payment_type', filters.payment_type);
       if (filters.tier) params.append('tier', filters.tier);
@@ -58,7 +60,7 @@ export default function TrackerView({ user, filters, onSelectDonor }) {
 
   useEffect(() => {
     loadTrackerData();
-  }, [filters]);
+  }, [filters, activeCompany]);
 
   const handleSaveTargets = (e) => {
     e.preventDefault();
@@ -70,6 +72,7 @@ export default function TrackerView({ user, filters, onSelectDonor }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        company_id: activeCompany,
         user_role: user?.role,
         targets: {
           Hafiz: parseFloat(targetInputs.Hafiz) || 240,

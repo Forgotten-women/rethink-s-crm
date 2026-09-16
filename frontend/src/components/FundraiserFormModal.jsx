@@ -11,7 +11,8 @@ export default function FundraiserFormModal({
   availableCampaigns = [],
   onSuccess,
   isSuperAdmin,
-  user
+  user,
+  activeCompany = 'rethink'
 }) {
   // Form fields state (decoupled so typing in text inputs doesn't trigger campaign re-filtering)
   const [formFields, setFormFields] = useState({
@@ -158,6 +159,7 @@ export default function FundraiserFormModal({
     setFormMsg('');
 
     const payload = {
+      company_id: activeCompany,
       name: formFields.name.trim(),
       email: formFields.email.trim(),
       phone: formFields.phone.trim(),

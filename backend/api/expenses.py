@@ -54,11 +54,15 @@ def init_expense_db():
         """)
 
         # Migration safe-guards for existing databases
-        for col_def in ["gl_code TEXT", "is_zakat INTEGER DEFAULT 0"]:
+        for col_def in ["gl_code TEXT", "is_zakat INTEGER DEFAULT 0", "company_id TEXT DEFAULT 'rethink'"]:
             try:
                 cursor.execute(f"ALTER TABLE expense_requests ADD COLUMN {col_def};")
             except Exception:
                 pass
+        try:
+            cursor.execute("ALTER TABLE code_transfers ADD COLUMN company_id TEXT DEFAULT 'rethink';")
+        except Exception:
+            pass
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS system_settings (
@@ -78,11 +82,13 @@ def init_expense_db():
                 amount REAL NOT NULL,
                 reason TEXT NOT NULL,
                 transferred_by TEXT NOT NULL,
+                company_id TEXT DEFAULT 'rethink',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_transfers_src ON code_transfers(source_code);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_transfers_dst ON code_transfers(destination_code);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_transfers_comp ON code_transfers(company_id);")
         
         # Seed SMTP settings from .env as defaults (INSERT OR IGNORE = only on first run)
         smtp_defaults = [
@@ -118,6 +124,7 @@ class SubmitExpenseRequest(BaseModel):
     requested_by: Optional[str] = "Admin User"
     is_zakat: Optional[bool] = False
     gl_code: Optional[str] = None
+    company_id: Optional[str] = "rethink"
 
 
 class ReviewExpenseRequest(BaseModel):
@@ -165,6 +172,7 @@ class TransferFundsRequest(BaseModel):
     user_role: Optional[str] = "super_admin"
     can_edit_donors: Optional[bool] = False
     transferred_by: Optional[str] = "Admin User"
+    company_id: Optional[str] = "rethink"
 
 
 class VoidTransferRequest(BaseModel):
@@ -290,18 +298,22 @@ def dispatch_approval_email(expense_id: str, title: str, amount: float, code: st
 
     return dest_email, approve_url, reject_url, email_sent, send_error
 
-_CODES_CACHE = None
+_CODES_CACHE = {}
 
-def clear_expenses_cache():
+def clear_expenses_cache(company_id: Optional[str] = None):
     global _CODES_CACHE
-    _CODES_CACHE = None
+    if company_id:
+        _CODES_CACHE.pop(company_id.strip().lower(), None)
+    else:
+        _CODES_CACHE.clear()
 
 @router.get("/codes")
-def get_project_codes(force_reload: bool = False):
+def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Query("rethink")):
     """Returns unique list of project codes with gross raised, approved expenses, and net balance aggregated across donations, payouts, and classifications in real-time."""
     global _CODES_CACHE
-    if not force_reload and _CODES_CACHE is not None:
-        return _CODES_CACHE
+    comp = (company_id or "rethink").strip().lower()
+    if not force_reload and comp in _CODES_CACHE:
+        return _CODES_CACHE[comp]
 
     init_expense_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -309,73 +321,138 @@ def get_project_codes(force_reload: bool = False):
         cur = conn.cursor()
         
         # 1. Fetch approved expenses per code
-        cur.execute("SELECT code, SUM(amount) FROM expense_requests WHERE status = 'APPROVED' GROUP BY code")
+        if comp != "all":
+            cur.execute("SELECT code, SUM(amount) FROM expense_requests WHERE status = 'APPROVED' AND company_id = ? GROUP BY code", (comp,))
+        else:
+            cur.execute("SELECT code, SUM(amount) FROM expense_requests WHERE status = 'APPROVED' GROUP BY code")
         approved_expense_map = {str(row[0]).strip().upper(): float(row[1] or 0.0) for row in cur.fetchall() if row[0]}
 
         # 1b. Fetch internal fund transfers in and out per code
         try:
-            cur.execute("""
-                SELECT UPPER(TRIM(source_code)), SUM(amount)
-                FROM code_transfers
-                WHERE source_code IS NOT NULL AND TRIM(source_code) != ''
-                GROUP BY UPPER(TRIM(source_code))
-            """)
-            transfers_out_map = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
+            if comp != "all":
+                cur.execute("""
+                    SELECT UPPER(TRIM(source_code)), SUM(amount)
+                    FROM code_transfers
+                    WHERE source_code IS NOT NULL AND TRIM(source_code) != '' AND company_id = ?
+                    GROUP BY UPPER(TRIM(source_code))
+                """, (comp,))
+                transfers_out_map = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
 
-            cur.execute("""
-                SELECT UPPER(TRIM(destination_code)), SUM(amount)
-                FROM code_transfers
-                WHERE destination_code IS NOT NULL AND TRIM(destination_code) != ''
-                GROUP BY UPPER(TRIM(destination_code))
-            """)
-            transfers_in_map = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
+                cur.execute("""
+                    SELECT UPPER(TRIM(destination_code)), SUM(amount)
+                    FROM code_transfers
+                    WHERE destination_code IS NOT NULL AND TRIM(destination_code) != '' AND company_id = ?
+                    GROUP BY UPPER(TRIM(destination_code))
+                """, (comp,))
+                transfers_in_map = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
+            else:
+                cur.execute("""
+                    SELECT UPPER(TRIM(source_code)), SUM(amount)
+                    FROM code_transfers
+                    WHERE source_code IS NOT NULL AND TRIM(source_code) != ''
+                    GROUP BY UPPER(TRIM(source_code))
+                """)
+                transfers_out_map = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
+
+                cur.execute("""
+                    SELECT UPPER(TRIM(destination_code)), SUM(amount)
+                    FROM code_transfers
+                    WHERE destination_code IS NOT NULL AND TRIM(destination_code) != ''
+                    GROUP BY UPPER(TRIM(destination_code))
+                """)
+                transfers_in_map = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
         except Exception:
             transfers_out_map = {}
             transfers_in_map = {}
         
-        # 2. Fetch ALL canonical codes from master_project_codes (single source of truth - 190 codes)
-        cur.execute("""
-            SELECT 
-                UPPER(TRIM(code)) as code,
-                department,
-                office,
-                portfolio,
-                country,
-                zakat_eligibility,
-                programme_fund,
-                fund_code,
-                legacy_non_zakat_code,
-                legacy_zakat_code,
-                old_codes,
-                description,
-                is_active
-            FROM master_project_codes
-            WHERE code IS NOT NULL AND TRIM(code) != ''
-            ORDER BY code
-        """)
+        # 2. Fetch canonical codes from master_project_codes for this company
+        if comp != "all":
+            cur.execute("""
+                SELECT 
+                    UPPER(TRIM(code)) as code,
+                    department,
+                    office,
+                    portfolio,
+                    country,
+                    zakat_eligibility,
+                    programme_fund,
+                    fund_code,
+                    legacy_non_zakat_code,
+                    legacy_zakat_code,
+                    old_codes,
+                    description,
+                    is_active,
+                    company_id
+                FROM master_project_codes
+                WHERE code IS NOT NULL AND TRIM(code) != '' AND company_id = ?
+                ORDER BY code
+            """, (comp,))
+        else:
+            cur.execute("""
+                SELECT 
+                    UPPER(TRIM(code)) as code,
+                    department,
+                    office,
+                    portfolio,
+                    country,
+                    zakat_eligibility,
+                    programme_fund,
+                    fund_code,
+                    legacy_non_zakat_code,
+                    legacy_zakat_code,
+                    old_codes,
+                    description,
+                    is_active,
+                    company_id
+                FROM master_project_codes
+                WHERE code IS NOT NULL AND TRIM(code) != ''
+                ORDER BY code
+            """)
         master_rows = cur.fetchall()
 
-        # 3. Fetch gross raised per code from donations table (for financial enrichment only)
-        cur.execute("""
-            SELECT 
-                UPPER(TRIM(Code)) as code, 
-                SUM([Total Online Donations Net Amount in Settled Currency]) 
-            FROM donations 
-            WHERE Code IS NOT NULL AND TRIM(Code) != '' AND UPPER(TRIM(Code)) NOT IN ('N/A', 'UNASSIGNED', 'NAN', 'NONE', '')
-            GROUP BY UPPER(TRIM(Code))
-        """)
-        gross_from_donations = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
-
-        # 4. Fetch gross raised per code from payout_settlements (for financial enrichment only)
-        try:
+        # 3. Fetch gross raised per code from donations table (filtered by company)
+        if comp != "all":
             cur.execute("""
                 SELECT 
                     UPPER(TRIM(Code)) as code, 
                     SUM([Total Online Donations Net Amount in Settled Currency]) 
-                FROM payout_settlements 
+                FROM donations 
+                WHERE Code IS NOT NULL AND TRIM(Code) != '' AND UPPER(TRIM(Code)) NOT IN ('N/A', 'UNASSIGNED', 'NAN', 'NONE', '')
+                AND company_id = ?
+                GROUP BY UPPER(TRIM(Code))
+            """, (comp,))
+        else:
+            cur.execute("""
+                SELECT 
+                    UPPER(TRIM(Code)) as code, 
+                    SUM([Total Online Donations Net Amount in Settled Currency]) 
+                FROM donations 
                 WHERE Code IS NOT NULL AND TRIM(Code) != '' AND UPPER(TRIM(Code)) NOT IN ('N/A', 'UNASSIGNED', 'NAN', 'NONE', '')
                 GROUP BY UPPER(TRIM(Code))
             """)
+        gross_from_donations = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
+
+        # 4. Fetch gross raised per code from payout_settlements
+        try:
+            if comp != "all":
+                cur.execute("""
+                    SELECT 
+                        UPPER(TRIM(Code)) as code, 
+                        SUM([Total Online Donations Net Amount in Settled Currency]) 
+                    FROM payout_settlements 
+                    WHERE Code IS NOT NULL AND TRIM(Code) != '' AND UPPER(TRIM(Code)) NOT IN ('N/A', 'UNASSIGNED', 'NAN', 'NONE', '')
+                    AND company_id = ?
+                    GROUP BY UPPER(TRIM(Code))
+                """, (comp,))
+            else:
+                cur.execute("""
+                    SELECT 
+                        UPPER(TRIM(Code)) as code, 
+                        SUM([Total Online Donations Net Amount in Settled Currency]) 
+                    FROM payout_settlements 
+                    WHERE Code IS NOT NULL AND TRIM(Code) != '' AND UPPER(TRIM(Code)) NOT IN ('N/A', 'UNASSIGNED', 'NAN', 'NONE', '')
+                    GROUP BY UPPER(TRIM(Code))
+                """)
             gross_from_payouts = {str(r[0]).strip().upper(): float(r[1] or 0.0) for r in cur.fetchall() if r[0]}
         except Exception:
             gross_from_payouts = {}
@@ -388,14 +465,13 @@ def get_project_codes(force_reload: bool = False):
 
     code_map = {}
 
-    # Build code list STRICTLY from master_project_codes (canonical 190 codes - single source of truth)
+    # Build code list STRICTLY from master_project_codes
     for (code_val, department, office, portfolio, country, zakat_elig,
          programme_fund, fund_code, legacy_nz, legacy_z, old_codes,
-         description, is_active) in master_rows:
+         description, is_active, comp_tag) in master_rows:
         if not code_val:
             continue
         code_str = str(code_val).strip().upper()
-        # Financial enrichment: prefer donations gross, fall back to payouts
         gross_val = gross_from_donations.get(code_str, gross_from_payouts.get(code_str, 0.0))
         exp_amt = approved_expense_map.get(code_str, 0.0)
         t_in = transfers_in_map.get(code_str, 0.0)
@@ -403,6 +479,7 @@ def get_project_codes(force_reload: bool = False):
         net_t = round(t_in - t_out, 2)
         code_map[code_str] = {
             "code": code_str,
+            "company_id": str(comp_tag or comp),
             "heading": str(department or "Unassigned"),
             "sub_heading": str(office or "Unassigned"),
             "portfolio": str(portfolio or ""),
@@ -433,6 +510,7 @@ def get_project_codes(force_reload: bool = False):
             net_t = round(t_in - t_out, 2)
             code_map[exp_code] = {
                 "code": exp_code,
+                "company_id": comp,
                 "heading": "Unassigned",
                 "sub_heading": "Unassigned",
                 "portfolio": "",
@@ -455,29 +533,36 @@ def get_project_codes(force_reload: bool = False):
             }
 
     sorted_codes = sorted(list(code_map.values()), key=lambda x: x["code"])
-    _CODES_CACHE = sorted_codes
+    _CODES_CACHE[comp] = sorted_codes
     return sorted_codes
 
 
 @router.get("/requests")
-def get_expense_requests(status_filter: Optional[str] = "ALL"):
-    """Returns list of expense requests and summary metrics."""
+def get_expense_requests(status_filter: Optional[str] = "ALL", company_id: Optional[str] = Query("rethink")):
+    """Returns list of expense requests and summary metrics for the given company."""
     init_expense_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    query = "SELECT * FROM expense_requests"
+    query = "SELECT * FROM expense_requests WHERE 1=1"
     params = []
+    if comp != "all":
+        query += " AND company_id = ?"
+        params.append(comp)
     if status_filter and status_filter != "ALL":
-        query += " WHERE status = ?"
+        query += " AND status = ?"
         params.append(status_filter)
     
     query += " ORDER BY created_at DESC"
     cursor.execute(query, params)
     rows = [dict(r) for r in cursor.fetchall()]
 
-    cursor.execute("SELECT status, SUM(amount), COUNT(*) FROM expense_requests GROUP BY status")
+    if comp != "all":
+        cursor.execute("SELECT status, SUM(amount), COUNT(*) FROM expense_requests WHERE company_id = ? GROUP BY status", (comp,))
+    else:
+        cursor.execute("SELECT status, SUM(amount), COUNT(*) FROM expense_requests GROUP BY status")
     kpi_rows = cursor.fetchall()
     
     total_requested = 0.0
@@ -505,6 +590,7 @@ def get_expense_requests(status_filter: Optional[str] = "ALL"):
     conn.close()
 
     return {
+        "company_id": comp,
         "summary": {
             "total_requested": round(total_requested, 2),
             "total_approved": round(total_approved, 2),
@@ -522,18 +608,23 @@ def get_expense_requests(status_filter: Optional[str] = "ALL"):
 @router.get("/export")
 def export_expense_requests(
     status_filter: Optional[str] = "ALL",
-    format: str = Query("csv", pattern="^(csv|xlsx)$")
+    format: str = Query("csv", pattern="^(csv|xlsx)$"),
+    company_id: Optional[str] = Query("rethink")
 ):
     """Exports expense requests to CSV or Excel (.xlsx) with GL ledger codes and Zakat indicator."""
     init_expense_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    query = "SELECT * FROM expense_requests"
+    query = "SELECT * FROM expense_requests WHERE 1=1"
     params = []
+    if comp != "all":
+        query += " AND company_id = ?"
+        params.append(comp)
     if status_filter and status_filter != "ALL":
-        query += " WHERE status = ?"
+        query += " AND status = ?"
         params.append(status_filter)
     query += " ORDER BY created_at DESC"
     cursor.execute(query, params)
@@ -550,6 +641,7 @@ def export_expense_requests(
 
     rename_map = {
         "id": "Claim ID",
+        "company_id": "Company",
         "created_at": "Submission Date",
         "payment_date": "Payment Date",
         "code": "Project Code",
@@ -569,7 +661,7 @@ def export_expense_requests(
     }
 
     target_cols = [
-        "id", "created_at", "payment_date", "code", "gl_code", "is_zakat",
+        "id", "company_id", "created_at", "payment_date", "code", "gl_code", "is_zakat",
         "title", "vendor", "amount", "heading", "sub_heading", "country",
         "status", "requested_by", "reviewed_by", "notes", "review_notes"
     ]
@@ -583,7 +675,7 @@ def export_expense_requests(
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Expense Claims")
         buffer.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="expenses_{status_filter.lower()}_{date_str}.xlsx"'}
+        headers = {"Content-Disposition": f'attachment; filename="expenses_{comp}_{status_filter.lower()}_{date_str}.xlsx"'}
         return Response(
             content=buffer.getvalue(),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -591,7 +683,7 @@ def export_expense_requests(
         )
     else:
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        headers = {"Content-Disposition": f'attachment; filename="expenses_{status_filter.lower()}_{date_str}.csv"'}
+        headers = {"Content-Disposition": f'attachment; filename="expenses_{comp}_{status_filter.lower()}_{date_str}.csv"'}
         return Response(
             content=csv_bytes,
             media_type="text/csv",
@@ -602,18 +694,24 @@ def export_expense_requests(
 @router.post("/submit")
 def submit_expense(payload: SubmitExpenseRequest):
     """Submits a new project expense request with deduplication guard and dispatches approval notification email."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot submit expense claims in 'All Companies (Consolidated)' mode. Please select a specific company."
+        )
+
     init_expense_db()
     
     # ----- Deduplication Guard -----
-    # Prevent duplicate submissions with same code + title + amount + payment_date within 60 seconds
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, created_at FROM expense_requests 
-        WHERE code = ? AND title = ? AND amount = ? AND payment_date = ?
+        WHERE code = ? AND title = ? AND amount = ? AND payment_date = ? AND company_id = ?
         AND created_at >= datetime('now', '-60 seconds')
         ORDER BY created_at DESC LIMIT 1
-    """, (payload.code.strip(), payload.title.strip(), payload.amount, payload.payment_date))
+    """, (payload.code.strip(), payload.title.strip(), payload.amount, payload.payment_date, comp))
     
     dup_row = cursor.fetchone()
     conn.close()
@@ -625,8 +723,8 @@ def submit_expense(payload: SubmitExpenseRequest):
         )
     
     # ----- Resolve Classification Details & GL Ledger Code -----
-    df_raw = load_data()
-    matrix_df = get_classification_matrix(df_raw).fillna("Unassigned")
+    df_raw = load_data(company_id=comp)
+    matrix_df = get_classification_matrix(df_raw, company_id=comp).fillna("Unassigned")
     
     heading, sub_heading, country = "Unassigned", "Unassigned", "Unassigned"
     target_code = payload.code.strip().lower()
@@ -648,7 +746,7 @@ def submit_expense(payload: SubmitExpenseRequest):
                 break
 
     from core.data_processor import get_code_to_classification_map
-    central_map = get_code_to_classification_map()
+    central_map = get_code_to_classification_map(company_id=comp)
     c_info = central_map.get(target_code, {})
 
     is_zkt_bool = bool(payload.is_zakat)
@@ -666,16 +764,16 @@ def submit_expense(payload: SubmitExpenseRequest):
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO expense_requests 
-        (id, code, gl_code, is_zakat, heading, sub_heading, country, title, vendor, amount, payment_date, notes, status, requested_by, approval_token)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?)
+        (id, code, gl_code, is_zakat, heading, sub_heading, country, title, vendor, amount, payment_date, notes, status, requested_by, approval_token, company_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?)
     """, (
         expense_id, payload.code.strip(), gl_code, 1 if is_zkt_bool else 0, heading, sub_heading, country,
         payload.title.strip(), payload.vendor.strip(), payload.amount, payload.payment_date,
-        payload.notes, payload.requested_by, token
+        payload.notes, payload.requested_by, token, comp
     ))
     conn.commit()
     conn.close()
-    clear_expenses_cache()
+    clear_expenses_cache(comp)
 
     dest_email, approve_url, reject_url, email_sent, send_error = dispatch_approval_email(
         expense_id, payload.title.strip(), payload.amount, payload.code.strip(), payload.requested_by, token,
@@ -684,6 +782,7 @@ def submit_expense(payload: SubmitExpenseRequest):
 
     broadcast_event_sync("EXPENSE_SUBMITTED", {
         "id": expense_id, 
+        "company_id": comp,
         "code": payload.code.strip(), 
         "gl_code": gl_code,
         "is_zakat": is_zkt_bool,
@@ -693,14 +792,19 @@ def submit_expense(payload: SubmitExpenseRequest):
     result = {
         "status": "success",
         "expense_id": expense_id,
+        "company_id": comp,
         "gl_code": gl_code,
         "is_zakat": is_zkt_bool,
         "approval_email_sent_to": dest_email,
         "email_actually_sent": email_sent,
         "approve_url": approve_url,
         "reject_url": reject_url,
-        "message": f"Expense claim {expense_id} submitted (GL: {gl_code or 'N/A'})! Approval notification dispatched to '{dest_email}'."
+        "message": f"Expense claim {expense_id} submitted for {comp.upper()} (GL: {gl_code or 'N/A'})! Approval notification dispatched to '{dest_email}'."
     }
+    if not email_sent:
+        result["email_warning"] = f"Email could not be sent: {send_error}. Configure SMTP_USER and SMTP_PASSWORD in .env to enable email delivery."
+    
+    return result
     if not email_sent:
         result["email_warning"] = f"Email could not be sent: {send_error}. Configure SMTP_USER and SMTP_PASSWORD in .env to enable email delivery."
     
@@ -929,15 +1033,24 @@ def test_smtp_email(payload: TestEmailRequest):
 # ── Internal Fund Transfers Between Project Codes ───────────────────────
 
 @router.get("/transfers")
-def get_code_transfers(code: Optional[str] = None, search: Optional[str] = None, limit: int = 500):
-    """Retrieves all internal fund transfer records with optional code and keyword search."""
+def get_code_transfers(
+    code: Optional[str] = None, 
+    search: Optional[str] = None, 
+    limit: int = 500,
+    company_id: Optional[str] = Query("rethink")
+):
+    """Retrieves all internal fund transfer records with optional code, keyword, and company search."""
     init_expense_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     query = "SELECT * FROM code_transfers WHERE 1=1"
     params = []
+    if comp != "all":
+        query += " AND company_id = ?"
+        params.append(comp)
     if code and code.strip():
         c_clean = code.strip().upper()
         query += " AND (UPPER(source_code) = ? OR UPPER(destination_code) = ?)"
@@ -956,6 +1069,7 @@ def get_code_transfers(code: Optional[str] = None, search: Optional[str] = None,
 
     total_amount = sum(r.get("amount", 0.0) for r in rows)
     return {
+        "company_id": comp,
         "transfers": rows,
         "total_count": len(rows),
         "total_amount": round(total_amount, 2)
@@ -964,7 +1078,14 @@ def get_code_transfers(code: Optional[str] = None, search: Optional[str] = None,
 
 @router.post("/transfers")
 def create_code_transfer(payload: TransferFundsRequest):
-    """Transfers funds from one project code to another, validating available balance and Super Admin permissions."""
+    """Transfers funds from one project code to another, validating available balance, single company boundary, and Super Admin permissions."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Transfers cannot be performed in 'All Companies (Consolidated)' mode. Please select a specific company."
+        )
+
     if payload.user_role not in ["super_admin", "admin"] and not payload.can_edit_donors:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -987,22 +1108,22 @@ def create_code_transfer(payload: TransferFundsRequest):
 
     init_expense_db()
 
-    # Verify source code available balance
-    all_codes = get_project_codes(force_reload=True)
+    # Verify source and destination codes belong strictly to this company
+    all_codes = get_project_codes(force_reload=True, company_id=comp)
     src_obj = next((c for c in all_codes if c["code"] == src), None)
     if not src_obj:
-        raise HTTPException(status_code=404, detail=f"Source project code '{src}' does not exist.")
+        raise HTTPException(status_code=404, detail=f"Source project code '{src}' does not exist in {comp.upper()}.")
 
     available_balance = src_obj.get("net_balance", 0.0)
     if amount > available_balance:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient funds on '{src}'. Available balance is £{available_balance:,.2f}, but requested transfer is £{amount:,.2f}."
+            detail=f"Insufficient funds on '{src}'. Available balance in {comp.upper()} is £{available_balance:,.2f}, but requested transfer is £{amount:,.2f}."
         )
 
     dst_obj = next((c for c in all_codes if c["code"] == dst), None)
     if not dst_obj:
-        raise HTTPException(status_code=404, detail=f"Destination project code '{dst}' does not exist.")
+        raise HTTPException(status_code=404, detail=f"Destination project code '{dst}' does not exist in {comp.upper()}. Cross-company transfers are strictly prohibited.")
 
     transfer_id = f"TRF-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
     t_date = payload.transfer_date.strip() if payload.transfer_date else datetime.now().strftime("%Y-%m-%d")
@@ -1010,15 +1131,16 @@ def create_code_transfer(payload: TransferFundsRequest):
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO code_transfers (id, transfer_date, source_code, destination_code, amount, reason, transferred_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (transfer_id, t_date, src, dst, amount, reason, payload.transferred_by or "Super Admin"))
+        INSERT INTO code_transfers (id, transfer_date, source_code, destination_code, amount, reason, transferred_by, company_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (transfer_id, t_date, src, dst, amount, reason, payload.transferred_by or "Super Admin", comp))
     conn.commit()
     conn.close()
 
-    clear_expenses_cache()
+    clear_expenses_cache(comp)
     broadcast_event_sync("BALANCE_TRANSFERRED", {
         "id": transfer_id,
+        "company_id": comp,
         "source_code": src,
         "destination_code": dst,
         "amount": amount,
@@ -1028,8 +1150,9 @@ def create_code_transfer(payload: TransferFundsRequest):
 
     return {
         "status": "success",
-        "message": f"Successfully transferred £{amount:,.2f} from '{src}' to '{dst}'.",
+        "message": f"Successfully transferred £{amount:,.2f} from '{src}' to '{dst}' within {comp.upper()}.",
         "transfer_id": transfer_id,
+        "company_id": comp,
         "source_code": src,
         "destination_code": dst,
         "amount": amount
@@ -1054,12 +1177,14 @@ def void_code_transfer(transfer_id: str, user_role: str = "super_admin", can_edi
         conn.close()
         raise HTTPException(status_code=404, detail=f"Transfer ID '{transfer_id}' not found.")
 
+    comp_val = row["company_id"] if "company_id" in row.keys() else "rethink"
+
     cur.execute("DELETE FROM code_transfers WHERE id = ?", (transfer_id,))
     conn.commit()
     conn.close()
 
-    clear_expenses_cache()
-    broadcast_event_sync("BALANCE_TRANSFERRED", {"id": transfer_id, "action": "VOIDED"})
+    clear_expenses_cache(comp_val)
+    broadcast_event_sync("BALANCE_TRANSFERRED", {"id": transfer_id, "action": "VOIDED", "company_id": comp_val})
 
     return {
         "status": "success",
@@ -1068,15 +1193,23 @@ def void_code_transfer(transfer_id: str, user_role: str = "super_admin", can_edi
 
 
 @router.get("/transfers/export")
-def export_transfers(format: str = "csv", code: Optional[str] = None):
+def export_transfers(
+    format: str = "csv", 
+    code: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink")
+):
     """Exports all fund transfers to CSV or Excel format."""
     init_expense_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-    query = "SELECT * FROM code_transfers"
+    query = "SELECT * FROM code_transfers WHERE 1=1"
     params = []
+    if comp != "all":
+        query += " AND company_id = ?"
+        params.append(comp)
     if code and code.strip():
         c_clean = code.strip().upper()
-        query += " WHERE UPPER(source_code) = ? OR UPPER(destination_code) = ?"
+        query += " AND (UPPER(source_code) = ? OR UPPER(destination_code) = ?)"
         params.extend([c_clean, c_clean])
     query += " ORDER BY created_at DESC"
 
@@ -1085,6 +1218,7 @@ def export_transfers(format: str = "csv", code: Optional[str] = None):
 
     rename_map = {
         "id": "Transfer ID",
+        "company_id": "Company",
         "transfer_date": "Transfer Date",
         "source_code": "Source Code",
         "destination_code": "Destination Code",
@@ -1101,7 +1235,7 @@ def export_transfers(format: str = "csv", code: Optional[str] = None):
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Fund Transfers")
         buffer.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="code_transfers_{date_str}.xlsx"'}
+        headers = {"Content-Disposition": f'attachment; filename="code_transfers_{comp}_{date_str}.xlsx"'}
         return Response(
             content=buffer.getvalue(),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1109,7 +1243,7 @@ def export_transfers(format: str = "csv", code: Optional[str] = None):
         )
     else:
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        headers = {"Content-Disposition": f'attachment; filename="code_transfers_{date_str}.csv"'}
+        headers = {"Content-Disposition": f'attachment; filename="code_transfers_{comp}_{date_str}.csv"'}
         return Response(
             content=csv_bytes,
             media_type="text/csv",

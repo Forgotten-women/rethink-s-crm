@@ -8,7 +8,8 @@ export default function TransferHistoryModal({
   user,
   isSuperAdmin,
   onTransfersUpdated,
-  filterCode = ''
+  filterCode = '',
+  activeCompany = 'rethink'
 }) {
   const [transfers, setTransfers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -23,7 +24,7 @@ export default function TransferHistoryModal({
     setLoading(true);
     const codeParam = filterCode ? `&code=${encodeURIComponent(filterCode)}` : '';
     const searchParam = search ? `&search=${encodeURIComponent(search)}` : '';
-    fetch(`${API_BASE_URL}/api/expenses/transfers?limit=500${codeParam}${searchParam}`)
+    fetch(`${API_BASE_URL}/api/expenses/transfers?limit=500${codeParam}${searchParam}&company_id=${encodeURIComponent(activeCompany)}`)
       .then(r => r.json())
       .then(res => {
         setTransfers(res.transfers || []);
@@ -60,7 +61,7 @@ export default function TransferHistoryModal({
     setVoidingId(transferId);
     setActionMsg('');
 
-    fetch(`${API_BASE_URL}/api/expenses/transfers/${transferId}?user_role=${user?.role || 'super_admin'}&can_edit_donors=${user?.can_edit_donors === 1}`, {
+    fetch(`${API_BASE_URL}/api/expenses/transfers/${transferId}?user_role=${user?.role || 'super_admin'}&can_edit_donors=${user?.can_edit_donors === 1}&company_id=${encodeURIComponent(activeCompany)}`, {
       method: 'DELETE'
     })
       .then(r => r.json())
@@ -85,7 +86,7 @@ export default function TransferHistoryModal({
 
   const handleExport = (format = 'csv') => {
     const codeParam = filterCode ? `&code=${encodeURIComponent(filterCode)}` : '';
-    window.open(`${API_BASE_URL}/api/expenses/transfers/export?format=${format}${codeParam}`, '_blank');
+    window.open(`${API_BASE_URL}/api/expenses/transfers/export?format=${format}${codeParam}&company_id=${encodeURIComponent(activeCompany)}`, '_blank');
   };
 
   return (

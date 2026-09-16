@@ -9,7 +9,8 @@ export default function TransferFundsModal({
   initialSourceCode = '',
   onSuccess,
   user,
-  isSuperAdmin
+  isSuperAdmin,
+  activeCompany = 'rethink'
 }) {
   const [sourceCode, setSourceCode] = useState(initialSourceCode || '');
   const [destCode, setDestCode] = useState('');
@@ -93,6 +94,7 @@ export default function TransferFundsModal({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        company_id: activeCompany,
         source_code: sourceCode,
         destination_code: destCode,
         amount: numAmount,

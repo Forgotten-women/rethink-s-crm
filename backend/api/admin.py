@@ -1,9 +1,12 @@
 import io
 import os
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+import sqlite3
+from typing import Optional, List
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Query, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from config.settings import PARQUET_PATH
+from config.settings import PARQUET_PATH, LOCAL_DB_PATH, LOGOS_DIR
 from core.data_processor import (
     delete_single_dataset,
     load_data,
@@ -13,11 +16,18 @@ from core.data_processor import (
     update_source_tag,
 )
 from core.database import get_cloud_sync_status
+from core.auth import get_all_users, update_user_permissions, edit_user_details
 
 router = APIRouter(prefix="/api/admin", tags=["Admin & Database Management"])
 
 
-from core.auth import get_all_users, update_user_permissions, edit_user_details
+class CompanyUpsertRequest(BaseModel):
+    user_role: str
+    id: str
+    name: str
+    short_code: str
+    accent_color: Optional[str] = "cyan"
+    is_active: Optional[bool] = True
 
 
 class UpdateUserPermissionRequest(BaseModel):
@@ -28,6 +38,7 @@ class UpdateUserPermissionRequest(BaseModel):
     can_edit_matrix: bool
     can_manage_tags: bool
     can_purge_data: bool
+    allowed_companies: Optional[List[str]] = None
 
 
 class EditUserRequest(BaseModel):
@@ -79,7 +90,8 @@ def update_user_permission_endpoint(payload: UpdateUserPermissionRequest):
         payload.can_edit_donors,
         payload.can_edit_matrix,
         payload.can_manage_tags,
-        payload.can_purge_data
+        payload.can_purge_data,
+        payload.allowed_companies
     )
     return {"status": "success", "message": f"Successfully updated permissions for '{payload.target_email}'."}
 
@@ -133,13 +145,28 @@ def edit_user_endpoint(payload: EditUserRequest):
 
 
 @router.get("/status")
-def get_system_status():
-    df_raw = load_data()
+def get_system_status(company_id: Optional[str] = Query(None)):
+    comp = str(company_id).lower().strip() if company_id else None
+    df_raw = load_data(company_id=comp) if comp and comp != "all" else load_data()
+    df_all = load_data()
+    total_global = len(df_all)
+
     pq_exists = os.path.exists(PARQUET_PATH)
-    pq_size = f"{os.path.getsize(PARQUET_PATH) / (1024*1024):.1f} MB" if pq_exists else "N/A"
+    if not pq_exists:
+        pq_size = "N/A"
+    elif len(df_raw) == 0:
+        pq_size = "0.0 MB"
+    elif comp and comp != "all" and total_global > 0:
+        global_bytes = os.path.getsize(PARQUET_PATH)
+        proportional_mb = (len(df_raw) / total_global) * (global_bytes / (1024 * 1024))
+        pq_size = f"{proportional_mb:.1f} MB"
+    else:
+        pq_size = f"{os.path.getsize(PARQUET_PATH) / (1024*1024):.1f} MB"
+
     sync_info = get_cloud_sync_status()
 
     return {
+        "company_id": comp or "all",
         "total_records": len(df_raw),
         "parquet_exists": pq_exists,
         "parquet_size": pq_size,
@@ -148,8 +175,9 @@ def get_system_status():
 
 
 @router.get("/tags")
-def get_dataset_tags():
-    df_raw = load_data()
+def get_dataset_tags(company_id: Optional[str] = Query(None)):
+    comp = str(company_id).lower().strip() if company_id else None
+    df_raw = load_data(company_id=comp) if comp and comp != "all" else load_data()
     if df_raw.empty or "Source" not in df_raw.columns:
         return []
 
@@ -235,6 +263,7 @@ def upload_raw_data_file(
     user_role: str = Form(...),
     upload_mode: str = Form("merge"),  # "merge" or "replace"
     platform: str = Form("auto"),       # "auto", "launchgood", "givebright", "paysuite", "website"
+    company_id: str = Form("rethink"),  # Target company
     file: UploadFile = File(...)
 ):
     """Bulk uploads a raw donation dataset (.csv, .xlsx, .xls) for LaunchGood, GiveBright, Paysuite, or Rethink Website."""
@@ -246,6 +275,10 @@ def upload_raw_data_file(
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    target_cid = str(company_id or "rethink").strip().lower()
+    if not target_cid or target_cid == "all":
+        raise HTTPException(status_code=400, detail="Please select a specific company to upload data into (cannot upload into 'All Companies').")
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in [".csv", ".xlsx", ".xls"]:
@@ -259,7 +292,8 @@ def upload_raw_data_file(
             file_buffer=file_buffer,
             source_name=file.filename,
             upload_mode=upload_mode,
-            platform=platform
+            platform=platform,
+            company_id=target_cid
         )
 
         if isinstance(res, dict) and res.get("status") == "error":
@@ -267,10 +301,99 @@ def upload_raw_data_file(
 
         return {
             "status": "success",
-            "message": f"Successfully processed '{file.filename}'! {res.get('added', 0):,} records imported and auto-classified.",
+            "message": f"Successfully processed '{file.filename}' for company '{target_cid}'! {res.get('added', 0):,} records imported and auto-classified.",
             "details": res
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
+
+
+# ── Dynamic Multi-Company & Brand Logo Management ──────────────────────────────
+
+@router.get("/companies")
+def list_companies_endpoint():
+    """Returns all registered companies with active status, accent color, and brand logo URL."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, short_code, accent_color, logo_url, is_active FROM companies ORDER BY created_at ASC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"status": "success", "companies": rows}
+
+
+@router.post("/companies")
+def upsert_company_endpoint(payload: CompanyUpsertRequest):
+    """Allows Super Admins to dynamically create or update companies."""
+    if payload.user_role != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Managing companies is restricted to Super Admin accounts."
+        )
+    cid = payload.id.strip().lower()
+    if not cid or cid == "all":
+        raise HTTPException(status_code=400, detail="Valid Company ID is required (cannot be 'all').")
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO companies (id, name, short_code, accent_color, is_active, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            short_code = excluded.short_code,
+            accent_color = excluded.accent_color,
+            is_active = excluded.is_active,
+            updated_at = CURRENT_TIMESTAMP
+    """, (cid, payload.name.strip(), payload.short_code.strip(), payload.accent_color or "cyan", 1 if payload.is_active else 0))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "message": f"Successfully saved company '{payload.name}'!"}
+
+
+@router.post("/companies/{company_id}/logo")
+def upload_company_logo_endpoint(company_id: str, user_role: str = Form(...), file: UploadFile = File(...)):
+    """Allows Super Admins to upload a custom brand logo image for a company."""
+    if user_role != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Uploading company brand logos is restricted to Super Admin accounts."
+        )
+    cid = company_id.strip().lower()
+    if not cid or cid == "all":
+        raise HTTPException(status_code=400, detail="Valid Company ID is required.")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".png", ".jpg", ".jpeg", ".svg", ".webp"]:
+        raise HTTPException(status_code=400, detail="Unsupported logo image format. Please upload PNG, SVG, JPG, or WEBP.")
+
+    os.makedirs(LOGOS_DIR, exist_ok=True)
+    logo_filename = f"{cid}_logo{ext}"
+    logo_path = os.path.join(LOGOS_DIR, logo_filename)
+
+    with open(logo_path, "wb") as f:
+        f.write(file.file.read())
+
+    logo_url = f"/api/admin/companies/{cid}/logo?t={int(os.path.getmtime(logo_path))}"
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute("UPDATE companies SET logo_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (logo_url, cid))
+    conn.commit()
+    conn.close()
+
+    return {"status": "success", "logo_url": logo_url, "message": f"Brand logo updated for company '{cid}'!"}
+
+
+@router.get("/companies/{company_id}/logo")
+def get_company_logo_endpoint(company_id: str):
+    """Serves the uploaded brand logo file for the requested company."""
+    cid = company_id.strip().lower()
+    for ext in [".png", ".svg", ".webp", ".jpg", ".jpeg"]:
+        logo_path = os.path.join(LOGOS_DIR, f"{cid}_logo{ext}")
+        if os.path.exists(logo_path):
+            media_type = "image/svg+xml" if ext == ".svg" else ("image/png" if ext == ".png" else "image/jpeg")
+            return FileResponse(logo_path, media_type=media_type)
+    raise HTTPException(status_code=404, detail=f"No custom brand logo found for company '{cid}'.")

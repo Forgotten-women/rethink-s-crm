@@ -22,6 +22,7 @@ def _get_amount_column(df):
 
 @router.get("/summary")
 def get_ltv_summary(
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -36,7 +37,7 @@ def get_ltv_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
-    df_raw = load_data()
+    df_raw = load_data(company_id=company_id)
     df = _apply_filters(
         df_raw,
         payment_type=payment_type,
@@ -51,7 +52,8 @@ def get_ltv_summary(
         campaign_search=campaign_search,
         gift_aid=gift_aid,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        company_id=company_id
     )
     col_amount = _get_amount_column(df)
 

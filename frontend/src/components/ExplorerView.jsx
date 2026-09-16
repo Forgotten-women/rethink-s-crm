@@ -117,7 +117,7 @@ const getStoredPreset = () => {
   }
 };
 
-export default function ExplorerView({ user, filters, onSelectDonor }) {
+export default function ExplorerView({ user, filters, onSelectDonor, onDataChange, activeCompany = 'rethink', companies = [] }) {
   const [data, setData] = useState({ total_records: 0, page: 1, page_size: 100, total_pages: 1, available_columns: [], records: [] });
   const [loading, setLoading] = useState(true);
   
@@ -217,25 +217,26 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
   const [bulkSaving, setBulkSaving] = useState(false);
   const [bulkMessage, setBulkMessage] = useState('');
 
-  const canEdit = user?.role === 'super_admin' || user?.can_edit_donors === 1;
+  const canEdit = (user?.role === 'super_admin' || user?.can_edit_donors === 1) && activeCompany !== 'all';
 
-  // Load Campaign Codes lookup, Code Map on mount
+  // Load Campaign Codes lookup, Code Map on mount and on company switch
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/classifications/campaign-codes`)
+    fetch(`${API_BASE_URL}/api/classifications/campaign-codes?company_id=${activeCompany}`)
       .then(r => r.json())
       .then(data => { if (data && typeof data === 'object') setCampaignCodesLookup(data); })
       .catch(err => console.error('Error fetching campaign-codes lookup:', err));
 
-    fetch(`${API_BASE_URL}/api/classifications/code-map`)
+    fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${activeCompany}`)
       .then(r => r.json())
       .then(data => { if (data && typeof data === 'object') setCodeMap(data); })
       .catch(err => console.error('Error fetching code-map:', err));
-  }, []);
+  }, [activeCompany]);
 
   const loadDonors = () => {
     setLoading(true);
     const searchFieldsParam = isAllActive ? 'all' : searchTargets.join(',');
     const params = new URLSearchParams({
+      company_id: activeCompany,
       page: currentPage,
       page_size: pageSize,
       search: search,
@@ -411,6 +412,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       body: JSON.stringify({
         user_role: user?.role || 'admin',
         can_edit_donors: canEdit,
+        company_id: activeCompany,
         row_id: row._row_id !== undefined && row._row_id !== null ? Number(row._row_id) : null,
         donation_id: row['Donation ID'] || null,
         column_name: colName,
@@ -430,6 +432,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
           setCellMessage(`✅ Saved ${colName}!`);
           setEditingCell(null);
           loadDonors();
+          if (onDataChange) onDataChange();
           setTimeout(() => setCellMessage(''), 2500);
         } else {
           setCellMessage(`❌ ${res?.detail || 'Save failed'}`);
@@ -454,6 +457,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       body: JSON.stringify({
         user_role: user?.role || 'admin',
         can_edit_donors: canEdit,
+        company_id: activeCompany,
         row_id: editingDonorModal.row._row_id !== undefined && editingDonorModal.row._row_id !== null ? Number(editingDonorModal.row._row_id) : null,
         donation_id: editingDonorModal.row['Donation ID'] || null,
         updated_fields: editingDonorModal.fields
@@ -472,6 +476,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
         if (res?.status === 'success') {
           setEditModalMsg(`✅ Successfully updated donor record!`);
           loadDonors();
+          if (onDataChange) onDataChange();
           setTimeout(() => {
             setEditingDonorModal(null);
             setEditModalMsg('');
@@ -524,6 +529,7 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         user_role: user?.role || 'admin',
+        company_id: activeCompany,
         target_columns,
         new_values,
         filter_search: search,
@@ -551,9 +557,10 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
         if (res?.status === 'success') {
           setBulkMessage(`✅ ${res.message}`);
           loadDonors();
+          if (onDataChange) onDataChange();
           setTimeout(() => setShowBulkEdit(false), 1500);
         } else {
-          setBulkMessage(`❌ ${res?.detail || 'Failed to apply bulk edit.'}`);
+          setBulkMessage(`❌ ${res?.detail || 'Bulk edit failed.'}`);
         }
       })
       .catch(err => {
@@ -579,10 +586,11 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
     return str.split('T')[0].split(' ')[0];
   };
 
-  const handleExportDonors = (format, exportAll = false) => {
+  const handleExportDonors = (format = 'xlsx', exportAll = false) => {
     const searchFieldsParam = isAllActive ? 'all' : searchTargets.join(',');
     const params = new URLSearchParams({
       format: format,
+      company_id: activeCompany,
       search: search,
       search_fields: searchFieldsParam
     });
@@ -616,6 +624,28 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
 
   return (
     <div className="flex flex-col gap-6">
+      {/* Consolidated Read-Only Mode Notice Banner */}
+      {activeCompany === 'all' && (
+        <div className="p-4 rounded-2xl bg-gradient-to-r from-indigo-900/40 via-purple-900/30 to-indigo-900/40 border border-indigo-500/30 text-indigo-200 text-xs shadow-lg backdrop-blur-md flex flex-wrap items-center justify-between gap-3 animate-fade-in">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 shrink-0">
+              <Globe className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="font-black text-white text-sm flex items-center gap-2">
+                Consolidated Enterprise Workspace (All Organizations)
+              </div>
+              <p className="text-slate-300 text-[11px] mt-0.5">
+                Viewing aggregated donor records across all registered tenants. Individual and bulk modifications are locked in consolidated mode. Switch to an individual company from the switcher to make updates.
+              </p>
+            </div>
+          </div>
+          <span className="text-[10px] font-black uppercase tracking-wider bg-indigo-500/20 text-indigo-300 px-3 py-1.5 rounded-xl border border-indigo-500/30 shrink-0">
+            🔒 Read-Only Consolidated View
+          </span>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
@@ -1268,6 +1298,11 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
                   <th className="whitespace-nowrap font-extrabold tracking-wider text-center pl-4 w-20">
                     Actions
                   </th>
+                  {activeCompany === 'all' && (
+                    <th className="whitespace-nowrap font-extrabold tracking-wider text-center px-3 w-28 text-indigo-400">
+                      Company
+                    </th>
+                  )}
                   {selectedColumns.map(c => {
                     const isSorted = sortBy === c;
                     return (
@@ -1357,6 +1392,21 @@ export default function ExplorerView({ user, filters, onSelectDonor }) {
                           )}
                         </div>
                       </td>
+
+                      {/* Company Badge Column in Consolidated Mode */}
+                      {activeCompany === 'all' && (
+                        <td className="whitespace-nowrap text-center px-3">
+                          <span className={`text-[10px] font-extrabold px-2.5 py-0.5 rounded-full border shadow-sm ${
+                            String(row.company_id).toLowerCase() === 'iqra'
+                              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                              : String(row.company_id).toLowerCase() === 'sp'
+                              ? 'bg-purple-500/15 text-purple-400 border-purple-500/30'
+                              : 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30'
+                          }`}>
+                            {companies.find(c => c.id === String(row.company_id).toLowerCase())?.short_code || String(row.company_id || 'Rethink').toUpperCase()}
+                          </span>
+                        </td>
+                      )}
 
                       {selectedColumns.map(c => {
                         const val = row[c];

@@ -43,6 +43,7 @@ def init_fundraiser_db():
             CREATE TABLE IF NOT EXISTS fundraisers (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                company_id TEXT DEFAULT 'rethink',
                 email TEXT DEFAULT '',
                 phone TEXT DEFAULT '',
                 target_goal REAL DEFAULT 0.0,
@@ -61,10 +62,18 @@ def init_fundraiser_db():
                 campaign_name TEXT NOT NULL,
                 code TEXT NOT NULL DEFAULT 'ALL',
                 platform TEXT DEFAULT 'ALL',
+                company_id TEXT DEFAULT 'rethink',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (fundraiser_id) REFERENCES fundraisers(id) ON DELETE CASCADE
             );
         """)
+
+        # Migration safe-guards
+        for tbl in ["fundraisers", "fundraiser_campaigns"]:
+            try:
+                cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN company_id TEXT DEFAULT 'rethink';")
+            except Exception:
+                pass
         
         # Purge legacy auto-sync campaign locks (id starting with fc_) so campaigns are not falsely locked
         cursor.execute("DELETE FROM fundraiser_campaigns WHERE id LIKE 'fc_%'")
@@ -96,31 +105,49 @@ def calculate_benchmark_goal(raised_amount: float) -> float:
         return math.ceil(raised_amount / 25000.0) * 25000.0
 
 
-def sync_discovered_fundraisers_internal() -> int:
+def sync_discovered_fundraisers_internal(company_id: str = "rethink") -> int:
     """
     Scans the live donations dataset for unique fundraiser_name values not yet present
     in the fundraisers table and auto-registers them without creating false campaign locks.
     """
     init_fundraiser_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     cur = conn.cursor()
     
-    cur.execute("SELECT LOWER(TRIM(name)) FROM fundraisers")
+    if comp != "all":
+        cur.execute("SELECT LOWER(TRIM(name)) FROM fundraisers WHERE company_id = ?", (comp,))
+    else:
+        cur.execute("SELECT LOWER(TRIM(name)) FROM fundraisers")
     existing_lower_names = set(r[0] for r in cur.fetchall() if r[0])
     
     try:
-        cur.execute("""
-            SELECT 
-                MAX(TRIM(fundraiser_name)) as fundraiser_name,
-                LOWER(TRIM(fundraiser_name)) as lower_name,
-                ROUND(SUM([Total Online Donations Net Amount in Settled Currency]), 2) as total_raised,
-                COUNT(*) as total_donations,
-                MIN([Created Date (UTC)]) as earliest_gift,
-                MAX([Created Date (UTC)]) as latest_gift
-            FROM donations
-            WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''
-            GROUP BY LOWER(TRIM(fundraiser_name))
-        """)
+        if comp != "all":
+            cur.execute("""
+                SELECT 
+                    MAX(TRIM(fundraiser_name)) as fundraiser_name,
+                    LOWER(TRIM(fundraiser_name)) as lower_name,
+                    ROUND(SUM([Total Online Donations Net Amount in Settled Currency]), 2) as total_raised,
+                    COUNT(*) as total_donations,
+                    MIN([Created Date (UTC)]) as earliest_gift,
+                    MAX([Created Date (UTC)]) as latest_gift
+                FROM donations
+                WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != '' AND company_id = ?
+                GROUP BY LOWER(TRIM(fundraiser_name))
+            """, (comp,))
+        else:
+            cur.execute("""
+                SELECT 
+                    MAX(TRIM(fundraiser_name)) as fundraiser_name,
+                    LOWER(TRIM(fundraiser_name)) as lower_name,
+                    ROUND(SUM([Total Online Donations Net Amount in Settled Currency]), 2) as total_raised,
+                    COUNT(*) as total_donations,
+                    MIN([Created Date (UTC)]) as earliest_gift,
+                    MAX([Created Date (UTC)]) as latest_gift
+                FROM donations
+                WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''
+                GROUP BY LOWER(TRIM(fundraiser_name))
+            """)
         don_fundraisers = cur.fetchall()
     except Exception as e:
         print(f"Sync fundraisers query notice: {e}")
@@ -131,14 +158,14 @@ def sync_discovered_fundraisers_internal() -> int:
     
     for fname, lname, total_raised, total_dons, earliest_gift, latest_gift in don_fundraisers:
         if lname not in existing_lower_names and fname:
-            fid = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, lname).hex[:16]}"
+            fid = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, f'{comp}_{lname}').hex[:16]}"
             raised = float(total_raised or 0.0)
             goal = calculate_benchmark_goal(raised)
             start_dt = str(earliest_gift or "").split("T")[0].split(" ")[0].strip()
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             new_fundraisers.append((
-                fid, fname, "", "", goal, start_dt, "ACTIVE",
+                fid, fname, comp if comp != "all" else "rethink", "", "", goal, start_dt, "ACTIVE",
                 f"Auto-discovered from donor data. Lifetime raised: £{raised:,.2f}",
                 now_str, now_str
             ))
@@ -146,8 +173,8 @@ def sync_discovered_fundraisers_internal() -> int:
     
     if new_fundraisers:
         cur.executemany("""
-            INSERT INTO fundraisers (id, name, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO fundraisers (id, name, company_id, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, new_fundraisers)
         conn.commit()
         
@@ -156,7 +183,7 @@ def sync_discovered_fundraisers_internal() -> int:
 
 
 try:
-    sync_discovered_fundraisers_internal()
+    sync_discovered_fundraisers_internal("rethink")
 except Exception as _sync_err:
     pass
 
@@ -171,6 +198,7 @@ class CreateFundraiserRequest(BaseModel):
     user_role: str
     can_edit_donors: Optional[bool] = False
     name: str
+    company_id: Optional[str] = "rethink"
     email: Optional[str] = ""
     phone: Optional[str] = ""
     target_goal: Optional[float] = 0.0
@@ -184,6 +212,7 @@ class UpdateFundraiserRequest(BaseModel):
     user_role: str
     can_edit_donors: Optional[bool] = False
     name: str
+    company_id: Optional[str] = "rethink"
     email: Optional[str] = ""
     phone: Optional[str] = ""
     target_goal: Optional[float] = 0.0
@@ -197,6 +226,7 @@ class AssignDonationsRequest(BaseModel):
     user_role: str
     can_edit_donors: Optional[bool] = False
     fundraiser_name: str
+    company_id: Optional[str] = "rethink"
     campaign_name: Optional[str] = None
     code: Optional[str] = None
     donor_emails: Optional[List[str]] = []
@@ -213,12 +243,13 @@ def _check_super_admin(user_role: str, can_edit_donors: bool = False):
 
 
 @router.get("/campaigns-list")
-def get_available_campaigns_list():
+def get_available_campaigns_list(company_id: Optional[str] = Query("rethink")):
     """
     Returns unique list of all (Campaign Name, Code, Platform, Heading) combinations
     across donations, payout settlements, and all classification tables in real-time.
     """
     init_fundraiser_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     cur = conn.cursor()
     
@@ -226,11 +257,19 @@ def get_available_campaigns_list():
     campaign_items = []
 
     try:
-        cur.execute("""
-            SELECT fc.fundraiser_id, fc.campaign_name, fc.code, f.name 
-            FROM fundraiser_campaigns fc 
-            JOIN fundraisers f ON fc.fundraiser_id = f.id
-        """)
+        if comp != "all":
+            cur.execute("""
+                SELECT fc.fundraiser_id, fc.campaign_name, fc.code, f.name 
+                FROM fundraiser_campaigns fc 
+                JOIN fundraisers f ON fc.fundraiser_id = f.id
+                WHERE f.company_id = ?
+            """, (comp,))
+        else:
+            cur.execute("""
+                SELECT fc.fundraiser_id, fc.campaign_name, fc.code, f.name 
+                FROM fundraiser_campaigns fc 
+                JOIN fundraisers f ON fc.fundraiser_id = f.id
+            """)
         assigned_map = {}
         for fid, cname, code, fname in cur.fetchall():
             cname_key = str(cname).strip().lower()
@@ -243,7 +282,7 @@ def get_available_campaigns_list():
 
         # 1. From donations cached dataset
         try:
-            df_don = load_data()
+            df_don = load_data(company_id=comp)
             if df_don is not None and not df_don.empty and "Campaign Name" in df_don.columns:
                 target_cols = [c for c in ["Campaign Name", "Code", "Platform", "Heading", "Sub-Heading", "Country"] if c in df_don.columns]
                 df_unique = df_don[df_don["Campaign Name"].notna() & (df_don["Campaign Name"].astype(str).str.strip() != "")][target_cols].drop_duplicates(subset=["Campaign Name", "Code"] if "Code" in target_cols else ["Campaign Name"])
@@ -274,17 +313,30 @@ def get_available_campaigns_list():
 
         # 2. From payout_settlements table
         try:
-            cur.execute("""
-                SELECT DISTINCT 
-                    [Campaign Name], 
-                    COALESCE(Code, 'Unassigned'), 
-                    'LaunchGood Payout', 
-                    COALESCE(Heading, 'Unassigned'),
-                    COALESCE([Sub-Heading], 'Unassigned'),
-                    COALESCE(Country, 'Unassigned')
-                FROM payout_settlements 
-                WHERE [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != ''
-            """)
+            if comp != "all":
+                cur.execute("""
+                    SELECT DISTINCT 
+                        [Campaign Name], 
+                        COALESCE(Code, 'Unassigned'), 
+                        'LaunchGood Payout', 
+                        COALESCE(Heading, 'Unassigned'),
+                        COALESCE([Sub-Heading], 'Unassigned'),
+                        COALESCE(Country, 'Unassigned')
+                    FROM payout_settlements 
+                    WHERE [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != '' AND company_id = ?
+                """, (comp,))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT 
+                        [Campaign Name], 
+                        COALESCE(Code, 'Unassigned'), 
+                        'LaunchGood Payout', 
+                        COALESCE(Heading, 'Unassigned'),
+                        COALESCE([Sub-Heading], 'Unassigned'),
+                        COALESCE(Country, 'Unassigned')
+                    FROM payout_settlements 
+                    WHERE [Campaign Name] IS NOT NULL AND TRIM([Campaign Name]) != ''
+                """)
             for cname, code, plat, head, subhead, country in cur.fetchall():
                 cname_str = str(cname).strip()
                 code_str = str(code).strip() if code else "Unassigned"
@@ -315,16 +367,28 @@ def get_available_campaigns_list():
         ]
         for tbl, plat_name in matrix_tables:
             try:
-                cur.execute(f"""
-                    SELECT DISTINCT 
-                        campaign_name, 
-                        COALESCE(code, 'Unassigned'), 
-                        heading, 
-                        sub_heading, 
-                        country 
-                    FROM {tbl} 
-                    WHERE campaign_name IS NOT NULL AND TRIM(campaign_name) != ''
-                """)
+                if comp != "all":
+                    cur.execute(f"""
+                        SELECT DISTINCT 
+                            campaign_name, 
+                            COALESCE(code, 'Unassigned'), 
+                            heading, 
+                            sub_heading, 
+                            country 
+                        FROM {tbl} 
+                        WHERE campaign_name IS NOT NULL AND TRIM(campaign_name) != '' AND company_id = ?
+                    """, (comp,))
+                else:
+                    cur.execute(f"""
+                        SELECT DISTINCT 
+                            campaign_name, 
+                            COALESCE(code, 'Unassigned'), 
+                            heading, 
+                            sub_heading, 
+                            country 
+                        FROM {tbl} 
+                        WHERE campaign_name IS NOT NULL AND TRIM(campaign_name) != ''
+                    """)
                 for cname, code, head, subhead, country in cur.fetchall():
                     cname_str = str(cname).strip()
                     code_str = str(code).strip() if code else "Unassigned"
@@ -353,27 +417,32 @@ def get_available_campaigns_list():
 
 
 @router.post("/sync-discovered")
-def sync_discovered_fundraisers():
+def sync_discovered_fundraisers(company_id: Optional[str] = Query("rethink")):
     """
     On-demand endpoint to scan donations for new unique fundraiser_name entries
     and auto-seed them into fundraisers table, preserving existing admin customizations.
     """
-    new_count = sync_discovered_fundraisers_internal()
+    comp = (company_id or "rethink").strip().lower()
+    new_count = sync_discovered_fundraisers_internal(comp)
     
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM fundraisers")
+    if comp != "all":
+        cur.execute("SELECT COUNT(*) FROM fundraisers WHERE company_id = ?", (comp,))
+    else:
+        cur.execute("SELECT COUNT(*) FROM fundraisers")
     total_count = cur.fetchone()[0]
     conn.close()
 
     if new_count > 0:
         try:
-            broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "sync", "new_count": new_count})
+            broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "sync", "company_id": comp, "new_count": new_count})
         except Exception:
             pass
 
     return {
         "status": "success",
+        "company_id": comp,
         "newly_added_count": new_count,
         "total_fundraisers": total_count,
         "message": f"Sync completed. {new_count} new fundraisers discovered and added (Total: {total_count})."
@@ -384,12 +453,14 @@ def sync_discovered_fundraisers():
 def get_fundraisers_list(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    status_filter: Optional[str] = "ALL"
+    status_filter: Optional[str] = "ALL",
+    company_id: Optional[str] = Query("rethink")
 ):
     """
-    Returns list of all fundraisers with live aggregated metrics.
+    Returns list of all fundraisers with live aggregated metrics for the given company.
     Attribution is strictly derived from the fundraiser_name column in the donor dataset.
     """
+    comp = (company_id or "rethink").strip().lower()
     status_clean = str(status_filter or "ALL").strip().upper()
     if status_clean in ["NONE", "", "NAN", "UNDEFINED"]:
         status_clean = "ALL"
@@ -400,16 +471,22 @@ def get_fundraisers_list(
     cur = conn.cursor()
 
     try:
-        query = "SELECT * FROM fundraisers"
+        query = "SELECT * FROM fundraisers WHERE 1=1"
         params = []
+        if comp != "all":
+            query += " AND company_id = ?"
+            params.append(comp)
         if status_clean != "ALL":
-            query += " WHERE status = ?"
+            query += " AND status = ?"
             params.append(status_clean)
         query += " ORDER BY created_at DESC"
         cur.execute(query, params)
         fundraiser_rows = [dict(r) for r in cur.fetchall()]
 
-        cur.execute("SELECT fundraiser_id, campaign_name, code, platform FROM fundraiser_campaigns")
+        if comp != "all":
+            cur.execute("SELECT fundraiser_id, campaign_name, code, platform FROM fundraiser_campaigns WHERE company_id = ?", (comp,))
+        else:
+            cur.execute("SELECT fundraiser_id, campaign_name, code, platform FROM fundraiser_campaigns")
         assignments = cur.fetchall()
         f_campaign_map = {}
         for r in assignments:
@@ -426,6 +503,7 @@ def get_fundraisers_list(
 
     if not fundraiser_rows:
         return {
+            "company_id": comp,
             "summary": {
                 "total_fundraisers": 0,
                 "total_raised_all_time": 0.0,
@@ -438,8 +516,8 @@ def get_fundraisers_list(
             "fundraisers": []
         }
 
-    # Load live transaction data
-    df_donations = load_data()
+    # Load live transaction data for this company
+    df_donations = load_data(company_id=comp)
     amount_col = "Total Online Donations Net Amount in Settled Currency"
 
     if df_donations is not None and not df_donations.empty:
@@ -650,12 +728,12 @@ def get_fundraisers_list(
         "fundraisers": fundraisers_result
     }
 
-
 @router.get("/{fundraiser_id}")
 def get_fundraiser_detail(
     fundraiser_id: str,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink")
 ):
     """
     Returns deep drilldown for a single fundraiser:
@@ -663,20 +741,24 @@ def get_fundraiser_detail(
     Attribution is strictly derived from the fundraiser_name column in the donor dataset.
     """
     init_fundraiser_db()
+    comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     fundraiser = None
     try:
-        cur.execute("SELECT * FROM fundraisers WHERE id = ?", (fundraiser_id,))
+        if comp != "all":
+            cur.execute("SELECT * FROM fundraisers WHERE id = ? AND company_id = ?", (fundraiser_id, comp))
+        else:
+            cur.execute("SELECT * FROM fundraisers WHERE id = ?", (fundraiser_id,))
         f_row = cur.fetchone()
         if f_row:
             fundraiser = dict(f_row)
     finally:
         conn.close()
 
-    df_donations = load_data()
+    df_donations = load_data(company_id=comp)
     amount_col = "Total Online Donations Net Amount in Settled Currency"
 
     campaign_breakdown = []
@@ -703,13 +785,14 @@ def get_fundraiser_detail(
         # If not found in SQLite by ID, resolve real-time fundraiser profile from live donor data
         if not fundraiser:
             for fn_k in df_work[df_work["fn_lower"] != ""]["fn_lower"].unique():
-                synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, fn_k).hex[:16]}"
+                synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, f'{comp}_{fn_k}').hex[:16]}"
                 if synth_id == fundraiser_id or fn_k == fundraiser_id.lower():
                     sample_name = df_work[df_work["fn_lower"] == fn_k]["fundraiser_name"].dropna()
                     display_name = str(sample_name.iloc[0]).strip() if not sample_name.empty else fn_k.title()
                     fundraiser = {
                         "id": fundraiser_id,
                         "name": display_name,
+                        "company_id": comp,
                         "email": "",
                         "phone": "",
                         "target_goal": 0.0,
@@ -785,10 +868,11 @@ def get_fundraiser_detail(
             # Monthly aggregation
             if "Created Date (UTC)" in sub_df.columns:
                 dates = pd.to_datetime(sub_df["Created Date (UTC)"], errors="coerce", format="mixed")
-                months = dates.dt.strftime("%Y-%m")
+                months = dates.dt.strftime("%Y-%m-%d")
                 for m_val, amt in zip(months, sub_df["net_num"]):
                     if pd.notna(m_val) and m_val != "NaT":
-                        monthly_timeline[m_val] = monthly_timeline.get(m_val, 0.0) + float(amt)
+                        m_prefix = m_val[:7]
+                        monthly_timeline[m_prefix] = monthly_timeline.get(m_prefix, 0.0) + float(amt)
 
             # Recent transactions
             sample_cols = [c for c in ["Created Date (UTC)", "Donor Name", "First Name", "Last Name", "Email", "Campaign Name", "Code", "net_num", "Platform"] if c in period_sub.columns]
@@ -851,6 +935,12 @@ def get_fundraiser_detail(
 def create_fundraiser(payload: CreateFundraiserRequest):
     """Creates a new fundraiser, assigns campaigns, and updates donor records permanently (Super Admin only)."""
     _check_super_admin(payload.user_role, payload.can_edit_donors or False)
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create fundraisers in 'All Companies (Consolidated)' mode. Please select a specific company."
+        )
 
     f_name = payload.name.strip()
     if not f_name:
@@ -863,11 +953,12 @@ def create_fundraiser(payload: CreateFundraiserRequest):
 
     try:
         cur.execute("""
-            INSERT INTO fundraisers (id, name, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT INTO fundraisers (id, name, company_id, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """, (
             fundraiser_id,
             f_name,
+            comp,
             payload.email.strip() if payload.email else "",
             payload.phone.strip() if payload.phone else "",
             float(payload.target_goal or 0.0),
@@ -876,7 +967,7 @@ def create_fundraiser(payload: CreateFundraiserRequest):
             payload.notes.strip() if payload.notes else ""
         ))
 
-        # Insert campaign assignments and update donor records permanently
+        # Insert campaign assignments and update donor records permanently for this company
         if payload.assigned_campaigns:
             for c in payload.assigned_campaigns:
                 cname = c.campaign_name.strip()
@@ -884,9 +975,9 @@ def create_fundraiser(payload: CreateFundraiserRequest):
                 plat = (c.platform or "ALL").strip()
                 if cname:
                     cur.execute("""
-                        INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, created_at)
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (str(uuid.uuid4()), fundraiser_id, cname, code, plat))
+                        INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, company_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (str(uuid.uuid4()), fundraiser_id, cname, code, plat, comp))
 
                     if code.upper() in ["ALL", "UNASSIGNED", ""] or not code:
                         cur.execute("""
@@ -894,14 +985,16 @@ def create_fundraiser(payload: CreateFundraiserRequest):
                             SET fundraiser_name = ? 
                             WHERE [Campaign Name] = ? 
                               AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-                        """, (f_name, cname))
+                              AND company_id = ?
+                        """, (f_name, cname, comp))
                     else:
                         cur.execute("""
                             UPDATE donations 
                             SET fundraiser_name = ? 
                             WHERE [Campaign Name] = ? AND Code = ?
                               AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-                        """, (f_name, cname, code))
+                              AND company_id = ?
+                        """, (f_name, cname, code, comp))
 
         conn.commit()
     finally:
@@ -910,15 +1003,16 @@ def create_fundraiser(payload: CreateFundraiserRequest):
     _sync_parquet_and_cache_from_sqlite()
 
     try:
-        broadcast_event_sync("DONORS_UPDATED", {"source": "fundraiser_create", "fundraiser_name": f_name})
-        broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "create", "id": fundraiser_id, "name": f_name})
+        broadcast_event_sync("DONORS_UPDATED", {"source": "fundraiser_create", "fundraiser_name": f_name, "company_id": comp})
+        broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "create", "id": fundraiser_id, "name": f_name, "company_id": comp})
     except Exception:
         pass
 
     return {
         "status": "success",
-        "message": f"Successfully created fundraiser '{f_name}'.",
-        "fundraiser_id": fundraiser_id
+        "message": f"Successfully created fundraiser '{f_name}' for {comp.upper()}.",
+        "fundraiser_id": fundraiser_id,
+        "company_id": comp
     }
 
 
@@ -926,6 +1020,12 @@ def create_fundraiser(payload: CreateFundraiserRequest):
 def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
     """Updates an existing fundraiser, synchronizes donor records, and re-assigns campaigns (Super Admin only)."""
     _check_super_admin(payload.user_role, payload.can_edit_donors or False)
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot update fundraisers in 'All Companies' mode. Please select a specific company."
+        )
 
     new_name = payload.name.strip()
     if not new_name:
@@ -943,18 +1043,16 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
         if row:
             old_name = row[0]
         else:
-            # Check if fundraiser exists by name in fundraisers table
-            cur.execute("SELECT id, name FROM fundraisers WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))", (new_name,))
+            cur.execute("SELECT id, name FROM fundraisers WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) AND company_id = ?", (new_name, comp))
             row_by_name = cur.fetchone()
             if row_by_name:
                 fundraiser_id = row_by_name[0]
                 old_name = row_by_name[1]
             else:
-                # Check if this is an auto-discovered fundraiser from donations
-                cur.execute("SELECT DISTINCT fundraiser_name FROM donations WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''")
+                cur.execute("SELECT DISTINCT fundraiser_name FROM donations WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != '' AND company_id = ?", (comp,))
                 don_names = [r[0] for r in cur.fetchall() if r[0]]
                 for d_name in don_names:
-                    synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, d_name.strip().lower()).hex[:16]}"
+                    synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, f'{comp}_{d_name.strip().lower()}').hex[:16]}"
                     if synth_id == fundraiser_id or d_name.strip().lower() == fundraiser_id.lower() or d_name.strip().lower() == new_name.lower():
                         old_name = d_name.strip()
                         break
@@ -962,13 +1060,13 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
                 if not old_name:
                     old_name = new_name
 
-                # Auto-insert into fundraisers table so it is officially registered and persisted
                 cur.execute("""
-                    INSERT INTO fundraisers (id, name, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    INSERT INTO fundraisers (id, name, company_id, email, phone, target_goal, start_date, status, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, (
                     fundraiser_id,
                     new_name,
+                    comp,
                     payload.email.strip() if payload.email else "",
                     payload.phone.strip() if payload.phone else "",
                     float(payload.target_goal or 0.0),
@@ -992,16 +1090,15 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
                     new_campaigns_set.add((cn.lower(), cd.lower()))
                     new_campaigns_list.append((cn, cd, pl))
 
-        # 1. If name changed, update all existing donations that had the old fundraiser name
+        # 1. If name changed, update all existing donations that had the old fundraiser name for this company
         if old_name.strip().lower() != new_name.lower():
             cur.execute("""
                 UPDATE donations 
                 SET fundraiser_name = ? 
-                WHERE LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?))
-            """, (new_name, old_name))
+                WHERE LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)) AND company_id = ?
+            """, (new_name, old_name, comp))
 
-        # 2. Handle unlinked campaigns (in old_campaigns but not in new_campaigns):
-        # Clear fundraiser_name on donations that were assigned to this fundraiser
+        # 2. Handle unlinked campaigns
         unlinked = old_campaigns - new_campaigns_set
         for u_cname_lower, u_code_lower in unlinked:
             if u_code_lower in ["all", "unassigned", ""]:
@@ -1010,17 +1107,18 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
                     SET fundraiser_name = NULL
                     WHERE LOWER(TRIM([Campaign Name])) = ?
                       AND (LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)) OR LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)))
-                """, (u_cname_lower, old_name, new_name))
+                      AND company_id = ?
+                """, (u_cname_lower, old_name, new_name, comp))
             else:
                 cur.execute("""
                     UPDATE donations
                     SET fundraiser_name = NULL
                     WHERE LOWER(TRIM([Campaign Name])) = ? AND LOWER(TRIM(Code)) = ?
                       AND (LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)) OR LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)))
-                """, (u_cname_lower, u_code_lower, old_name, new_name))
+                      AND company_id = ?
+                """, (u_cname_lower, u_code_lower, old_name, new_name, comp))
 
-        # 3. Handle newly assigned campaigns:
-        # Assign matching unassigned donations (or existing donations of this fundraiser) to new_name
+        # 3. Handle newly assigned campaigns
         for cn, cd, pl in new_campaigns_list:
             if cd.upper() in ["ALL", "UNASSIGNED", ""] or not cd:
                 cur.execute("""
@@ -1028,14 +1126,16 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
                     SET fundraiser_name = ?
                     WHERE [Campaign Name] = ?
                       AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '' OR LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)))
-                """, (new_name, cn, old_name))
+                      AND company_id = ?
+                """, (new_name, cn, old_name, comp))
             else:
                 cur.execute("""
                     UPDATE donations
                     SET fundraiser_name = ?
                     WHERE [Campaign Name] = ? AND Code = ?
                       AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '' OR LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)))
-                """, (new_name, cn, cd, old_name))
+                      AND company_id = ?
+                """, (new_name, cn, cd, old_name, comp))
 
         # Update fundraisers table
         cur.execute("""
@@ -1057,9 +1157,9 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
         cur.execute("DELETE FROM fundraiser_campaigns WHERE fundraiser_id = ?", (fundraiser_id,))
         for cn, cd, pl in new_campaigns_list:
             cur.execute("""
-                INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, created_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (str(uuid.uuid4()), fundraiser_id, cn, cd, pl))
+                INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, company_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (str(uuid.uuid4()), fundraiser_id, cn, cd, pl, comp))
 
         conn.commit()
     finally:
@@ -1068,14 +1168,14 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
     _sync_parquet_and_cache_from_sqlite()
 
     try:
-        broadcast_event_sync("DONORS_UPDATED", {"source": "fundraiser_update", "fundraiser_name": new_name})
-        broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "update", "id": fundraiser_id, "name": new_name})
+        broadcast_event_sync("DONORS_UPDATED", {"source": "fundraiser_update", "fundraiser_name": new_name, "company_id": comp})
+        broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "update", "id": fundraiser_id, "name": new_name, "company_id": comp})
     except Exception:
         pass
 
     return {
         "status": "success",
-        "message": f"Successfully updated fundraiser '{new_name}' and synchronized donor records."
+        "message": f"Successfully updated fundraiser '{new_name}' in {comp.upper()} and synchronized donor records."
     }
 
 
@@ -1086,6 +1186,12 @@ def assign_unassigned_donations(payload: AssignDonationsRequest):
     to a specific fundraiser, writing the fundraiser_name to the SQLite database and parquet cache.
     """
     _check_super_admin(payload.user_role, payload.can_edit_donors or False)
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot assign donations in 'All Companies' mode. Please select a specific company."
+        )
     
     target_fname = payload.fundraiser_name.strip()
     if not target_fname:
@@ -1104,7 +1210,8 @@ def assign_unassigned_donations(payload: AssignDonationsRequest):
                 SET fundraiser_name = ? 
                 WHERE LOWER(TRIM(Email)) IN ({placeholders})
                   AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-            """, [target_fname] + emails_clean)
+                  AND company_id = ?
+            """, [target_fname] + emails_clean + [comp])
             updated_rows = cur.rowcount
         elif payload.campaign_name:
             cname = payload.campaign_name.strip()
@@ -1115,14 +1222,16 @@ def assign_unassigned_donations(payload: AssignDonationsRequest):
                     SET fundraiser_name = ? 
                     WHERE [Campaign Name] = ? 
                       AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-                """, (target_fname, cname))
+                      AND company_id = ?
+                """, (target_fname, cname, comp))
             else:
                 cur.execute("""
                     UPDATE donations 
                     SET fundraiser_name = ? 
                     WHERE [Campaign Name] = ? AND Code = ?
                       AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-                """, (target_fname, cname, code))
+                      AND company_id = ?
+                """, (target_fname, cname, code, comp))
             updated_rows = cur.rowcount
 
         conn.commit()
@@ -1132,22 +1241,28 @@ def assign_unassigned_donations(payload: AssignDonationsRequest):
     if updated_rows > 0:
         _sync_parquet_and_cache_from_sqlite()
         try:
-            broadcast_event_sync("DONORS_UPDATED", {"source": "assign_donations", "fundraiser_name": target_fname})
-            broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "assign_donations", "fundraiser_name": target_fname})
+            broadcast_event_sync("DONORS_UPDATED", {"source": "assign_donations", "fundraiser_name": target_fname, "company_id": comp})
+            broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "assign_donations", "fundraiser_name": target_fname, "company_id": comp})
         except Exception:
             pass
 
     return {
         "status": "success",
         "updated_donations_count": updated_rows,
-        "message": f"Successfully assigned {updated_rows} donations to fundraiser '{target_fname}'."
+        "message": f"Successfully assigned {updated_rows} donations to fundraiser '{target_fname}' in {comp.upper()}."
     }
 
 
 @router.delete("/{fundraiser_id}")
-def delete_fundraiser(fundraiser_id: str, user_role: str = "guest", can_edit_donors: bool = False):
+def delete_fundraiser(
+    fundraiser_id: str, 
+    user_role: str = "guest", 
+    can_edit_donors: bool = False,
+    company_id: Optional[str] = Query("rethink")
+):
     """Deletes a fundraiser, unlinks its campaigns, and clears fundraiser_name on its donations (Super Admin only)."""
     _check_super_admin(user_role, can_edit_donors)
+    comp = (company_id or "rethink").strip().lower()
 
     init_fundraiser_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
@@ -1157,11 +1272,11 @@ def delete_fundraiser(fundraiser_id: str, user_role: str = "guest", can_edit_don
         cur.execute("SELECT name FROM fundraisers WHERE id = ?", (fundraiser_id,))
         row = cur.fetchone()
         if not row:
-            cur.execute("SELECT DISTINCT fundraiser_name FROM donations WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''")
+            cur.execute("SELECT DISTINCT fundraiser_name FROM donations WHERE fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != '' AND company_id = ?", (comp,))
             don_names = [r[0] for r in cur.fetchall() if r[0]]
             matched = None
             for d_name in don_names:
-                synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, d_name.strip().lower()).hex[:16]}"
+                synth_id = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, f'{comp}_{d_name.strip().lower()}').hex[:16]}"
                 if synth_id == fundraiser_id or d_name.strip().lower() == fundraiser_id.lower():
                     matched = d_name.strip()
                     break
@@ -1174,12 +1289,12 @@ def delete_fundraiser(fundraiser_id: str, user_role: str = "guest", can_edit_don
         cur.execute("DELETE FROM fundraiser_campaigns WHERE fundraiser_id = ?", (fundraiser_id,))
         cur.execute("DELETE FROM fundraisers WHERE id = ?", (fundraiser_id,))
 
-        # Clear fundraiser_name in donations table so it's permanently unassigned and not re-discovered
+        # Clear fundraiser_name in donations table for this company so it's permanently unassigned
         cur.execute("""
             UPDATE donations 
             SET fundraiser_name = NULL 
-            WHERE LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?))
-        """, (f_name,))
+            WHERE LOWER(TRIM(fundraiser_name)) = LOWER(TRIM(?)) AND company_id = ?
+        """, (f_name, comp))
 
         conn.commit()
     finally:
@@ -1188,12 +1303,12 @@ def delete_fundraiser(fundraiser_id: str, user_role: str = "guest", can_edit_don
     _sync_parquet_and_cache_from_sqlite()
 
     try:
-        broadcast_event_sync("DONORS_UPDATED", {"source": "fundraiser_delete", "fundraiser_name": f_name})
-        broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "delete", "id": fundraiser_id, "name": f_name})
+        broadcast_event_sync("DONORS_UPDATED", {"source": "fundraiser_delete", "fundraiser_name": f_name, "company_id": comp})
+        broadcast_event_sync("FUNDRAISER_UPDATED", {"action": "delete", "id": fundraiser_id, "name": f_name, "company_id": comp})
     except Exception:
         pass
 
     return {
         "status": "success",
-        "message": f"Successfully deleted fundraiser '{f_name}' and cleared donor assignments."
+        "message": f"Successfully deleted fundraiser '{f_name}' in {comp.upper()} and cleared donor assignments."
     }

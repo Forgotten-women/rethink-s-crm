@@ -20,6 +20,7 @@ def _get_amount_column(df):
 
 @router.get("/timeline")
 def get_overview_timeline(
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -34,8 +35,8 @@ def get_overview_timeline(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
-    df_raw = load_data()
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date)
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, company_id=company_id)
     col_amount = _get_amount_column(df)
     col_date = "Created Date (UTC)"
 
@@ -60,6 +61,7 @@ def get_overview_timeline(
 
 @router.get("/headings")
 def get_overview_headings(
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -74,8 +76,8 @@ def get_overview_headings(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
-    df_raw = load_data()
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date)
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, company_id=company_id)
     col_amount = _get_amount_column(df)
     col_heading = "Heading"
 
@@ -92,6 +94,7 @@ def get_overview_headings(
 
 @router.get("/campaigns")
 def get_overview_top_campaigns(
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -106,8 +109,8 @@ def get_overview_top_campaigns(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
-    df_raw = load_data()
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date)
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, company_id=company_id)
     col_amount = _get_amount_column(df)
     col_campaign = "Campaign Name"
 
@@ -124,6 +127,7 @@ def get_overview_top_campaigns(
 
 @router.get("/subheadings")
 def get_overview_subheadings(
+    company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
@@ -138,8 +142,8 @@ def get_overview_subheadings(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ):
-    df_raw = load_data()
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date)
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, company_id=company_id)
     col_amount = _get_amount_column(df)
     col_sub = "Sub-Heading"
 

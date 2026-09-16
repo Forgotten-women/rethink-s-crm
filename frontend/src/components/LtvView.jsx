@@ -2,13 +2,15 @@ import React, { useEffect, useState } from 'react';
 import { Crown, DollarSign, Users, Award } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function LtvView({ filters }) {
+export default function LtvView({ filters, activeCompany = 'rethink' }) {
   const [summary, setSummary] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
     const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
+
     if (filters) {
       if (filters.payment_type) params.append('payment_type', filters.payment_type);
       if (filters.tier) params.append('tier', filters.tier);
@@ -35,7 +37,7 @@ export default function LtvView({ filters }) {
         console.error('Error loading LTV summary:', err);
         setLoading(false);
       });
-  }, [filters]);
+  }, [filters, activeCompany]);
 
   if (loading) {
     return (

@@ -23,7 +23,8 @@ import {
   ChevronsRight,
   Filter,
   Plus,
-  Edit3
+  Edit3,
+  Sparkles
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
@@ -53,10 +54,20 @@ function cleanText(val) {
   return s;
 }
 
-export default function ClassificationView({ user }) {
-  // Persist selected platform in localStorage so it NEVER resets unexpectedly!
+export default function ClassificationView({ user, activeCompany = 'rethink', companies = [] }) {
+  const isConsolidated = activeCompany === 'all';
+  // Enforce company platform partitioning
+  // Iqra: GiveBrite, Madinah, Master
+  // Rethink: LaunchGood, GiveBright, Paysuite, Website, Master
+  const isIqra = activeCompany === 'iqra';
+
+  // Persist selected platform in localStorage with company compatibility
   const [platform, setPlatform] = useState(() => {
-    return localStorage.getItem('selected_classification_platform') || 'launchgood';
+    const saved = localStorage.getItem('selected_classification_platform');
+    if (activeCompany === 'iqra') {
+      return ['master', 'givebright', 'madinah'].includes(saved) ? saved : 'givebright';
+    }
+    return ['master', 'launchgood', 'givebright', 'paysuite', 'website'].includes(saved) ? saved : 'launchgood';
   });
 
   const [matrixData, setMatrixData] = useState({ total_campaigns: 0, classified_campaigns: 0, unassigned_campaigns: 0, rules: [] });
@@ -74,6 +85,19 @@ export default function ClassificationView({ user }) {
       return () => clearTimeout(timer);
     }
   }, [saveNotification]);
+
+  // Ensure active platform matches active company
+  useEffect(() => {
+    if (activeCompany === 'iqra') {
+      if (!['master', 'givebright', 'madinah'].includes(platform)) {
+        handleSelectPlatform('givebright');
+      }
+    } else if (activeCompany === 'rethink') {
+      if (!['master', 'launchgood', 'givebright', 'paysuite', 'website'].includes(platform)) {
+        handleSelectPlatform('launchgood');
+      }
+    }
+  }, [activeCompany]);
 
   // 🚀 Fast Client-Side Search & Pagination State
   const [searchQuery, setSearchQuery] = useState('');
@@ -107,7 +131,7 @@ export default function ClassificationView({ user }) {
 
   // Fetch Code Map for dynamic Code -> Heading, Sub-Heading, Country, Zakat auto-fill
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/classifications/code-map`)
+    fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${encodeURIComponent(activeCompany)}`)
       .then(res => res.json())
       .then(data => {
         if (data && typeof data === 'object') {
@@ -115,7 +139,7 @@ export default function ClassificationView({ user }) {
         }
       })
       .catch(err => console.error('Error fetching code map:', err));
-  }, []);
+  }, [activeCompany]);
 
   // Master Code Modal State
   const [masterCodeModal, setMasterCodeModal] = useState(null); // { isEdit: bool, data: { code, department, office, portfolio, country, zakat_eligibility, description, is_active } }
@@ -178,6 +202,7 @@ export default function ClassificationView({ user }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_role: user?.role,
+          company_id: activeCompany,
           code: masterCodeModal.data.code,
           programme_fund: masterCodeModal.data.programme_fund || '',
           fund_code: masterCodeModal.data.fund_code || '',
@@ -205,7 +230,7 @@ export default function ClassificationView({ user }) {
           message: data.message || `Master project code '${masterCodeModal.data.code}' saved & cascaded to matching donations.`,
           timestamp: new Date().toLocaleTimeString()
         });
-        fetch(`${API_BASE_URL}/api/classifications/code-map`)
+        fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${encodeURIComponent(activeCompany)}`)
           .then(r => r.json())
           .then(cm => { if (cm) setCodeMap(cm); });
         setTimeout(() => {
@@ -229,7 +254,7 @@ export default function ClassificationView({ user }) {
     }
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/classifications/master-codes/${encodeURIComponent(cCode)}?user_role=${encodeURIComponent(user?.role)}`, {
+      const res = await fetch(`${API_BASE_URL}/api/classifications/master-codes/${encodeURIComponent(cCode)}?user_role=${encodeURIComponent(user?.role)}&company_id=${encodeURIComponent(activeCompany)}`, {
         method: 'DELETE'
       });
       const data = await res.json();
@@ -241,7 +266,7 @@ export default function ClassificationView({ user }) {
           timestamp: new Date().toLocaleTimeString()
         });
         loadMatrixData();
-        fetch(`${API_BASE_URL}/api/classifications/code-map`)
+        fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${encodeURIComponent(activeCompany)}`)
           .then(r => r.json())
           .then(cm => { if (cm) setCodeMap(cm); });
       } else {
@@ -267,7 +292,7 @@ export default function ClassificationView({ user }) {
     setLoading(true);
 
     if (platform === 'master') {
-      fetch(`${API_BASE_URL}/api/classifications/master-codes`)
+      fetch(`${API_BASE_URL}/api/classifications/master-codes?company_id=${encodeURIComponent(activeCompany)}`)
         .then(res => res.json())
         .then(data => {
           let rules = (data.codes || []).map((r, i) => ({
@@ -307,7 +332,7 @@ export default function ClassificationView({ user }) {
       return;
     }
 
-    fetch(`${API_BASE_URL}/api/classifications/${platform}`)
+    fetch(`${API_BASE_URL}/api/classifications/${platform}?company_id=${encodeURIComponent(activeCompany)}`)
       .then(res => res.json())
       .then(data => {
         let rules = (data.rules || []).map((r, i) => ({
@@ -346,7 +371,7 @@ export default function ClassificationView({ user }) {
   // Race-Condition-Free Data Loading
   useEffect(() => {
     loadMatrixData();
-  }, [platform]);
+  }, [platform, activeCompany]);
 
   // Dynamic list of all known unique codes (from central code map + active rules + any newly typed codes)
   const knownCodes = useMemo(() => {
@@ -638,11 +663,20 @@ export default function ClassificationView({ user }) {
 
   const handleSave = async () => {
     if (!isSuperAdmin) return;
+    if (isConsolidated) {
+      setSaveNotification({
+        type: 'error',
+        title: 'Action Prohibited',
+        message: 'Modifying classification rules in consolidated (All Companies) mode is disabled. Please switch to a specific company.',
+        timestamp: new Date().toLocaleTimeString()
+      });
+      return;
+    }
     setSaving(true);
     setSaveNotification({
       type: 'info',
       title: 'Saving & Syncing...',
-      message: `Saving classification matrix rules and synchronizing to database records for ${platform.toUpperCase()}...`,
+      message: `Saving classification matrix rules and synchronizing to database records for ${platform.toUpperCase()} (${activeCompany.toUpperCase()})...`,
       timestamp: new Date().toLocaleTimeString()
     });
 
@@ -654,6 +688,7 @@ export default function ClassificationView({ user }) {
           user_role: user?.role,
           can_edit_matrix: true,
           platform: platform,
+          company_id: activeCompany,
           rules: matrixData.rules
         })
       });
@@ -691,6 +726,10 @@ export default function ClassificationView({ user }) {
 
   const handleDeleteRule = async (rule) => {
     if (!isSuperAdmin) return;
+    if (isConsolidated) {
+      alert('Deleting classification rules is disabled in Consolidated (All Companies) mode.');
+      return;
+    }
     const cName = rule['Campaign Name'] || rule['campaign_name'];
     const cCode = rule['Code'] || rule['code'] || '';
     if (!window.confirm(`Are you sure you want to delete the classification rule for "${cName}" (Code: ${cCode || 'Unassigned'})?\n\nMatching donor records will be reset to Unassigned.`)) {
@@ -704,6 +743,7 @@ export default function ClassificationView({ user }) {
         body: JSON.stringify({
           user_role: user?.role,
           platform: platform,
+          company_id: activeCompany,
           campaign_name: cName,
           code: cCode || null,
           community_name: rule['Community Name'] || rule['community_name'] || null
@@ -750,12 +790,16 @@ export default function ClassificationView({ user }) {
   };
 
   const handleExport = (format = 'csv') => {
-    const url = `${API_BASE_URL}/api/classifications/export?platform=${platform}&format=${format}`;
+    const url = `${API_BASE_URL}/api/classifications/export?platform=${platform}&format=${format}&company_id=${encodeURIComponent(activeCompany)}`;
     window.open(url, '_blank');
   };
 
   const handleImportSubmit = async (e) => {
     e.preventDefault();
+    if (isConsolidated) {
+      setImportMsg('Importing rules is disabled in Consolidated (All Companies) mode.');
+      return;
+    }
     if (!importFile) {
       setImportMsg('Please select a CSV or Excel file.');
       return;
@@ -768,6 +812,7 @@ export default function ClassificationView({ user }) {
     formData.append('file', importFile);
     formData.append('platform', platform);
     formData.append('mode', importMode);
+    formData.append('company_id', activeCompany);
     formData.append('user_role', user?.role || 'user');
 
     try {
@@ -786,7 +831,7 @@ export default function ClassificationView({ user }) {
           setImportMsg('');
           // Re-fetch active matrix
           setLoading(true);
-          fetch(`${API_BASE_URL}/api/classifications/${platform}`)
+          fetch(`${API_BASE_URL}/api/classifications/${platform}?company_id=${encodeURIComponent(activeCompany)}`)
             .then(r => r.json())
             .then(d => {
               let rules = (d.rules || []).map(r => ({
@@ -844,6 +889,14 @@ export default function ClassificationView({ user }) {
       subtitle: 'text-slate-600 dark:text-slate-400 font-medium',
       activePill: 'bg-purple-600 text-white shadow-purple-500/30',
       countPill: 'border-purple-500/40 text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40'
+    },
+    madinah: {
+      container: 'bg-gradient-to-r from-teal-500/15 via-emerald-500/10 to-transparent border-teal-500/30 text-teal-900 dark:text-teal-200',
+      iconBg: 'bg-teal-600 text-white',
+      title: 'text-teal-700 dark:text-teal-300 font-extrabold',
+      subtitle: 'text-slate-600 dark:text-slate-400 font-medium',
+      activePill: 'bg-teal-600 text-white shadow-teal-500/30',
+      countPill: 'border-teal-500/40 text-teal-700 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/40'
     },
     paysuite: {
       container: 'bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-transparent border-amber-500/30 text-amber-900 dark:text-amber-200',
@@ -1004,8 +1057,13 @@ export default function ClassificationView({ user }) {
             platform === 'master' ? (
               <button
                 onClick={handleOpenAddMasterCode}
-                className="px-4 py-2 text-xs font-extrabold rounded-xl text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-md shadow-emerald-500/20 transition-all flex items-center gap-2 cursor-pointer"
-                title="Create a new Master Project Code in the canonical registry"
+                disabled={isConsolidated}
+                className={`px-4 py-2 text-xs font-extrabold rounded-xl text-white transition-all flex items-center gap-2 ${
+                  isConsolidated 
+                    ? 'bg-slate-400 dark:bg-slate-700 opacity-60 cursor-not-allowed' 
+                    : 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-md shadow-emerald-500/20 cursor-pointer'
+                }`}
+                title={isConsolidated ? "Adding master codes is disabled in consolidated mode" : "Create a new Master Project Code in the canonical registry"}
               >
                 <Plus className="w-3.5 h-3.5 text-white" />
                 <span>Add Master Code</span>
@@ -1013,9 +1071,13 @@ export default function ClassificationView({ user }) {
             ) : (
               <button
                 onClick={handleSave}
-                disabled={saving}
-                className="px-4 py-2 text-xs font-extrabold rounded-xl text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-md shadow-emerald-500/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
-                title="Save matrix edits and sync classification rules across all donor records"
+                disabled={saving || isConsolidated}
+                className={`px-4 py-2 text-xs font-extrabold rounded-xl text-white transition-all flex items-center gap-2 ${
+                  isConsolidated 
+                    ? 'bg-slate-400 dark:bg-slate-700 opacity-60 cursor-not-allowed' 
+                    : 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-md shadow-emerald-500/20 cursor-pointer disabled:opacity-50'
+                }`}
+                title={isConsolidated ? "Saving is disabled in consolidated mode" : "Save matrix edits and sync classification rules across all donor records"}
               >
                 {saving ? (
                   <>
@@ -1055,6 +1117,16 @@ export default function ClassificationView({ user }) {
         </div>
       </div>
 
+      {/* Consolidated Mode Alert Banner */}
+      {isConsolidated && (
+        <div className="flex items-center gap-3 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-900 dark:text-amber-200 animate-fadeIn">
+          <AlertCircle className="w-5 h-5 text-amber-500 shrink-0" />
+          <div className="text-xs">
+            <span className="font-bold">Consolidated Mode (All Companies):</span> Showing aggregated rules across all organizations. Adding, editing, importing, and deleting classification rules is disabled in consolidated view. Switch to a specific company in the top navigation to create or modify rules.
+          </div>
+        </div>
+      )}
+
       {/* 🚀 Platform Selector Pill Buttons */}
       <div className="flex flex-wrap items-center gap-3">
         {/* Master Project Codes Tab */}
@@ -1076,26 +1148,28 @@ export default function ClassificationView({ user }) {
           )}
         </button>
 
-        {/* LaunchGood Tab */}
-        <button 
-          onClick={() => handleSelectPlatform('launchgood')}
-          className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
-            platform === 'launchgood'
-              ? 'bg-gradient-to-r from-teal-600 to-cyan-600 text-white shadow-md shadow-cyan-500/30 border border-cyan-400 ring-2 ring-cyan-400/40'
-              : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
-          }`}
-        >
-          <Zap className={`w-4 h-4 ${platform === 'launchgood' ? 'text-white' : 'text-teal-600 dark:text-cyan-400'}`} />
-          <span className="font-bold">LaunchGood Matrix</span>
-          {platform === 'launchgood' && (
-            <span className="flex h-2.5 w-2.5 relative ml-1">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
-            </span>
-          )}
-        </button>
+        {/* LaunchGood Tab (Rethink & Consolidated only) */}
+        {!isIqra && (
+          <button 
+            onClick={() => handleSelectPlatform('launchgood')}
+            className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
+              platform === 'launchgood'
+                ? 'bg-gradient-to-r from-teal-600 to-cyan-600 text-white shadow-md shadow-cyan-500/30 border border-cyan-400 ring-2 ring-cyan-400/40'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
+            }`}
+          >
+            <Zap className={`w-4 h-4 ${platform === 'launchgood' ? 'text-white' : 'text-teal-600 dark:text-cyan-400'}`} />
+            <span className="font-bold">LaunchGood Matrix</span>
+            {platform === 'launchgood' && (
+              <span className="flex h-2.5 w-2.5 relative ml-1">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
+              </span>
+            )}
+          </button>
+        )}
 
-        {/* GiveBright Tab */}
+        {/* GiveBright Tab (Both Rethink & Iqra) */}
         <button 
           onClick={() => handleSelectPlatform('givebright')}
           className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
@@ -1114,43 +1188,68 @@ export default function ClassificationView({ user }) {
           )}
         </button>
 
-        {/* Paysuite Tab */}
-        <button 
-          onClick={() => handleSelectPlatform('paysuite')}
-          className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
-            platform === 'paysuite'
-              ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md shadow-amber-500/30 border border-amber-400 ring-2 ring-amber-400/40'
-              : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
-          }`}
-        >
-          <CreditCard className={`w-4 h-4 ${platform === 'paysuite' ? 'text-white' : 'text-amber-600 dark:text-amber-400'}`} />
-          <span className="font-bold">Paysuite Matrix</span>
-          {platform === 'paysuite' && (
-            <span className="flex h-2.5 w-2.5 relative ml-1">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
-            </span>
-          )}
-        </button>
+        {/* Madinah Tab (Iqra & Consolidated) */}
+        {(isIqra || isConsolidated) && (
+          <button 
+            onClick={() => handleSelectPlatform('madinah')}
+            className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
+              platform === 'madinah'
+                ? 'bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-md shadow-teal-500/30 border border-teal-400 ring-2 ring-teal-400/40'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
+            }`}
+          >
+            <Sparkles className={`w-4 h-4 ${platform === 'madinah' ? 'text-white' : 'text-teal-600 dark:text-teal-400'}`} />
+            <span className="font-bold">Madinah Matrix</span>
+            {platform === 'madinah' && (
+              <span className="flex h-2.5 w-2.5 relative ml-1">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
+              </span>
+            )}
+          </button>
+        )}
 
-        {/* Website Tab */}
-        <button 
-          onClick={() => handleSelectPlatform('website')}
-          className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
-            platform === 'website'
-              ? 'bg-gradient-to-r from-blue-600 to-cyan-600 text-white shadow-md shadow-blue-500/30 border border-blue-400 ring-2 ring-blue-400/40'
-              : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
-          }`}
-        >
-          <Globe className={`w-4 h-4 ${platform === 'website' ? 'text-white' : 'text-blue-600 dark:text-blue-400'}`} />
-          <span className="font-bold">Website Matrix</span>
-          {platform === 'website' && (
-            <span className="flex h-2.5 w-2.5 relative ml-1">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
-            </span>
-          )}
-        </button>
+        {/* Paysuite Tab (Rethink & Consolidated only) */}
+        {!isIqra && (
+          <button 
+            onClick={() => handleSelectPlatform('paysuite')}
+            className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
+              platform === 'paysuite'
+                ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md shadow-amber-500/30 border border-amber-400 ring-2 ring-amber-400/40'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
+            }`}
+          >
+            <CreditCard className={`w-4 h-4 ${platform === 'paysuite' ? 'text-white' : 'text-amber-600 dark:text-amber-400'}`} />
+            <span className="font-bold">Paysuite Matrix</span>
+            {platform === 'paysuite' && (
+              <span className="flex h-2.5 w-2.5 relative ml-1">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
+              </span>
+            )}
+          </button>
+        )}
+
+        {/* Website Tab (Rethink & Consolidated only) */}
+        {!isIqra && (
+          <button 
+            onClick={() => handleSelectPlatform('website')}
+            className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
+              platform === 'website'
+                ? 'bg-gradient-to-r from-blue-600 to-cyan-600 text-white shadow-md shadow-blue-500/30 border border-blue-400 ring-2 ring-blue-400/40'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
+            }`}
+          >
+            <Globe className={`w-4 h-4 ${platform === 'website' ? 'text-white' : 'text-blue-600 dark:text-blue-400'}`} />
+            <span className="font-bold">Website Matrix</span>
+            {platform === 'website' && (
+              <span className="flex h-2.5 w-2.5 relative ml-1">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
+              </span>
+            )}
+          </button>
+        )}
       </div>
 
       {/* 🎯 High-Contrast Active Matrix Banner Indicator */}
@@ -1160,6 +1259,7 @@ export default function ClassificationView({ user }) {
             {platform === 'master' ? <Shield className="w-5 h-5" /> :
              platform === 'launchgood' ? <Zap className="w-5 h-5" /> :
              platform === 'givebright' ? <Gift className="w-5 h-5" /> :
+             platform === 'madinah' ? <Sparkles className="w-5 h-5" /> :
              platform === 'paysuite' ? <CreditCard className="w-5 h-5" /> :
              <Globe className="w-5 h-5" />}
           </span>
@@ -1170,6 +1270,7 @@ export default function ClassificationView({ user }) {
                   platform === 'master' ? 'Canonical Master Project Codes (Single Source of Truth)' :
                   platform === 'launchgood' ? 'LaunchGood Campaign Master' :
                   platform === 'givebright' ? 'GiveBright Campaign & URL Master' :
+                  platform === 'madinah' ? 'Madinah Campaign & URL Master' :
                   platform === 'paysuite' ? 'Paysuite Direct Debit Master' :
                   'Rethink Website Project Master'
                 }
@@ -1181,7 +1282,7 @@ export default function ClassificationView({ user }) {
             <div className={`text-xs mt-0.5 ${bStyles.subtitle}`}>
               {platform === 'master'
                 ? 'Single Source of Truth: Canonical Project Codes ➔ Department, Office, Portfolio, Country, Zakat Eligibility'
-                : platform === 'givebright'
+                : platform === 'givebright' || platform === 'madinah'
                 ? 'Hierarchy: Campaign Name & URL ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
                 : platform === 'paysuite'
                 ? 'Hierarchy: Direct Debit Ref (Bank Ref) ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
@@ -1499,8 +1600,8 @@ export default function ClassificationView({ user }) {
                       <th className="w-28 text-center">Campaign URL</th>
                     )}
 
-                    {/* LaunchGood & Paysuite: Community Name column */}
-                    {platform !== 'givebright' && (
+                    {/* LaunchGood & Paysuite: Community Name column (Hidden for GiveBright & Madinah) */}
+                    {platform !== 'givebright' && platform !== 'madinah' && (
                       <th className="min-w-[160px] text-left">{platform === 'paysuite' ? 'Platform Source' : 'Community Name'}</th>
                     )}
                     
@@ -1516,7 +1617,7 @@ export default function ClassificationView({ user }) {
                 <tbody>
                   {paginatedRules.length === 0 ? (
                     <tr>
-                      <td colSpan={platform === 'paysuite' ? 8 : 9} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'madinah' ? 8 : 9} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No classification rules match the active search or status filter.
                       </td>
                     </tr>
@@ -1555,7 +1656,7 @@ export default function ClassificationView({ user }) {
                             </>
                           )}
 
-                          {/* LaunchGood & GiveBright: Clickable Campaign URL Cell */}
+                          {/* Clickable Campaign URL Cell */}
                           {platform !== 'paysuite' && (
                             <td className="py-2 px-2 text-center w-28">
                               {r['Campaign URL'] && r['Campaign URL'] !== '' && r['Campaign URL'] !== 'Unassigned' && r['Campaign URL'] !== 'None' ? (
@@ -1583,8 +1684,8 @@ export default function ClassificationView({ user }) {
                             </td>
                           )}
 
-                          {/* LaunchGood & Paysuite: Community Name Cell */}
-                          {platform !== 'givebright' && (
+                          {/* Community Name Cell (Hidden for GiveBright & Madinah) */}
+                          {platform !== 'givebright' && platform !== 'madinah' && (
                             <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[160px] max-w-[220px]" title={r['Community Name']}>
                               <div className="truncate font-medium">{r['Community Name']}</div>
                             </td>
@@ -1850,6 +1951,8 @@ export default function ClassificationView({ user }) {
                 <div className="mt-1.5 font-mono text-[11px] p-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-slate-800 dark:text-slate-200">
                   {platform === 'paysuite' 
                     ? 'Direct Debit Ref (Bank Ref), Platform Source, Code, Department, Office, Portfolio, Country, Zakat Eligibility'
+                    : platform === 'givebright' || platform === 'madinah'
+                    ? 'Campaign Name, Campaign URL, Code, Department, Office, Portfolio, Country, Zakat Eligibility'
                     : 'Campaign Name, Community Name, Campaign URL, Code, Department, Office, Portfolio, Country, Zakat Eligibility'}
                 </div>
               </div>

@@ -158,20 +158,34 @@ def deduplicate_dataframe_columns(df_input):
 
     return res_df
 
-# Global In-Memory Code Map Cache
-_CACHED_CODE_MAP = None
+# Global In-Memory Code Map Cache per Company
+_CACHED_CODE_MAP = {}
 
 
-def get_code_to_classification_map(force_reload: bool = False):
+def invalidate_code_map(company_id: Optional[str] = None):
+    """Invalidates the in-memory code classification map cache for a company or all companies."""
+    global _CACHED_CODE_MAP
+    if company_id:
+        _CACHED_CODE_MAP.pop(str(company_id).lower().strip(), None)
+    else:
+        _CACHED_CODE_MAP = {}
+
+
+def get_code_to_classification_map(force_reload: bool = False, company_id: Optional[str] = "rethink"):
     """
     Queries all known classifications from master_project_codes (Two-Tier Model)
     to build a dynamic dictionary mapping a Code (case-insensitive) to its corresponding
     Department, Office, Portfolio, Country, and Zakat Eligibility in < 1ms via in-memory caching.
     Provides backward-compatible aliases for 'Heading' and 'Sub-Heading'.
+    Strictly partitioned by company_id.
     """
     global _CACHED_CODE_MAP
-    if not force_reload and _CACHED_CODE_MAP is not None:
-        return _CACHED_CODE_MAP
+    if _CACHED_CODE_MAP is None or not isinstance(_CACHED_CODE_MAP, dict):
+        _CACHED_CODE_MAP = {}
+
+    comp = str(company_id or "rethink").lower().strip()
+    if not force_reload and comp in _CACHED_CODE_MAP:
+        return _CACHED_CODE_MAP[comp]
 
     code_map = {}
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -179,13 +193,18 @@ def get_code_to_classification_map(force_reload: bool = False):
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='master_project_codes'")
         if cur.fetchone():
-            # Check columns in master_project_codes
             mpc_cols = [r[1] for r in cur.execute("PRAGMA table_info(master_project_codes)").fetchall()]
             select_cols = ["code", "department", "office", "portfolio", "country", "zakat_eligibility"]
             if "programme_fund" in mpc_cols:
                 select_cols.extend(["programme_fund", "fund_code", "legacy_non_zakat_code", "legacy_zakat_code", "old_codes"])
-            
-            df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM master_project_codes", conn)
+
+            where_clause = ""
+            params = []
+            if comp != "all" and "company_id" in mpc_cols:
+                where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?"
+                params = [comp]
+
+            df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM master_project_codes{where_clause}", conn, params=params)
             for _, row in df.iterrows():
                 code = str(row.get("code") or "").strip()
                 if not code or code.lower() in ["unassigned", "nan", "none", ""]:
@@ -228,7 +247,7 @@ def get_code_to_classification_map(force_reload: bool = False):
                             code_map[tok] = entry
         else:
             # Fallback for unmigrated environments
-            tables = ["campaign_classifications", "givebright_classifications", "paysuite_classifications", "rethink_website_classifications"]
+            tables = ["campaign_classifications", "givebright_classifications", "paysuite_classifications", "rethink_website_classifications", "madinah_classifications"]
             for tbl in tables:
                 try:
                     df = pd.read_sql_query(f"SELECT code, heading, sub_heading, country, zakat_eligibility FROM {tbl}", conn)
@@ -254,12 +273,12 @@ def get_code_to_classification_map(force_reload: bool = False):
                 except Exception:
                     pass
     except Exception as e:
-        print(f"Error loading master code map: {e}")
+        print(f"[Warning] Failed to generate code mapping: {e}")
     finally:
         conn.close()
 
-    _CACHED_CODE_MAP = code_map
-    return _CACHED_CODE_MAP
+    _CACHED_CODE_MAP[comp] = code_map
+    return code_map
 
 
 def classify_donor_amount(amount):
@@ -291,35 +310,49 @@ def _mode_or_last(series):
     return mode_vals.iloc[0] if not mode_vals.empty else clean.iloc[-1]
 
 def init_classification_db():
-    """Ensure two-tier schema (master_project_codes, platform_campaign_mappings), backward-compatible views, and sponsorship_targets exist."""
-    try:
-        with _DB_LOCK:
-            conn = get_db_connection(timeout=60.0)
+    """Ensures that database schema is up-to-date with two-tier architecture."""
+    with _DB_LOCK:
+        conn = get_db_connection()
+        try:
             cur = conn.cursor()
-            
-            # 1. Master Project Codes Table
+
+            # 1. Master project codes table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS master_project_codes (
-                    code TEXT PRIMARY KEY,
-                    department TEXT NOT NULL DEFAULT 'Unassigned',
-                    office TEXT NOT NULL DEFAULT 'Unassigned',
+                    code TEXT NOT NULL,
+                    company_id TEXT NOT NULL DEFAULT 'rethink',
+                    programme_fund TEXT DEFAULT '',
+                    fund_code TEXT DEFAULT '',
+                    department TEXT DEFAULT 'Unassigned',
+                    office TEXT DEFAULT 'Unassigned',
                     portfolio TEXT DEFAULT '',
-                    country TEXT NOT NULL DEFAULT 'Unassigned',
-                    zakat_eligibility TEXT NOT NULL DEFAULT 'Zakat',
+                    country TEXT DEFAULT 'Unassigned',
+                    zakat_eligibility TEXT DEFAULT 'Zakat',
+                    legacy_non_zakat_code TEXT DEFAULT '',
+                    legacy_zakat_code TEXT DEFAULT '',
+                    old_codes TEXT DEFAULT '',
                     description TEXT DEFAULT '',
                     is_active INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (company_id, code)
                 );
             """)
 
-            # 2. Platform Campaign Mappings Table
+            # Ensure company_id column exists
+            cur.execute("PRAGMA table_info(master_project_codes)")
+            cols = [r[1] for r in cur.fetchall()]
+            if "company_id" not in cols:
+                cur.execute("ALTER TABLE master_project_codes ADD COLUMN company_id TEXT NOT NULL DEFAULT 'rethink'")
+
+            # 2. Platform campaign mappings table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS platform_campaign_mappings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     platform TEXT NOT NULL,
+                    company_id TEXT NOT NULL DEFAULT 'rethink',
                     campaign_name TEXT NOT NULL,
-                    code TEXT NOT NULL,
+                    code TEXT,
                     community_name TEXT DEFAULT 'N/A',
                     campaign_url TEXT DEFAULT '',
                     is_primary INTEGER DEFAULT 0,
@@ -327,20 +360,20 @@ def init_classification_db():
                     donor_email TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(platform, campaign_name, code)
+                    UNIQUE (platform, company_id, campaign_name, code)
                 );
             """)
 
+            cur.execute("PRAGMA table_info(platform_campaign_mappings)")
+            map_cols = [r[1] for r in cur.fetchall()]
+            if "company_id" not in map_cols:
+                cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN company_id TEXT NOT NULL DEFAULT 'rethink'")
+
             # 3. Create views if they don't exist
-            cur.execute("SELECT name, type FROM sqlite_master WHERE name IN ('campaign_classifications', 'givebright_classifications', 'paysuite_classifications', 'rethink_website_classifications')")
+            cur.execute("SELECT name, type FROM sqlite_master WHERE name IN ('campaign_classifications', 'givebright_classifications', 'paysuite_classifications', 'rethink_website_classifications', 'madinah_classifications')")
             existing_objects = {row[0]: row[1] for row in cur.fetchall()}
 
-            for tbl, plat in [
-                ("campaign_classifications", "launchgood"),
-                ("givebright_classifications", "givebright"),
-                ("paysuite_classifications", "paysuite"),
-                ("rethink_website_classifications", "website")
-            ]:
+            for tbl in ["campaign_classifications", "givebright_classifications", "paysuite_classifications", "rethink_website_classifications", "madinah_classifications"]:
                 if existing_objects.get(tbl) == "table":
                     try:
                         cur.execute(f"DROP TABLE IF EXISTS _legacy_{tbl}")
@@ -354,6 +387,7 @@ def init_classification_db():
                 cur.execute("""
                     CREATE VIEW campaign_classifications AS
                     SELECT 
+                        COALESCE(m.company_id, 'rethink') AS company_id,
                         m.campaign_name,
                         m.code,
                         COALESCE(m.community_name, 'N/A') AS community_name,
@@ -361,13 +395,21 @@ def init_classification_db():
                         COALESCE(c.department, 'Unassigned') AS department,
                         COALESCE(c.office, 'Unassigned') AS office,
                         COALESCE(c.portfolio, '') AS portfolio,
+                        COALESCE(c.programme_fund, '') AS programme_fund,
+                        COALESCE(c.fund_code, '') AS fund_code,
+                        COALESCE(c.legacy_non_zakat_code, '') AS legacy_non_zakat_code,
+                        COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                         COALESCE(c.department, 'Unassigned') AS heading,
                         COALESCE(c.office, 'Unassigned') AS sub_heading,
                         COALESCE(c.country, 'Unassigned') AS country,
                         COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
-                        COALESCE(m.is_primary, 0) AS is_primary
+                        COALESCE(m.is_primary, 0) AS is_primary,
+                        COALESCE(m.donor_name, '') AS donor_name,
+                        COALESCE(m.donor_email, '') AS donor_email
                     FROM platform_campaign_mappings m
-                    LEFT JOIN master_project_codes c ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                    LEFT JOIN master_project_codes c 
+                        ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                       AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
                     WHERE m.platform = 'launchgood';
                 """)
 
@@ -376,19 +418,29 @@ def init_classification_db():
                 cur.execute("""
                     CREATE VIEW givebright_classifications AS
                     SELECT 
+                        COALESCE(m.company_id, 'rethink') AS company_id,
                         m.campaign_name,
                         m.code,
+                        COALESCE(m.community_name, 'N/A') AS community_name,
                         COALESCE(m.campaign_url, '') AS campaign_url,
                         COALESCE(c.department, 'Unassigned') AS department,
                         COALESCE(c.office, 'Unassigned') AS office,
                         COALESCE(c.portfolio, '') AS portfolio,
+                        COALESCE(c.programme_fund, '') AS programme_fund,
+                        COALESCE(c.fund_code, '') AS fund_code,
+                        COALESCE(c.legacy_non_zakat_code, '') AS legacy_non_zakat_code,
+                        COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                         COALESCE(c.department, 'Unassigned') AS heading,
                         COALESCE(c.office, 'Unassigned') AS sub_heading,
                         COALESCE(c.country, 'Unassigned') AS country,
                         COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
-                        COALESCE(m.is_primary, 0) AS is_primary
+                        COALESCE(m.is_primary, 0) AS is_primary,
+                        COALESCE(m.donor_name, '') AS donor_name,
+                        COALESCE(m.donor_email, '') AS donor_email
                     FROM platform_campaign_mappings m
-                    LEFT JOIN master_project_codes c ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                    LEFT JOIN master_project_codes c 
+                        ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                       AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
                     WHERE m.platform = 'givebright';
                 """)
 
@@ -397,12 +449,18 @@ def init_classification_db():
                 cur.execute("""
                     CREATE VIEW paysuite_classifications AS
                     SELECT 
+                        COALESCE(m.company_id, 'rethink') AS company_id,
                         m.campaign_name,
                         m.code,
                         COALESCE(m.community_name, 'N/A') AS community_name,
+                        COALESCE(m.campaign_url, '') AS campaign_url,
                         COALESCE(c.department, 'Unassigned') AS department,
                         COALESCE(c.office, 'Unassigned') AS office,
                         COALESCE(c.portfolio, '') AS portfolio,
+                        COALESCE(c.programme_fund, '') AS programme_fund,
+                        COALESCE(c.fund_code, '') AS fund_code,
+                        COALESCE(c.legacy_non_zakat_code, '') AS legacy_non_zakat_code,
+                        COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                         COALESCE(c.department, 'Unassigned') AS heading,
                         COALESCE(c.office, 'Unassigned') AS sub_heading,
                         COALESCE(c.country, 'Unassigned') AS country,
@@ -411,7 +469,9 @@ def init_classification_db():
                         COALESCE(m.donor_email, '') AS donor_email,
                         COALESCE(m.is_primary, 0) AS is_primary
                     FROM platform_campaign_mappings m
-                    LEFT JOIN master_project_codes c ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                    LEFT JOIN master_project_codes c 
+                        ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                       AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
                     WHERE m.platform = 'paysuite';
                 """)
 
@@ -420,20 +480,60 @@ def init_classification_db():
                 cur.execute("""
                     CREATE VIEW rethink_website_classifications AS
                     SELECT 
+                        COALESCE(m.company_id, 'rethink') AS company_id,
                         m.campaign_name,
                         m.code,
                         COALESCE(m.community_name, 'N/A') AS community_name,
                         COALESCE(c.department, 'Unassigned') AS department,
                         COALESCE(c.office, 'Unassigned') AS office,
                         COALESCE(c.portfolio, '') AS portfolio,
+                        COALESCE(c.programme_fund, '') AS programme_fund,
+                        COALESCE(c.fund_code, '') AS fund_code,
+                        COALESCE(c.legacy_non_zakat_code, '') AS legacy_non_zakat_code,
+                        COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                         COALESCE(c.department, 'Unassigned') AS heading,
                         COALESCE(c.office, 'Unassigned') AS sub_heading,
                         COALESCE(c.country, 'Unassigned') AS country,
                         COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
-                        COALESCE(m.is_primary, 0) AS is_primary
+                        COALESCE(m.is_primary, 0) AS is_primary,
+                        COALESCE(m.donor_name, '') AS donor_name,
+                        COALESCE(m.donor_email, '') AS donor_email
                     FROM platform_campaign_mappings m
-                    LEFT JOIN master_project_codes c ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                    LEFT JOIN master_project_codes c 
+                        ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                       AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
                     WHERE m.platform IN ('website', 'rethink_website');
+                """)
+
+            if existing_objects.get("madinah_classifications") != "view":
+                cur.execute("DROP VIEW IF EXISTS madinah_classifications")
+                cur.execute("""
+                    CREATE VIEW madinah_classifications AS
+                    SELECT 
+                        COALESCE(m.company_id, 'iqra') AS company_id,
+                        m.campaign_name,
+                        m.code,
+                        COALESCE(m.community_name, 'N/A') AS community_name,
+                        COALESCE(m.campaign_url, '') AS campaign_url,
+                        COALESCE(c.department, 'Unassigned') AS department,
+                        COALESCE(c.office, 'Unassigned') AS office,
+                        COALESCE(c.portfolio, '') AS portfolio,
+                        COALESCE(c.programme_fund, '') AS programme_fund,
+                        COALESCE(c.fund_code, '') AS fund_code,
+                        COALESCE(c.legacy_non_zakat_code, '') AS legacy_non_zakat_code,
+                        COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
+                        COALESCE(c.department, 'Unassigned') AS heading,
+                        COALESCE(c.office, 'Unassigned') AS sub_heading,
+                        COALESCE(c.country, 'Unassigned') AS country,
+                        COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
+                        COALESCE(m.is_primary, 0) AS is_primary,
+                        COALESCE(m.donor_name, '') AS donor_name,
+                        COALESCE(m.donor_email, '') AS donor_email
+                    FROM platform_campaign_mappings m
+                    LEFT JOIN master_project_codes c 
+                        ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                       AND COALESCE(m.company_id, 'iqra') = COALESCE(c.company_id, 'iqra')
+                    WHERE m.platform = 'madinah';
                 """)
 
             # Ensure sponsorship targets table exists
@@ -455,19 +555,23 @@ def init_classification_db():
                     ("Ex-Prisoner", 1080.0)
                 ])
             conn.commit()
+        except Exception as e:
+            print(f"Classification DB init notice: {e}")
+        finally:
             conn.close()
-    except Exception as e:
-        print(f"Classification DB init notice: {e}")
 
-def get_classification_matrix(df_raw=None):
-    """Returns the campaign_classifications matrix DataFrame with unique (Campaign Name, Code) granularity."""
+def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
+    """Returns the campaign_classifications matrix DataFrame with unique (Campaign Name, Code) granularity for a company."""
     init_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    comp = str(company_id or "rethink").lower().strip()
 
     # 1. Read existing saved rules directly from SQLite
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
-        db_matrix = pd.read_sql_query("""
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+        db_matrix = pd.read_sql_query(f"""
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -478,7 +582,8 @@ def get_classification_matrix(df_raw=None):
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility"
             FROM campaign_classifications
-        """, conn)
+            {where_clause}
+        """, conn, params=params)
     except Exception:
         db_matrix = pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL", "Community Name"] + [c for c in target_cols if c != "Code"])
     finally:
@@ -494,6 +599,7 @@ def get_classification_matrix(df_raw=None):
         from core.analytics_engine import get_duckdb_connection
         con = get_duckdb_connection()
         if con and os.path.exists(PARQUET_PATH):
+            company_filter = f"AND LOWER(COALESCE(\"company_id\", 'rethink')) = '{comp}'" if comp != "all" else ""
             donor_distinct = con.execute(f"""
                 SELECT DISTINCT
                     COALESCE(NULLIF(TRIM("Campaign Name"), ''), 'N/A') as "Campaign Name",
@@ -502,12 +608,13 @@ def get_classification_matrix(df_raw=None):
                 FROM '{PARQUET_PATH.replace(chr(92), '/')}'
                 WHERE LOWER(COALESCE("Platform", '')) NOT IN ('givebright', 'paysuite')
                   AND "Campaign Name" IS NOT NULL
+                  {company_filter}
             """).df()
     except Exception as e:
         donor_distinct = None
 
     if donor_distinct is None or donor_distinct.empty:
-        df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data()
+        df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
         if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
             plat_series = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
             lg_mask = ~plat_series.isin(["givebright", "paysuite"])
@@ -576,7 +683,7 @@ def get_classification_matrix(df_raw=None):
     matrix_df = pd.DataFrame(final_rows) if final_rows else deduped_df
 
     # Dynamic auto-assignment based on Code mapping in < 5ms
-    code_map = get_code_to_classification_map()
+    code_map = get_code_to_classification_map(company_id=comp)
     if code_map and "Code" in matrix_df.columns:
         code_clean = matrix_df["Code"].astype(str).str.strip().str.lower()
         for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"]:
@@ -613,11 +720,17 @@ def sync_donors_to_classification_matrix(df_raw=None):
     Synchronizes updated classifications (Code, Department/Heading, Office/Sub-Heading, Portfolio, Country, Zakat Eligibility)
     from active donor transactions into SQLite master_project_codes and platform_campaign_mappings.
     """
-    global _CACHED_CODE_MAP
-    _CACHED_CODE_MAP = None  # Invalidate cached code map
+def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink"):
+    """
+    Synchronizes updated classifications (Code, Department/Heading, Office/Sub-Heading, Portfolio, Country, Zakat Eligibility)
+    from active donor transactions into SQLite master_project_codes and platform_campaign_mappings.
+    Strictly isolated per company_id.
+    """
+    comp = str(company_id or "rethink").lower().strip()
+    invalidate_code_map(comp)
     
     init_classification_db()
-    df = df_raw if (df_raw is not None and not df_raw.empty) else load_data()
+    df = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
     if df.empty or "Campaign Name" not in df.columns:
         return 0
 
@@ -687,7 +800,7 @@ def sync_donors_to_classification_matrix(df_raw=None):
                     zakat = "Zakat"
 
                 if code and code not in ["UNASSIGNED", "NAN", "NONE", "N/A", ""]:
-                    master_rows.append((code, dept, off, port, country, zakat))
+                    master_rows.append((code, dept, off, port, country, zakat, comp))
 
                 comm = str(r.get("Community Name") or "N/A").strip()
                 curl = str(r.get("Campaign URL") or "").strip()
@@ -696,13 +809,13 @@ def sync_donors_to_classification_matrix(df_raw=None):
                 d_name = f"{fname} {lname}".strip()
                 d_email = str(r.get("Email") or "").strip()
 
-                mapping_rows.append((plat_name, cname, code, comm, curl, d_name, d_email))
+                mapping_rows.append((plat_name, cname, code, comm, curl, d_name, d_email, comp))
 
             if master_rows:
                 cursor.executemany("""
-                    INSERT INTO master_project_codes (code, department, office, portfolio, country, zakat_eligibility)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(code) DO UPDATE SET
+                    INSERT INTO master_project_codes (code, department, office, portfolio, country, zakat_eligibility, company_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(company_id, code) DO UPDATE SET
                         department = CASE WHEN excluded.department != 'Unassigned' THEN excluded.department ELSE master_project_codes.department END,
                         office = CASE WHEN excluded.office != 'Unassigned' THEN excluded.office ELSE master_project_codes.office END,
                         portfolio = CASE WHEN excluded.portfolio != '' THEN excluded.portfolio ELSE master_project_codes.portfolio END,
@@ -712,9 +825,9 @@ def sync_donors_to_classification_matrix(df_raw=None):
 
             if mapping_rows:
                 cursor.executemany("""
-                    INSERT INTO platform_campaign_mappings (platform, campaign_name, code, community_name, campaign_url, donor_name, donor_email)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(platform, campaign_name, code) DO UPDATE SET
+                    INSERT INTO platform_campaign_mappings (platform, campaign_name, code, community_name, campaign_url, donor_name, donor_email, company_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(company_id, platform, campaign_name, code) DO UPDATE SET
                         community_name = COALESCE(NULLIF(excluded.community_name, 'N/A'), platform_campaign_mappings.community_name),
                         campaign_url = COALESCE(NULLIF(excluded.campaign_url, ''), platform_campaign_mappings.campaign_url),
                         donor_name = CASE WHEN excluded.donor_name != '' THEN excluded.donor_name ELSE platform_campaign_mappings.donor_name END,
@@ -729,16 +842,28 @@ def sync_donors_to_classification_matrix(df_raw=None):
     return synced_total
 
 
-def sync_matrix_classifications_to_donors(matrix_df):
+def sync_matrix_classifications_to_donors(matrix_df, company_id: str = "rethink"):
     """
     Updates matching donor records and payout settlements in Parquet and SQLite DB
     with saved classification matrix rules using (Campaign Name, Code) precision.
+    Strictly partitioned to only update records belonging to company_id.
     """
     if matrix_df is None or matrix_df.empty:
         return 0
 
-    df_raw = load_data()
+    comp = str(company_id or "rethink").lower().strip()
+    if comp == "all":
+        return 0
+
+    df_raw = load_data(force_reload=True)
     if df_raw.empty or "Campaign Name" not in df_raw.columns:
+        return 0
+
+    if "company_id" not in df_raw.columns:
+        df_raw["company_id"] = "rethink"
+
+    comp_mask = (df_raw["company_id"].astype(str).str.lower() == comp)
+    if not comp_mask.any():
         return 0
 
     updated_count = 0
@@ -755,7 +880,7 @@ def sync_matrix_classifications_to_donors(matrix_df):
             cname_to_rules[cname].append(row)
 
     for cname, rules_list in cname_to_rules.items():
-        c_mask = (campaign_series == cname)
+        c_mask = comp_mask & (campaign_series == cname)
         if not c_mask.any():
             continue
 
@@ -769,7 +894,6 @@ def sync_matrix_classifications_to_donors(matrix_df):
                 df_raw[c] = init_v
 
         if len(rules_list) == 1:
-            # Single-rule campaign: update ALL records for this campaign unconditionally
             row = rules_list[0]
             col_vals = {
                 "Department": dept_val,
@@ -789,11 +913,9 @@ def sync_matrix_classifications_to_donors(matrix_df):
                     df_raw.loc[c_mask, col_name] = col_val
             updated_count += int(c_mask.sum())
         else:
-            # Multi-code campaign:
             primary_row = next((r for r in rules_list if bool(r.get("is_primary") in [1, True, "1", "true", "True"])), rules_list[0])
             valid_codes = [str(r.get("Code", "")).strip().lower() for r in rules_list if str(r.get("Code", "")).strip().lower() not in ["", "unassigned", "nan", "none", "n/a"]]
 
-            # 1. Update matching exact code rows
             for row in rules_list:
                 code = str(row.get("Code", "")).strip().lower()
                 if not code or code in ["unassigned", "nan", "none", "n/a"]:
@@ -817,7 +939,6 @@ def sync_matrix_classifications_to_donors(matrix_df):
                             df_raw.loc[code_mask, col] = val
                     updated_count += int(code_mask.sum())
 
-            # 2. Update any leftover or unassigned transactions of this campaign to the Primary variant
             leftover_mask = c_mask & (~code_series.isin(valid_codes))
             if leftover_mask.any():
                 p_dept = str(primary_row.get("Department") or primary_row.get("Heading", "Unassigned"))
@@ -839,8 +960,14 @@ def sync_matrix_classifications_to_donors(matrix_df):
 
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
     df_raw.to_parquet(PARQUET_PATH, index=False)
+
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-    df_raw.to_sql("donations", con=conn, if_exists="replace", index=False)
+    try:
+        conn.execute("DELETE FROM donations WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
+        df_raw[comp_mask].to_sql("donations", con=conn, if_exists="append", index=False, chunksize=5000)
+        conn.commit()
+    except Exception as e:
+        print(f"[Donations sync to DB notice]: {e}")
 
     # Also update payouts_cache.parquet & payout_settlements table in SQLite
     try:
@@ -848,42 +975,51 @@ def sync_matrix_classifications_to_donors(matrix_df):
         if os.path.exists(PAYOUTS_PARQUET_PATH):
             pdf = pd.read_parquet(PAYOUTS_PARQUET_PATH)
             if not pdf.empty:
-                p_cname = pdf.get("Campaign Name", pdf.get("Project Name", pd.Series("", index=pdf.index))).astype(str).str.strip().str.lower()
-                p_code = pdf.get("Code", pd.Series("unassigned", index=pdf.index)).astype(str).str.strip().str.lower()
+                if "company_id" not in pdf.columns:
+                    pdf["company_id"] = "rethink"
+                p_comp_mask = (pdf["company_id"].astype(str).str.lower() == comp)
+                if p_comp_mask.any():
+                    p_cname = pdf.get("Campaign Name", pdf.get("Project Name", pd.Series("", index=pdf.index))).astype(str).str.strip().str.lower()
+                    p_code = pdf.get("Code", pd.Series("unassigned", index=pdf.index)).astype(str).str.strip().str.lower()
 
-                for cname, rules_list in cname_to_rules.items():
-                    pc_mask = (p_cname == cname)
-                    if not pc_mask.any():
-                        continue
+                    for cname, rules_list in cname_to_rules.items():
+                        pc_mask = p_comp_mask & (p_cname == cname)
+                        if not pc_mask.any():
+                            continue
 
-                    if len(rules_list) == 1:
-                        row = rules_list[0]
-                        for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
-                            if col in pdf.columns:
-                                pdf.loc[pc_mask, col] = str(row.get(col, "Unassigned"))
-                    else:
-                        primary_row = next((r for r in rules_list if bool(r.get("is_primary") in [1, True, "1", "true", "True"])), rules_list[0])
-                        valid_codes = [str(r.get("Code", "")).strip().lower() for r in rules_list if str(r.get("Code", "")).strip().lower() not in ["", "unassigned", "nan", "none", "n/a"]]
-
-                        for row in rules_list:
-                            code = str(row.get("Code", "")).strip().lower()
-                            if not code or code in ["unassigned", "nan", "none", "n/a"]:
-                                continue
-                            pcode_mask = pc_mask & (p_code == code)
-                            if pcode_mask.any():
-                                for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
-                                    if col in pdf.columns:
-                                        pdf.loc[pcode_mask, col] = str(row.get(col, "Unassigned"))
-
-                        leftover_pmask = pc_mask & (~p_code.isin(valid_codes))
-                        if leftover_pmask.any():
+                        if len(rules_list) == 1:
+                            row = rules_list[0]
                             for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
                                 if col in pdf.columns:
-                                    pdf.loc[leftover_pmask, col] = str(primary_row.get(col, "Unassigned"))
+                                    pdf.loc[pc_mask, col] = str(row.get(col, "Unassigned"))
+                        else:
+                            primary_row = next((r for r in rules_list if bool(r.get("is_primary") in [1, True, "1", "true", "True"])), rules_list[0])
+                            valid_codes = [str(r.get("Code", "")).strip().lower() for r in rules_list if str(r.get("Code", "")).strip().lower() not in ["", "unassigned", "nan", "none", "n/a"]]
 
-                pdf = sanitize_df_dtypes_for_parquet(pdf)
-                pdf.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
-                pdf.to_sql("payout_settlements", con=conn, if_exists="replace", index=False)
+                            for row in rules_list:
+                                code = str(row.get("Code", "")).strip().lower()
+                                if not code or code in ["unassigned", "nan", "none", "n/a"]:
+                                    continue
+                                pcode_mask = pc_mask & (p_code == code)
+                                if pcode_mask.any():
+                                    for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
+                                        if col in pdf.columns:
+                                            pdf.loc[pcode_mask, col] = str(row.get(col, "Unassigned"))
+
+                            leftover_pmask = pc_mask & (~p_code.isin(valid_codes))
+                            if leftover_pmask.any():
+                                for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
+                                    if col in pdf.columns:
+                                        pdf.loc[leftover_pmask, col] = str(primary_row.get(col, "Unassigned"))
+
+                    pdf = sanitize_df_dtypes_for_parquet(pdf)
+                    pdf.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
+                    try:
+                        conn.execute("DELETE FROM payout_settlements WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
+                        pdf[p_comp_mask].to_sql("payout_settlements", con=conn, if_exists="append", index=False, chunksize=5000)
+                        conn.commit()
+                    except Exception as e:
+                        print(f"[Payout DB update notice]: {e}")
     except Exception as e:
         print(f"[Payout settlement sync notice]: {e}")
 
@@ -899,13 +1035,18 @@ def sync_matrix_classifications_to_donors(matrix_df):
     return updated_count
 
 
-def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame) -> int:
+def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_id: str = "rethink") -> int:
     """
     Saves platform classification matrix rules cleanly into two-tier architecture:
     1. Upserts Code -> (department, office, portfolio, country, zakat_eligibility) into master_project_codes.
     2. Synchronizes (platform, campaign_name, code) mappings into platform_campaign_mappings.
     3. Synchronizes matching active donor records.
+    Strictly isolated per company_id.
     """
+    comp = str(company_id or "rethink").lower().strip()
+    if comp == "all":
+        raise ValueError("Cannot modify matrix rules in consolidated 'All Companies' mode. Select a specific company.")
+
     init_classification_db()
     if matrix_df.empty:
         return 0
@@ -931,7 +1072,7 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame) -> int:
             zakat = "Zakat"
 
         if code and code not in ["UNASSIGNED", "NAN", "NONE", "N/A", ""]:
-            master_code_rows.append((code, dept, off, port, country, zakat))
+            master_code_rows.append((code, dept, off, port, country, zakat, comp))
 
         comm = str(row.get("Community Name", "N/A")).strip()
         curl = str(row.get("Campaign URL", "") or "").strip()
@@ -939,7 +1080,7 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame) -> int:
         d_name = str(row.get("Donor Name", "") or "").strip()
         d_email = str(row.get("Donor Email", "") or "").strip()
 
-        mapping_rows.append((platform.lower(), cname, code, comm, curl, is_prim, d_name, d_email))
+        mapping_rows.append((platform.lower(), cname, code, comm, curl, is_prim, d_name, d_email, comp))
 
     import time
     for attempt in range(5):
@@ -950,9 +1091,9 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame) -> int:
                     # 1. Upsert master project codes
                     if master_code_rows:
                         conn.executemany("""
-                            INSERT INTO master_project_codes (code, department, office, portfolio, country, zakat_eligibility)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(code) DO UPDATE SET
+                            INSERT INTO master_project_codes (code, department, office, portfolio, country, zakat_eligibility, company_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(company_id, code) DO UPDATE SET
                                 department = CASE WHEN excluded.department != 'Unassigned' THEN excluded.department ELSE master_project_codes.department END,
                                 office = CASE WHEN excluded.office != 'Unassigned' THEN excluded.office ELSE master_project_codes.office END,
                                 portfolio = CASE WHEN excluded.portfolio != '' THEN excluded.portfolio ELSE master_project_codes.portfolio END,
@@ -963,12 +1104,12 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame) -> int:
                     # 2. Synchronize platform_campaign_mappings
                     for cname_lower, codes in cname_to_codes.items():
                         placeholders = ','.join(['?'] * len(codes))
-                        conn.execute(f"DELETE FROM platform_campaign_mappings WHERE platform = ? AND LOWER(campaign_name) = ? AND LOWER(code) NOT IN ({placeholders})", [platform.lower(), cname_lower] + list(codes))
+                        conn.execute(f"DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ? AND LOWER(code) NOT IN ({placeholders})", [comp, platform.lower(), cname_lower] + list(codes))
 
                     conn.executemany("""
-                        INSERT INTO platform_campaign_mappings (platform, campaign_name, code, community_name, campaign_url, is_primary, donor_name, donor_email)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(platform, campaign_name, code) DO UPDATE SET
+                        INSERT INTO platform_campaign_mappings (platform, campaign_name, code, community_name, campaign_url, is_primary, donor_name, donor_email, company_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(company_id, platform, campaign_name, code) DO UPDATE SET
                             community_name = COALESCE(NULLIF(excluded.community_name, 'N/A'), platform_campaign_mappings.community_name),
                             campaign_url = COALESCE(NULLIF(excluded.campaign_url, ''), platform_campaign_mappings.campaign_url),
                             is_primary = excluded.is_primary,
@@ -984,23 +1125,27 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame) -> int:
             raise
 
     # 3. Synchronize to active donor records
-    sync_matrix_classifications_to_donors(clean_matrix)
+    sync_matrix_classifications_to_donors(clean_matrix, company_id=comp)
+    invalidate_code_map(comp)
     return len(clean_matrix)
 
 
-def save_classification_matrix(matrix_df):
+def save_classification_matrix(matrix_df, company_id: str = "rethink"):
     """Saves updated LaunchGood classification matrix into two-tier architecture."""
-    return save_platform_matrix_rules("launchgood", matrix_df)
+    return save_platform_matrix_rules("launchgood", matrix_df, company_id=company_id)
 
 
-def get_paysuite_classification_matrix(df_raw=None):
-    """Returns the paysuite_classifications matrix DataFrame with (Campaign Name, Code) granularity."""
+def get_paysuite_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
+    """Returns the paysuite_classifications matrix DataFrame with (Campaign Name, Code) granularity for a company."""
     init_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    comp = str(company_id or "rethink").lower().strip()
 
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
-        db_matrix = pd.read_sql_query("""
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+        db_matrix = pd.read_sql_query(f"""
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -1012,13 +1157,14 @@ def get_paysuite_classification_matrix(df_raw=None):
                 COALESCE(donor_name, '') as "Donor Name",
                 COALESCE(donor_email, '') as "Donor Email"
             FROM paysuite_classifications
-        """, conn)
+            {where_clause}
+        """, conn, params=params)
     except Exception:
         db_matrix = pd.DataFrame(columns=["Campaign Name", "Code", "Community Name"] + [c for c in target_cols if c != "Code"] + ["Donor Name", "Donor Email"])
     finally:
         conn.close()
 
-    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data()
+    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
     if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
         platform_s = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
         source_s = df_donations.get("Source", pd.Series("", index=df_donations.index)).astype(str).str.lower()
@@ -1052,19 +1198,22 @@ def get_paysuite_classification_matrix(df_raw=None):
     return pd.DataFrame(columns=["Campaign Name", "Code", "Community Name"] + [c for c in target_cols if c != "Code"])
 
 
-def save_paysuite_classification_matrix(matrix_df):
+def save_paysuite_classification_matrix(matrix_df, company_id: str = "rethink"):
     """Saves updated Paysuite classification matrix into two-tier architecture."""
-    return save_platform_matrix_rules("paysuite", matrix_df)
+    return save_platform_matrix_rules("paysuite", matrix_df, company_id=company_id)
 
 
-def get_rethink_website_classification_matrix(df_raw=None):
-    """Returns the rethink_website_classifications matrix DataFrame with (Campaign Name, Code) granularity."""
+def get_rethink_website_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
+    """Returns the rethink_website_classifications matrix DataFrame with (Campaign Name, Code) granularity for a company."""
     init_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    comp = str(company_id or "rethink").lower().strip()
 
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
-        db_matrix = pd.read_sql_query("""
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+        db_matrix = pd.read_sql_query(f"""
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -1074,13 +1223,14 @@ def get_rethink_website_classification_matrix(df_raw=None):
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility"
             FROM rethink_website_classifications
-        """, conn)
+            {where_clause}
+        """, conn, params=params)
     except Exception:
         db_matrix = pd.DataFrame(columns=["Campaign Name", "Code", "Community Name"] + [c for c in target_cols if c != "Code"])
     finally:
         conn.close()
 
-    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data()
+    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
     if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
         platform_s = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
         ws_mask = platform_s.str.contains("rethink website|website", regex=True, na=False)
@@ -1113,9 +1263,9 @@ def get_rethink_website_classification_matrix(df_raw=None):
     return pd.DataFrame(columns=["Campaign Name", "Code", "Community Name"] + [c for c in target_cols if c != "Code"])
 
 
-def save_rethink_website_classification_matrix(matrix_df):
+def save_rethink_website_classification_matrix(matrix_df, company_id: str = "rethink"):
     """Saves updated Rethink Website classification matrix into two-tier architecture."""
-    return save_platform_matrix_rules("website", matrix_df)
+    return save_platform_matrix_rules("website", matrix_df, company_id=company_id)
 
 
 def _enrich_dataframe(df, platform="auto"):
@@ -1657,8 +1807,12 @@ def _enrich_dataframe(df, platform="auto"):
     return df
 
 
-def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace", platform="auto"):
-    """Reads Excel/CSV, standardizes schema, enriches data, auto-classifies, and saves to database."""
+def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace", platform="auto", company_id: str = "rethink"):
+    """Reads Excel/CSV, standardizes schema, enriches data, auto-classifies, and saves to database with strict company_id isolation."""
+    target_cid = str(company_id or "rethink").strip().lower()
+    if not target_cid or target_cid == "all":
+        target_cid = "rethink"
+
     # Detect CSV format defensively
     is_csv = False
     if source_name and str(source_name).lower().endswith('.csv'):
@@ -1705,6 +1859,9 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
     batch_label = str(source_name).strip() if (source_name and str(source_name).strip()) else "Master Dataset"
     df["Source"] = batch_label
 
+    # Tag rows strictly with target company_id
+    df["company_id"] = target_cid
+
     # Check if uploaded file is a Payout report vs Raw Donor report
     is_payout_file = (
         str(platform).lower() == "launchgood payout" or
@@ -1718,22 +1875,37 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
 
     # Enrich and Auto-Classify New Raw Data
     df_new = _enrich_dataframe(df, platform=platform)
+    df_new["company_id"] = target_cid
 
     # Sync auto-assigned classifications for new upload batch ONLY (< 10ms)
-    sync_donors_to_classification_matrix(df_new)
+    sync_donors_to_classification_matrix(df_new, company_id=target_cid)
 
-    # Merge or Replace dataset in database
-    if upload_mode in ["merge", "append"] and os.path.exists(PARQUET_PATH):
+    # Merge or Replace dataset with strict company isolation (other companies' data is NEVER touched)
+    if os.path.exists(PARQUET_PATH):
         try:
             existing_df = pd.read_parquet(PARQUET_PATH)
             if existing_df is not None and not existing_df.empty:
-                df_combined = pd.concat([existing_df, df_new], ignore_index=True)
-                if "Donation ID" in df_combined.columns:
-                    valid_mask = df_combined["Donation ID"].notna() & (~df_combined["Donation ID"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "n/a", "<na>"]))
-                    df_valid = df_combined[valid_mask].drop_duplicates(subset=["Donation ID"], keep="last")
-                    df_invalid = df_combined[~valid_mask]
-                    df_combined = pd.concat([df_valid, df_invalid], ignore_index=True)
-                df_save = df_combined
+                if "company_id" not in existing_df.columns:
+                    existing_df["company_id"] = "rethink"
+
+                # Other companies data must always be 100% preserved
+                other_comp_df = existing_df[existing_df["company_id"].astype(str).str.lower() != target_cid]
+                same_comp_df = existing_df[existing_df["company_id"].astype(str).str.lower() == target_cid]
+
+                if upload_mode in ["merge", "append"]:
+                    df_combined_target = pd.concat([same_comp_df, df_new], ignore_index=True)
+                    if "Donation ID" in df_combined_target.columns:
+                        valid_mask = df_combined_target["Donation ID"].notna() & (~df_combined_target["Donation ID"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "n/a", "<na>"]))
+                        df_valid = df_combined_target[valid_mask].drop_duplicates(subset=["Donation ID"], keep="last")
+                        df_invalid = df_combined_target[~valid_mask]
+                        df_target_final = pd.concat([df_valid, df_invalid], ignore_index=True)
+                    else:
+                        df_target_final = df_combined_target
+                else:
+                    # Replace mode: replaces ONLY this company's donations
+                    df_target_final = df_new
+
+                df_save = pd.concat([other_comp_df, df_target_final], ignore_index=True)
             else:
                 df_save = df_new
         except Exception as e:
@@ -1951,11 +2123,12 @@ def process_payout_settlement_upload(df_raw, source_name="LaunchGood Payout.xlsx
         "total_records": len(df_save)
     }
 
-def sync_donor_classifications_to_matrix(df_donations):
-    """Synchronizes cell edits from donor records back into campaign classification rules."""
+def sync_donor_classifications_to_matrix(df_donations, company_id: str = "rethink"):
+    """Synchronizes cell edits from donor records back into campaign classification rules for a company."""
     if df_donations.empty or "Campaign Name" not in df_donations.columns:
         return
     try:
+        comp = str(company_id or "rethink").lower().strip()
         target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
         available_cols = [c for c in target_cols if c in df_donations.columns]
         if not available_cols:
@@ -1969,97 +2142,9 @@ def sync_donor_classifications_to_matrix(df_donations):
             donor_df[tc] = df_donations[tc].values
 
         matrix_df = donor_df.groupby(["Campaign Name", "Community Name"], dropna=False)[available_cols].agg(_mode_or_last).reset_index()
-        save_classification_matrix(matrix_df)
+        save_classification_matrix(matrix_df, company_id=comp)
     except Exception as e:
         print(f"Donor to matrix sync notice: {e}")
-
-def sync_matrix_classifications_to_donors(matrix_df):
-    """Applies classification matrix rule changes directly to all matching donor donation records and payout settlement records instantly (Single Source of Truth)."""
-    if matrix_df.empty or "Campaign Name" not in matrix_df.columns:
-        return 0
-
-    try:
-        camp_rule_map = {}
-        for _, r in matrix_df.iterrows():
-            c_name = str(r["Campaign Name"]).strip().lower()
-            camp_rule_map[c_name] = {
-                "Heading": str(r.get("Heading", "Unassigned")),
-                "Sub-Heading": str(r.get("Sub-Heading", "Unassigned")),
-                "Country": str(r.get("Country", "Unassigned")),
-                "Code": str(r.get("Code", "N/A")),
-                "Zakat Eligibility": str(r.get("Zakat Eligibility", "Unassigned"))
-            }
-
-        target_fields = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
-        updated_count = 0
-
-        # 1. Update Raw Donor Records in donations table
-        df_donations = load_data(force_reload=True)
-        if not df_donations.empty and "Campaign Name" in df_donations.columns:
-            c_keys = df_donations["Campaign Name"].astype(str).str.strip().str.lower()
-            for col in target_fields:
-                if col in df_donations.columns:
-                    col_map = {k: v[col] for k, v in camp_rule_map.items()}
-                    mapped_series = c_keys.map(col_map)
-                    mask = mapped_series.notna()
-                    df_donations.loc[mask, col] = mapped_series[mask]
-                    updated_count = int(mask.sum())
-
-            df_donations = sanitize_df_dtypes_for_parquet(df_donations)
-            df_donations.to_parquet(PARQUET_PATH, index=False)
-            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-            df_donations.to_sql("donations", con=conn, if_exists="replace", index=False, chunksize=5000)
-            conn.close()
-
-        # 2. Update Payout Settlement Records in payout_settlements table
-        if os.path.exists(PAYOUTS_PARQUET_PATH):
-            try:
-                df_payouts = pd.read_parquet(PAYOUTS_PARQUET_PATH)
-                if not df_payouts.empty and "Campaign Name" in df_payouts.columns:
-                    p_keys = df_payouts["Campaign Name"].astype(str).str.strip().str.lower()
-                    for col in target_fields:
-                        if col in df_payouts.columns:
-                            col_map = {k: v[col] for k, v in camp_rule_map.items()}
-                            mapped_series = p_keys.map(col_map)
-                            mask = mapped_series.notna()
-                            df_payouts.loc[mask, col] = mapped_series[mask]
-
-                    df_payouts = sanitize_df_dtypes_for_parquet(df_payouts)
-                    df_payouts.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
-                    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-                    df_payouts.to_sql("payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
-                    conn.close()
-            except Exception as e:
-                print(f"Payout matrix sync notice: {e}")
-
-        # 3. Update Paysuite Payout Settlement Records in paysuite_payout_settlements table
-        if os.path.exists(PAYSUITE_PAYOUTS_PARQUET_PATH):
-            try:
-                df_ps_payouts = pd.read_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH)
-                if not df_ps_payouts.empty and "Campaign Name" in df_ps_payouts.columns:
-                    ps_keys = df_ps_payouts["Campaign Name"].astype(str).str.strip().str.lower()
-                    for col in target_fields:
-                        if col in df_ps_payouts.columns:
-                            col_map = {k: v[col] for k, v in camp_rule_map.items()}
-                            mapped_series = ps_keys.map(col_map)
-                            mask = mapped_series.notna()
-                            df_ps_payouts.loc[mask, col] = mapped_series[mask]
-
-                    df_ps_payouts = sanitize_df_dtypes_for_parquet(df_ps_payouts)
-                    df_ps_payouts.to_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH, index=False)
-                    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-                    df_ps_payouts.to_sql("paysuite_payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
-                    conn.close()
-            except Exception as e:
-                print(f"Paysuite payout matrix sync notice: {e}")
-
-        load_data(force_reload=True)
-        invalidate_payouts_cache()
-        invalidate_paysuite_payouts_cache()
-        return updated_count
-    except Exception as e:
-        print(f"Matrix to donor/payout sync notice: {e}")
-        return 0
 
 def purge_all_data():
     """Purges active transaction datasets (donations and payout settlements) while keeping campaign classification rules 100% intact."""
@@ -2246,6 +2331,8 @@ def _ensure_two_tier_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["Fund Code"] = ""
     if "Old Code" not in df.columns:
         df["Old Code"] = ""
+    if "company_id" not in df.columns:
+        df["company_id"] = "rethink"
     if "Department" in df.columns and "Heading" not in df.columns:
         df["Heading"] = df["Department"]
     if "Office" in df.columns and "Sub-Heading" not in df.columns:
@@ -2253,11 +2340,11 @@ def _ensure_two_tier_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_data(force_reload: bool = False) -> pd.DataFrame:
+def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> pd.DataFrame:
     """
     High-Performance Dataset Loader with In-Memory Singleton Caching.
     Returns the cached DataFrame in < 1ms when available and up-to-date on disk.
-    Transparently falls back to Parquet, then SQLite, then empty DataFrame on error.
+    Supports strict company_id isolation (defaults to all if None).
     """
     global _CACHED_DF, _CACHE_MTIME
 
@@ -2272,13 +2359,17 @@ def load_data(force_reload: bool = False) -> pd.DataFrame:
     # Return cached DataFrame if valid and not force_reload
     if not force_reload and _CACHED_DF is not None and len(_CACHED_DF) > 0:
         if current_mtime == _CACHE_MTIME or current_mtime == 0.0:
+            if company_id is not None:
+                cid_clean = str(company_id).strip().lower()
+                if cid_clean != "all" and "company_id" in _CACHED_DF.columns:
+                    return _CACHED_DF[_CACHED_DF["company_id"].astype(str).str.strip().str.lower() == cid_clean]
             return _CACHED_DF
 
     with _CACHE_LOCK:
         # Double-check inside lock
         if not force_reload and _CACHED_DF is not None and len(_CACHED_DF) > 0:
             if current_mtime == _CACHE_MTIME or current_mtime == 0.0:
-                return _CACHED_DF
+                return _filter_cached_by_company(_CACHED_DF, company_id)
 
         # 1. Primary: Load from Parquet binary cache (Fast columnar format)
         if os.path.exists(PARQUET_PATH):
@@ -2288,7 +2379,7 @@ def load_data(force_reload: bool = False) -> pd.DataFrame:
                     df = _ensure_two_tier_columns(df)
                     _CACHED_DF = df
                     _CACHE_MTIME = current_mtime
-                    return _CACHED_DF
+                    return _filter_cached_by_company(_CACHED_DF, company_id)
             except Exception as e:
                 print(f"[CACHE NOTICE] Parquet read fallback: {e}")
 
@@ -2306,12 +2397,20 @@ def load_data(force_reload: bool = False) -> pd.DataFrame:
                 except Exception:
                     pass
                 _CACHED_DF = df
-                return _CACHED_DF
+                return _filter_cached_by_company(_CACHED_DF, company_id)
         except Exception as e:
             print(f"[CACHE NOTICE] SQLite read fallback: {e}")
 
         # 3. Tertiary Fallback: Return empty DataFrame
         return pd.DataFrame()
+
+
+def _filter_cached_by_company(df, company_id):
+    if company_id is not None and df is not None and not df.empty and "company_id" in df.columns:
+        cid_clean = str(company_id).strip().lower()
+        if cid_clean != "all":
+            return df[df["company_id"].astype(str).str.strip().str.lower() == cid_clean]
+    return df
 
 
 _CACHED_PAYOUTS_DF = None
@@ -2336,8 +2435,8 @@ def invalidate_paysuite_payouts_cache():
         _CACHED_PAYSUITE_PAYOUTS_DF = None
         _CACHE_PAYSUITE_PAYOUTS_MTIME = 0.0
 
-def load_payouts_data(force_reload: bool = False) -> pd.DataFrame:
-    """Thread-safe cached loader for payout settlements dataset."""
+def load_payouts_data(force_reload: bool = False, company_id: Optional[str] = None) -> pd.DataFrame:
+    """Thread-safe cached loader for payout settlements dataset with company_id filtering."""
     global _CACHED_PAYOUTS_DF, _CACHE_PAYOUTS_MTIME
 
     current_mtime = 0.0
@@ -2349,20 +2448,21 @@ def load_payouts_data(force_reload: bool = False) -> pd.DataFrame:
 
     if not force_reload and _CACHED_PAYOUTS_DF is not None and len(_CACHED_PAYOUTS_DF) > 0:
         if current_mtime == _CACHE_PAYOUTS_MTIME or current_mtime == 0.0:
-            return _CACHED_PAYOUTS_DF
+            return _filter_cached_by_company(_CACHED_PAYOUTS_DF, company_id)
 
     with _CACHE_PAYOUTS_LOCK:
         if not force_reload and _CACHED_PAYOUTS_DF is not None and len(_CACHED_PAYOUTS_DF) > 0:
             if current_mtime == _CACHE_PAYOUTS_MTIME or current_mtime == 0.0:
-                return _CACHED_PAYOUTS_DF
+                return _filter_cached_by_company(_CACHED_PAYOUTS_DF, company_id)
 
         if os.path.exists(PAYOUTS_PARQUET_PATH):
             try:
                 df = pd.read_parquet(PAYOUTS_PARQUET_PATH)
                 if not df.empty:
+                    if "company_id" not in df.columns:
+                        df["company_id"] = "rethink"
                     _CACHED_PAYOUTS_DF = df
-                    _CACHE_PAYOUTS_MTIME = current_mtime
-                    return _CACHED_PAYOUTS_DF
+                    return _filter_cached_by_company(_CACHED_PAYOUTS_DF, company_id)
             except Exception as e:
                 print(f"[CACHE NOTICE] Payouts parquet read fallback: {e}")
 
@@ -2390,8 +2490,8 @@ def load_payouts_data(force_reload: bool = False) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_paysuite_payouts_data(force_reload: bool = False) -> pd.DataFrame:
-    """Thread-safe cached loader for Paysuite payout settlements dataset."""
+def load_paysuite_payouts_data(force_reload: bool = False, company_id: Optional[str] = None) -> pd.DataFrame:
+    """Thread-safe cached loader for Paysuite payout settlements dataset with company_id filtering."""
     global _CACHED_PAYSUITE_PAYOUTS_DF, _CACHE_PAYSUITE_PAYOUTS_MTIME
 
     current_mtime = 0.0
@@ -2403,20 +2503,22 @@ def load_paysuite_payouts_data(force_reload: bool = False) -> pd.DataFrame:
 
     if not force_reload and _CACHED_PAYSUITE_PAYOUTS_DF is not None and len(_CACHED_PAYSUITE_PAYOUTS_DF) > 0:
         if current_mtime == _CACHE_PAYSUITE_PAYOUTS_MTIME or current_mtime == 0.0:
-            return _CACHED_PAYSUITE_PAYOUTS_DF
+            return _filter_cached_by_company(_CACHED_PAYSUITE_PAYOUTS_DF, company_id)
 
     with _CACHE_PAYSUITE_PAYOUTS_LOCK:
         if not force_reload and _CACHED_PAYSUITE_PAYOUTS_DF is not None and len(_CACHED_PAYSUITE_PAYOUTS_DF) > 0:
             if current_mtime == _CACHE_PAYSUITE_PAYOUTS_MTIME or current_mtime == 0.0:
-                return _CACHED_PAYSUITE_PAYOUTS_DF
+                return _filter_cached_by_company(_CACHED_PAYSUITE_PAYOUTS_DF, company_id)
 
         if os.path.exists(PAYSUITE_PAYOUTS_PARQUET_PATH):
             try:
                 df = pd.read_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH)
                 if not df.empty:
+                    if "company_id" not in df.columns:
+                        df["company_id"] = "rethink"
                     _CACHED_PAYSUITE_PAYOUTS_DF = df
                     _CACHE_PAYSUITE_PAYOUTS_MTIME = current_mtime
-                    return _CACHED_PAYSUITE_PAYOUTS_DF
+                    return _filter_cached_by_company(_CACHED_PAYSUITE_PAYOUTS_DF, company_id)
             except Exception as e:
                 print(f"[CACHE NOTICE] Paysuite payouts parquet read fallback: {e}")
 
@@ -2428,6 +2530,8 @@ def load_paysuite_payouts_data(force_reload: bool = False) -> pd.DataFrame:
                 df = pd.read_sql_query("SELECT * FROM paysuite_payout_settlements", conn)
                 conn.close()
                 if not df.empty:
+                    if "company_id" not in df.columns:
+                        df["company_id"] = "rethink"
                     try:
                         df.to_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH, index=False)
                         if os.path.exists(PAYSUITE_PAYOUTS_PARQUET_PATH):
@@ -2435,7 +2539,7 @@ def load_paysuite_payouts_data(force_reload: bool = False) -> pd.DataFrame:
                     except Exception:
                         pass
                     _CACHED_PAYSUITE_PAYOUTS_DF = df
-                    return _CACHED_PAYSUITE_PAYOUTS_DF
+                    return _filter_cached_by_company(_CACHED_PAYSUITE_PAYOUTS_DF, company_id)
             else:
                 conn.close()
         except Exception as e:
@@ -2475,14 +2579,17 @@ def ensure_database_indexes():
         print(f"[Index Notice]: {e}")
 
 
-def get_givebright_classification_matrix(df_raw=None):
-    """Returns GiveBright classification matrix DataFrame with (Campaign Name, Code) granularity."""
+def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
+    """Returns GiveBright classification matrix DataFrame with (Campaign Name, Code) granularity for a company."""
     target_cols_display = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    comp = str(company_id or "rethink").lower().strip()
 
     # 1. Read SQLite stored GiveBright classifications
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
-        db_matrix = pd.read_sql_query("""
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+        db_matrix = pd.read_sql_query(f"""
             SELECT 
                 campaign_name as "Campaign Name",
                 COALESCE(code, 'Unassigned') as "Code",
@@ -2492,14 +2599,15 @@ def get_givebright_classification_matrix(df_raw=None):
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility"
             FROM givebright_classifications
-        """, conn)
+            {where_clause}
+        """, conn, params=params)
     except Exception:
         db_matrix = pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL"] + [c for c in target_cols_display if c != "Code"])
     finally:
         conn.close()
 
     # 2. Extract distinct GiveBright campaigns from in-memory cached donations
-    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data()
+    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
     if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
         platform_s = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
         source_s = df_donations.get("Source", pd.Series("", index=df_donations.index)).astype(str).str.lower()
@@ -2542,9 +2650,9 @@ def get_givebright_classification_matrix(df_raw=None):
     return pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL"] + [c for c in target_cols_display if c != "Code"])
 
 
-def save_givebright_classification_matrix(matrix_df):
+def save_givebright_classification_matrix(matrix_df, company_id: str = "rethink"):
     """Saves updated GiveBright classification matrix into two-tier architecture."""
-    return save_platform_matrix_rules("givebright", matrix_df)
+    return save_platform_matrix_rules("givebright", matrix_df, company_id=company_id)
 
 
 def normalize_classification_import_df(raw_df):
