@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal } from 'lucide-react';
+import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal, Globe } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
 const DEFAULT_EXPLORER_COLUMNS = [

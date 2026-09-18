@@ -48,6 +48,10 @@ export default function NavigationSidebar({
     rose: 'hover:bg-rose-500/5 hover:text-rose-500'
   };
 
+  const safeAccent = accentClasses[accentColor] ? accentColor : 'cyan';
+  const currentAccentClasses = accentClasses[safeAccent] || accentClasses.cyan;
+  const currentHoverClasses = hoverClasses[safeAccent] || hoverClasses.cyan;
+
   const handleMouseEnter = () => {
     setIsHovered(true);
   };
@@ -78,7 +82,7 @@ export default function NavigationSidebar({
               />
             ) : (
               <Diamond 
-                className={`w-5 h-5 ${accentClasses[accentColor].split(' ')[0]} fill-current`} 
+                className={`w-5 h-5 ${currentAccentClasses.split(' ')[0]} fill-current`} 
                 aria-hidden="true"
               />
             )}
@@ -110,8 +114,8 @@ export default function NavigationSidebar({
               title={!showExpanded ? t.label : undefined}
               className={`flex items-center ${!showExpanded ? 'justify-center px-0 py-3' : 'gap-3 px-4 py-3'} rounded-xl transition-all text-sm font-semibold text-left w-full
                 ${isActive 
-                  ? `shadow-sm ${accentClasses[accentColor]}` 
-                  : `text-slate-500 dark:text-slate-400 ${hoverClasses[accentColor]}`
+                  ? `shadow-sm ${currentAccentClasses}` 
+                  : `text-slate-500 dark:text-slate-400 ${currentHoverClasses}`
                 }
               `}
             >

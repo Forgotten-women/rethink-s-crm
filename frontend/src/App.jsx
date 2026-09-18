@@ -418,7 +418,7 @@ export default function App() {
       </div>
 
       {/* Donor 360° Profile Drawer Modal */}
-      <DonorDrawer donorId={selectedDonor} onClose={() => setSelectedDonor(null)} />
+      <DonorDrawer donorId={selectedDonor} onClose={() => setSelectedDonor(null)} activeCompany={activeCompany} />
     </div>
   );
 }

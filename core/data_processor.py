@@ -1,8 +1,10 @@
 import os
 import sqlite3
 import threading
+import datetime
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH, PAYOUTS_PARQUET_PATH, PAYSUITE_PAYOUTS_PARQUET_PATH
@@ -745,12 +747,14 @@ def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink
         # Partition Platform Masks
         ws_mask = platform_s.isin(["rethink website", "website"]) | source_s.str.contains("rethink|website", na=False)
         gb_mask = platform_s.isin(["givebright"]) | source_s.str.contains("givebright|give_bright", na=False)
+        mad_mask = platform_s.isin(["madinah"]) | source_s.str.contains("madinah", na=False)
         ps_mask = platform_s.isin(["paysuite"]) | source_s.str.contains("paysuite", na=False)
-        lg_mask = (~ws_mask) & (~gb_mask) & (~ps_mask)
+        lg_mask = (~ws_mask) & (~gb_mask) & (~mad_mask) & (~ps_mask)
 
         platforms_data = [
             ("launchgood", df[lg_mask]),
             ("givebright", df[gb_mask]),
+            ("madinah", df[mad_mask]),
             ("paysuite", df[ps_mask]),
             ("website", df[ws_mask])
         ]
@@ -1268,25 +1272,53 @@ def save_rethink_website_classification_matrix(matrix_df, company_id: str = "ret
     return save_platform_matrix_rules("website", matrix_df, company_id=company_id)
 
 
-def _enrich_dataframe(df, platform="auto"):
+def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
     """Pre-compute all derived columns (Donor ID, LTV, Classification, Payment Frequency) and apply classifications."""
     if df is None or df.empty:
         return df
 
+    target_cid = str(company_id or "rethink").strip().lower()
+
     # 1. Platform Detection & Standardization
-    is_paysuite = "Bank Ref" in df.columns and "Date of collection" in df.columns
+    is_paysuite = (
+        str(platform).lower() == "paysuite" or
+        ("Date of collection" in df.columns and ("Bank Ref" in df.columns or "Direct Debit Ref" in df.columns or "Customer Ref" in df.columns)) or
+        ("Direct Debit Ref" in df.columns and "Amount" in df.columns) or
+        ("Bank Ref" in df.columns and "Amount" in df.columns and ("Due" in df.columns or "Date Due" in df.columns or "Date of collection" in df.columns or "Details" in df.columns))
+    )
     is_rethink_website = ("Reference" in df.columns and "Donor First Name" in df.columns and ("Project Name" in df.columns or "Processor" in df.columns)) or (str(platform).lower() in ["rethink website", "website", "rethink_website"])
+    is_madinah = False
     is_givebright = False
     
     if not is_paysuite and not is_rethink_website:
-        if str(platform).lower() == "givebright":
+        if str(platform).lower() == "madinah":
+            is_madinah = True
+        elif str(platform).lower() == "givebright":
             is_givebright = True
         elif str(platform).lower() in ["auto", "none", ""]:
-            gb_sig = {"donation_id", "campaign_name", "fundraiser_by", "fundraiser_name", "campaign_url", "charge_id", "payment_method_type"}
-            if len(gb_sig.intersection(set(df.columns))) >= 2:
-                is_givebright = True
+            mad_sig = {"Invoice ID", "Invoice Number", "Announcement Title", "Giving Levels", "Stripe Fees (USD)", "Net Amount (USD)"}
+            if len(mad_sig.intersection(set(df.columns))) >= 2:
+                is_madinah = True
+            else:
+                gb_sig = {"donation_id", "campaign_name", "fundraiser_by", "fundraiser_name", "campaign_url", "charge_id", "payment_method_type"}
+                if len(gb_sig.intersection(set(df.columns))) >= 2:
+                    is_givebright = True
 
     if is_paysuite:
+        # Pre-normalize column aliases
+        if "Direct Debit Ref" in df.columns and "Bank Ref" not in df.columns:
+            df["Bank Ref"] = df["Direct Debit Ref"]
+        if "Date Due" in df.columns and "Due" not in df.columns:
+            df["Due"] = df["Date Due"]
+        if "Firstname" in df.columns and "First Name" not in df.columns:
+            df["First Name"] = df["Firstname"]
+        if "Surname" in df.columns and "Last Name" not in df.columns:
+            df["Last Name"] = df["Surname"]
+        if "Post code" in df.columns and "Postcode" not in df.columns:
+            df["Postcode"] = df["Post code"]
+        if "Address" in df.columns and "Billing Address" not in df.columns:
+            df["Billing Address"] = df["Address"]
+
         # Classroom rethink village mapping
         if "Code" in df.columns:
             df["Code"] = df["Code"].astype(str).str.strip().replace({
@@ -1299,16 +1331,14 @@ def _enrich_dataframe(df, platform="auto"):
         # Rename standard columns
         df = df.rename(columns={
             "Bank Ref": "Donation ID",
-            "Firstname": "First Name",
-            "Surname": "Last Name",
-            "Email": "Email",
             "Comments": "Comments",
-            "Address": "Billing Address",
-            "Post code": "Billing Zip",
+            "Billing Address": "Billing Address",
+            "Postcode": "Billing Zip",
         })
 
         if "Amount" in df.columns:
             df["Total Online Donations Net Amount in Settled Currency"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+            df["Total Online Donation Gross Amount in Settled Currency"] = df["Total Online Donations Net Amount in Settled Currency"]
             df["Donation Amount in Project Currency (May be approx.)"] = df["Total Online Donations Net Amount in Settled Currency"]
             df["Donation Amount (in Donation Currency)"] = df["Total Online Donations Net Amount in Settled Currency"]
 
@@ -1316,9 +1346,15 @@ def _enrich_dataframe(df, platform="auto"):
             parsed_dates = pd.to_datetime(df["Date of collection"], dayfirst=True, errors="coerce")
             df["Created Date (UTC)"] = parsed_dates
             df["Created Time (UTC)"] = "00:00:00"
+        elif "Due" in df.columns:
+            parsed_dates = pd.to_datetime(df["Due"], dayfirst=True, errors="coerce")
+            df["Created Date (UTC)"] = parsed_dates
+            df["Created Time (UTC)"] = "00:00:00"
 
         if "Type" in df.columns:
-            df["Payment Frequency"] = df["Type"].apply(lambda t: "Recurring Payment" if str(t).lower() == "regular" else "One-Time Payment")
+            df["Payment Frequency"] = df["Type"].apply(lambda t: "Recurring Payment" if str(t).lower() in ["regular", "recurring"] else "One-Time Payment")
+        else:
+            df["Payment Frequency"] = "Recurring Payment"
 
         df["Platform"] = "Paysuite"
         df["Payment Type"] = "Direct Debit"
@@ -1326,6 +1362,10 @@ def _enrich_dataframe(df, platform="auto"):
         
         df["Campaign Name"] = df["Donation ID"]
         df["Community Name"] = "Paysuite"
+        
+        f_name = df.get("First Name", pd.Series("", index=df.index)).fillna("").astype(str)
+        l_name = df.get("Last Name", pd.Series("", index=df.index)).fillna("").astype(str)
+        df["Display Name"] = (f_name + " " + l_name).str.strip()
 
         # Try to look up existing donor details (Email, Billing Address, Billing Zip) and classifications from database by Bank Ref
         existing_map = {}
@@ -1577,14 +1617,14 @@ def _enrich_dataframe(df, platform="auto"):
         init_classification_db()
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
         try:
-            db_matrix = pd.read_sql_query("SELECT * FROM givebright_classifications", conn)
+            db_matrix = pd.read_sql_query("SELECT * FROM givebright_classifications WHERE LOWER(company_id) = ?", conn, params=(target_cid,))
             rule_dict = {str(r["campaign_name"]).strip().lower(): r for _, r in db_matrix.iterrows()}
         except Exception:
             rule_dict = {}
         finally:
             conn.close()
 
-        for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
+        for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
             if col not in df.columns:
                 df[col] = "Unassigned"
 
@@ -1592,14 +1632,14 @@ def _enrich_dataframe(df, platform="auto"):
             cname_series = df["Campaign Name"].astype(str).str.strip()
             cname_lower = cname_series.str.lower()
 
-            for f in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
+            for f in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
                 mapped_vals = cname_lower.map(lambda c: rule_dict.get(c, {}).get(db_f))
                 valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
                 if valid_mask.any():
                     df.loc[valid_mask, f] = mapped_vals[valid_mask]
 
-            # Seed new GiveBright campaigns into givebright_classifications database in 1 vectorized pass
+            # Seed new GiveBright campaigns into platform_campaign_mappings database in 1 vectorized pass
             unique_cnames = df[["Campaign Name"]].drop_duplicates(subset=["Campaign Name"])
             new_rules = []
             for _, r in unique_cnames.iterrows():
@@ -1607,18 +1647,116 @@ def _enrich_dataframe(df, platform="auto"):
                 cn_l = cn.lower()
                 if cn and cn_l not in ["nan", "none", "n/a", ""] and cn_l not in rule_dict:
                     curl = str(r.get("Campaign URL") or "").strip() if "Campaign URL" in r else ""
-                    new_rules.append((cn, curl, "Unassigned", "Unassigned", "Unassigned", "Unassigned", "Unassigned"))
+                    new_rules.append((target_cid, "givebright", cn, "Unassigned", curl, 1))
 
             if new_rules:
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
                 try:
                     conn.executemany("""
-                        INSERT OR REPLACE INTO givebright_classifications (campaign_name, campaign_url, heading, sub_heading, country, code, zakat_eligibility)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR IGNORE INTO platform_campaign_mappings (company_id, platform, campaign_name, code, campaign_url, is_primary)
+                        VALUES (?, ?, ?, ?, ?, ?)
                     """, new_rules)
                     conn.commit()
                 except Exception as e:
                     print(f"Error seeding new givebright rules: {e}")
+                finally:
+                    conn.close()
+
+    elif is_madinah:
+        df["Platform"] = "Madinah"
+        col_map = {
+            "Invoice ID": "Donation ID",
+            "Campaign": "Campaign Name",
+            "Name": "Display Name",
+            "Email": "Email",
+            "Currency Code": "Donation Currency (DC)",
+            "Amount": "Donation Amount (in Donation Currency)",
+            "Amount (USD)": "Total Online Donation Gross Amount in Settled Currency",
+            "Net Amount (USD)": "Total Online Donations Net Amount in Settled Currency",
+            "Comment": "Comments",
+            "Giving Levels": "Giving Level Title",
+            "Status": "Status",
+        }
+        df.rename(columns=col_map, inplace=True)
+        df["Settlement Currency"] = "USD"
+
+        # Processing Fees = Stripe Fees (USD) + Processing Fees (USD)
+        sf = pd.to_numeric(df.get("Stripe Fees (USD)", 0.0), errors="coerce").fillna(0.0)
+        pf = pd.to_numeric(df.get("Processing Fees (USD)", 0.0), errors="coerce").fillna(0.0)
+        df["Total Processing Fees Paid by CC In Settled Currency"] = sf + pf
+
+        # First Name / Last Name split from Display Name
+        if "Display Name" in df.columns:
+            names = df["Display Name"].fillna("").astype(str).str.strip()
+            df["First Name"] = names.apply(lambda n: n.split(" ")[0] if n else "")
+            df["Last Name"] = names.apply(lambda n: " ".join(n.split(" ")[1:]) if len(n.split(" ")) > 1 else "")
+
+        # UTM / Referral Source
+        utm = df.get("UTM Source", pd.Series("", index=df.index)).fillna("").astype(str)
+        ref = df.get("Referral Token", pd.Series("", index=df.index)).fillna("").astype(str)
+        df["UTM / Referral Source"] = utm.where(utm != "", ref)
+
+        # Payment Frequency from Subscription Type
+        if "Subscription Type" in df.columns:
+            df["Payment Frequency"] = df["Subscription Type"].apply(
+                lambda s: "Recurring Payment" if pd.notna(s) and str(s).strip().lower() in ["recurring", "subscription", "monthly"] else "One-Time Payment"
+            )
+
+        # Parse Date
+        if "Date" in df.columns:
+            parsed = pd.to_datetime(df["Date"], errors="coerce")
+            df["Created Date (UTC)"] = parsed.dt.date.astype(str)
+            df["Created Time (UTC)"] = parsed.dt.time.astype(str)
+            df["_parsed_date"] = parsed.dt.date.astype(str)
+
+        # Vectorized classification rule mapping for Madinah (< 5ms)
+        init_classification_db()
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        try:
+            db_matrix = pd.read_sql_query(
+                "SELECT * FROM madinah_classifications WHERE LOWER(company_id) = ?", conn, params=(target_cid,)
+            )
+            rule_dict = {str(r["campaign_name"]).strip().lower(): r for _, r in db_matrix.iterrows()}
+        except Exception:
+            rule_dict = {}
+        finally:
+            conn.close()
+
+        for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
+            if col not in df.columns:
+                df[col] = "Unassigned"
+
+        if "Campaign Name" in df.columns:
+            cname_series = df["Campaign Name"].astype(str).str.strip()
+            cname_lower = cname_series.str.lower()
+
+            for f in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
+                db_f = f.lower().replace("-", "_").replace(" ", "_")
+                mapped_vals = cname_lower.map(lambda c: rule_dict.get(c, {}).get(db_f))
+                valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
+                if valid_mask.any():
+                    df.loc[valid_mask, f] = mapped_vals[valid_mask]
+
+            # Seed new Madinah campaigns into platform_campaign_mappings in 1 vectorized pass
+            unique_cnames = df[["Campaign Name"]].drop_duplicates(subset=["Campaign Name"])
+            new_rules = []
+            for _, r in unique_cnames.iterrows():
+                cn = str(r["Campaign Name"]).strip()
+                cn_l = cn.lower()
+                if cn and cn_l not in ["nan", "none", "n/a", ""] and cn_l not in rule_dict:
+                    curl = str(r.get("Campaign URL") or "").strip() if "Campaign URL" in r else ""
+                    new_rules.append((target_cid, "madinah", cn, "Unassigned", curl, 1))
+
+            if new_rules:
+                conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+                try:
+                    conn.executemany("""
+                        INSERT OR IGNORE INTO platform_campaign_mappings (company_id, platform, campaign_name, code, campaign_url, is_primary)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, new_rules)
+                    conn.commit()
+                except Exception as e:
+                    print(f"Error seeding new madinah rules: {e}")
                 finally:
                     conn.close()
 
@@ -1735,8 +1873,13 @@ def _enrich_dataframe(df, platform="auto"):
 
     if col_amount in df.columns:
         df[col_amount] = pd.to_numeric(df[col_amount], errors='coerce').fillna(0)
-        ltv_map = df.groupby('Donor ID')[col_amount].sum()
-        df['Total LTV'] = df['Donor ID'].map(ltv_map)
+        if 'Status' in df.columns:
+            succ_mask = ~df['Status'].astype(str).str.lower().isin(['failed', 'cancelled', 'canceled'])
+            valid_amounts = df[col_amount].where(succ_mask, 0.0)
+            ltv_map = valid_amounts.groupby(df['Donor ID']).sum()
+        else:
+            ltv_map = df.groupby('Donor ID')[col_amount].sum()
+        df['Total LTV'] = df['Donor ID'].map(ltv_map).fillna(0.0)
         df['Lifetime Donor Classification'] = df['Total LTV'].apply(classify_donor_amount)
         df['Transaction Donor Classification'] = df[col_amount].apply(classify_donor_amount)
 
@@ -1749,7 +1892,7 @@ def _enrich_dataframe(df, platform="auto"):
     df = deduplicate_dataframe_columns(df)
 
     # --- CLASSIFICATIONS MATRIX LOOKUP BY CAMPAIGN NAME (INDEPENDENT PER PLATFORM) ---
-    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
     for col in target_cols:
         if col not in df.columns:
             df[col] = "Unassigned"
@@ -1760,9 +1903,13 @@ def _enrich_dataframe(df, platform="auto"):
             "rethink_website_classifications" if is_rethink_website else
             "paysuite_classifications" if is_paysuite else
             "givebright_classifications" if is_givebright else
+            "madinah_classifications" if is_madinah else
             "campaign_classifications"
         )
-        db_matrix = pd.read_sql_query(f"SELECT * FROM {tbl_name}", conn)
+        try:
+            db_matrix = pd.read_sql_query(f"SELECT * FROM {tbl_name} WHERE LOWER(company_id) = ?", conn, params=(target_cid,))
+        except Exception:
+            db_matrix = pd.read_sql_query(f"SELECT * FROM {tbl_name}", conn)
         conn.close()
 
         if not db_matrix.empty and "campaign_name" in db_matrix.columns and "Campaign Name" in df.columns:
@@ -1790,10 +1937,10 @@ def _enrich_dataframe(df, platform="auto"):
         print(f"Error mapping campaign classifications matrix: {e}")
 
     # Second Pass: Dynamic auto-assignment based on Code mapping across all platforms (< 5ms)
-    code_map = get_code_to_classification_map()
+    code_map = get_code_to_classification_map(company_id=target_cid)
     if code_map and "Code" in df.columns:
         code_series = df["Code"].astype(str).str.strip().str.lower()
-        for tc in ["Heading", "Sub-Heading", "Country", "Zakat Eligibility"]:
+        for tc in ["Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
             tc_map = {k: v[tc] for k, v in code_map.items() if tc in v and str(v[tc]).lower() not in ["unassigned", "nan", "none", ""]}
             mapped_vals = code_series.map(tc_map)
             curr_unassigned = df[tc].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
@@ -1874,7 +2021,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
         return process_payout_settlement_upload(df, source_name=batch_label, upload_mode=upload_mode)
 
     # Enrich and Auto-Classify New Raw Data
-    df_new = _enrich_dataframe(df, platform=platform)
+    df_new = _enrich_dataframe(df, platform=platform, company_id=target_cid)
     df_new["company_id"] = target_cid
 
     # Sync auto-assigned classifications for new upload batch ONLY (< 10ms)
@@ -1923,6 +2070,13 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
 
     # Invalidate dataset cache so new rows show up instantly
     load_data(force_reload=True)
+
+    # If this is Paysuite data, also sync into paysuite_payout_settlements and payouts cache
+    is_ps_records = False
+    if "Platform" in df_new.columns:
+        is_ps_records = (df_new["Platform"].astype(str).str.lower() == "paysuite").any()
+    if is_ps_records or str(platform).lower() == "paysuite":
+        process_paysuite_payout_settlement_upload(df_new, source_name=batch_label, upload_mode=upload_mode, company_id=target_cid)
 
     return {
         "status": "success",
@@ -2122,6 +2276,158 @@ def process_payout_settlement_upload(df_raw, source_name="LaunchGood Payout.xlsx
         "added": len(df_new),
         "total_records": len(df_save)
     }
+
+def process_paysuite_payout_settlement_upload(df_enriched, source_name="Paysuite Direct Debit", upload_mode="merge", company_id="rethink"):
+    """
+    Constructs and persists Paysuite direct debit settlement records into paysuite_payout_settlements
+    and paysuite_payouts_cache.parquet with strict company_id isolation, and broadcasts real-time updates.
+    """
+    if df_enriched is None or df_enriched.empty:
+        return 0
+
+    target_cid = str(company_id or "rethink").strip().lower()
+    df_ps = pd.DataFrame()
+
+    # 1. Map columns
+    b_ref = df_enriched.get("Donation ID", df_enriched.get("Bank Ref", df_enriched.get("Direct Debit Ref", ""))).fillna("").astype(str).str.strip()
+    df_ps["Donation ID"] = b_ref
+    df_ps["Bank Ref"] = b_ref
+    df_ps["Customer Ref"] = df_enriched.get("Customer Ref", pd.Series("", index=df_enriched.index)).fillna("").astype(str).str.strip()
+
+    f_name = df_enriched.get("First Name", df_enriched.get("Firstname", pd.Series("", index=df_enriched.index))).fillna("").astype(str).str.strip()
+    l_name = df_enriched.get("Last Name", df_enriched.get("Surname", pd.Series("", index=df_enriched.index))).fillna("").astype(str).str.strip()
+    disp_name = (f_name + " " + l_name).str.strip()
+    df_ps["Display Name"] = df_enriched.get("Display Name", disp_name).fillna(disp_name)
+    df_ps["First Name"] = f_name
+    df_ps["Last Name"] = l_name
+    df_ps["Email"] = df_enriched.get("Email", pd.Series("", index=df_enriched.index)).fillna("").astype(str).str.strip()
+    df_ps["Campaign Name"] = b_ref
+    df_ps["Schedule"] = df_enriched.get("Schedule", pd.Series("Direct Debit Collection", index=df_enriched.index)).fillna("Direct Debit Collection")
+    df_ps["Type"] = df_enriched.get("Type", pd.Series("Regular", index=df_enriched.index)).fillna("Regular")
+    df_ps["Transaction Type"] = "donation"
+    df_ps["row_type"] = "donation"
+
+    st = df_enriched.get("Status", df_enriched.get("Paid/Unpaid", pd.Series("Paid", index=df_enriched.index))).fillna("Paid").astype(str).str.capitalize()
+    df_ps["Paid/Unpaid"] = st
+    df_ps["Status"] = st
+    df_ps["Settlement Currency"] = "GBP"
+    df_ps["Project Currency"] = "GBP"
+
+    amt_series = pd.to_numeric(df_enriched.get("Amount", df_enriched.get("Total Online Donations Net Amount in Settled Currency", 0.0)), errors="coerce").fillna(0.0)
+    df_ps["Donation Amount"] = amt_series
+    df_ps["Total Online Donation Gross Amount in Settled Currency"] = amt_series
+    df_ps["Total Processing Fees Paid by CC In Settled Currency"] = 0.0
+    df_ps["Total Online Donations Net Amount in Settled Currency"] = np.where(st == "Paid", amt_series, 0.0)
+
+    # Dates & Batches
+    if "Created Date (UTC)" in df_enriched.columns and df_enriched["Created Date (UTC)"].notna().any():
+        parsed_dt = pd.to_datetime(df_enriched["Created Date (UTC)"], errors="coerce")
+    elif "Date of collection" in df_enriched.columns:
+        parsed_dt = pd.to_datetime(df_enriched["Date of collection"], dayfirst=True, errors="coerce")
+    elif "Due" in df_enriched.columns:
+        parsed_dt = pd.to_datetime(df_enriched["Due"], dayfirst=True, errors="coerce")
+    else:
+        parsed_dt = pd.to_datetime(datetime.date.today())
+
+    df_ps["Created Date (UTC)"] = parsed_dt.dt.strftime('%Y-%m-%d')
+    df_ps["Date of collection"] = df_enriched.get("Date of collection", parsed_dt.dt.strftime('%d/%m/%Y'))
+    df_ps["Due"] = df_enriched.get("Due", df_enriched.get("Date Due", parsed_dt.dt.strftime('%d/%m/%Y')))
+    df_ps["Created Time (UTC)"] = "00:00:00"
+
+    df_ps["Transfer ID"] = parsed_dt.dt.strftime('%Y-%m').fillna("Unknown")
+    df_ps["Batch Label"] = parsed_dt.dt.strftime('%B %Y Collection').fillna("Collection")
+    df_ps["Collection Month"] = parsed_dt.dt.strftime('%B %Y').fillna("Collection")
+
+    df_ps["Platform"] = "Paysuite"
+    df_ps["Source"] = source_name or "Paysuite Direct Debit"
+
+    # Classifications
+    for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
+        df_ps[col] = df_enriched.get(col, pd.Series("Unassigned", index=df_enriched.index)).fillna("Unassigned")
+
+    df_ps["Payment Frequency"] = df_enriched.get("Payment Frequency", pd.Series("Recurring", index=df_enriched.index)).fillna("Recurring")
+    df_ps["Address"] = df_enriched.get("Billing Address", df_enriched.get("Address", pd.Series("", index=df_enriched.index))).fillna("")
+    df_ps["Postcode"] = df_enriched.get("Billing Zip", df_enriched.get("Post code", df_enriched.get("Postcode", pd.Series("", index=df_enriched.index)))).fillna("")
+    df_ps["Phone"] = df_enriched.get("Phone Number", df_enriched.get("Phone", pd.Series("", index=df_enriched.index))).fillna("")
+    df_ps["Comments"] = df_enriched.get("Comments", pd.Series("", index=df_enriched.index)).fillna("")
+    df_ps["company_id"] = target_cid
+
+    # Lookup any missing donor info or classifications from paysuite_classifications view
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
+        ps_matrix = pd.read_sql_query("SELECT * FROM paysuite_classifications WHERE LOWER(company_id) = ?", conn, params=(target_cid,))
+        conn.close()
+        if not ps_matrix.empty:
+            rule_dict = {str(r["campaign_name"]).strip().lower(): r for _, r in ps_matrix.iterrows()}
+            for idx, r in df_ps.iterrows():
+                bkey = str(r["Bank Ref"]).strip().lower()
+                if bkey in rule_dict:
+                    entry = rule_dict[bkey]
+                    if (not r["Email"] or r["Email"] == "None" or r["Email"] == "nan") and entry.get("donor_email"):
+                        df_ps.at[idx, "Email"] = str(entry["donor_email"])
+                    if (not r["Display Name"] or r["Display Name"] == "None" or r["Display Name"] == "nan") and entry.get("donor_name"):
+                        df_ps.at[idx, "Display Name"] = str(entry["donor_name"])
+                    if (r["Code"] == "Unassigned" or not r["Code"]) and entry.get("code"):
+                        df_ps.at[idx, "Code"] = str(entry["code"])
+                    if (r["Heading"] == "Unassigned" or not r["Heading"]) and entry.get("heading"):
+                        df_ps.at[idx, "Heading"] = str(entry["heading"])
+                    if (r["Sub-Heading"] == "Unassigned" or not r["Sub-Heading"]) and entry.get("sub_heading"):
+                        df_ps.at[idx, "Sub-Heading"] = str(entry["sub_heading"])
+                    if (r["Country"] == "Unassigned" or not r["Country"]) and entry.get("country"):
+                        df_ps.at[idx, "Country"] = str(entry["country"])
+                    if (r["Zakat Eligibility"] == "Unassigned" or not r["Zakat Eligibility"]) and entry.get("zakat_eligibility"):
+                        df_ps.at[idx, "Zakat Eligibility"] = str(entry["zakat_eligibility"])
+    except Exception as e:
+        print(f"[Paysuite Rule Overlay Notice]: {e}")
+
+    # 2. Merge with existing paysuite_payout_settlements
+    if upload_mode in ["merge", "append"] and os.path.exists(PAYSUITE_PAYOUTS_PARQUET_PATH):
+        try:
+            existing_ps = pd.read_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH)
+            if existing_ps is not None and not existing_ps.empty:
+                if "company_id" not in existing_ps.columns:
+                    existing_ps["company_id"] = "rethink"
+                other_comp = existing_ps[existing_ps["company_id"].astype(str).str.lower() != target_cid]
+                same_comp = existing_ps[existing_ps["company_id"].astype(str).str.lower() == target_cid]
+
+                df_combined_target = pd.concat([same_comp, df_ps], ignore_index=True)
+                dedup_cols = [c for c in ["Bank Ref", "Date of collection", "Transfer ID"] if c in df_combined_target.columns]
+                if dedup_cols:
+                    df_target_final = df_combined_target.drop_duplicates(subset=dedup_cols, keep="last")
+                else:
+                    df_target_final = df_combined_target
+                df_save = pd.concat([other_comp, df_target_final], ignore_index=True)
+            else:
+                df_save = df_ps
+        except Exception as e:
+            print(f"[Paysuite Payout Merge Notice]: {e}")
+            df_save = df_ps
+    else:
+        df_save = df_ps
+
+    df_save = sanitize_df_dtypes_for_parquet(df_save)
+    df_save.to_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH, index=False)
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    df_save.to_sql("paysuite_payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
+    conn.close()
+
+    invalidate_paysuite_payouts_cache()
+    load_paysuite_payouts_data(force_reload=True)
+    try:
+        from backend.api.payouts import invalidate_payouts_cache
+        invalidate_payouts_cache()
+    except Exception:
+        pass
+
+    try:
+        from backend.api.events import broadcast_event_sync
+        broadcast_event_sync("PAYOUTS_UPDATED", {"source": "upload", "platform": "paysuite", "company_id": target_cid})
+        broadcast_event_sync("DONORS_UPDATED", {"source": "upload", "platform": "paysuite", "company_id": target_cid})
+    except Exception:
+        pass
+
+    return len(df_ps)
 
 def sync_donor_classifications_to_matrix(df_donations, company_id: str = "rethink"):
     """Synchronizes cell edits from donor records back into campaign classification rules for a company."""

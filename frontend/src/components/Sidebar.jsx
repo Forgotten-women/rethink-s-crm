@@ -40,8 +40,8 @@ export default function Sidebar({ filters, onFilterChange, onResetFilters }) {
       .catch(err => console.error('Error loading filter options:', err));
   }, [filters]);
 
-  const selectedSources = filters.source && filters.source !== 'All Sources (Combined)'
-    ? filters.source.split(',').map(s => s.trim())
+  const selectedSources = filters?.source && filters.source !== 'All Sources (Combined)'
+    ? String(filters.source).split(',').map(s => s.trim())
     : [];
 
   const activeFilterSummary = [

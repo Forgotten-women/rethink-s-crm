@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { X, User, DollarSign, Calendar, MapPin, Tag, CreditCard, ShieldCheck, Mail, Phone, Globe, FileText, Gift, CheckCircle, PieChart, Layers } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
-export default function DonorDrawer({ donorId, onClose }) {
+export default function DonorDrawer({ donorId, onClose, activeCompany }) {
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -20,8 +20,12 @@ export default function DonorDrawer({ donorId, onClose }) {
     setLoading(true);
     setError('');
     setHistoryPage(1);
-    fetch(`${API_BASE_URL}/api/donors/profile/${encodeURIComponent(donorId)}`)
-      .then(res => res.json())
+    const compQuery = activeCompany ? `?company_id=${encodeURIComponent(activeCompany)}` : '';
+    fetch(`${API_BASE_URL}/api/donors/profile/${encodeURIComponent(donorId)}${compQuery}`)
+      .then(res => {
+        if (!res.ok) throw new Error('Donor profile not found');
+        return res.json();
+      })
       .then(data => {
         setProfile(data);
         setHistoryTotalRecords(data.total_donations_count || 0);
@@ -36,13 +40,14 @@ export default function DonorDrawer({ donorId, onClose }) {
         setError('Unable to load donor profile. Please try again.');
         setLoading(false);
       });
-  }, [donorId]);
+  }, [donorId, activeCompany]);
 
   // Fetch specific history pages for massive donor accounts
   const fetchHistoryPage = (p, ps) => {
     if (!donorId) return;
     setHistoryLoading(true);
-    fetch(`${API_BASE_URL}/api/donors/history?donor_id=${encodeURIComponent(donorId)}&page=${p}&page_size=${ps}`)
+    const compParam = activeCompany ? `&company_id=${encodeURIComponent(activeCompany)}` : '';
+    fetch(`${API_BASE_URL}/api/donors/history?donor_id=${encodeURIComponent(donorId)}${compParam}&page=${p}&page_size=${ps}`)
       .then(res => res.json())
       .then(data => {
         setHistoryRecords(data.records || []);

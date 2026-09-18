@@ -179,12 +179,12 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
           <button
             onClick={() => toggleDropdown('source')}
             className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition-all hover:bg-slate-50 dark:hover:bg-slate-800/50 ${
-              filters.source !== 'All Sources (Combined)'
+              filters?.source && filters.source !== 'All Sources (Combined)'
                 ? `${actClass} font-bold`
                 : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10'
             }`}
           >
-            <span>Source: {filters.source === 'All Sources (Combined)' ? 'All' : filters.source.split(',').length + ' selected'}</span>
+            <span>Source: {!filters?.source || filters.source === 'All Sources (Combined)' ? 'All' : (String(filters.source).split(',').length + ' selected')}</span>
             <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
           
@@ -197,12 +197,12 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
                 Clear / All Sources
               </button>
               {filterOptions.sources.map(src => {
-                const isSel = filters.source !== 'All Sources (Combined)' && filters.source.split(',').includes(src);
+                const isSel = filters?.source && filters.source !== 'All Sources (Combined)' && String(filters.source).split(',').includes(src);
                 return (
                   <button
                     key={src}
                     onClick={() => {
-                      let selected = filters.source === 'All Sources (Combined)' ? [] : filters.source.split(',');
+                      let selected = (!filters?.source || filters.source === 'All Sources (Combined)') ? [] : String(filters.source).split(',');
                       if (selected.includes(src)) {
                         selected = selected.filter(s => s !== src);
                       } else {

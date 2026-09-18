@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { 
   CreditCard, 
   DollarSign, 
@@ -136,6 +136,83 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   const canEdit = user?.role === 'super_admin' || user?.role === 'admin' || user?.can_edit_donors === 1;
   const currSymbol = '£';
   const isPaysuite = selectedPlatform === 'paysuite';
+
+  // Dynamic Platform Counts per Tenant
+  const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0 });
+
+  // State Refs to ensure zero stale-closure drift on async/event updates
+  const selectedPlatformRef = useRef(selectedPlatform);
+  selectedPlatformRef.current = selectedPlatform;
+  const selectedBatchRef = useRef(selectedBatch);
+  selectedBatchRef.current = selectedBatch;
+  const statusFilterRef = useRef(statusFilter);
+  statusFilterRef.current = statusFilter;
+  const debouncedSearchRef = useRef(debouncedSearch);
+  debouncedSearchRef.current = debouncedSearch;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const donorPageRef = useRef(donorPage);
+  donorPageRef.current = donorPage;
+  const donorPageSizeRef = useRef(donorPageSize);
+  donorPageSizeRef.current = donorPageSize;
+  const activeCompanyRef = useRef(activeCompany);
+  activeCompanyRef.current = activeCompany;
+
+  const fetchPlatformCounts = () => {
+    const companyParam = `&company_id=${encodeURIComponent(activeCompanyRef.current)}`;
+    Promise.all([
+      fetch(`${API_BASE_URL}/api/payouts/summary?platform=launchgood&currency=${currency}${companyParam}`).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/summary?platform=paysuite&currency=${currency}${companyParam}`).then(r => r.ok ? r.json() : {})
+    ]).then(([lgRes, psRes]) => {
+      setPlatformCounts({
+        launchgood: lgRes?.total_transactions || 0,
+        paysuite: psRes?.total_transactions || 0
+      });
+    }).catch(err => console.error('Error fetching platform counts:', err));
+  };
+
+  useEffect(() => {
+    fetchPlatformCounts();
+  }, [activeCompany, currency]);
+
+  // Real-Time WebSocket & Window Focus Listener for Live Sync (Zero-Polling)
+  useEffect(() => {
+    let socket = null;
+
+    try {
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsHost = API_BASE_URL.replace(/^http(s)?:\/\//, '') || window.location.host;
+      const wsUrl = `${wsProtocol}//${wsHost}/ws/events`;
+
+      socket = new WebSocket(wsUrl);
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if ([
+            'PAYOUTS_UPDATED', 'DONORS_UPDATED', 'DONOR_RECORD_UPDATED',
+            'BULK_DONORS_UPDATED', 'MATRIX_UPDATED'
+          ].includes(payload?.event)) {
+            fetchPlatformCounts();
+            fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current);
+            if (activeTabRef.current === 'donors') {
+              fetchDonorsData(debouncedSearchRef.current, selectedBatchRef.current, donorPageRef.current, donorPageSizeRef.current, selectedPlatformRef.current, statusFilterRef.current);
+            }
+          }
+        } catch (e) {}
+      };
+    } catch (e) {}
+
+    const handleFocus = () => {
+      fetchPlatformCounts();
+      fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current);
+    };
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      if (socket) socket.close();
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, []);
 
   // Load Code Map on Mount
   useEffect(() => {
@@ -576,7 +653,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               <span className={`text-[10px] px-1.5 py-0.2 rounded-md font-mono font-black ${
                 !isPaysuite ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
               }`}>
-                8,761
+                {platformCounts.launchgood.toLocaleString()}
               </span>
             </button>
 
@@ -600,7 +677,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               <span className={`text-[10px] px-1.5 py-0.2 rounded-md font-mono font-black ${
                 isPaysuite ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
               }`}>
-                1,480
+                {platformCounts.paysuite.toLocaleString()}
               </span>
             </button>
           </div>
@@ -642,6 +719,23 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           </button>
         </div>
       </div>
+
+      {/* Notice for tenants with no payout settlement files uploaded */}
+      {activeCompany === 'iqra' && summary.total_transactions === 0 && !loading && (
+        <div className="p-4 rounded-2xl bg-indigo-900/30 border border-indigo-500/30 text-indigo-200 text-xs shadow-lg backdrop-blur-md flex items-center justify-between gap-3 animate-fade-in">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-indigo-500/20 text-indigo-400 shrink-0">
+              <Zap className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="font-bold text-white text-xs">No Payout Settlements Uploaded for Iqra</div>
+              <p className="text-slate-300 text-[11px] mt-0.5">
+                Iqra donor data is currently active for <b>GiveBrite</b> (14,092 records) and <b>Madinah</b> (16,700 records). Payout reconciliation batches will populate here once settlement reports for Iqra are uploaded.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Batch & Status Filters Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm">
@@ -883,7 +977,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             }`}
           >
             <Users className="w-3.5 h-3.5" />
-            <span>Donor Level Breakdown ({donorsData.total_records > 0 ? donorsData.total_records.toLocaleString() : (summary.total_transactions ? summary.total_transactions.toLocaleString() : (isPaysuite ? '1,480' : '8,761'))})</span>
+            <span>Donor Level Breakdown ({donorsData.total_records > 0 ? donorsData.total_records.toLocaleString() : (summary.total_transactions ? summary.total_transactions.toLocaleString() : '0')})</span>
           </button>
 
           <button 

@@ -1073,28 +1073,33 @@ def delete_single_rule(payload: DeleteRuleRequest):
         conn = get_db_connection(timeout=60.0)
         try:
             with conn:
-                if code:
+                if code and code.lower() not in ["", "none", "nan", "unassigned"]:
                     conn.execute(
-                        "DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ? AND LOWER(code) = ?",
+                        "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ? AND LOWER(code) = ?",
                         (comp, plat_db, cname.lower(), code.lower())
+                    )
+                elif payload.community_name and payload.community_name.strip().lower() not in ["", "none", "nan", "n/a", "unassigned"]:
+                    conn.execute(
+                        "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ? AND (LOWER(community_name) = ? OR LOWER(code) IN ('unassigned', ''))",
+                        (comp, plat_db, cname.lower(), payload.community_name.strip().lower())
                     )
                 else:
                     conn.execute(
-                        "DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ?",
+                        "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ?",
                         (comp, plat_db, cname.lower())
                     )
 
                 # Reset matching donations in DB for this company
                 sql_update = """
                     UPDATE donations 
-                    SET department='Unassigned', office='Unassigned', portfolio='', 
-                        heading='Unassigned', sub_heading='Unassigned', country='Unassigned', 
-                        code='Unassigned', zakat_eligibility='Unassigned' 
-                    WHERE company_id = ? AND LOWER(campaign_name) = ?
+                    SET "Department"='Unassigned', "Office"='Unassigned', "Portfolio"='', 
+                        "Heading"='Unassigned', "Sub-Heading"='Unassigned', "Country"='Unassigned', 
+                        "Code"='Unassigned', "Zakat Eligibility"='Unassigned' 
+                    WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER("Campaign Name") = ?
                 """
                 params = [comp, cname.lower()]
-                if code:
-                    sql_update += " AND LOWER(code) = ?"
+                if code and code.lower() not in ["", "none", "nan", "unassigned"]:
+                    sql_update += " AND LOWER(\"Code\") = ?"
                     params.append(code.lower())
                 conn.execute(sql_update, tuple(params))
         finally:
@@ -1109,7 +1114,7 @@ def delete_single_rule(payload: DeleteRuleRequest):
                 mask = df["Campaign Name"].astype(str).str.strip().str.lower() == cname.lower()
                 if comp_col:
                     mask = mask & (df[comp_col].astype(str).str.strip().str.lower() == comp)
-                if code and "Code" in df.columns:
+                if code and code.lower() not in ["", "none", "nan", "unassigned"] and "Code" in df.columns:
                     mask = mask & (df["Code"].astype(str).str.strip().str.lower() == code.lower())
                 if payload.community_name and "Community Name" in df.columns:
                     mask = mask & (df["Community Name"].astype(str).str.strip().str.lower() == payload.community_name.strip().lower())
@@ -1160,13 +1165,13 @@ def clear_platform_rules(payload: ClearPlatformRequest):
         conn = get_db_connection(timeout=30.0)
         try:
             with conn:
-                conn.execute("DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ?;", (comp, plat_db))
+                conn.execute("DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ?;", (comp, plat_db))
                 conn.execute("""
                     UPDATE donations 
-                    SET department='Unassigned', office='Unassigned', portfolio='', 
-                        heading='Unassigned', sub_heading='Unassigned', country='Unassigned', 
-                        code='Unassigned', zakat_eligibility='Unassigned' 
-                    WHERE company_id = ? AND LOWER(platform) = ?
+                    SET "Department"='Unassigned', "Office"='Unassigned', "Portfolio"='', 
+                        "Heading"='Unassigned', "Sub-Heading"='Unassigned', "Country"='Unassigned', 
+                        "Code"='Unassigned', "Zakat Eligibility"='Unassigned' 
+                    WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER("Platform") = ?
                 """, (comp, plat_db))
         finally:
             conn.close()

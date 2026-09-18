@@ -6,6 +6,32 @@ import {
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
+const COLOR_NAME_TO_HEX = {
+  emerald: '#10B981',
+  cyan: '#06B6D4',
+  purple: '#8B5CF6',
+  indigo: '#6366F1',
+  pink: '#EC4899',
+  amber: '#F59E0B',
+  orange: '#F97316',
+  blue: '#3B82F6',
+  teal: '#14B8A6',
+  rose: '#F43F5E'
+};
+
+function toValidHex(colorVal) {
+  if (!colorVal || typeof colorVal !== 'string') return '#06B6D4';
+  const c = colorVal.trim().toLowerCase();
+  if (COLOR_NAME_TO_HEX[c]) return COLOR_NAME_TO_HEX[c];
+  if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c)) {
+    if (c.length === 4) {
+      return `#${c[1]}${c[1]}${c[2]}${c[2]}${c[3]}${c[3]}`;
+    }
+    return c;
+  }
+  return '#06B6D4';
+}
+
 export default function AdminView({ user, onDataChange, activeCompany = 'rethink', companies = [], onCompaniesChange }) {
   const [status, setStatus] = useState(null);
   const [tags, setTags] = useState([]);
@@ -264,9 +290,10 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     const formData = new FormData();
     formData.append('file', logoFile);
+    formData.append('user_role', user?.role || 'super_admin');
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/companies/${uploadLogoModal.companyId}/logo?user_role=${encodeURIComponent(user?.role)}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/companies/${uploadLogoModal.companyId}/logo?user_role=${encodeURIComponent(user?.role || 'super_admin')}`, {
         method: 'POST',
         body: formData
       });
@@ -281,7 +308,10 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
         if (onCompaniesChange) onCompaniesChange();
         if (onDataChange) onDataChange();
       } else {
-        setCompanyMsg(`❌ ${data?.detail || 'Failed to upload brand logo.'}`);
+        const errorDetail = Array.isArray(data?.detail)
+          ? data.detail.map(d => d.msg || JSON.stringify(d)).join(', ')
+          : (typeof data?.detail === 'object' && data?.detail !== null ? JSON.stringify(data.detail) : (data?.detail || data?.message || 'Failed to upload brand logo.'));
+        setCompanyMsg(`❌ ${errorDetail}`);
       }
     } catch (err) {
       setUploadingLogo(false);
@@ -1195,7 +1225,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
                   <div className="flex items-center gap-2">
                     <input
                       type="color"
-                      value={companyModal.data.accent_color || '#06B6D4'}
+                      value={toValidHex(companyModal.data.accent_color)}
                       onChange={e => setCompanyModal({
                         ...companyModal,
                         data: { ...companyModal.data, accent_color: e.target.value }

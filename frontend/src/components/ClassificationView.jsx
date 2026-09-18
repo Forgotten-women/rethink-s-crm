@@ -57,7 +57,7 @@ function cleanText(val) {
 export default function ClassificationView({ user, activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
   // Enforce company platform partitioning
-  // Iqra: GiveBrite, Madinah, Master
+  // Iqra: LaunchGood, GiveBrite, Madinah, Master
   // Rethink: LaunchGood, GiveBright, Paysuite, Website, Master
   const isIqra = activeCompany === 'iqra';
 
@@ -65,7 +65,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   const [platform, setPlatform] = useState(() => {
     const saved = localStorage.getItem('selected_classification_platform');
     if (activeCompany === 'iqra') {
-      return ['master', 'givebright', 'madinah'].includes(saved) ? saved : 'givebright';
+      return ['master', 'launchgood', 'givebright', 'madinah'].includes(saved) ? saved : 'launchgood';
     }
     return ['master', 'launchgood', 'givebright', 'paysuite', 'website'].includes(saved) ? saved : 'launchgood';
   });
@@ -89,8 +89,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   // Ensure active platform matches active company
   useEffect(() => {
     if (activeCompany === 'iqra') {
-      if (!['master', 'givebright', 'madinah'].includes(platform)) {
-        handleSelectPlatform('givebright');
+      if (!['master', 'launchgood', 'givebright', 'madinah'].includes(platform)) {
+        handleSelectPlatform('launchgood');
       }
     } else if (activeCompany === 'rethink') {
       if (!['master', 'launchgood', 'givebright', 'paysuite', 'website'].includes(platform)) {
@@ -1181,26 +1181,24 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           )}
         </button>
 
-        {/* LaunchGood Tab (Rethink & Consolidated only) */}
-        {!isIqra && (
-          <button 
-            onClick={() => handleSelectPlatform('launchgood')}
-            className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
-              platform === 'launchgood'
-                ? 'bg-gradient-to-r from-teal-600 to-cyan-600 text-white shadow-md shadow-cyan-500/30 border border-cyan-400 ring-2 ring-cyan-400/40'
-                : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
-            }`}
-          >
-            <Zap className={`w-4 h-4 ${platform === 'launchgood' ? 'text-white' : 'text-teal-600 dark:text-cyan-400'}`} />
-            <span className="font-bold">LaunchGood Matrix</span>
-            {platform === 'launchgood' && (
-              <span className="flex h-2.5 w-2.5 relative ml-1">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
-              </span>
-            )}
-          </button>
-        )}
+        {/* LaunchGood Tab (Available for all companies) */}
+        <button 
+          onClick={() => handleSelectPlatform('launchgood')}
+          className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
+            platform === 'launchgood'
+              ? 'bg-gradient-to-r from-teal-600 to-cyan-600 text-white shadow-md shadow-cyan-500/30 border border-cyan-400 ring-2 ring-cyan-400/40'
+              : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
+          }`}
+        >
+          <Zap className={`w-4 h-4 ${platform === 'launchgood' ? 'text-white' : 'text-teal-600 dark:text-cyan-400'}`} />
+          <span className="font-bold">LaunchGood Matrix</span>
+          {platform === 'launchgood' && (
+            <span className="flex h-2.5 w-2.5 relative ml-1">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
+            </span>
+          )}
+        </button>
 
         {/* GiveBright Tab (Both Rethink & Iqra) */}
         <button 

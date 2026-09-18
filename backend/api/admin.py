@@ -354,9 +354,15 @@ def upsert_company_endpoint(payload: CompanyUpsertRequest):
 
 
 @router.post("/companies/{company_id}/logo")
-def upload_company_logo_endpoint(company_id: str, user_role: str = Form(...), file: UploadFile = File(...)):
+def upload_company_logo_endpoint(
+    company_id: str, 
+    user_role: Optional[str] = Form(None),
+    role_query: Optional[str] = Query(None, alias="user_role"),
+    file: UploadFile = File(...)
+):
     """Allows Super Admins to upload a custom brand logo image for a company."""
-    if user_role != "super_admin":
+    eff_role = str(user_role or role_query or "").strip().lower()
+    if eff_role != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Uploading company brand logos is restricted to Super Admin accounts."

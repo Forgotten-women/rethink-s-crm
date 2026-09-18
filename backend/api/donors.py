@@ -1024,14 +1024,20 @@ def _get_donor_matching_mask(df: pd.DataFrame, donor_id_or_email: str) -> pd.Ser
 
 
 @router.get("/profile/{donor_id_or_email:path}")
-def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Query("rethink")):
+def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Query(None)):
     """Returns complete 360° Donor Profile payload with all donor details, dual classifications, and full transaction history."""
-    df = load_data(company_id=company_id)
-    if df.empty:
-        raise HTTPException(status_code=404, detail="Donor dataset is empty.")
+    comp = str(company_id or "").strip().lower()
+    df = load_data(company_id=comp if comp and comp != "all" else None)
+    match_mask = _get_donor_matching_mask(df, donor_id_or_email) if not df.empty else pd.Series(False, index=df.index)
+    donor_txns = df.loc[match_mask] if not df.empty else pd.DataFrame()
 
-    match_mask = _get_donor_matching_mask(df, donor_id_or_email)
-    donor_txns = df.loc[match_mask]
+    if donor_txns.empty:
+        df_all = load_data(company_id="all")
+        if not df_all.empty:
+            match_mask_all = _get_donor_matching_mask(df_all, donor_id_or_email)
+            donor_txns = df_all.loc[match_mask_all]
+            df = df_all
+
     if donor_txns.empty:
         raise HTTPException(status_code=404, detail=f"Donor '{donor_id_or_email}' not found.")
 
@@ -1136,15 +1142,21 @@ def get_donor_history_paginated(
     donor_id: str = Query(...),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
-    company_id: Optional[str] = Query("rethink")
+    company_id: Optional[str] = Query(None)
 ):
     """Paginated transaction history for a donor to handle large transaction counts smoothly."""
-    df = load_data(company_id=company_id)
-    if df.empty:
-        raise HTTPException(status_code=404, detail="Donor dataset is empty.")
+    comp = str(company_id or "").strip().lower()
+    df = load_data(company_id=comp if comp and comp != "all" else None)
+    match_mask = _get_donor_matching_mask(df, donor_id) if not df.empty else pd.Series(False, index=df.index)
+    donor_txns = df.loc[match_mask] if not df.empty else pd.DataFrame()
 
-    match_mask = _get_donor_matching_mask(df, donor_id)
-    donor_txns = df.loc[match_mask]
+    if donor_txns.empty:
+        df_all = load_data(company_id="all")
+        if not df_all.empty:
+            match_mask_all = _get_donor_matching_mask(df_all, donor_id)
+            donor_txns = df_all.loc[match_mask_all]
+            df = df_all
+
     if donor_txns.empty:
         return {"total_records": 0, "page": 1, "page_size": page_size, "total_pages": 1, "records": []}
 
