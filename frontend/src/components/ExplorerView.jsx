@@ -5,6 +5,7 @@ import { API_BASE_URL } from '../config';
 const DEFAULT_EXPLORER_COLUMNS = [
   'First Name',
   'Last Name',
+  'Campaign Name',
   'Total Online Donations Net Amount in Settled Currency',
   'Transaction Donor Classification',
   'Lifetime Donor Classification',
@@ -14,13 +15,30 @@ const DEFAULT_EXPLORER_COLUMNS = [
   'Department',
   'Office',
   'Portfolio',
-  'Heading',
-  'Sub-Heading',
   'Country',
   'Code',
   'Old Code',
   'Zakat Eligibility'
 ];
+
+const sanitizeSelectedColumns = (cols = []) => {
+  if (!cols || !Array.isArray(cols) || cols.length === 0) return DEFAULT_EXPLORER_COLUMNS;
+  let clean = [...cols];
+  // Deduplicate Department vs Heading and Office vs Sub-Heading
+  if (clean.includes('Department') && clean.includes('Heading')) {
+    clean = clean.filter(c => c !== 'Heading');
+  }
+  if (clean.includes('Office') && clean.includes('Sub-Heading')) {
+    clean = clean.filter(c => c !== 'Sub-Heading');
+  }
+  if (clean.includes('department') && clean.includes('heading')) {
+    clean = clean.filter(c => c !== 'heading');
+  }
+  if (clean.includes('office') && clean.includes('sub_heading')) {
+    clean = clean.filter(c => c !== 'sub_heading');
+  }
+  return Array.from(new Set(clean));
+};
 
 const COLUMN_ALIASES = {
   'Display Name': 'Donor Name',
@@ -100,7 +118,7 @@ const getStoredColumns = () => {
     if (saved) {
       const parsed = JSON.parse(saved);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
+        return sanitizeSelectedColumns(parsed);
       }
     }
   } catch (e) {
@@ -274,8 +292,9 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
         setData(resData);
         if (resData.available_columns?.length > 0) {
           setSelectedColumns(prev => {
-            let candidate = (prev && prev.length > 0) ? prev : (getStoredColumns() || DEFAULT_EXPLORER_COLUMNS);
-            const valid = candidate.filter(c => resData.available_columns.includes(c));
+            let candidate = (prev && prev.length > 0) ? sanitizeSelectedColumns(prev) : (getStoredColumns() || DEFAULT_EXPLORER_COLUMNS);
+            let valid = candidate.filter(c => resData.available_columns.includes(c));
+            valid = sanitizeSelectedColumns(valid);
             if (valid.length > 0) {
               const currentPreset = getStoredPreset();
               if (currentPreset === 'fundraisers') {
@@ -295,7 +314,7 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
               return valid;
             }
             const defaultCols = DEFAULT_EXPLORER_COLUMNS.filter(c => resData.available_columns.includes(c));
-            const fallback = defaultCols.length > 0 ? defaultCols : resData.available_columns.slice(0, 12);
+            const fallback = sanitizeSelectedColumns(defaultCols.length > 0 ? defaultCols : resData.available_columns.slice(0, 12));
             try {
               localStorage.setItem('explorer_selected_columns', JSON.stringify(fallback));
             } catch (e) {}
