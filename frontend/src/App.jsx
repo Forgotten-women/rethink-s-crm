@@ -144,6 +144,7 @@ export default function App() {
   const handleSignOut = () => {
     setUser(null);
     localStorage.removeItem('analytics_user');
+    localStorage.removeItem('analytics_token');
   };
 
   // Auto-restore session from localStorage
@@ -164,7 +165,9 @@ export default function App() {
         setUser(parsed);
 
         // Real-time verification & permission sync with backend
-        fetch(`${API_BASE_URL}/api/auth/me?user_identity=${parsed.email || parsed.username}`)
+        const token = localStorage.getItem('analytics_token');
+        const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+        fetch(`${API_BASE_URL}/api/auth/me?user_identity=${encodeURIComponent(parsed.email || parsed.username)}`, { headers })
           .then(res => {
             if (res.status === 401 || res.status === 404) {
               throw new Error('Invalid user session');
@@ -252,13 +255,16 @@ export default function App() {
     setFilters(INITIAL_FILTERS);
   };
 
-  const handleLoginSuccess = (userData) => {
+  const handleLoginSuccess = (userData, accessToken) => {
     const sessionData = {
       ...userData,
       login_timestamp: Date.now()
     };
     setUser(sessionData);
     localStorage.setItem('analytics_user', JSON.stringify(sessionData));
+    if (accessToken) {
+      localStorage.setItem('analytics_token', accessToken);
+    }
   };
 
   if (!user) {

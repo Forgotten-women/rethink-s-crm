@@ -1,5 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Zap, LogOut, User, Sun, Moon, TrendingUp, Gift, Layers, Euro, ChevronDown, Check, Building2, Globe } from 'lucide-react';
+import { API_BASE_URL } from '../config';
+
+const resolveLogoUrl = (url) => {
+  if (!url) return null;
+  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) return url;
+  const base = (API_BASE_URL || '').replace(/\/+$/, '');
+  const path = url.startsWith('/') ? url : `/${url}`;
+  return base ? `${base}${path}` : path;
+};
 
 export default function Navbar({ 
   user, 
@@ -103,18 +112,27 @@ export default function Navbar({
             <div className="relative w-11 h-11 rounded-2xl bg-white dark:bg-slate-950 flex items-center justify-center text-slate-900 dark:text-white font-black shadow-sm border border-slate-200 dark:border-white/10 overflow-hidden">
               {currentCompany?.logo_url ? (
                 <img 
-                  src={currentCompany.logo_url} 
+                  src={resolveLogoUrl(currentCompany.logo_url)} 
                   alt={currentCompany.name} 
                   className="w-full h-full object-contain p-1 rounded-xl"
-                  onError={(e) => { e.target.style.display = 'none'; }}
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none';
+                    if (e.currentTarget.nextElementSibling) {
+                      e.currentTarget.nextElementSibling.style.display = 'block';
+                    }
+                  }}
                 />
-              ) : activeCompany === 'all' ? (
-                <Globe className={`w-6 h-6 ${tColors.textAccent}`} />
-              ) : (
-                <span className={`text-sm font-black tracking-tight ${tColors.textAccent}`}>
-                  {currentCompany?.short_code?.slice(0, 3).toUpperCase() || 'CRM'}
-                </span>
-              )}
+              ) : null}
+              <span 
+                className={`text-sm font-black tracking-tight ${tColors.textAccent}`}
+                style={{ display: currentCompany?.logo_url ? 'none' : 'block' }}
+              >
+                {activeCompany === 'all' ? (
+                  <Globe className={`w-6 h-6 ${tColors.textAccent}`} />
+                ) : (
+                  currentCompany?.short_code?.slice(0, 3).toUpperCase() || 'CRM'
+                )}
+              </span>
             </div>
           </div>
 
@@ -175,7 +193,7 @@ export default function Navbar({
                         <div className="flex items-center gap-2.5 min-w-0">
                           <div className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-xs font-black shrink-0 overflow-hidden border border-slate-200 dark:border-white/5">
                             {comp.logo_url ? (
-                              <img src={comp.logo_url} alt="" className="w-full h-full object-contain p-0.5" />
+                              <img src={resolveLogoUrl(comp.logo_url)} alt="" className="w-full h-full object-contain p-0.5" onError={(e) => { e.currentTarget.style.display = 'none'; }} />
                             ) : (
                               <Building2 className="w-4 h-4 text-slate-500" />
                             )}

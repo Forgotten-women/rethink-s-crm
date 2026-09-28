@@ -1,8 +1,8 @@
 import io
 import os
 import sqlite3
-from typing import Optional, List
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Query, status
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -17,12 +17,13 @@ from core.data_processor import (
 )
 from core.database import get_cloud_sync_status
 from core.auth import get_all_users, update_user_permissions, edit_user_details
+from backend.api.auth import get_current_user, require_super_admin
 
 router = APIRouter(prefix="/api/admin", tags=["Admin & Database Management"])
 
 
 class CompanyUpsertRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     id: str
     name: str
     short_code: str
@@ -31,7 +32,7 @@ class CompanyUpsertRequest(BaseModel):
 
 
 class UpdateUserPermissionRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     target_email: str
     new_role: str
     can_edit_donors: bool
@@ -42,48 +43,45 @@ class UpdateUserPermissionRequest(BaseModel):
 
 
 class EditUserRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     user_id: int
     email: str
     username: str
-    password: str = None  # Optional reset password
+    password: Optional[str] = None
 
 
 class AssignPresetRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     target_email: str
     preset_name: str  # "super_admin", "admin", "data_editor"
 
 
 class RenameTagRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     old_tag: str
     new_tag: str
 
 
 class DeleteTagRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     tag_name: str
 
 
 class PurgeDataRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     confirm: bool = False
 
 
 @router.get("/users")
-def get_users_list():
+def get_users_list(current_user: Dict[str, Any] = Depends(require_super_admin)):
     return get_all_users()
 
 
 @router.post("/users/permissions")
-def update_user_permission_endpoint(payload: UpdateUserPermissionRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Managing user roles and permissions is restricted to Super Admin accounts."
-        )
-
+def update_user_permission_endpoint(
+    payload: UpdateUserPermissionRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     update_user_permissions(
         payload.target_email,
         payload.new_role,
@@ -97,13 +95,10 @@ def update_user_permission_endpoint(payload: UpdateUserPermissionRequest):
 
 
 @router.post("/users/preset")
-def assign_preset_endpoint(payload: AssignPresetRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Assigning role presets is restricted to Super Admin accounts."
-        )
-
+def assign_preset_endpoint(
+    payload: AssignPresetRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     preset = payload.preset_name.lower()
     if preset == "super_admin":
         role, d, m, t, p = "super_admin", 1, 1, 1, 1
@@ -117,13 +112,10 @@ def assign_preset_endpoint(payload: AssignPresetRequest):
 
 
 @router.post("/users/edit")
-def edit_user_endpoint(payload: EditUserRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Editing user details is restricted to Super Admin accounts."
-        )
-
+def edit_user_endpoint(
+    payload: EditUserRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     if not payload.email.strip() or not payload.username.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -187,13 +179,10 @@ def get_dataset_tags(company_id: Optional[str] = Query(None)):
 
 
 @router.post("/tags/rename")
-def rename_dataset_tag(payload: RenameTagRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Renaming dataset tags is restricted to Super Admin accounts."
-        )
-
+def rename_dataset_tag(
+    payload: RenameTagRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     if not payload.old_tag or not payload.new_tag.strip():
         raise HTTPException(status_code=400, detail="Old tag and new tag name are required.")
 
@@ -205,13 +194,10 @@ def rename_dataset_tag(payload: RenameTagRequest):
 
 
 @router.post("/tags/delete")
-def delete_dataset_tag(payload: DeleteTagRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Deleting dataset batches is restricted to Super Admin accounts."
-        )
-
+def delete_dataset_tag(
+    payload: DeleteTagRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     if not payload.tag_name:
         raise HTTPException(status_code=400, detail="Tag name is required.")
 
@@ -223,13 +209,10 @@ def delete_dataset_tag(payload: DeleteTagRequest):
 
 
 @router.post("/purge")
-def purge_database(payload: PurgeDataRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Purging all database records is restricted to Super Admin accounts."
-        )
-
+def purge_database(
+    payload: PurgeDataRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="Confirmation is required to purge data.")
 
@@ -241,13 +224,10 @@ def purge_database(payload: PurgeDataRequest):
 
 
 @router.post("/purge-payouts")
-def purge_payouts_endpoint(payload: PurgeDataRequest):
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Purging payout data is restricted to Super Admin accounts."
-        )
-
+def purge_payouts_endpoint(
+    payload: PurgeDataRequest,
+    current_user: Dict[str, Any] = Depends(require_super_admin)
+):
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="Confirmation is required to purge payout data.")
 
@@ -260,14 +240,16 @@ def purge_payouts_endpoint(payload: PurgeDataRequest):
 
 @router.post("/upload-data")
 def upload_raw_data_file(
-    user_role: str = Form(...),
+    user_role: Optional[str] = Form("admin"),
     upload_mode: str = Form("merge"),  # "merge" or "replace"
     platform: str = Form("auto"),       # "auto", "launchgood", "givebright", "paysuite", "website"
     company_id: str = Form("rethink"),  # Target company
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Bulk uploads a raw donation dataset (.csv, .xlsx, .xls) for LaunchGood, GiveBright, Paysuite, or Rethink Website."""
-    if user_role not in ["super_admin", "admin", "data_editor"]:
+    role = current_user.get("role", user_role)
+    if role not in ["super_admin", "admin", "data_editor"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Uploading donation datasets requires Data Editor or Admin privileges."

@@ -19,6 +19,7 @@ import {
   Search,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   ChevronsLeft,
   ChevronsRight,
   Filter,
@@ -101,10 +102,34 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
   // 🚀 Fast Client-Side Search & Pagination State
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState('ALL'); // 'ALL', 'CLASSIFIED', 'UNASSIGNED'
+  const [statusFilter, setStatusFilter] = useState('ALL'); // 'ALL', 'SINGLE_CODE', 'MULTI_CODE', 'UNASSIGNED'
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50); // 25, 50, 100, 250, 'All'
   const [jumpPage, setJumpPage] = useState('');
+  
+  // 📂 Collapsible Campaign View State
+  const [expandedCampaigns, setExpandedCampaigns] = useState(() => new Set());
+
+  const toggleExpandCampaign = (campaignName) => {
+    setExpandedCampaigns(prev => {
+      const next = new Set(prev);
+      if (next.has(campaignName)) {
+        next.delete(campaignName);
+      } else {
+        next.add(campaignName);
+      }
+      return next;
+    });
+  };
+
+  const handleExpandAll = (campaignList) => {
+    const multi = new Set((campaignList || []).filter(c => c.is_multi).map(c => c.campaign_name));
+    setExpandedCampaigns(multi);
+  };
+
+  const handleCollapseAll = () => {
+    setExpandedCampaigns(new Set());
+  };
   
   // Importer Modal State
   const [showImportModal, setShowImportModal] = useState(false);
@@ -370,8 +395,9 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       .then(data => {
         let rules = (data.rules || []).map((r, i) => ({
           ...r,
-          _row_id: `${r['Campaign Name'] || r['campaign_name']}__${r['Code'] || r['code'] || i}__${i}`,
+          _row_id: `${r['Campaign Name'] || r['campaign_name']}__${r['Giving Level'] || r['giving_level'] || ''}__${r['Code'] || r['code'] || i}__${i}`,
           'Campaign Name': cleanText(r['Campaign Name']),
+          'Giving Level': cleanText(r['Giving Level'] || r['giving_level'] || ''),
           'Community Name': cleanText(r['Community Name']),
           'Donor Name': cleanText(r['Donor Name'] || r['donor_name'] || ''),
           'Donor Email': cleanText(r['Donor Email'] || r['donor_email'] || ''),
@@ -383,7 +409,9 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           'Country': cleanText(r['Country']),
           'Code': cleanText(r['Code']),
           'Zakat Eligibility': cleanText(r['Zakat Eligibility']),
-          'Campaign URL': r['Campaign URL'] || r['campaign_url'] || ''
+          'Campaign URL': r['Campaign URL'] || r['campaign_url'] || '',
+          'donation_count': r.donation_count || 0,
+          'total_amount': r.total_amount || 0
         }));
 
         setMatrixData({
@@ -565,9 +593,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   const handleDuplicateRule = (rule) => {
     if (!isSuperAdmin) return;
     const cName = rule['Campaign Name'] || rule['campaign_name'];
+    const glName = rule['Giving Level'] || rule['giving_level'] || '';
     const newRule = {
       ...rule,
-      _row_id: `${cName}__new__${Date.now()}`,
+      _row_id: `${cName}__${glName}__new__${Date.now()}`,
+      'Giving Level': glName,
       Code: '',
       Department: 'Unassigned',
       Office: 'Unassigned',
@@ -586,6 +616,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       unassigned_campaigns: prev.unassigned_campaigns + 1,
       rules: [newRule, ...prev.rules]
     }));
+    setExpandedCampaigns(prev => new Set(prev).add(cName));
     setSaveNotification({
       type: 'info',
       title: 'Variant Added',
@@ -626,45 +657,115 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     });
   };
 
-  // Dynamic status counts calculation
-  const { singleCodeCount, multiCodeCount, unassignedCount } = useMemo(() => {
+  // 📂 Group rules by Campaign Name for clean Hierarchical & Collapsible Matrix
+  const groupedCampaigns = useMemo(() => {
+    const rules = matrixData.rules || [];
+    if (platform === 'master') {
+      return rules.map((r, i) => ({
+        campaign_name: r['Code'] || r['code'] || `code_${i}`,
+        'Campaign Name': r['Code'] || r['code'] || `code_${i}`,
+        is_multi: false,
+        variants_count: 1,
+        status: (r['Department'] && r['Department'] !== 'Unassigned') ? 'single_code' : 'unassigned',
+        rules: [r],
+        ...r
+      }));
+    }
+
+    const map = new Map();
+    rules.forEach(r => {
+      const rawName = (r['Campaign Name'] || r['campaign_name'] || '').trim();
+      const name = rawName || 'Unassigned Campaign';
+      if (!map.has(name)) {
+        map.set(name, {
+          campaign_name: name,
+          'Campaign Name': name,
+          'Community Name': r['Community Name'] || r['community_name'] || 'N/A',
+          'Campaign URL': r['Campaign URL'] || r['campaign_url'] || '',
+          'Donor Name': r['Donor Name'] || r['donor_name'] || '',
+          'Donor Email': r['Donor Email'] || r['donor_email'] || '',
+          rules: []
+        });
+      }
+      map.get(name).rules.push(r);
+    });
+
+    const list = [];
+    map.forEach((grp) => {
+      const grpRules = grp.rules;
+      const variantsCount = grpRules.length;
+      const hasUnassigned = grpRules.some(r => !r['Department'] || r['Department'] === 'Unassigned' || !r['Code'] || r['Code'] === 'Unassigned' || r.status === 'unassigned');
+      const isMulti = variantsCount > 1 || grpRules.some(r => r.variants_count > 1 || r.status === 'multi_code');
+      const totalDonations = grpRules.reduce((sum, r) => sum + (Number(r.donation_count) || 0), 0);
+      const totalAmount = grpRules.reduce((sum, r) => sum + (Number(r.total_amount) || 0), 0);
+      const primaryRule = grpRules.find(r => r.is_primary) || grpRules[0];
+      const hasGivingLevels = grpRules.some(r => Boolean(r['Giving Level'] && r['Giving Level'] !== 'Default (General)'));
+
+      let status = 'single_code';
+      if (hasUnassigned) {
+        status = 'unassigned';
+      } else if (isMulti) {
+        status = 'multi_code';
+      }
+
+      list.push({
+        ...grp,
+        is_multi: isMulti,
+        variants_count: variantsCount,
+        has_unassigned: hasUnassigned,
+        status: status,
+        donation_count: totalDonations,
+        total_amount: totalAmount,
+        primaryRule: primaryRule,
+        has_giving_levels: hasGivingLevels
+      });
+    });
+
+    return list;
+  }, [matrixData.rules, platform]);
+
+  // Dynamic status counts calculation based on UNIQUE campaigns
+  const { uniqueCampaignsCount, classifiedCampaignsCount, unassignedCampaignsCount, singleCodeCampaignsCount, multiCodeCampaignsCount } = useMemo(() => {
+    if (platform === 'master') {
+      const len = matrixData.rules?.length || 0;
+      const classified = matrixData.rules?.filter(r => r['Department'] && r['Department'] !== 'Unassigned').length || 0;
+      return {
+        uniqueCampaignsCount: len,
+        classifiedCampaignsCount: classified,
+        unassignedCampaignsCount: len - classified,
+        singleCodeCampaignsCount: len,
+        multiCodeCampaignsCount: 0
+      };
+    }
+
     let single = 0, multi = 0, unassigned = 0;
-    (matrixData.rules || []).forEach(r => {
-      const isUn = !r['Heading'] || r['Heading'] === 'Unassigned' || !r['Code'] || r['Code'] === 'Unassigned';
-      if (isUn) {
+    groupedCampaigns.forEach(c => {
+      if (c.status === 'unassigned') {
         unassigned++;
-      } else if (r.status === 'multi_code' || r.variants_count > 1) {
+      } else if (c.status === 'multi_code') {
         multi++;
       } else {
         single++;
       }
     });
-    return { singleCodeCount: single, multiCodeCount: multi, unassignedCount: unassigned };
-  }, [matrixData.rules]);
+    const total = groupedCampaigns.length;
+    return {
+      uniqueCampaignsCount: total,
+      classifiedCampaignsCount: total - unassigned,
+      unassignedCampaignsCount: unassigned,
+      singleCodeCampaignsCount: single,
+      multiCodeCampaignsCount: multi
+    };
+  }, [groupedCampaigns, matrixData.rules, platform]);
 
-  // 🔍 Filtered Rules Calculation (Status + Live Search)
-  const filteredRules = useMemo(() => {
-    let list = matrixData.rules || [];
-
-    // 1. Status Filter
-    if (statusFilter === 'SINGLE_CODE') {
-      list = list.filter(r => (r.status === 'single_code' || (!r.status && (r.variants_count === 1 || !r.variants_count) && r['Heading'] && r['Heading'] !== 'Unassigned')));
-    } else if (statusFilter === 'MULTI_CODE') {
-      list = list.filter(r => (r.status === 'multi_code' || r.variants_count > 1));
-    } else if (statusFilter === 'UNASSIGNED') {
-      list = list.filter(r => (r.status === 'unassigned' || !r['Heading'] || r['Heading'] === 'Unassigned' || !r['Code'] || r['Code'] === 'Unassigned'));
-    }
-
-    // 2. Search Query Filter
-    if (searchQuery && searchQuery.trim()) {
-      const q = searchQuery.trim().toLowerCase();
-      list = list.filter(r => {
-        return (
-          (r['Campaign Name'] && String(r['Campaign Name']).toLowerCase().includes(q)) ||
-          (r['Community Name'] && String(r['Community Name']).toLowerCase().includes(q)) ||
+  // 🔍 Filtered Campaigns Calculation (Status + Live Search)
+  const filteredCampaigns = useMemo(() => {
+    if (platform === 'master') {
+      let list = matrixData.rules || [];
+      if (searchQuery && searchQuery.trim()) {
+        const q = searchQuery.trim().toLowerCase();
+        list = list.filter(r => (
           (r['Code'] && String(r['Code']).toLowerCase().includes(q)) ||
-          (r['Programme Fund'] && String(r['Programme Fund']).toLowerCase().includes(q)) ||
-          (r['Fund Code'] && String(r['Fund Code']).toLowerCase().includes(q)) ||
           (r['Department'] && String(r['Department']).toLowerCase().includes(q)) ||
           (r['Office'] && String(r['Office']).toLowerCase().includes(q)) ||
           (r['Portfolio'] && String(r['Portfolio']).toLowerCase().includes(q)) ||
@@ -672,27 +773,64 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           (r['Sub-Heading'] && String(r['Sub-Heading']).toLowerCase().includes(q)) ||
           (r['Country'] && String(r['Country']).toLowerCase().includes(q)) ||
           (r['Zakat Eligibility'] && String(r['Zakat Eligibility']).toLowerCase().includes(q)) ||
-          (r['Old Code(s)'] && String(r['Old Code(s)']).toLowerCase().includes(q)) ||
-          (r['Legacy Non-Zakat GL Code'] && String(r['Legacy Non-Zakat GL Code']).toLowerCase().includes(q)) ||
-          (r['Legacy Zakat GL Code'] && String(r['Legacy Zakat GL Code']).toLowerCase().includes(q)) ||
-          (r['Campaign URL'] && String(r['Campaign URL']).toLowerCase().includes(q))
+          (r['Programme Fund'] && String(r['Programme Fund']).toLowerCase().includes(q)) ||
+          (r['Fund Code'] && String(r['Fund Code']).toLowerCase().includes(q))
+        ));
+      }
+      return list.map((r, i) => ({ campaign_name: r['Code'] || `code_${i}`, rules: [r], ...r }));
+    }
+
+    let list = groupedCampaigns;
+
+    // 1. Status Filter
+    if (statusFilter === 'SINGLE_CODE') {
+      list = list.filter(c => c.status === 'single_code');
+    } else if (statusFilter === 'MULTI_CODE') {
+      list = list.filter(c => c.status === 'multi_code');
+    } else if (statusFilter === 'UNASSIGNED') {
+      list = list.filter(c => c.status === 'unassigned');
+    }
+
+    // 2. Search Query Filter
+    if (searchQuery && searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      list = list.filter(c => {
+        const matchCampaign = (
+          (c.campaign_name && c.campaign_name.toLowerCase().includes(q)) ||
+          (c['Community Name'] && String(c['Community Name']).toLowerCase().includes(q)) ||
+          (c['Campaign URL'] && String(c['Campaign URL']).toLowerCase().includes(q)) ||
+          (c['Donor Name'] && String(c['Donor Name']).toLowerCase().includes(q)) ||
+          (c['Donor Email'] && String(c['Donor Email']).toLowerCase().includes(q))
         );
+        if (matchCampaign) return true;
+
+        return c.rules.some(r => (
+          (r['Giving Level'] && String(r['Giving Level']).toLowerCase().includes(q)) ||
+          (r['Code'] && String(r['Code']).toLowerCase().includes(q)) ||
+          (r['Department'] && String(r['Department']).toLowerCase().includes(q)) ||
+          (r['Office'] && String(r['Office']).toLowerCase().includes(q)) ||
+          (r['Portfolio'] && String(r['Portfolio']).toLowerCase().includes(q)) ||
+          (r['Heading'] && String(r['Heading']).toLowerCase().includes(q)) ||
+          (r['Sub-Heading'] && String(r['Sub-Heading']).toLowerCase().includes(q)) ||
+          (r['Country'] && String(r['Country']).toLowerCase().includes(q)) ||
+          (r['Zakat Eligibility'] && String(r['Zakat Eligibility']).toLowerCase().includes(q))
+        ));
       });
     }
 
     return list;
-  }, [matrixData.rules, statusFilter, searchQuery]);
+  }, [groupedCampaigns, statusFilter, searchQuery, platform, matrixData.rules]);
 
-  // 📑 Pagination Bounds & Slices
-  const effectivePageSize = pageSize === 'All' ? Math.max(1, filteredRules.length) : Number(pageSize);
-  const totalPages = Math.max(1, Math.ceil(filteredRules.length / effectivePageSize));
+  // 📑 Pagination Bounds & Slices on Unique Campaigns
+  const effectivePageSize = pageSize === 'All' ? Math.max(1, filteredCampaigns.length) : Number(pageSize);
+  const totalPages = Math.max(1, Math.ceil(filteredCampaigns.length / effectivePageSize));
   const safePage = Math.min(Math.max(1, currentPage), totalPages);
 
-  const paginatedRules = useMemo(() => {
-    if (pageSize === 'All') return filteredRules;
+  const paginatedCampaigns = useMemo(() => {
+    if (pageSize === 'All') return filteredCampaigns;
     const start = (safePage - 1) * effectivePageSize;
-    return filteredRules.slice(start, start + effectivePageSize);
-  }, [filteredRules, safePage, effectivePageSize, pageSize]);
+    return filteredCampaigns.slice(start, start + effectivePageSize);
+  }, [filteredCampaigns, safePage, effectivePageSize, pageSize]);
 
   const handleSave = async () => {
     if (!isSuperAdmin) return;
@@ -765,7 +903,9 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     }
     const cName = rule['Campaign Name'] || rule['campaign_name'];
     const cCode = rule['Code'] || rule['code'] || '';
-    if (!window.confirm(`Are you sure you want to delete the classification rule for "${cName}" (Code: ${cCode || 'Unassigned'})?\n\nMatching donor records will be reset to Unassigned.`)) {
+    const cGivingLevel = rule['Giving Level'] || rule['giving_level'] || '';
+    const glLabel = cGivingLevel ? ` (Giving Level: "${cGivingLevel}")` : '';
+    if (!window.confirm(`Are you sure you want to delete the classification rule for "${cName}"${glLabel} (Code: ${cCode || 'Unassigned'})?\n\nMatching donor records will be reset to Unassigned.`)) {
       return;
     }
 
@@ -778,6 +918,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           platform: platform,
           company_id: activeCompany,
           campaign_name: cName,
+          giving_level: cGivingLevel,
           code: cCode || null,
           community_name: rule['Community Name'] || rule['community_name'] || null
         })
@@ -794,7 +935,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           const filtered = prev.rules.filter(r => {
             const matchName = (r['Campaign Name'] || r['campaign_name']) === cName;
             const matchCode = (r['Code'] || r['code'] || '') === cCode;
-            return !(matchName && matchCode);
+            const matchGL = (r['Giving Level'] || r['giving_level'] || '') === cGivingLevel;
+            return !(matchName && matchCode && matchGL);
           });
           return {
             ...prev,
@@ -1367,19 +1509,19 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'paysuite' ? 'Total Tracked Direct Debits' : 'Unique Tracked Campaigns'}
             </div>
-            <div className="text-2xl font-black text-slate-900 dark:text-white mt-1">{matrixData.total_campaigns?.toLocaleString()}</div>
+            <div className="text-2xl font-black text-slate-900 dark:text-white mt-1">{uniqueCampaignsCount.toLocaleString()}</div>
           </div>
           <div className="glass-panel p-4 border-l-4 border-emerald-500 dark:border-emerald-400">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'paysuite' ? 'Fully Classified Debits' : 'Fully Classified Campaigns'}
             </div>
-            <div className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{matrixData.classified_campaigns?.toLocaleString()}</div>
+            <div className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{classifiedCampaignsCount.toLocaleString()}</div>
           </div>
           <div className="glass-panel p-4 border-l-4 border-amber-500 dark:border-amber-400">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'paysuite' ? 'Unassigned Debits' : 'Unassigned Campaigns'}
             </div>
-            <div className="text-2xl font-black text-amber-600 dark:text-amber-400 mt-1">{matrixData.unassigned_campaigns?.toLocaleString()}</div>
+            <div className="text-2xl font-black text-amber-600 dark:text-amber-400 mt-1">{unassignedCampaignsCount.toLocaleString()}</div>
           </div>
         </div>
       )}
@@ -1393,7 +1535,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             type="text"
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            placeholder={`Search ${matrixData.total_campaigns?.toLocaleString() || 0} ${platform} rules (Name, Code, Country)...`}
+            placeholder={`Search ${uniqueCampaignsCount.toLocaleString()} unique ${platform} campaigns (Name, Giving Level, Code)...`}
             className="w-full pl-9 pr-8 py-2 rounded-xl text-xs border focus:outline-none focus:border-cyan-500 transition-all font-medium"
             style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', borderColor: 'var(--input-border)' }}
           />
@@ -1418,7 +1560,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
             }`}
           >
-            All ({matrixData.rules?.length?.toLocaleString() || 0})
+            All ({uniqueCampaignsCount.toLocaleString()})
           </button>
           <button
             onClick={() => setStatusFilter('SINGLE_CODE')}
@@ -1429,7 +1571,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             }`}
           >
             <span>🟢 Single Code</span>
-            <span className="opacity-80">({singleCodeCount.toLocaleString()})</span>
+            <span className="opacity-80">({singleCodeCampaignsCount.toLocaleString()})</span>
           </button>
           <button
             onClick={() => setStatusFilter('MULTI_CODE')}
@@ -1440,7 +1582,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             }`}
           >
             <span>🟡 Multi-Code Splits</span>
-            <span className="opacity-80">({multiCodeCount.toLocaleString()})</span>
+            <span className="opacity-80">({multiCodeCampaignsCount.toLocaleString()})</span>
           </button>
           <button
             onClick={() => setStatusFilter('UNASSIGNED')}
@@ -1451,24 +1593,50 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             }`}
           >
             <span>🔴 Unassigned</span>
-            <span className="opacity-80">({unassignedCount.toLocaleString()})</span>
+            <span className="opacity-80">({unassignedCampaignsCount.toLocaleString()})</span>
           </button>
         </div>
 
-        {/* Rows Per Page Selector */}
+        {/* Expand / Collapse & Rows Per Page Controls */}
         <div className="flex items-center gap-2">
-          <span className="text-xs font-bold text-slate-500 dark:text-slate-400">Rows per page:</span>
-          <select
-            value={pageSize}
-            onChange={e => setPageSize(e.target.value === 'All' ? 'All' : Number(e.target.value))}
-            className="border rounded-xl px-2.5 py-1.5 text-xs font-bold focus:outline-none focus:border-cyan-500 transition-all cursor-pointer"
-            style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', borderColor: 'var(--input-border)' }}
-          >
-            <option value={25}>25</option>
-            <option value={50}>50</option>
-            <option value={100}>100</option>
-            <option value={250}>250</option>
-          </select>
+          {platform !== 'master' && (
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => handleExpandAll(filteredCampaigns)}
+                className="px-2.5 py-1.5 rounded-xl text-xs font-bold text-cyan-700 dark:text-cyan-300 bg-cyan-50 dark:bg-cyan-950/50 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 border border-cyan-300/40 transition-all cursor-pointer flex items-center gap-1"
+                title="Expand all multi-variant campaigns"
+              >
+                <ChevronDown className="w-3.5 h-3.5" />
+                <span>Expand All</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleCollapseAll}
+                className="px-2.5 py-1.5 rounded-xl text-xs font-bold text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800/60 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-white/10 transition-all cursor-pointer flex items-center gap-1"
+                title="Collapse all multi-variant campaigns"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+                <span>Collapse All</span>
+              </button>
+            </div>
+          )}
+
+          <div className="flex items-center gap-1.5 ml-1">
+            <span className="text-xs font-bold text-slate-500 dark:text-slate-400">Rows:</span>
+            <select
+              value={pageSize}
+              onChange={e => setPageSize(e.target.value === 'All' ? 'All' : Number(e.target.value))}
+              className="border rounded-xl px-2.5 py-1.5 text-xs font-bold focus:outline-none focus:border-cyan-500 transition-all cursor-pointer"
+              style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', borderColor: 'var(--input-border)' }}
+            >
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={250}>250</option>
+              <option value="All">All</option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -1506,14 +1674,14 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                   </tr>
                 </thead>
                 <tbody>
-                  {paginatedRules.length === 0 ? (
+                  {paginatedCampaigns.length === 0 ? (
                     <tr>
                       <td colSpan={14} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No master project codes match the active search.
                       </td>
                     </tr>
                   ) : (
-                    paginatedRules.map((r, idx) => (
+                    paginatedCampaigns.map((r, idx) => (
                       <tr key={r._row_id || idx} className="hover:bg-slate-50 dark:hover:bg-emerald-500/5 transition-colors border-b border-slate-200 dark:border-white/5">
                         <td className="py-3 px-3 w-36">
                           <span className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-400 px-2.5 py-1 bg-emerald-100/60 dark:bg-emerald-950/60 rounded-lg border border-emerald-400/40 shadow-xs">
@@ -1663,6 +1831,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                       </>
                     )}
 
+                    {/* Giving Level / Option Column */}
+                    {platform !== 'paysuite' && (
+                      <th className="min-w-[180px] text-left">Giving Level / Option</th>
+                    )}
+
                     {/* LaunchGood & GiveBright: Campaign URL Column */}
                     {platform !== 'paysuite' && (
                       <th className="w-28 text-center">Campaign URL</th>
@@ -1683,197 +1856,553 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                   </tr>
                 </thead>
                 <tbody>
-                  {paginatedRules.length === 0 ? (
+                  {paginatedCampaigns.length === 0 ? (
                     <tr>
-                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'madinah' ? 8 : 9} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'madinah' ? 9 : 10} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No classification rules match the active search or status filter.
                       </td>
                     </tr>
                   ) : (
-                    paginatedRules.map((r, idx) => {
-                      const rowUniqueKey = r._row_id || `${r['Campaign Name'] || r['campaign_name']}__${idx}`;
-                      const isMulti = r.variants_count > 1 || r.status === 'multi_code';
-                      return (
-                        <tr key={rowUniqueKey} className="hover:bg-slate-50 dark:hover:bg-cyan-500/5 transition-colors border-b border-slate-200 dark:border-white/5">
-                          {/* Campaign Name */}
-                          <td className="font-bold text-slate-800 dark:text-slate-100 text-xs py-2.5 px-3 min-w-[220px] max-w-[300px]" title={r['Campaign Name']}>
-                            <div className="truncate font-bold text-slate-900 dark:text-slate-100">{r['Campaign Name']}</div>
-                            {isMulti && (
-                              <div className="flex items-center gap-1.5 mt-1">
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-400/40 shadow-xs">
-                                  🟡 {r.variants_count} Code Variants
-                                </span>
-                                {r.is_primary && (
-                                  <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[9px] font-extrabold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-400/40">
-                                    ⭐ Primary
-                                  </span>
-                                )}
-                              </div>
+                    paginatedCampaigns.map((c, cIdx) => {
+                      const isMulti = c.is_multi;
+                      const isExpanded = expandedCampaigns.has(c.campaign_name);
+                      const isSingle = c.rules.length === 1;
+                      const singleRule = c.rules[0] || {};
+                      const parentKey = `parent_${c.campaign_name}__${cIdx}`;
+
+                      if (isSingle) {
+                        // 🟢 Single-Variant Campaign Row (Compact, directly editable)
+                        const r = singleRule;
+                        const rowUniqueKey = r._row_id || `${c.campaign_name}__single__${cIdx}`;
+                        return (
+                          <tr key={rowUniqueKey} className="hover:bg-slate-50 dark:hover:bg-cyan-500/5 transition-colors border-b border-slate-200 dark:border-white/5">
+                            {/* Campaign Name */}
+                            <td className="font-bold text-slate-800 dark:text-slate-100 text-xs py-2.5 px-3 min-w-[220px] max-w-[300px]" title={c.campaign_name}>
+                              <div className="truncate font-bold text-slate-900 dark:text-slate-100">{c.campaign_name}</div>
+                            </td>
+
+                            {/* Paysuite: Donor Name and Email */}
+                            {platform === 'paysuite' && (
+                              <>
+                                <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[120px] max-w-[150px]" title={r['Donor Name']}>
+                                  <div className="truncate font-medium">{r['Donor Name'] || 'N/A'}</div>
+                                </td>
+                                <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[150px] max-w-[200px]" title={r['Donor Email']}>
+                                  <div className="truncate font-medium">{r['Donor Email'] || 'N/A'}</div>
+                                </td>
+                              </>
                             )}
-                          </td>
 
-                          {/* Paysuite: Donor Name and Email */}
-                          {platform === 'paysuite' && (
-                            <>
-                              <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[120px] max-w-[150px]" title={r['Donor Name']}>
-                                <div className="truncate font-medium">{r['Donor Name'] || 'N/A'}</div>
+                            {/* Giving Level / Option Cell */}
+                            {platform !== 'paysuite' && (
+                              <td className="text-slate-700 dark:text-slate-300 text-xs py-2.5 px-3 min-w-[180px] max-w-[240px]">
+                                {r['Giving Level'] ? (
+                                  <div className="flex flex-col gap-1">
+                                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-bold bg-indigo-50 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300 border border-indigo-300/40 shadow-xs truncate max-w-[220px]" title={r['Giving Level']}>
+                                      🎁 {r['Giving Level']}
+                                    </span>
+                                    {(r.donation_count > 0 || r.total_amount > 0) && (
+                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                        {r.donation_count || 0} donors • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <div className="flex flex-col gap-1">
+                                    <span className="text-slate-400 dark:text-slate-500 text-[11px] italic font-medium">
+                                      Default (General)
+                                    </span>
+                                    {(r.donation_count > 0 || r.total_amount > 0) && (
+                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                        {r.donation_count || 0} donors • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
                               </td>
-                              <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[150px] max-w-[200px]" title={r['Donor Email']}>
-                                <div className="truncate font-medium">{r['Donor Email'] || 'N/A'}</div>
+                            )}
+
+                            {/* Clickable Campaign URL Cell */}
+                            {platform !== 'paysuite' && (
+                              <td className="py-2 px-2 text-center w-28">
+                                {r['Campaign URL'] && r['Campaign URL'] !== '' && r['Campaign URL'] !== 'Unassigned' && r['Campaign URL'] !== 'None' ? (
+                                  <a 
+                                    href={r['Campaign URL'].startsWith('http') ? r['Campaign URL'] : `https://${r['Campaign URL']}`} 
+                                    target="_blank" 
+                                    rel="noreferrer" 
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 bg-cyan-100 text-cyan-800 dark:bg-cyan-500/10 dark:text-cyan-400 hover:bg-cyan-200 dark:hover:bg-cyan-500/20 border border-cyan-300 dark:border-cyan-500/30 rounded-lg text-[11px] font-bold transition-all max-w-[110px] truncate shadow-sm"
+                                    title={r['Campaign URL']}
+                                  >
+                                    <ExternalLink className="w-3 h-3 shrink-0" />
+                                    <span className="truncate">Open Link</span>
+                                  </a>
+                                ) : (
+                                  <input
+                                    type="text"
+                                    disabled={!isSuperAdmin}
+                                    value={r['Campaign URL'] || ''}
+                                    onChange={e => handleCellChange(r._row_id, 'Campaign URL', e.target.value)}
+                                    placeholder="Paste URL..."
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-24 focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
+                                    title="Paste or edit campaign URL"
+                                  />
+                                )}
                               </td>
-                            </>
-                          )}
+                            )}
 
-                          {/* Clickable Campaign URL Cell */}
-                          {platform !== 'paysuite' && (
-                            <td className="py-2 px-2 text-center w-28">
-                              {r['Campaign URL'] && r['Campaign URL'] !== '' && r['Campaign URL'] !== 'Unassigned' && r['Campaign URL'] !== 'None' ? (
-                                <a 
-                                  href={r['Campaign URL'].startsWith('http') ? r['Campaign URL'] : `https://${r['Campaign URL']}`} 
-                                  target="_blank" 
-                                  rel="noreferrer" 
-                                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-cyan-100 text-cyan-800 dark:bg-cyan-500/10 dark:text-cyan-400 hover:bg-cyan-200 dark:hover:bg-cyan-500/20 border border-cyan-300 dark:border-cyan-500/30 rounded-lg text-[11px] font-bold transition-all max-w-[110px] truncate shadow-sm"
-                                  title={r['Campaign URL']}
-                                >
-                                  <ExternalLink className="w-3 h-3 shrink-0" />
-                                  <span className="truncate">Open Link</span>
-                                </a>
-                              ) : (
-                                <input
-                                  type="text"
-                                  disabled={!isSuperAdmin}
-                                  value={r['Campaign URL'] || ''}
-                                  onChange={e => handleCellChange(r._row_id, 'Campaign URL', e.target.value)}
-                                  placeholder="Paste URL..."
-                                  className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-24 focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
-                                  title="Paste or edit campaign URL"
-                                />
-                              )}
+                            {/* Community Name Cell (Hidden for GiveBright & Madinah) */}
+                            {platform !== 'givebright' && platform !== 'madinah' && (
+                              <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[160px] max-w-[220px]" title={r['Community Name']}>
+                                <div className="truncate font-medium">{r['Community Name']}</div>
+                              </td>
+                            )}
+
+                            {/* Editable Code with Datalist & Instant Auto-Fill */}
+                            <td className="py-2 px-2 w-36">
+                              <input 
+                                type="text" 
+                                list="known-codes-list"
+                                disabled={!isSuperAdmin}
+                                value={r['Code'] || ''} 
+                                onChange={e => handleCellChange(r._row_id, 'Code', e.target.value)}
+                                placeholder="Type Code..."
+                                className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
+                                title="Changing Code automatically auto-fills Department, Office, Portfolio, Country, and Zakat!"
+                              />
                             </td>
-                          )}
 
-                          {/* Community Name Cell (Hidden for GiveBright & Madinah) */}
-                          {platform !== 'givebright' && platform !== 'madinah' && (
-                            <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[160px] max-w-[220px]" title={r['Community Name']}>
-                              <div className="truncate font-medium">{r['Community Name']}</div>
+                            {/* Editable Department */}
+                            <td className="py-2 px-2 min-w-[170px]">
+                              <input 
+                                type="text" 
+                                disabled={!isSuperAdmin}
+                                value={r['Department'] || r['Heading'] || ''} 
+                                onChange={e => handleCellChange(r._row_id, 'Department', e.target.value)}
+                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200 font-semibold w-full focus:outline-none focus:border-teal-500 dark:focus:border-cyan-400 disabled:opacity-60 shadow-sm"
+                                title={r['Department'] || r['Heading']}
+                              />
                             </td>
-                          )}
 
-                          {/* Editable Code with Datalist & Instant Auto-Fill */}
-                          <td className="py-2 px-2 w-36">
-                            <input 
-                              type="text" 
-                              list="known-codes-list"
-                              disabled={!isSuperAdmin}
-                              value={r['Code'] || ''} 
-                              onChange={e => handleCellChange(r._row_id, 'Code', e.target.value)}
-                              placeholder="Type Code..."
-                              className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
-                              title="Changing Code automatically auto-fills Department, Office, Portfolio, Country, and Zakat!"
-                            />
-                          </td>
+                            {/* Editable Office */}
+                            <td className="py-2 px-2 min-w-[190px]">
+                              <input 
+                                type="text" 
+                                disabled={!isSuperAdmin}
+                                value={r['Office'] || r['Sub-Heading'] || ''} 
+                                onChange={e => handleCellChange(r._row_id, 'Office', e.target.value)}
+                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-purple-800 dark:text-purple-300 font-semibold w-full focus:outline-none focus:border-purple-500 dark:focus:border-purple-400 disabled:opacity-60 shadow-sm"
+                                title={r['Office'] || r['Sub-Heading']}
+                              />
+                            </td>
 
-                          {/* Editable Department */}
-                          <td className="py-2 px-2 min-w-[170px]">
-                            <input 
-                              type="text" 
-                              disabled={!isSuperAdmin}
-                              value={r['Department'] || r['Heading'] || ''} 
-                              onChange={e => handleCellChange(r._row_id, 'Department', e.target.value)}
-                              className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200 font-semibold w-full focus:outline-none focus:border-teal-500 dark:focus:border-cyan-400 disabled:opacity-60 shadow-sm"
-                              title={r['Department'] || r['Heading']}
-                            />
-                          </td>
+                            {/* Editable Portfolio */}
+                            <td className="py-2 px-2 min-w-[150px]">
+                              <input 
+                                type="text" 
+                                disabled={!isSuperAdmin}
+                                value={r['Portfolio'] || ''} 
+                                onChange={e => handleCellChange(r._row_id, 'Portfolio', e.target.value)}
+                                placeholder="Portfolio..."
+                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-amber-800 dark:text-amber-300 font-semibold w-full focus:outline-none focus:border-amber-500 dark:focus:border-amber-400 disabled:opacity-60 shadow-sm placeholder:italic placeholder:font-normal placeholder:text-slate-400"
+                                title={r['Portfolio']}
+                              />
+                            </td>
 
-                          {/* Editable Office */}
-                          <td className="py-2 px-2 min-w-[190px]">
-                            <input 
-                              type="text" 
-                              disabled={!isSuperAdmin}
-                              value={r['Office'] || r['Sub-Heading'] || ''} 
-                              onChange={e => handleCellChange(r._row_id, 'Office', e.target.value)}
-                              className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-purple-800 dark:text-purple-300 font-semibold w-full focus:outline-none focus:border-purple-500 dark:focus:border-purple-400 disabled:opacity-60 shadow-sm"
-                              title={r['Office'] || r['Sub-Heading']}
-                            />
-                          </td>
+                            {/* Editable Country */}
+                            <td className="py-2 px-2 min-w-[150px]">
+                              <input 
+                                type="text" 
+                                disabled={!isSuperAdmin}
+                                value={r['Country'] || ''} 
+                                onChange={e => handleCellChange(r._row_id, 'Country', e.target.value)}
+                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
+                                title={r['Country']}
+                              />
+                            </td>
 
-                          {/* Editable Portfolio */}
-                          <td className="py-2 px-2 min-w-[150px]">
-                            <input 
-                              type="text" 
-                              disabled={!isSuperAdmin}
-                              value={r['Portfolio'] || ''} 
-                              onChange={e => handleCellChange(r._row_id, 'Portfolio', e.target.value)}
-                              placeholder="Portfolio..."
-                              className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-amber-800 dark:text-amber-300 font-semibold w-full focus:outline-none focus:border-amber-500 dark:focus:border-amber-400 disabled:opacity-60 shadow-sm placeholder:italic placeholder:font-normal placeholder:text-slate-400"
-                              title={r['Portfolio']}
-                            />
-                          </td>
+                            {/* Editable Zakat Eligibility */}
+                            <td className="py-2 px-2 w-40">
+                              <select 
+                                disabled={!isSuperAdmin}
+                                value={r['Zakat Eligibility'] || 'Unassigned'} 
+                                onChange={e => handleCellChange(r._row_id, 'Zakat Eligibility', e.target.value)}
+                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1.5 text-xs font-bold text-slate-800 dark:text-slate-200 w-full focus:outline-none focus:border-teal-500 dark:focus:border-cyan-400 disabled:opacity-60 cursor-pointer shadow-sm"
+                              >
+                                <option value="Unassigned">Unassigned</option>
+                                <option value="Zakat">Zakat</option>
+                                <option value="Non-Zakat">Non-Zakat</option>
+                              </select>
+                            </td>
 
-                          {/* Editable Country */}
-                          <td className="py-2 px-2 min-w-[150px]">
-                            <input 
-                              type="text" 
-                              disabled={!isSuperAdmin}
-                              value={r['Country'] || ''} 
-                              onChange={e => handleCellChange(r._row_id, 'Country', e.target.value)}
-                              className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
-                              title={r['Country']}
-                            />
-                          </td>
-
-                          {/* Editable Zakat Eligibility */}
-                          <td className="py-2 px-2 w-40">
-                            <select 
-                              disabled={!isSuperAdmin}
-                              value={r['Zakat Eligibility'] || 'Unassigned'} 
-                              onChange={e => handleCellChange(r._row_id, 'Zakat Eligibility', e.target.value)}
-                              className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1.5 text-xs font-bold text-slate-800 dark:text-slate-200 w-full focus:outline-none focus:border-teal-500 dark:focus:border-cyan-400 disabled:opacity-60 cursor-pointer shadow-sm"
-                            >
-                              <option value="Unassigned">Unassigned</option>
-                              <option value="Zakat">Zakat</option>
-                              <option value="Non-Zakat">Non-Zakat</option>
-                            </select>
-                          </td>
-
-                          {/* Super Admin Actions: Primary Toggle, Add Code Variant & Delete */}
-                          {isSuperAdmin && (
-                            <td className="text-center py-2 px-2 w-24">
-                              <div className="flex items-center justify-center gap-1">
-                                {isMulti && (
+                            {/* Super Admin Actions: Add Code Variant & Delete */}
+                            {isSuperAdmin && (
+                              <td className="text-center py-2 px-2 w-24">
+                                <div className="flex items-center justify-center gap-1">
                                   <button
                                     type="button"
-                                    onClick={() => handleTogglePrimary(r)}
-                                    className={`p-1.5 rounded-lg transition-all cursor-pointer ${
-                                      r.is_primary 
-                                        ? 'text-amber-500 bg-amber-500/20 border border-amber-400' 
-                                        : 'text-slate-400 hover:text-amber-400 hover:bg-slate-100 dark:hover:bg-slate-800'
-                                    }`}
-                                    title={r.is_primary ? 'Current Primary Code for this Campaign' : 'Click to make this the Primary Code for this Campaign'}
+                                    onClick={() => handleDuplicateRule(r)}
+                                    className="p-1.5 text-cyan-600 dark:text-cyan-400 hover:text-cyan-800 dark:hover:text-cyan-200 hover:bg-cyan-500/10 rounded-lg transition-colors cursor-pointer"
+                                    title="Add another Code variant rule for this campaign"
                                   >
-                                    <span className="text-xs font-bold">{r.is_primary ? '⭐' : '☆'}</span>
+                                    <Plus className="w-4 h-4" />
                                   </button>
-                                )}
+                                  <button 
+                                    type="button"
+                                    onClick={() => handleDeleteRule(r)}
+                                    className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-500/10 rounded-lg transition-colors cursor-pointer"
+                                    title="Delete this classification rule"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      }
+
+                      // 🟡 Multi-Variant / Multi-Giving-Level Collapsible Campaign Row
+                      const classifiedSubCount = c.rules.filter(r => (r['Department'] || r['Heading']) && (r['Department'] || r['Heading']) !== 'Unassigned').length;
+                      return (
+                        <React.Fragment key={parentKey}>
+                          {/* Parent Campaign Collapsible Header Row */}
+                          <tr className="bg-slate-100/75 dark:bg-slate-800/60 hover:bg-slate-200/80 dark:hover:bg-slate-800 border-b border-slate-300 dark:border-white/10 transition-colors">
+                            {/* Campaign Name with Toggle Chevron & Badges */}
+                            <td className="font-extrabold text-slate-900 dark:text-white text-xs py-3 px-3 min-w-[220px] max-w-[300px]">
+                              <div className="flex items-start gap-2">
                                 <button
                                   type="button"
-                                  onClick={() => handleDuplicateRule(r)}
-                                  className="p-1.5 text-cyan-600 dark:text-cyan-400 hover:text-cyan-800 dark:hover:text-cyan-200 hover:bg-cyan-500/10 rounded-lg transition-colors cursor-pointer"
-                                  title="Add another Code variant rule for this campaign"
+                                  onClick={() => toggleExpandCampaign(c.campaign_name)}
+                                  className="mt-0.5 p-1 rounded-lg text-cyan-700 dark:text-cyan-400 hover:bg-cyan-500/20 transition-all cursor-pointer shrink-0"
+                                  title={isExpanded ? "Collapse variants" : "Expand variants"}
                                 >
-                                  <Plus className="w-4 h-4" />
+                                  <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'rotate-90 text-cyan-500' : ''}`} />
                                 </button>
-                                <button 
+                                <div className="min-w-0 flex-1">
+                                  <div 
+                                    className="truncate font-black text-slate-900 dark:text-white cursor-pointer hover:text-cyan-600 dark:hover:text-cyan-400 transition-colors text-[13px]"
+                                    onClick={() => toggleExpandCampaign(c.campaign_name)}
+                                    title={c.campaign_name}
+                                  >
+                                    {c.campaign_name}
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleExpandCampaign(c.campaign_name)}
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-amber-200/80 text-amber-950 dark:bg-amber-950/80 dark:text-amber-300 border border-amber-400/50 hover:bg-amber-300 dark:hover:bg-amber-900 transition-colors cursor-pointer shadow-xs"
+                                    >
+                                      {c.has_giving_levels ? `🎁 ${c.rules.length} Giving Levels` : `🟡 ${c.rules.length} Code Variants`}
+                                      <span className="text-[9px]">{isExpanded ? '▲' : '▼'}</span>
+                                    </button>
+                                    <span className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[9px] font-bold ${
+                                      classifiedSubCount === c.rules.length 
+                                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-400/40'
+                                        : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300 border border-rose-400/40'
+                                    }`}>
+                                      {classifiedSubCount}/{c.rules.length} Classified
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+
+                            {/* Paysuite: Donor Name and Email */}
+                            {platform === 'paysuite' && (
+                              <>
+                                <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[120px] max-w-[150px]" title={c['Donor Name']}>
+                                  <div className="truncate font-medium">{c['Donor Name'] || 'Multiple Donors'}</div>
+                                </td>
+                                <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[150px] max-w-[200px]" title={c['Donor Email']}>
+                                  <div className="truncate font-medium">{c['Donor Email'] || 'Multiple Emails'}</div>
+                                </td>
+                              </>
+                            )}
+
+                            {/* Giving Level Column Summary Button */}
+                            {platform !== 'paysuite' && (
+                              <td className="py-2.5 px-3 min-w-[180px] max-w-[240px]">
+                                <button
                                   type="button"
-                                  onClick={() => handleDeleteRule(r)}
-                                  className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-500/10 rounded-lg transition-colors cursor-pointer"
-                                  title="Delete this classification rule"
+                                  onClick={() => toggleExpandCampaign(c.campaign_name)}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold bg-slate-200/90 dark:bg-slate-700/80 text-slate-800 dark:text-slate-200 hover:bg-cyan-100 hover:text-cyan-900 dark:hover:bg-cyan-900/50 dark:hover:text-cyan-200 transition-colors cursor-pointer border border-slate-300 dark:border-white/10 shadow-xs"
                                 >
-                                  <Trash2 className="w-4 h-4" />
+                                  <span>{isExpanded ? 'Hide' : 'View'} {c.rules.length} Sub-Rules</span>
+                                  <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180 text-cyan-500' : ''}`} />
+                                </button>
+                                {c.donation_count > 0 && (
+                                  <div className="text-[10px] font-semibold text-slate-500 dark:text-slate-400 mt-1">
+                                    Total: {c.donation_count} donors • £{Number(c.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                  </div>
+                                )}
+                              </td>
+                            )}
+
+                            {/* Clickable Campaign URL */}
+                            {platform !== 'paysuite' && (
+                              <td className="py-2 px-2 text-center w-28">
+                                {c['Campaign URL'] && c['Campaign URL'] !== '' && c['Campaign URL'] !== 'Unassigned' && c['Campaign URL'] !== 'None' ? (
+                                  <a 
+                                    href={c['Campaign URL'].startsWith('http') ? c['Campaign URL'] : `https://${c['Campaign URL']}`} 
+                                    target="_blank" 
+                                    rel="noreferrer" 
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 bg-cyan-100 text-cyan-800 dark:bg-cyan-500/10 dark:text-cyan-400 hover:bg-cyan-200 dark:hover:bg-cyan-500/20 border border-cyan-300 dark:border-cyan-500/30 rounded-lg text-[11px] font-bold transition-all max-w-[110px] truncate shadow-sm"
+                                    title={c['Campaign URL']}
+                                  >
+                                    <ExternalLink className="w-3 h-3 shrink-0" />
+                                    <span className="truncate">Open Link</span>
+                                  </a>
+                                ) : (
+                                  <span className="text-slate-400 text-xs italic">N/A</span>
+                                )}
+                              </td>
+                            )}
+
+                            {/* Community Name */}
+                            {platform !== 'givebright' && platform !== 'madinah' && (
+                              <td className="text-slate-700 dark:text-slate-300 text-xs py-2.5 px-3 min-w-[160px] max-w-[220px]" title={c['Community Name']}>
+                                <div className="truncate font-semibold">{c['Community Name']}</div>
+                              </td>
+                            )}
+
+                            {/* Summary span across code and classification columns */}
+                            <td colSpan={6} className="py-2.5 px-3 text-slate-500 dark:text-slate-400 text-xs font-medium italic">
+                              <div className="flex items-center justify-between gap-2">
+                                <span>
+                                  {isExpanded 
+                                    ? `Showing all ${c.rules.length} giving levels / variants below ↴` 
+                                    : `Click expand to view and assign codes for ${c.rules.length} giving levels`}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => toggleExpandCampaign(c.campaign_name)}
+                                  className="text-cyan-600 dark:text-cyan-400 hover:underline font-bold text-xs not-italic cursor-pointer"
+                                >
+                                  {isExpanded ? 'Collapse ▴' : 'Expand ▾'}
                                 </button>
                               </div>
                             </td>
-                          )}
-                        </tr>
+
+                            {/* Action column */}
+                            {isSuperAdmin && (
+                              <td className="text-center py-2 px-2 w-24">
+                                <div className="flex items-center justify-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDuplicateRule(c.primaryRule || c.rules[0])}
+                                    className="p-1.5 text-cyan-700 dark:text-cyan-400 hover:text-cyan-900 dark:hover:text-cyan-200 hover:bg-cyan-500/20 rounded-lg transition-colors cursor-pointer"
+                                    title="Add new Code variant rule for this campaign"
+                                  >
+                                    <Plus className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              </td>
+                            )}
+                          </tr>
+
+                          {/* Expanded Nested Sub-Rows */}
+                          {isExpanded && c.rules.map((rule, rIdx) => {
+                            const childKey = rule._row_id || `${c.campaign_name}__child__${rIdx}`;
+                            return (
+                              <tr key={childKey} className="bg-cyan-50/40 dark:bg-cyan-950/15 hover:bg-cyan-100/50 dark:hover:bg-cyan-900/30 border-b border-cyan-200/50 dark:border-white/5 transition-colors">
+                                {/* Sub-row indent & Variant label */}
+                                <td className="py-2 px-3 pl-8 text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-cyan-500 font-mono font-bold text-sm">↳</span>
+                                    <span className="truncate max-w-[200px] text-[11px]" title={rule['Giving Level'] || rule['Campaign Name']}>
+                                      {rule['Giving Level'] || 'General Default Variant'}
+                                    </span>
+                                    {rule.is_primary && (
+                                      <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[9px] font-extrabold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-400/40 shrink-0">
+                                        ⭐ Primary
+                                      </span>
+                                    )}
+                                  </div>
+                                </td>
+
+                                {/* Paysuite: Donor Name and Email */}
+                                {platform === 'paysuite' && (
+                                  <>
+                                    <td className="text-slate-600 dark:text-slate-400 text-xs py-2 px-3 truncate">{rule['Donor Name'] || 'N/A'}</td>
+                                    <td className="text-slate-600 dark:text-slate-400 text-xs py-2 px-3 truncate">{rule['Donor Email'] || 'N/A'}</td>
+                                  </>
+                                )}
+
+                                {/* Giving Level Cell */}
+                                {platform !== 'paysuite' && (
+                                  <td className="py-2 px-3 min-w-[180px] max-w-[240px]">
+                                    {rule['Giving Level'] ? (
+                                      <div className="flex flex-col gap-0.5">
+                                        <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-bold bg-indigo-100 text-indigo-900 dark:bg-indigo-950/70 dark:text-indigo-300 border border-indigo-300/50 shadow-xs truncate max-w-[220px]" title={rule['Giving Level']}>
+                                          🎁 {rule['Giving Level']}
+                                        </span>
+                                        {(rule.donation_count > 0 || rule.total_amount > 0) && (
+                                          <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                            {rule.donation_count || 0} donors • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                          </span>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <div className="flex flex-col gap-0.5">
+                                        <span className="text-slate-400 dark:text-slate-500 text-[11px] italic font-medium">
+                                          Default (General)
+                                        </span>
+                                        {(rule.donation_count > 0 || rule.total_amount > 0) && (
+                                          <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                            {rule.donation_count || 0} donors • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </td>
+                                )}
+
+                                {/* Clickable Campaign URL */}
+                                {platform !== 'paysuite' && (
+                                  <td className="py-2 px-2 text-center w-28">
+                                    {rule['Campaign URL'] && rule['Campaign URL'] !== '' && rule['Campaign URL'] !== 'Unassigned' && rule['Campaign URL'] !== 'None' ? (
+                                      <a 
+                                        href={rule['Campaign URL'].startsWith('http') ? rule['Campaign URL'] : `https://${rule['Campaign URL']}`} 
+                                        target="_blank" 
+                                        rel="noreferrer" 
+                                        className="inline-flex items-center gap-1 px-2.5 py-1 bg-cyan-100 text-cyan-800 dark:bg-cyan-500/10 dark:text-cyan-400 hover:bg-cyan-200 dark:hover:bg-cyan-500/20 border border-cyan-300 dark:border-cyan-500/30 rounded-lg text-[11px] font-bold transition-all max-w-[110px] truncate shadow-sm"
+                                        title={rule['Campaign URL']}
+                                      >
+                                        <ExternalLink className="w-3 h-3 shrink-0" />
+                                        <span className="truncate">Open Link</span>
+                                      </a>
+                                    ) : (
+                                      <input
+                                        type="text"
+                                        disabled={!isSuperAdmin}
+                                        value={rule['Campaign URL'] || ''}
+                                        onChange={e => handleCellChange(rule._row_id, 'Campaign URL', e.target.value)}
+                                        placeholder="Paste URL..."
+                                        className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-24 focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
+                                        title="Paste or edit campaign URL"
+                                      />
+                                    )}
+                                  </td>
+                                )}
+
+                                {/* Community Name */}
+                                {platform !== 'givebright' && platform !== 'madinah' && (
+                                  <td className="text-slate-600 dark:text-slate-400 text-xs py-2 px-3 min-w-[160px] max-w-[220px] truncate" title={rule['Community Name']}>
+                                    {rule['Community Name']}
+                                  </td>
+                                )}
+
+                                {/* Editable Code */}
+                                <td className="py-2 px-2 w-36">
+                                  <input 
+                                    type="text" 
+                                    list="known-codes-list"
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Code'] || ''} 
+                                    onChange={e => handleCellChange(rule._row_id, 'Code', e.target.value)}
+                                    placeholder="Type Code..."
+                                    className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
+                                  />
+                                </td>
+
+                                {/* Editable Department */}
+                                <td className="py-2 px-2 min-w-[170px]">
+                                  <input 
+                                    type="text" 
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Department'] || rule['Heading'] || ''} 
+                                    onChange={e => handleCellChange(rule._row_id, 'Department', e.target.value)}
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1 text-xs text-slate-800 dark:text-slate-200 font-semibold w-full focus:outline-none focus:border-teal-500 dark:focus:border-cyan-400 disabled:opacity-60 shadow-sm"
+                                  />
+                                </td>
+
+                                {/* Editable Office */}
+                                <td className="py-2 px-2 min-w-[190px]">
+                                  <input 
+                                    type="text" 
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Office'] || rule['Sub-Heading'] || ''} 
+                                    onChange={e => handleCellChange(rule._row_id, 'Office', e.target.value)}
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1 text-xs text-purple-800 dark:text-purple-300 font-semibold w-full focus:outline-none focus:border-purple-500 dark:focus:border-purple-400 disabled:opacity-60 shadow-sm"
+                                  />
+                                </td>
+
+                                {/* Editable Portfolio */}
+                                <td className="py-2 px-2 min-w-[150px]">
+                                  <input 
+                                    type="text" 
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Portfolio'] || ''} 
+                                    onChange={e => handleCellChange(rule._row_id, 'Portfolio', e.target.value)}
+                                    placeholder="Portfolio..."
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1 text-xs text-amber-800 dark:text-amber-300 font-semibold w-full focus:outline-none focus:border-amber-500 dark:focus:border-amber-400 disabled:opacity-60 shadow-sm placeholder:italic placeholder:font-normal placeholder:text-slate-400"
+                                  />
+                                </td>
+
+                                {/* Editable Country */}
+                                <td className="py-2 px-2 min-w-[150px]">
+                                  <input 
+                                    type="text" 
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Country'] || ''} 
+                                    onChange={e => handleCellChange(rule._row_id, 'Country', e.target.value)}
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
+                                  />
+                                </td>
+
+                                {/* Editable Zakat Eligibility */}
+                                <td className="py-2 px-2 w-40">
+                                  <select 
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Zakat Eligibility'] || 'Unassigned'} 
+                                    onChange={e => handleCellChange(rule._row_id, 'Zakat Eligibility', e.target.value)}
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-xs font-bold text-slate-800 dark:text-slate-200 w-full focus:outline-none focus:border-teal-500 dark:focus:border-cyan-400 disabled:opacity-60 cursor-pointer shadow-sm"
+                                  >
+                                    <option value="Unassigned">Unassigned</option>
+                                    <option value="Zakat">Zakat</option>
+                                    <option value="Non-Zakat">Non-Zakat</option>
+                                  </select>
+                                </td>
+
+                                {/* Sub-row Actions: Primary Toggle, Duplicate Variant & Delete */}
+                                {isSuperAdmin && (
+                                  <td className="text-center py-2 px-2 w-24">
+                                    <div className="flex items-center justify-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleTogglePrimary(rule)}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                                          rule.is_primary 
+                                            ? 'text-amber-500 bg-amber-500/20 border border-amber-400' 
+                                            : 'text-slate-400 hover:text-amber-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+                                        }`}
+                                        title={rule.is_primary ? 'Current Primary Code for this Campaign' : 'Click to make this the Primary Code for this Campaign'}
+                                      >
+                                        <span className="text-xs font-bold">{rule.is_primary ? '⭐' : '☆'}</span>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDuplicateRule(rule)}
+                                        className="p-1.5 text-cyan-600 dark:text-cyan-400 hover:text-cyan-800 dark:hover:text-cyan-200 hover:bg-cyan-500/10 rounded-lg transition-colors cursor-pointer"
+                                        title="Add another Code variant rule for this campaign"
+                                      >
+                                        <Plus className="w-4 h-4" />
+                                      </button>
+                                      <button 
+                                        type="button"
+                                        onClick={() => handleDeleteRule(rule)}
+                                        className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-500/10 rounded-lg transition-colors cursor-pointer"
+                                        title="Delete this classification rule"
+                                      >
+                                        <Trash2 className="w-4 h-4" />
+                                      </button>
+                                    </div>
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                        </React.Fragment>
                       );
                     })
                   )}
@@ -1885,12 +2414,12 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           {/* 📑 Bottom Pagination Footer */}
           <div className="p-4 border-t border-slate-200 dark:border-white/10 flex flex-wrap items-center justify-between gap-4 bg-slate-50/50 dark:bg-slate-900/50">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400">
-              {filteredRules.length === 0 ? (
+              {filteredCampaigns.length === 0 ? (
                 'No matching campaigns found'
               ) : (
                 <>
-                  Showing <span className="text-slate-900 dark:text-white font-black">{((safePage - 1) * effectivePageSize) + 1}</span> to <span className="text-slate-900 dark:text-white font-black">{Math.min(safePage * effectivePageSize, filteredRules.length)}</span> of <span className="text-cyan-600 dark:text-cyan-400 font-black">{filteredRules.length.toLocaleString()}</span> rules
-                  {searchQuery && <span className="ml-1 text-[11px] text-slate-400 font-normal">(filtered from {matrixData.total_campaigns?.toLocaleString()} total)</span>}
+                  Showing <span className="text-slate-900 dark:text-white font-black">{((safePage - 1) * effectivePageSize) + 1}</span> to <span className="text-slate-900 dark:text-white font-black">{Math.min(safePage * effectivePageSize, filteredCampaigns.length)}</span> of <span className="text-cyan-600 dark:text-cyan-400 font-black">{filteredCampaigns.length.toLocaleString()}</span> unique campaigns
+                  {searchQuery && <span className="ml-1 text-[11px] text-slate-400 font-normal">(filtered from {uniqueCampaignsCount.toLocaleString()} total)</span>}
                 </>
               )}
             </div>

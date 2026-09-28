@@ -1,7 +1,66 @@
 import hashlib
+import json
+import os
 import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+
+import bcrypt
+from jose import JWTError, jwt
 
 from config.settings import LOCAL_DB_PATH, SUPABASE_KEY, SUPABASE_URL
+
+# JWT Configuration
+JWT_SECRET = os.environ.get("JWT_SECRET") or os.environ.get("APP_SECRET_KEY", "RethinkCharityCRM_SecretKey_2026!")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+
+def hash_password(password: str) -> str:
+    """Hashes a password using native secure bcrypt."""
+    pw_bytes = password.encode("utf-8")[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pw_bytes, salt).decode("utf-8")
+
+get_password_hash = hash_password
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verifies a password against bcrypt hash, with backward-compatible
+    fallback to legacy unsalted SHA-256 for existing database users.
+    """
+    if not plain_password or not hashed_password:
+        return False
+
+    # Standard Bcrypt Hash ($2b$, $2a$, $2y$)
+    if hashed_password.startswith("$2"):
+        try:
+            pw_bytes = plain_password.encode("utf-8")[:72]
+            return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
+        except Exception:
+            return False
+
+    # Legacy SHA-256 fallback
+    legacy_hash = hashlib.sha256(plain_password.encode("utf-8")).hexdigest()
+    return legacy_hash == hashed_password
+
+
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+    """Creates a signed, time-limited JWT access token."""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "iat": datetime.utcnow()})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
+    """Decodes and cryptographically verifies a JWT access token."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except JWTError:
+        return None
 
 
 def init_user_db():
@@ -19,6 +78,7 @@ def init_user_db():
                 can_edit_matrix INTEGER DEFAULT 0,
                 can_manage_tags INTEGER DEFAULT 0,
                 can_purge_data INTEGER DEFAULT 0,
+                allowed_companies TEXT DEFAULT '["ALL"]',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -32,20 +92,20 @@ def init_user_db():
             if perm_col not in cols:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {perm_col} INTEGER DEFAULT 0")
                 conn.commit()
+        if "allowed_companies" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN allowed_companies TEXT DEFAULT '[\"ALL\"]'")
+            conn.commit()
 
         cursor.execute("SELECT COUNT(*) FROM users")
         count = cursor.fetchone()[0]
         if count == 0:
-            def _hash_pwd(p):
-                return hashlib.sha256(p.encode('utf-8')).hexdigest()
-
             seed_users = [
-                ('superadmin', 'superadmin@analytics.com', _hash_pwd('SuperAdmin@123'), 'super_admin', 1, 1, 1, 1),
-                ('admin', 'admin@analytics.com', _hash_pwd('Admin@123'), 'admin', 0, 0, 0, 0)
+                ('superadmin', 'superadmin@analytics.com', hash_password('SuperAdmin@123'), 'super_admin', 1, 1, 1, 1, '["ALL"]'),
+                ('admin', 'admin@analytics.com', hash_password('Admin@123'), 'admin', 0, 0, 0, 0, '["ALL"]')
             ]
             cursor.executemany("""
-                INSERT INTO users (username, email, password_hash, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users (username, email, password_hash, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, seed_users)
             conn.commit()
         else:
@@ -65,9 +125,7 @@ def init_user_db():
         print(f"User DB init notice: {e}")
 
 
-import json
-
-def get_all_users():
+def get_all_users() -> List[Dict[str, Any]]:
     """Returns list of all registered users with their roles, granular permissions, and allowed companies."""
     init_user_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
@@ -117,17 +175,16 @@ def update_user_permissions(email, role, can_edit_donors, can_edit_matrix, can_m
     conn.close()
     return True
 
-def authenticate_user(email_or_username, password):
+
+def authenticate_user(email_or_username: str, password: str) -> Optional[Dict[str, Any]]:
     """
     Authenticates user via Supabase Auth API if configured,
     or falls back to local SQLite users table.
+    Upgrades legacy SHA-256 password hash to bcrypt automatically on successful login.
     Returns user dict with role ('super_admin' or 'admin') or None.
     """
     if not email_or_username or not password:
         return None
-
-    def _hash_pwd(p):
-        return hashlib.sha256(p.encode('utf-8')).hexdigest()
 
     user_identity = str(email_or_username).strip()
 
@@ -166,31 +223,44 @@ def authenticate_user(email_or_username, password):
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     try:
         cur = conn.cursor()
-        hashed = _hash_pwd(password)
         cur.execute("""
-            SELECT username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies FROM users
-            WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) AND password_hash = ?
-        """, (user_identity, user_identity, hashed))
+            SELECT id, username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies, password_hash
+            FROM users
+            WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
+        """, (user_identity, user_identity))
         row = cur.fetchone()
         if row:
-            is_super = (row[2] == "super_admin")
-            raw_comp = row[7] if len(row) > 7 and row[7] else '["ALL"]'
-            try:
-                allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
-            except Exception:
-                allowed_comp = ["ALL"]
+            stored_hash = row[9]
+            if verify_password(password, stored_hash):
+                # Transparent migration: upgrade legacy SHA-256 to modern bcrypt
+                if not stored_hash.startswith("$2"):
+                    try:
+                        new_bcrypt = hash_password(password)
+                        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_bcrypt, row[0]))
+                        conn.commit()
+                        print(f"[Security] Upgraded user '{row[1]}' password hash to bcrypt.")
+                    except Exception as up_err:
+                        print(f"[Security Notice] Password hash upgrade notice: {up_err}")
 
-            return {
-                "username": row[0],
-                "email": row[1],
-                "role": row[2],
-                "can_edit_donors": 1 if (is_super or row[3]) else 0,
-                "can_edit_matrix": 1 if (is_super or row[4]) else 0,
-                "can_manage_tags": 1 if (is_super or row[5]) else 0,
-                "can_purge_data": 1 if (is_super or row[6]) else 0,
-                "allowed_companies": allowed_comp,
-                "provider": "local"
-            }
+                is_super = (row[3] == "super_admin")
+                raw_comp = row[8] if row[8] else '["ALL"]'
+                try:
+                    allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
+                except Exception:
+                    allowed_comp = ["ALL"]
+
+                return {
+                    "id": row[0],
+                    "username": row[1],
+                    "email": row[2],
+                    "role": row[3],
+                    "can_edit_donors": 1 if (is_super or row[4]) else 0,
+                    "can_edit_matrix": 1 if (is_super or row[5]) else 0,
+                    "can_manage_tags": 1 if (is_super or row[6]) else 0,
+                    "can_purge_data": 1 if (is_super or row[7]) else 0,
+                    "allowed_companies": allowed_comp,
+                    "provider": "local"
+                }
     except Exception as e:
         print(f"Local auth error: {e}")
     finally:
@@ -198,9 +268,10 @@ def authenticate_user(email_or_username, password):
 
     return None
 
-def get_user_by_identity(user_identity):
+
+def get_user_by_identity(user_identity: str) -> Optional[Dict[str, Any]]:
     """
-    Retrieves user dict by username or email for session persistence across browser refreshes.
+    Retrieves user dict by username, email, or user id.
     """
     if not user_identity or not str(user_identity).strip():
         return None
@@ -211,26 +282,27 @@ def get_user_by_identity(user_identity):
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies FROM users
+            SELECT id, username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies FROM users
             WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
         """, (ident, ident))
         row = cur.fetchone()
         if row:
-            is_super = (row[2] == "super_admin")
-            raw_comp = row[7] if len(row) > 7 and row[7] else '["ALL"]'
+            is_super = (row[3] == "super_admin")
+            raw_comp = row[8] if row[8] else '["ALL"]'
             try:
                 allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
             except Exception:
                 allowed_comp = ["ALL"]
 
             return {
-                "username": row[0],
-                "email": row[1],
-                "role": row[2],
-                "can_edit_donors": 1 if (is_super or row[3]) else 0,
-                "can_edit_matrix": 1 if (is_super or row[4]) else 0,
-                "can_manage_tags": 1 if (is_super or row[5]) else 0,
-                "can_purge_data": 1 if (is_super or row[6]) else 0,
+                "id": row[0],
+                "username": row[1],
+                "email": row[2],
+                "role": row[3],
+                "can_edit_donors": 1 if (is_super or row[4]) else 0,
+                "can_edit_matrix": 1 if (is_super or row[5]) else 0,
+                "can_manage_tags": 1 if (is_super or row[6]) else 0,
+                "can_purge_data": 1 if (is_super or row[7]) else 0,
                 "allowed_companies": allowed_comp,
                 "provider": "local"
             }
@@ -241,7 +313,8 @@ def get_user_by_identity(user_identity):
 
     return None
 
-def send_password_reset_request(email):
+
+def send_password_reset_request(email: str):
     """
     Sends password reset email via Supabase Auth API if configured,
     or provides local recovery guidance.
@@ -280,7 +353,8 @@ def send_password_reset_request(email):
     finally:
         conn.close()
 
-def change_user_password(email_or_username, current_password, new_password):
+
+def change_user_password(email_or_username: str, current_password: str, new_password: str):
     """
     Changes password for logged in user via Supabase Auth API if configured,
     or via local SQLite users table.
@@ -291,9 +365,6 @@ def change_user_password(email_or_username, current_password, new_password):
         return False, "Please fill in both current password and new password."
     if len(new_password.strip()) < 6:
         return False, "New password must be at least 6 characters long."
-
-    def _hash_pwd(p):
-        return hashlib.sha256(p.encode('utf-8')).hexdigest()
 
     user_identity = str(email_or_username).strip()
 
@@ -330,19 +401,20 @@ def change_user_password(email_or_username, current_password, new_password):
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     try:
         cur = conn.cursor()
-        old_hashed = _hash_pwd(current_password)
-        new_hashed = _hash_pwd(new_password.strip())
-
         cur.execute("""
-            SELECT id FROM users
-            WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) AND password_hash = ?
-        """, (user_identity, user_identity, old_hashed))
+            SELECT id, password_hash FROM users
+            WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
+        """, (user_identity, user_identity))
         row = cur.fetchone()
         if not row:
+            return False, "❌ User not found."
+
+        user_id, stored_hash = row[0], row[1]
+        if not verify_password(current_password, stored_hash):
             return False, "❌ Current password is incorrect."
 
-        user_id = row[0]
-        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hashed, user_id))
+        new_bcrypt = hash_password(new_password.strip())
+        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_bcrypt, user_id))
         conn.commit()
         return True, "✅ Password changed successfully!"
     except Exception as e:
@@ -360,7 +432,7 @@ def edit_user_details(user_id: int, email: str, username: str, password: str = N
     cursor = conn.cursor()
     try:
         if password and password.strip():
-            hashed = hashlib.sha256(password.strip().encode('utf-8')).hexdigest()
+            hashed = hash_password(password.strip())
             cursor.execute("""
                 UPDATE users SET email = ?, username = ?, password_hash = ?
                 WHERE id = ?
@@ -378,4 +450,3 @@ def edit_user_details(user_id: int, email: str, username: str, password: str = N
         return False, f"Database error: {str(e)}"
     finally:
         conn.close()
-

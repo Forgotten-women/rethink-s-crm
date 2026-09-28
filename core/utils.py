@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import time
+import re
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -760,41 +761,124 @@ def _enrich_dataframe(df):
         col_amount = "Donation Amount (in Donation Currency)"
 
     # Identity Resolution - Vectorized
-    df['email_clean'] = df['Email'].astype(str).str.strip().str.lower()
     GENERIC_DONOR_NAMES = {
         'anonymous', 'anonymous kind soul', 'anonymous donor', 'kind soul', 
         'donation boost', 'unnamed donor', 'nan', 'none', 'null', '', 'unassigned',
-        'mr', 'mrs', 'miss', 'dr', 'ms', 'm', 's', 'a', 'n'
+        'mr', 'mrs', 'miss', 'dr', 'ms', 'm', 's', 'a', 'n', 'guest user'
     }
 
-    df['email_clean'] = df['email_clean'].where(~df['email_clean'].isin(['nan', 'none', '', 'unassigned', 'null']), None)
-    fname = df['First Name'].astype(str).str.strip().str.lower().replace({'nan': '', 'none': ''})
-    lname = df['Last Name'].astype(str).str.strip().str.lower().replace({'nan': '', 'none': ''})
-    df['full_name_clean'] = (fname + " " + lname).str.strip()
-    df['full_name_clean'] = df['full_name_clean'].where(~df['full_name_clean'].isin(GENERIC_DONOR_NAMES), None)
+    DONOR_TITLE_PREFIXES = {
+        'dr', 'dr.', 'mr', 'mr.', 'mrs', 'mrs.', 'ms', 'ms.', 'miss', 
+        'prof', 'prof.', 'professor', 'sheikh', 'shaykh', 'shaykha', 'sheikha',
+        'haji', 'hajji', 'hajjah', 'haja', 'ustadh', 'ustad', 'ustadha',
+        'imam', 'mufti', 'brother', 'sister', 'dr/mr', 'dr/mrs', 'lord', 'lady', 'sir'
+    }
 
-    bname_col = df['Billing Name'] if 'Billing Name' in df.columns else pd.Series(index=df.index, dtype=str)
-    df['bname_clean'] = bname_col.astype(str).str.strip().str.lower()
-    df['bname_clean'] = df['bname_clean'].where(~df['bname_clean'].isin(GENERIC_DONOR_NAMES), None)
+    def _normalize_human_name(name_str):
+        if pd.isna(name_str):
+            return None
+        raw = str(name_str).strip()
+        if not raw or raw.lower() in GENERIC_DONOR_NAMES:
+            return None
+        words = raw.split()
+        while words and words[0].lower().rstrip('.') in DONOR_TITLE_PREFIXES:
+            words.pop(0)
+        cleaned = ' '.join(words).strip().lower()
+        cleaned = re.sub(r'[^a-z\s]', '', cleaned).strip()
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        if cleaned in GENERIC_DONOR_NAMES or len(cleaned) < 3 or ' ' not in cleaned:
+            return None
+        return cleaned
 
-    # Only map authentic human full names (at least 2 words or distinct non-generic names) to email
-    valid = pd.DataFrame({'name': df['full_name_clean'], 'email': df['email_clean']}).dropna()
-    valid = valid[valid['name'].str.contains(' ') & (~valid['name'].isin(GENERIC_DONOR_NAMES))]
-    name_to_email_map = valid.groupby('name')['email'].first() if not valid.empty else pd.Series(dtype=str)
+    def _normalize_phone_number(p_val):
+        if pd.isna(p_val):
+            return None
+        digits = re.sub(r'[^\d]', '', str(p_val).strip())
+        digits = re.sub(r'^44', '', digits).lstrip('0')
+        if 7 <= len(digits) <= 15:
+            return digits
+        return None
+
+    # 1. Multi-field Email Resolution (Primary Email, Giving Level Email, Tax Receipt Email)
+    email_series_list = []
+    for em_col in ["Email", "Giving Level Email", "Email (for tax receipt)"]:
+        if em_col in df.columns:
+            s_em = df[em_col].fillna("").astype(str).str.strip().str.lower()
+            clean_s = s_em.where(~s_em.isin(['nan', 'none', '', 'unassigned', 'null', 'n/a', '<na>']) & s_em.str.contains('@', na=False), None)
+            email_series_list.append(clean_s)
+
+    if email_series_list:
+        primary_email = email_series_list[0]
+        for next_em in email_series_list[1:]:
+            primary_email = primary_email.combine_first(next_em)
+    else:
+        primary_email = pd.Series(None, index=df.index, dtype=object)
+
+    df['email_clean'] = primary_email
+
+    # 2. Normalized Name Extraction (First + Last, and Billing Name)
+    fn_s = df['First Name'].fillna("").astype(str).str.strip() if 'First Name' in df.columns else pd.Series("", index=df.index)
+    ln_s = df['Last Name'].fillna("").astype(str).str.strip() if 'Last Name' in df.columns else pd.Series("", index=df.index)
+    raw_full_name = (fn_s + " " + ln_s).str.strip()
+    df['full_name_clean'] = raw_full_name.apply(_normalize_human_name)
+
+    bname_col = df['Billing Name'] if 'Billing Name' in df.columns else pd.Series("", index=df.index, dtype=str)
+    df['bname_clean'] = bname_col.apply(_normalize_human_name)
+
+    # 3. Clean Phone Numbers
+    phone_series_list = []
+    for p_col in ["Phone Number", "Phone", "phone_number", "Home phone number", "Contact Phone"]:
+        if p_col in df.columns:
+            p_clean = df[p_col].apply(_normalize_phone_number)
+            phone_series_list.append(p_clean)
+    
+    if phone_series_list:
+        primary_phone = phone_series_list[0]
+        for next_p in phone_series_list[1:]:
+            primary_phone = primary_phone.combine_first(next_p)
+    else:
+        primary_phone = pd.Series(None, index=df.index, dtype=object)
+    df['phone_clean'] = primary_phone
+
+    # 4. Cross-Attribute Mapping to Email (Multi-signal relation)
+    # Name -> Email map
+    valid_name_email = pd.DataFrame({'name': df['full_name_clean'], 'email': df['email_clean']}).dropna()
+    name_to_email_map = valid_name_email.groupby('name')['email'].first() if not valid_name_email.empty else pd.Series(dtype=str)
+
+    # Billing Name -> Email map
+    valid_bname_email = pd.DataFrame({'bname': df['bname_clean'], 'email': df['email_clean']}).dropna()
+    bname_to_email_map = valid_bname_email.groupby('bname')['email'].first() if not valid_bname_email.empty else pd.Series(dtype=str)
+
+    # Phone -> Email map
+    valid_phone_email = pd.DataFrame({'phone': df['phone_clean'], 'email': df['email_clean']}).dropna()
+    phone_to_email_map = valid_phone_email.groupby('phone')['email'].first() if not valid_phone_email.empty else pd.Series(dtype=str)
 
     mapped_email_from_name = df['full_name_clean'].map(name_to_email_map) if not name_to_email_map.empty else pd.Series(None, index=df.index)
-    mapped_email_from_billing = df['bname_clean'].map(name_to_email_map) if not name_to_email_map.empty else pd.Series(None, index=df.index)
+    mapped_email_from_billing = df['bname_clean'].map(bname_to_email_map) if not bname_to_email_map.empty else pd.Series(None, index=df.index)
+    mapped_email_from_phone = df['phone_clean'].map(phone_to_email_map) if not phone_to_email_map.empty else pd.Series(None, index=df.index)
 
     did_series = df['Donation ID'].astype(str) if 'Donation ID' in df.columns else pd.Series(range(len(df)), index=df.index).astype(str)
 
+    # 5. Canonical Donor ID Assignment (Safe & Guaranteed Non-Null)
+    phone_id_series = df['phone_clean'].apply(lambda p: f"phone:{p}" if pd.notna(p) and p else None)
+    name_id_series = df['full_name_clean'].apply(lambda n: f"name:{n}" if pd.notna(n) and n else None)
+    billing_id_series = df['bname_clean'].apply(lambda b: f"name:{b}" if pd.notna(b) and b else None)
+
     df['Donor ID'] = df['email_clean'] \
+        .combine_first(mapped_email_from_phone) \
         .combine_first(mapped_email_from_name) \
         .combine_first(mapped_email_from_billing) \
-        .combine_first(df['full_name_clean']) \
-        .combine_first(df['bname_clean']) \
+        .combine_first(phone_id_series) \
+        .combine_first(name_id_series) \
+        .combine_first(billing_id_series) \
         .combine_first(did_series)
 
-    df.drop(columns=['email_clean', 'full_name_clean', 'bname_clean'], inplace=True, errors='ignore')
+    # Ensure no NaN, empty string, or literal 'nan' survives in Donor ID
+    bad_did_mask = df['Donor ID'].isna() | df['Donor ID'].astype(str).str.strip().str.lower().isin(['nan', 'none', '', 'null', '<na>', 'unassigned'])
+    if bad_did_mask.any():
+        df.loc[bad_did_mask, 'Donor ID'] = did_series.loc[bad_did_mask]
+
+    df.drop(columns=['email_clean', 'full_name_clean', 'bname_clean', 'phone_clean'], inplace=True, errors='ignore')
 
     # LTV Calculation & Classification
     if col_amount in df.columns:

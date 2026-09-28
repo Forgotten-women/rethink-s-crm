@@ -1,5 +1,14 @@
 import React, { useState } from 'react';
 import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake } from 'lucide-react';
+import { API_BASE_URL } from '../config';
+
+const resolveLogoUrl = (url) => {
+  if (!url) return null;
+  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) return url;
+  const base = (API_BASE_URL || '').replace(/\/+$/, '');
+  const path = url.startsWith('/') ? url : `/${url}`;
+  return base ? `${base}${path}` : path;
+};
 
 const tabs = [
   { id: 'overview', label: 'Dashboard', icon: TrendingUp },
@@ -75,17 +84,17 @@ export default function NavigationSidebar({
           <div className="w-10 h-10 rounded-xl bg-slate-500/10 dark:bg-white/5 border border-slate-200 dark:border-white/10 flex items-center justify-center transition-transform group-hover:scale-105 shrink-0 overflow-hidden shadow-sm">
             {currentCompany?.logo_url ? (
               <img 
-                src={currentCompany.logo_url} 
+                src={resolveLogoUrl(currentCompany.logo_url)} 
                 alt={displayName} 
                 className="w-full h-full object-contain p-1 rounded-lg"
-                onError={(e) => { e.target.style.display = 'none'; }}
+                onError={(e) => { e.currentTarget.style.display = 'none'; }}
               />
-            ) : (
-              <Diamond 
-                className={`w-5 h-5 ${currentAccentClasses.split(' ')[0]} fill-current`} 
-                aria-hidden="true"
-              />
-            )}
+            ) : null}
+            <Diamond 
+              className={`w-5 h-5 ${currentAccentClasses.split(' ')[0]} fill-current`} 
+              style={{ display: currentCompany?.logo_url ? 'none' : 'block' }}
+              aria-hidden="true"
+            />
           </div>
           
           {showExpanded && (

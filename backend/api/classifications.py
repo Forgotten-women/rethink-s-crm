@@ -76,6 +76,7 @@ class DeleteRuleRequest(BaseModel):
     platform: str
     campaign_name: str
     company_id: Optional[str] = "rethink"
+    giving_level: Optional[str] = ""
     code: Optional[str] = None
     community_name: Optional[str] = None
 
@@ -124,9 +125,15 @@ def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Normalize column is_primary
+    # Normalize columns
     if "is_primary" not in df.columns:
         df["is_primary"] = 0
+    if "Giving Level" not in df.columns:
+        df["Giving Level"] = ""
+    if "donation_count" not in df.columns:
+        df["donation_count"] = 0
+    if "total_amount" not in df.columns:
+        df["total_amount"] = 0.0
 
     # Count distinct valid codes per campaign name
     c_series = df["Campaign Name"].astype(str).str.strip().str.lower()
@@ -147,8 +154,9 @@ def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
 
     for idx, row in df.iterrows():
         c_name = str(row.get("Campaign Name") or "").strip().lower()
+        gl_name = str(row.get("Giving Level") or "").strip().lower()
         c_code = str(row.get("Code") or "").strip().upper()
-        h_val = str(row.get("Heading") or "").strip().lower()
+        h_val = str(row.get("Department") or row.get("Heading") or "").strip().lower()
 
         distinct_codes = camp_code_map.get(c_name, set())
         v_count = len(distinct_codes)
@@ -167,11 +175,11 @@ def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
         if is_prim:
             is_primary_flags.append(True)
             seen_camps_primary.add(c_name)
-        elif c_name not in seen_camps_primary and c_code not in ["UNASSIGNED", "N/A", "NONE", "NAN", ""]:
+        elif not gl_name and c_name not in seen_camps_primary and c_code not in ["UNASSIGNED", "N/A", "NONE", "NAN", ""]:
             is_primary_flags.append(True)
             seen_camps_primary.add(c_name)
         else:
-            is_primary_flags.append(False)
+            is_primary_flags.append(is_prim)
 
     df["variants_count"] = variants_counts
     df["status"] = statuses
@@ -579,50 +587,43 @@ def get_code_map(company_id: Optional[str] = Query("rethink")):
     return clean_map
 
 
-@router.get("/launchgood")
-def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
-    """Returns LaunchGood classification matrix rules with (Campaign Name, Code) granularity."""
-    comp = (company_id or "rethink").strip().lower()
-    try:
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        query = """
-            SELECT 
-                campaign_name as "Campaign Name",
-                COALESCE(code, 'Unassigned') as "Code",
-                COALESCE(campaign_url, '') as "Campaign URL",
-                COALESCE(community_name, 'N/A') as "Community Name",
-                COALESCE(department, heading, 'Unassigned') as "Department",
-                COALESCE(office, sub_heading, 'Unassigned') as "Office",
-                COALESCE(portfolio, '') as "Portfolio",
-                COALESCE(heading, department, 'Unassigned') as "Heading",
-                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
-                COALESCE(country, 'Unassigned') as "Country",
-                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary",
-                company_id
-            FROM campaign_classifications
-        """
-        if comp != "all":
-            query += " WHERE company_id = ?"
-            df = pd.read_sql_query(query, conn, params=(comp,))
-        else:
-            df = pd.read_sql_query(query, conn)
-        conn.close()
-    except Exception as e:
-        print(f"[LaunchGood Matrix Query Notice]: {e}")
-        df = get_classification_matrix(company_id=comp).fillna("Unassigned")
-
+def _compute_matrix_summary(df: pd.DataFrame, comp: str, platform_name: str) -> dict:
     df = sanitize_matrix_df(df)
     df = _enrich_rules_metadata(df)
-    unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
+    c_col = "Campaign Name" if "Campaign Name" in df.columns else ("campaign_name" if "campaign_name" in df.columns else None)
+    total_rules = len(df)
+    if c_col and not df.empty:
+        unique_campaigns = int(df[c_col].nunique())
+        # A campaign is unassigned if any of its variants is unassigned
+        unassigned_mask = (df["status"] == "unassigned") if "status" in df.columns else (
+            df["Heading"].astype(str).str.lower().isin(["", "unassigned", "nan", "none"]) | 
+            df["Code"].astype(str).str.lower().isin(["", "unassigned", "nan", "none"])
+        )
+        unassigned_campaigns_set = set(df[unassigned_mask][c_col].unique())
+        unassigned_count = len(unassigned_campaigns_set)
+        classified_count = max(0, unique_campaigns - unassigned_count)
+    else:
+        unique_campaigns = total_rules
+        unassigned_count = int((df["status"] == "unassigned").sum()) if "status" in df.columns else 0
+        classified_count = max(0, total_rules - unassigned_count)
+
     return {
-        "platform": "LaunchGood",
+        "platform": platform_name,
         "company_id": comp,
-        "total_campaigns": len(df),
-        "classified_campaigns": int(len(df) - unassigned_count),
+        "total_campaigns": unique_campaigns,
+        "total_rules": total_rules,
+        "classified_campaigns": int(classified_count),
         "unassigned_campaigns": int(unassigned_count),
         "rules": df.to_dict(orient="records")
     }
+
+
+@router.get("/launchgood")
+def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
+    """Returns LaunchGood classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
+    comp = (company_id or "rethink").strip().lower()
+    df = get_classification_matrix(company_id=comp).fillna("Unassigned")
+    return _compute_matrix_summary(df, comp, "LaunchGood")
 
 
 @router.get("/givebright")
@@ -634,6 +635,7 @@ def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
         query = """
             SELECT 
                 campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
                 COALESCE(campaign_url, '') as "Campaign URL",
                 COALESCE(department, heading, 'Unassigned') as "Department",
@@ -670,17 +672,7 @@ def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
                 if fill_mask.any():
                     df.loc[fill_mask, tc] = mapped_vals[fill_mask]
 
-    df = sanitize_matrix_df(df)
-    df = _enrich_rules_metadata(df)
-    unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
-    return {
-        "platform": "GiveBright",
-        "company_id": comp,
-        "total_campaigns": len(df),
-        "classified_campaigns": int(len(df) - unassigned_count),
-        "unassigned_campaigns": int(unassigned_count),
-        "rules": df.to_dict(orient="records")
-    }
+    return _compute_matrix_summary(df, comp, "GiveBright")
 
 
 @router.get("/paysuite")
@@ -692,6 +684,7 @@ def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
         query = """
             SELECT 
                 campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
                 COALESCE(community_name, 'N/A') as "Community Name",
                 COALESCE(department, heading, 'Unassigned') as "Department",
@@ -717,17 +710,7 @@ def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
         print(f"[Paysuite Matrix Query Notice]: {e}")
         df = get_paysuite_classification_matrix(company_id=comp).fillna("Unassigned")
 
-    df = sanitize_matrix_df(df)
-    df = _enrich_rules_metadata(df)
-    unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
-    return {
-        "platform": "Paysuite",
-        "company_id": comp,
-        "total_campaigns": len(df),
-        "classified_campaigns": int(len(df) - unassigned_count),
-        "unassigned_campaigns": int(unassigned_count),
-        "rules": df.to_dict(orient="records")
-    }
+    return _compute_matrix_summary(df, comp, "Paysuite")
 
 
 @router.get("/website")
@@ -739,6 +722,7 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
         query = """
             SELECT 
                 campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
                 COALESCE(community_name, 'N/A') as "Community Name",
                 COALESCE(department, heading, 'Unassigned') as "Department",
@@ -762,17 +746,7 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
         print(f"[Website Matrix Query Notice]: {e}")
         df = get_rethink_website_classification_matrix(company_id=comp).fillna("Unassigned")
 
-    df = sanitize_matrix_df(df)
-    df = _enrich_rules_metadata(df)
-    unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
-    return {
-        "platform": "Rethink Website",
-        "company_id": comp,
-        "total_campaigns": len(df),
-        "classified_campaigns": int(len(df) - unassigned_count),
-        "unassigned_campaigns": int(unassigned_count),
-        "rules": df.to_dict(orient="records")
-    }
+    return _compute_matrix_summary(df, comp, "Rethink Website")
 
 
 @router.get("/madinah")
@@ -784,6 +758,7 @@ def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
         query = """
             SELECT 
                 campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
                 COALESCE(campaign_url, '') as "Campaign URL",
                 COALESCE(department, heading, 'Unassigned') as "Department",
@@ -805,7 +780,7 @@ def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
         conn.close()
     except Exception as e:
         print(f"[Madinah Matrix Query Notice]: {e}")
-        df = pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL", "Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "is_primary", "company_id"])
+        df = pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Campaign URL", "Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "is_primary", "company_id"])
 
     # Strict mapping: Code -> Department, Office, Portfolio, Country, Zakat Eligibility
     code_map = get_code_to_classification_map(company_id=comp)
@@ -820,17 +795,7 @@ def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
                 if fill_mask.any():
                     df.loc[fill_mask, tc] = mapped_vals[fill_mask]
 
-    df = sanitize_matrix_df(df)
-    df = _enrich_rules_metadata(df)
-    unassigned_count = (df["status"] == "unassigned").sum() if "status" in df.columns else 0
-    return {
-        "platform": "Madinah",
-        "company_id": comp,
-        "total_campaigns": len(df),
-        "classified_campaigns": int(len(df) - unassigned_count),
-        "unassigned_campaigns": int(unassigned_count),
-        "rules": df.to_dict(orient="records")
-    }
+    return _compute_matrix_summary(df, comp, "Madinah")
 
 
 @router.get("/export")
@@ -1004,9 +969,11 @@ def save_matrix_rules(payload: SaveRulesRequest):
 
         d_name = sanitize_text(r.get("Donor Name") or r.get("donor_name", ""))
         d_email = sanitize_text(r.get("Donor Email") or r.get("donor_email", ""))
+        gl_val = sanitize_text(r.get("Giving Level") or r.get("giving_level") or "")
 
         rules_dict.append({
             "Campaign Name": sanitize_text(r.get("Campaign Name") or r.get("campaign_name", "N/A")),
+            "Giving Level": gl_val,
             "Campaign URL": sanitize_text(r.get("Campaign URL") or r.get("campaign_url", "")),
             "Community Name": sanitize_text(r.get("Community Name") or r.get("community_name", "Unassigned")),
             "Donor Name": d_name,
@@ -1022,7 +989,7 @@ def save_matrix_rules(payload: SaveRulesRequest):
             "is_primary": 1 if r.get("is_primary") in [1, True, "1", "true", "True"] else 0
         })
     matrix_df = pd.DataFrame(rules_dict)
-    matrix_df = matrix_df.drop_duplicates(subset=["Campaign Name", "Code"], keep="last")
+    matrix_df = matrix_df.drop_duplicates(subset=["Campaign Name", "Giving Level", "Code"], keep="last")
 
     plat = payload.platform.lower().strip()
     if plat in ["website", "rethink_website", "rethink website"]:
@@ -1065,6 +1032,7 @@ def delete_single_rule(payload: DeleteRuleRequest):
         )
 
     cname = sanitize_text(payload.campaign_name.strip())
+    gl_name = sanitize_text((payload.giving_level or "").strip())
     code = sanitize_text(payload.code.strip()) if payload.code else None
     platform = payload.platform.lower()
     plat_db = "givebright" if platform == "givebright" else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
@@ -1073,21 +1041,19 @@ def delete_single_rule(payload: DeleteRuleRequest):
         conn = get_db_connection(timeout=60.0)
         try:
             with conn:
+                del_sql = "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ?"
+                del_params = [comp, plat_db, cname.lower()]
+                if gl_name:
+                    del_sql += " AND LOWER(COALESCE(giving_level, '')) = ?"
+                    del_params.append(gl_name.lower())
                 if code and code.lower() not in ["", "none", "nan", "unassigned"]:
-                    conn.execute(
-                        "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ? AND LOWER(code) = ?",
-                        (comp, plat_db, cname.lower(), code.lower())
-                    )
+                    del_sql += " AND LOWER(code) = ?"
+                    del_params.append(code.lower())
                 elif payload.community_name and payload.community_name.strip().lower() not in ["", "none", "nan", "n/a", "unassigned"]:
-                    conn.execute(
-                        "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ? AND (LOWER(community_name) = ? OR LOWER(code) IN ('unassigned', ''))",
-                        (comp, plat_db, cname.lower(), payload.community_name.strip().lower())
-                    )
-                else:
-                    conn.execute(
-                        "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ?",
-                        (comp, plat_db, cname.lower())
-                    )
+                    del_sql += " AND (LOWER(community_name) = ? OR LOWER(code) IN ('unassigned', ''))"
+                    del_params.append(payload.community_name.strip().lower())
+                
+                conn.execute(del_sql, tuple(del_params))
 
                 # Reset matching donations in DB for this company
                 sql_update = """
@@ -1098,6 +1064,9 @@ def delete_single_rule(payload: DeleteRuleRequest):
                     WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER("Campaign Name") = ?
                 """
                 params = [comp, cname.lower()]
+                if gl_name:
+                    sql_update += " AND LOWER(COALESCE(\"Giving Level Title\", '')) = ?"
+                    params.append(gl_name.lower())
                 if code and code.lower() not in ["", "none", "nan", "unassigned"]:
                     sql_update += " AND LOWER(\"Code\") = ?"
                     params.append(code.lower())
@@ -1114,6 +1083,8 @@ def delete_single_rule(payload: DeleteRuleRequest):
                 mask = df["Campaign Name"].astype(str).str.strip().str.lower() == cname.lower()
                 if comp_col:
                     mask = mask & (df[comp_col].astype(str).str.strip().str.lower() == comp)
+                if gl_name and "Giving Level Title" in df.columns:
+                    mask = mask & (df["Giving Level Title"].fillna("").astype(str).str.strip().str.lower() == gl_name.lower())
                 if code and code.lower() not in ["", "none", "nan", "unassigned"] and "Code" in df.columns:
                     mask = mask & (df["Code"].astype(str).str.strip().str.lower() == code.lower())
                 if payload.community_name and "Community Name" in df.columns:

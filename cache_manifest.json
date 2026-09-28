@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-09-23T09:42:38.176459Z",
+  "algorithm": "AES-256-GCM",
+  "caches": {
+    "donations_cache.parquet": {
+      "encrypted_file": "donations_cache.parquet.enc",
+      "encrypted_sha256": "6b41350167e665c8efddc5a82313530a216dc8fde9ab3941dddf0db9a4639f51",
+      "encrypted_size_bytes": 8918588,
+      "raw_size_bytes": 8918556,
+      "record_count": 105934,
+      "updated_at": "2026-09-23T09:42:38.295948Z"
+    },
+    "payouts_cache.parquet": {
+      "encrypted_file": "payouts_cache.parquet.enc",
+      "encrypted_sha256": "1ac032fa47025829d4f9cef2b16596a3c7517518b76b316256005f9c53a17352",
+      "encrypted_size_bytes": 441008,
+      "raw_size_bytes": 440976,
+      "record_count": 8761,
+      "updated_at": "2026-09-23T09:42:38.298409Z"
+    },
+    "paysuite_payouts_cache.parquet": {
+      "encrypted_file": "paysuite_payouts_cache.parquet.enc",
+      "encrypted_sha256": "6fd6ba90e23d68eafe50f9b2dfeb1a49c11705a7491c9da4b62af3867cd105c0",
+      "encrypted_size_bytes": 63661,
+      "raw_size_bytes": 63629,
+      "record_count": 1541,
+      "updated_at": "2026-09-23T09:42:38.299736Z"
+    }
+  }
+}

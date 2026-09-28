@@ -9,7 +9,8 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from typing import List, Optional
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Response, status, Depends, Request, Form
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from config.settings import (
@@ -19,6 +20,7 @@ from config.settings import (
 from core.data_processor import load_data, get_classification_matrix
 from core.security import encrypt_string, decrypt_string
 from backend.api.events import broadcast_event_sync
+from backend.api.auth import get_current_user, require_super_admin
 
 router = APIRouter(prefix="/api/expenses", tags=["Expense & Payment Tracking"])
 
@@ -892,9 +894,99 @@ def delete_expense(payload: DeleteExpenseRequest):
     }
 
 
-@router.get("/action-email")
-def handle_email_approval(id: str, token: str, action: str):
-    """Handles email link approval/rejection sync."""
+@router.get("/action-email", response_class=HTMLResponse)
+def show_email_approval_page(id: str, token: str, action: str):
+    """
+    Renders an interactive confirmation page for email actions.
+    Prevents automated email crawlers/SafeLinks from automatically approving/rejecting on GET.
+    """
+    action_status = action.upper()
+    if action_status not in ["APPROVED", "REJECTED"]:
+        return HTMLResponse(
+            content="<h3>Invalid Action</h3><p>Action must be APPROVED or REJECTED.</p>",
+            status_code=400
+        )
+
+    init_expense_db()
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM expense_requests WHERE id = ? AND approval_token = ?
+    """, (id, token))
+    record = cursor.fetchone()
+    conn.close()
+
+    if not record:
+        return HTMLResponse(
+            content="""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Invalid Link - Rethink CRM</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px;">
+              <div style="max-width: 480px; width: 100%; background: #1e293b; border-radius: 16px; padding: 32px; text-align: center; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);">
+                <div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
+                <h2 style="margin: 0 0 12px; font-size: 22px;">Link Expired or Invalid</h2>
+                <p style="color: #94a3b8; font-size: 14px; line-height: 1.6;">This approval link is invalid or the expense request has already been processed.</p>
+              </div>
+            </body>
+            </html>
+            """,
+            status_code=404
+        )
+
+    is_approve = action_status == "APPROVED"
+    color_theme = "#10B981" if is_approve else "#EF4444"
+    action_label = "Approve Expense" if is_approve else "Reject Expense"
+    icon = "✅" if is_approve else "🛑"
+
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>{action_label} - Rethink CRM</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
+        .card {{ max-width: 520px; width: 100%; background: #1e293b; border-radius: 20px; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }}
+        .header {{ background: linear-gradient(135deg, {color_theme}, #0f172a); padding: 32px 28px; text-align: center; }}
+        .content {{ padding: 28px; }}
+        .item {{ display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 14px; }}
+        .btn {{ display: block; width: 100%; padding: 14px; background: {color_theme}; color: #fff; font-weight: 700; border: none; border-radius: 12px; font-size: 16px; cursor: pointer; margin-top: 24px; transition: transform 0.1s ease; }}
+        .btn:hover {{ opacity: 0.9; transform: translateY(-1px); }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="header">
+          <div style="font-size: 40px; margin-bottom: 8px;">{icon}</div>
+          <h2 style="margin: 0; font-size: 22px; font-weight: 800; color: #fff;">Confirm {action_label}</h2>
+          <p style="margin: 6px 0 0; font-size: 13px; color: rgba(255,255,255,0.85);">Rethink Charity CRM Authorization Portal</p>
+        </div>
+        <div class="content">
+          <div class="item"><span style="color: #94a3b8;">Request ID</span><span style="font-family: monospace; font-weight: 600;">{record['id']}</span></div>
+          <div class="item"><span style="color: #94a3b8;">Title</span><strong style="color: #f1f5f9;">{record['title'] or 'Expense Request'}</strong></div>
+          <div class="item"><span style="color: #94a3b8;">Vendor / Payee</span><span>{record['vendor'] or 'N/A'}</span></div>
+          <div class="item"><span style="color: #94a3b8;">Amount</span><strong style="color: #38BDF8; font-size: 16px;">£{float(record['amount'] or 0):,.2f}</strong></div>
+          <div class="item"><span style="color: #94a3b8;">Category / GL</span><span>{record['heading'] or 'N/A'} ({record['gl_code'] or 'N/A'})</span></div>
+          <div class="item"><span style="color: #94a3b8;">Current Status</span><span style="padding: 2px 8px; border-radius: 6px; font-size: 12px; background: rgba(255,255,255,0.1);">{record['status']}</span></div>
+
+          <form method="POST" action="/api/expenses/action-email">
+            <input type="hidden" name="id" value="{id}" />
+            <input type="hidden" name="token" value="{token}" />
+            <input type="hidden" name="action" value="{action_status}" />
+            <button type="submit" class="btn">Confirm {action_label}</button>
+          </form>
+        </div>
+      </div>
+    </body>
+    </html>
+    """)
+
+
+@router.post("/action-email", response_class=HTMLResponse)
+def handle_email_approval_post(id: str = Form(...), token: str = Form(...), action: str = Form(...)):
+    """Executes email link approval/rejection on verified POST confirmation."""
     action_status = action.upper()
     if action_status not in ["APPROVED", "REJECTED"]:
         raise HTTPException(status_code=400, detail="Invalid action.")
@@ -914,18 +1006,50 @@ def handle_email_approval(id: str, token: str, action: str):
     clear_expenses_cache()
 
     if rows_affected == 0:
-        return {"status": "error", "message": "Invalid link or token expired."}
+        return HTMLResponse(
+            content="""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Action Failed</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family: sans-serif; background: #0b1120; color: #fff; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0;">
+              <div style="background: #1e293b; border-radius: 16px; padding: 32px; text-align: center;">
+                <h2>⚠️ Error</h2>
+                <p style="color: #94a3b8;">Invalid request or token has already been used.</p>
+              </div>
+            </body>
+            </html>
+            """,
+            status_code=400
+        )
 
     broadcast_event_sync("EXPENSE_REVIEWED", {"id": id, "action": action_status, "source": "email_link"})
 
-    return {
-        "status": "success",
-        "message": f"Expense request {id} has been marked as {action_status} via email sync!"
-    }
+    color_theme = "#10B981" if action_status == "APPROVED" else "#EF4444"
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Success - Rethink CRM</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
+        .card {{ max-width: 480px; width: 100%; background: #1e293b; border-radius: 20px; padding: 36px 28px; text-align: center; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div style="font-size: 52px; margin-bottom: 16px;">🎉</div>
+        <h2 style="margin: 0 0 8px; font-size: 24px; color: {color_theme};">Expense Successfully {action_status}!</h2>
+        <p style="color: #94a3b8; font-size: 14px; line-height: 1.6;">Request ID <code>{id}</code> has been updated in the database and synced across the CRM.</p>
+        <p style="color: #64748b; font-size: 12px; margin-top: 24px;">You can now safely close this tab.</p>
+      </div>
+    </body>
+    </html>
+    """)
 
 
 @router.get("/settings")
-def get_expense_settings():
+def get_expense_settings(current_user = Depends(get_current_user)):
     """Returns all SMTP + approval email settings. Password is masked."""
     init_expense_db()
     cfg = _get_smtp_config()
@@ -945,14 +1069,8 @@ def get_expense_settings():
 
 
 @router.post("/settings")
-def update_expense_settings(payload: UpdateSmtpSettingsRequest):
+def update_expense_settings(payload: UpdateSmtpSettingsRequest, current_user = Depends(require_super_admin)):
     """Updates all SMTP + approval email settings. Super Admin only."""
-    if payload.user_role not in ["super_admin", "admin"] and not payload.can_edit_donors:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Updating email settings is restricted to Super Admins."
-        )
-
     init_expense_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     cursor = conn.cursor()
@@ -992,14 +1110,8 @@ def update_expense_settings(payload: UpdateSmtpSettingsRequest):
 
 
 @router.post("/test-email")
-def test_smtp_email(payload: TestEmailRequest):
+def test_smtp_email(payload: TestEmailRequest, current_user = Depends(require_super_admin)):
     """Sends a test email using current SMTP settings. Super Admin only."""
-    if payload.user_role != "super_admin" and not payload.can_edit_donors:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Sending test emails is restricted to Super Admins."
-        )
-
     init_expense_db()
     smtp_cfg = _get_smtp_config()
     dest_email = smtp_cfg.get('approval_email', APPROVAL_EMAIL)

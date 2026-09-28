@@ -70,6 +70,34 @@ def _clean_str(val: Any, default: str = "") -> str:
         return default
     return str(val).strip()
 
+LEGACY_PAYOUT_CODE_MAP = {
+    'AFG-QRN': 'AFG-EDU-INS-QIN',
+    'AFG-SPN-HUF': 'AFG-EDU-SPN-HUF',
+    'AFG-ONE-MAD': 'AFG-EDU-SCH-MAD',
+    'ALL-GFN': 'ALL-GEN-GEN-GEN',
+    'AFG-SPN-WID': 'AFG-EDU-SPN-WID',
+    'GAZ-FOD': 'GAZ-SOC-AID-FOD',
+    'GAZ-W': 'GAZ-INF-MIS-WEL',
+    'SHAM-EMR': 'SHAM-SOC-AID-SPC',
+    'SHAM-SPN-WID': 'SHAM-EDU-SPN-WID',
+    'GAZ-ONE-DOC': 'GAZ-EDU-SPN-MOT',
+    'SHAM-MAS-CSR': 'SHAM-INF-MAS-MOS',
+    'AFG-WAT-WEL': 'AFG-INF-MIS-WEL',
+    'SHAM-WAF-SHP': 'SHAM-INF-VIL-SHP',
+    'SHAM-SPN-ORP': 'SHAM-EDU-SPN-ORP',
+    'SHAM-SEA-IFT': 'SHAM-SOC-AID-IFT',
+    'AFG-INF-SOL': 'AFG-INF-MIS-SOL',
+    'SHAM-QRN': 'SHAM-EDU-INS-GEN',
+    'GAZ-EMR': 'GAZ-SOC-AID-SPC',
+    'SHAM-SPN-HUF': 'SHAM-EDU-SPN-HUF',
+    'AFG-SPN-ORP': 'AFG-EDU-SPN-ORP',
+    'AFG-INF-HOU': 'AFG-INF-MIS-HOU',
+    'GBR-FBK': 'ALL-GEN-GEN-GEN',
+    'GAZ-ONE-MUS': 'GAZ-INF-MAS-GEN',
+    'ALL-DIV': 'ALL-GEN-GEN-GEN',
+    'ALL-SEA-FIT': 'ALL-SOC-AID-ZKT'
+}
+
 def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Optional[str] = "rethink") -> Dict[Any, Dict[str, str]]:
     global _CLASSIFICATION_MATRIX_CACHE, _PAYSUITE_MATRIX_CACHE
     p_clean = _clean_str(platform, "launchgood").lower()
@@ -113,34 +141,100 @@ def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Op
             return _CLASSIFICATION_MATRIX_CACHE[cid]
         try:
             conn = get_db_connection(timeout=10.0)
-            if cid == "all":
-                matrix_df = pd.read_sql_query("""
-                    SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
-                    FROM campaign_classifications
-                """, conn)
-            else:
-                matrix_df = pd.read_sql_query("""
-                    SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
-                    FROM campaign_classifications WHERE company_id = ?
-                """, conn, params=(cid,))
+            cur = conn.cursor()
+            
+            # 1. Master project codes lookup
+            cur.execute("SELECT code, department, office, country, zakat_eligibility FROM master_project_codes")
+            master_codes_map = {}
+            for r in cur.fetchall():
+                if r[0]:
+                    c_up = str(r[0]).strip().upper()
+                    master_codes_map[c_up] = {
+                        "code": c_up,
+                        "heading": r[1] or "Unassigned",
+                        "sub_heading": r[2] or "Unassigned",
+                        "country": r[3] or "Unassigned",
+                        "zakat_eligibility": r[4] or "Unassigned"
+                    }
+
+            # 2. Platform campaign mappings for LaunchGood
+            where_pcm = "WHERE (platform = 'launchgood' OR platform IS NULL OR platform = '') AND LOWER(COALESCE(company_id, 'rethink')) = ?" if cid != "all" else "WHERE (platform = 'launchgood' OR platform IS NULL OR platform = '')"
+            params_pcm = (cid,) if cid != "all" else ()
+            cur.execute(f"""
+                SELECT campaign_name, code, is_primary, COALESCE(giving_level, '')
+                FROM platform_campaign_mappings
+                {where_pcm}
+                ORDER BY is_primary ASC
+            """, params_pcm)
+            
+            cache = {}
+            for cname, code, is_pri, gl in cur.fetchall():
+                c_clean = fix_mojibake(cname).strip().lower()
+                raw_code = str(code or "").strip().upper()
+                mapped_code = LEGACY_PAYOUT_CODE_MAP.get(raw_code, raw_code)
+                gl_clean = fix_mojibake(gl).strip().lower()
+
+                meta = master_codes_map.get(mapped_code, {
+                    "code": mapped_code,
+                    "heading": "Unassigned",
+                    "sub_heading": "Unassigned",
+                    "country": "Unassigned",
+                    "zakat_eligibility": "Unassigned"
+                })
+
+                entry = {
+                    "campaign_name": cname,
+                    "code": mapped_code,
+                    "heading": meta["heading"],
+                    "sub_heading": meta["sub_heading"],
+                    "country": meta["country"],
+                    "zakat_eligibility": meta["zakat_eligibility"],
+                    "is_primary": is_pri
+                }
+
+                if c_clean:
+                    if gl_clean:
+                        cache[(c_clean, gl_clean)] = entry
+                    cache[c_clean] = entry
+
+            # 3. Campaign classifications overlay
+            where_cc = "WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if cid != "all" else ""
+            params_cc = (cid,) if cid != "all" else ()
+            cur.execute(f"""
+                SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
+                FROM campaign_classifications
+                {where_cc}
+                ORDER BY is_primary ASC
+            """, params_cc)
+            for cname, heading, sub_heading, country, code, zakat, is_pri in cur.fetchall():
+                c_clean = fix_mojibake(cname).strip().lower()
+                raw_code = str(code or "").strip().upper()
+                mapped_code = LEGACY_PAYOUT_CODE_MAP.get(raw_code, raw_code)
+                meta = master_codes_map.get(mapped_code, {
+                    "code": mapped_code,
+                    "heading": heading or "Unassigned",
+                    "sub_heading": sub_heading or "Unassigned",
+                    "country": country or "Unassigned",
+                    "zakat_eligibility": zakat or "Unassigned"
+                })
+                entry = {
+                    "campaign_name": cname,
+                    "code": mapped_code,
+                    "heading": meta["heading"],
+                    "sub_heading": meta["sub_heading"],
+                    "country": meta["country"],
+                    "zakat_eligibility": meta["zakat_eligibility"],
+                    "is_primary": is_pri
+                }
+                if c_clean and c_clean not in cache:
+                    cache[c_clean] = entry
+
             conn.close()
-            if not matrix_df.empty:
-                for c in ["campaign_name", "heading", "sub_heading", "country", "code", "zakat_eligibility"]:
-                    if c in matrix_df.columns:
-                        matrix_df[c] = matrix_df[c].apply(fix_mojibake)
-                cache = {}
-                for _, r in matrix_df.iterrows():
-                    c_clean = fix_mojibake(r["campaign_name"]).strip().lower()
-                    code_clean = str(r["code"]).strip().lower()
-                    if c_clean:
-                        cache[(c_clean, code_clean)] = r.to_dict()
-                        if c_clean not in cache or bool(r.get("is_primary") in [1, True, "1", "true"]):
-                            cache[c_clean] = r.to_dict()
-                _CLASSIFICATION_MATRIX_CACHE[cid] = cache
-                return _CLASSIFICATION_MATRIX_CACHE[cid]
+            _CLASSIFICATION_MATRIX_CACHE[cid] = cache
+            return _CLASSIFICATION_MATRIX_CACHE[cid]
         except Exception as e:
             print(f"[LaunchGood Matrix Overlay Notice]: {e}")
-        return {}
+            return {}
 
 
 def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = False, company_id: Optional[str] = "rethink"):
@@ -274,22 +368,41 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["Platform"] = "LaunchGood"
 
                 rule_dict = _get_classification_matrix_dict("launchgood", company_id=cid)
-                if rule_dict:
-                    c_keys = df["campaign_name"].astype(str).str.strip().str.lower().tolist()
-                    code_keys = df["code"].astype(str).str.strip().str.lower().tolist()
-                    for f, db_f in [("heading", "heading"), ("sub_heading", "sub_heading"), ("country", "country"), ("code", "code"), ("zakat", "zakat_eligibility")]:
-                        updated_vals = []
-                        for cn, cc in zip(c_keys, code_keys):
-                            entry = rule_dict.get((cn, cc), rule_dict.get(cn, {}))
-                            val = entry.get(db_f, "")
-                            if val and str(val).strip().lower() not in ["", "nan", "none", "unassigned"]:
-                                updated_vals.append(fix_mojibake(val))
-                            else:
-                                updated_vals.append(None)
-                        series_updated = pd.Series(updated_vals, index=df.index)
-                        mask_valid = series_updated.notna()
-                        if mask_valid.any():
-                            df.loc[mask_valid, f] = series_updated[mask_valid]
+                c_keys = df["campaign_name"].astype(str).str.strip().str.lower().apply(fix_mojibake).tolist()
+                code_keys = df["code"].astype(str).str.strip().str.upper().tolist()
+                
+                updated_codes = []
+                updated_headings = []
+                updated_subheadings = []
+                updated_countries = []
+                updated_zakats = []
+
+                for idx, (cn, cc) in enumerate(zip(c_keys, code_keys)):
+                    entry = rule_dict.get(cn, {})
+                    raw_new_code = entry.get("code") or LEGACY_PAYOUT_CODE_MAP.get(cc, cc)
+                    new_code = LEGACY_PAYOUT_CODE_MAP.get(raw_new_code, raw_new_code)
+                    
+                    heading = entry.get("heading") or df.iloc[idx]["heading"]
+                    sub_heading = entry.get("sub_heading") or df.iloc[idx]["sub_heading"]
+                    country = entry.get("country") or df.iloc[idx]["country"]
+                    zakat = entry.get("zakat_eligibility") or df.iloc[idx]["zakat"]
+
+                    updated_codes.append(fix_mojibake(new_code))
+                    updated_headings.append(fix_mojibake(heading))
+                    updated_subheadings.append(fix_mojibake(sub_heading))
+                    updated_countries.append(fix_mojibake(country))
+                    updated_zakats.append(fix_mojibake(zakat))
+
+                df["code"] = updated_codes
+                df["Code"] = updated_codes
+                df["heading"] = updated_headings
+                df["Heading"] = updated_headings
+                df["sub_heading"] = updated_subheadings
+                df["Sub-Heading"] = updated_subheadings
+                df["country"] = updated_countries
+                df["Country"] = updated_countries
+                df["zakat"] = updated_zakats
+                df["Zakat Eligibility"] = updated_zakats
 
                 _CLASSIFIED_PAYOUTS_CACHE[cid] = df
                 return _CLASSIFIED_PAYOUTS_CACHE[cid]
@@ -1464,7 +1577,7 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
                 cur.execute("""
                     INSERT INTO platform_campaign_mappings (company_id, platform, campaign_name, code, community_name, is_primary)
                     VALUES (?, ?, ?, ?, 'Payouts', 1)
-                    ON CONFLICT(company_id, platform, campaign_name, code) DO UPDATE SET
+                    ON CONFLICT(company_id, platform, campaign_name, giving_level, code) DO UPDATE SET
                         is_primary = 1,
                         updated_at = CURRENT_TIMESTAMP
                 """, (target_cid, plat, cname, code))

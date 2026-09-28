@@ -29,7 +29,7 @@ export default function LoginView({ theme, onToggleTheme, onLoginSuccess }) {
       .then(res => {
         setLoading(false);
         if (res?.status === 'success') {
-          onLoginSuccess(res.user);
+          onLoginSuccess(res.user, res.access_token);
         } else {
           setError(res?.detail || 'Invalid credentials or user not found.');
         }

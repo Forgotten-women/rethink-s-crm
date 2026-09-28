@@ -7,6 +7,14 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  const resolvedDonorId = typeof donorId === 'object' && donorId !== null 
+    ? (donorId.donor_id || donorId.email || donorId.name || '')
+    : (donorId || '');
+
+  const fallbackDisplayName = typeof donorId === 'object' && donorId !== null
+    ? (donorId.name || donorId.email || donorId.donor_id || 'Donor Profile')
+    : (String(donorId || 'Donor Profile'));
+
   // Pagination State for Transaction History
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(20);
@@ -16,12 +24,12 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
   const [historyLoading, setHistoryLoading] = useState(false);
 
   useEffect(() => {
-    if (!donorId) return;
+    if (!resolvedDonorId) return;
     setLoading(true);
     setError('');
     setHistoryPage(1);
     const compQuery = activeCompany ? `?company_id=${encodeURIComponent(activeCompany)}` : '';
-    fetch(`${API_BASE_URL}/api/donors/profile/${encodeURIComponent(donorId)}${compQuery}`)
+    fetch(`${API_BASE_URL}/api/donors/profile/${encodeURIComponent(resolvedDonorId)}${compQuery}`)
       .then(res => {
         if (!res.ok) throw new Error('Donor profile not found');
         return res.json();
@@ -40,14 +48,14 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
         setError('Unable to load donor profile. Please try again.');
         setLoading(false);
       });
-  }, [donorId, activeCompany]);
+  }, [resolvedDonorId, activeCompany]);
 
   // Fetch specific history pages for massive donor accounts
   const fetchHistoryPage = (p, ps) => {
-    if (!donorId) return;
+    if (!resolvedDonorId) return;
     setHistoryLoading(true);
     const compParam = activeCompany ? `&company_id=${encodeURIComponent(activeCompany)}` : '';
-    fetch(`${API_BASE_URL}/api/donors/history?donor_id=${encodeURIComponent(donorId)}${compParam}&page=${p}&page_size=${ps}`)
+    fetch(`${API_BASE_URL}/api/donors/history?donor_id=${encodeURIComponent(resolvedDonorId)}${compParam}&page=${p}&page_size=${ps}`)
       .then(res => res.json())
       .then(data => {
         setHistoryRecords(data.records || []);
@@ -110,7 +118,7 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
               <User className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-extrabold" style={{ color: 'var(--text-main)' }}>{profile?.display_name || donorId}</h2>
+              <h2 className="text-xl font-extrabold" style={{ color: 'var(--text-main)' }}>{profile?.display_name || fallbackDisplayName}</h2>
               <div className="flex flex-wrap items-center gap-2 mt-1">
                 <span className={`badge ${getTierBadge(profile?.lifetime_tier)}`}>Lifetime: {profile?.lifetime_tier}</span>
                 <span className={`badge ${getTierBadge(profile?.transaction_tier)}`}>Transaction: {profile?.transaction_tier}</span>

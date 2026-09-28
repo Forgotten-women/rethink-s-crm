@@ -1,17 +1,35 @@
 .env
+.env*
 launchgood_donations.db*
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 __pycache__/
+*.pyc
 
 scratch/
 *.csv
 *.xlsx
-*.env*
-.github/
-*.md
-scripts/
-*.sqlite
-.lol
+
+# Raw Parquet Caches (Must stay local/ignored to prevent PII exposure)
+*.parquet
+*.parquet.tmp
+*.tmp
+
+# Allow AES-256 Encrypted Parquet Backups & Metadata Manifest
+!*.parquet.enc
+!cache_manifest.json
+*.html
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.txt
+*.
+*.tar.gz
+*.tar
+*.gz
+*.zip
+*.bak
+crm_database_backup.tar.gz

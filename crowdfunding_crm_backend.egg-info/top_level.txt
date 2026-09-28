@@ -1,6 +1,0 @@
-api
-backend
-components
-config
-core
-views

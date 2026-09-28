@@ -3,17 +3,29 @@ import math
 import os
 import sqlite3
 import tempfile
+import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH, PAYOUTS_PARQUET_PATH
-from core.data_processor import load_data, load_payouts_data, sync_donor_classifications_to_matrix
+from core.data_processor import (
+    load_data,
+    load_payouts_data,
+    sync_donor_classifications_to_matrix,
+    atomic_write_parquet,
+    sanitize_df_dtypes_for_parquet,
+    invalidate_data_cache,
+    invalidate_payouts_cache,
+    sync_donors_to_classification_matrix,
+    get_code_to_classification_map,
+)
 from core.fast_export import dataframe_to_fast_xlsx, dataframe_to_fast_csv
+from backend.api.auth import get_current_user
 
 def _cleanup_temp_file(path: str):
     try:
@@ -26,7 +38,7 @@ router = APIRouter(prefix="/api/donors", tags=["Donors & Explorer"])
 
 
 class BulkEditDonorsRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     target_columns: List[str]
     new_values: List[str]
     company_id: Optional[str] = "rethink"
@@ -51,7 +63,7 @@ class BulkEditDonorsRequest(BaseModel):
 
 
 class UpdateSingleDonorRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = "admin"
     company_id: Optional[str] = "rethink"
     row_id: Optional[int] = None
     donation_id: Optional[str] = None
@@ -63,14 +75,20 @@ class UpdateSingleDonorRequest(BaseModel):
 
 
 @router.post("/update-record")
-def update_single_donor_record(payload: UpdateSingleDonorRequest):
+def update_single_donor_record(
+    payload: UpdateSingleDonorRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     if payload.company_id and str(payload.company_id).strip().lower() == "all":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Modifications are disabled in consolidated 'All Companies' mode. Please select a specific company to edit records."
         )
 
-    if payload.user_role != "super_admin" and not payload.can_edit_donors:
+    # Verify authorization
+    user_role = current_user.get("role", "admin")
+    can_edit = bool(current_user.get("can_edit_donors") or user_role == "super_admin" or payload.can_edit_donors)
+    if not can_edit:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Editing records is restricted to authorized accounts."
@@ -96,67 +114,120 @@ def update_single_donor_record(payload: UpdateSingleDonorRequest):
     if df_raw.empty:
         raise HTTPException(status_code=400, detail="Target dataset is empty.")
 
-    target_idx = None
+    target_table = "payout_settlements" if is_payout_target else "donations"
+    target_donation_id = str(payload.donation_id).strip() if payload.donation_id else None
 
-    # 1. Exact Row Index targeting (100% precision guarantee)
-    if payload.row_id is not None and payload.row_id in df_raw.index:
-        target_idx = payload.row_id
-    elif payload.donation_id and "Donation ID" in df_raw.columns:
-        d_id_str = str(payload.donation_id).strip().lower()
-        matches = df_raw.index[df_raw["Donation ID"].astype(str).str.strip().str.lower() == d_id_str].tolist()
+    # Resolve target_donation_id from SQLite rowid if donation_id was omitted
+    if not target_donation_id and payload.row_id is not None:
+        try:
+            conn_find = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+            c_find = conn_find.cursor()
+            c_find.execute(f'SELECT "Donation ID" FROM {target_table} WHERE rowid = ?', (payload.row_id + 1,))
+            r_find = c_find.fetchone()
+            conn_find.close()
+            if r_find and r_find[0]:
+                target_donation_id = str(r_find[0]).strip()
+        except Exception:
+            pass
+
+    # If still not resolved, attempt dataframe index
+    target_idx = None
+    if target_donation_id and "Donation ID" in df_raw.columns:
+        d_id_lower = target_donation_id.lower()
+        matches = df_raw.index[df_raw["Donation ID"].astype(str).str.strip().str.lower() == d_id_lower].tolist()
         if len(matches) > 0:
             target_idx = matches[0]
+    elif payload.row_id is not None and payload.row_id in df_raw.index:
+        target_idx = payload.row_id
+        if "Donation ID" in df_raw.columns:
+            target_donation_id = str(df_raw.loc[target_idx, "Donation ID"]).strip()
 
-    if target_idx is None:
+    if target_idx is None and not target_donation_id:
         raise HTTPException(status_code=404, detail="Specific record could not be uniquely identified for editing.")
 
-    # Apply changes strictly to ONE single row
+    # Gather field updates
+    update_dict = {}
     if payload.updated_fields and isinstance(payload.updated_fields, dict):
         for col, val in payload.updated_fields.items():
-            if col in df_raw.columns and not col.startswith("_"):
-                df_raw.loc[target_idx, col] = val
+            if not str(col).startswith("_"):
+                update_dict[col] = val
     elif payload.column_name and payload.new_value is not None:
-        if payload.column_name in df_raw.columns and not payload.column_name.startswith("_"):
-            df_raw.loc[target_idx, payload.column_name] = payload.new_value
+        if not str(payload.column_name).startswith("_"):
+            update_dict[payload.column_name] = payload.new_value
 
-    # Auto-fill classification metadata from Code dictionary if Code was set
-    new_code_val = None
-    if payload.updated_fields and "Code" in payload.updated_fields:
-        new_code_val = str(payload.updated_fields["Code"]).strip().lower()
-    elif payload.column_name == "Code" and payload.new_value is not None:
-        new_code_val = str(payload.new_value).strip().lower()
+    old_email = ""
+    old_did = ""
+    if target_idx is not None:
+        old_email = str(df_raw.loc[target_idx, "Email"]).strip().lower() if "Email" in df_raw.columns and pd.notna(df_raw.loc[target_idx, "Email"]) else ""
+        old_did = str(df_raw.loc[target_idx, "Donor ID"]).strip().lower() if "Donor ID" in df_raw.columns and pd.notna(df_raw.loc[target_idx, "Donor ID"]) else ""
 
-    if new_code_val and new_code_val not in ["unassigned", "nan", "none", "n/a", ""]:
-        from core.data_processor import get_code_to_classification_map
-        c_map = get_code_to_classification_map()
-        if new_code_val in c_map:
-            c_info = c_map[new_code_val]
-            for col in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Programme Fund", "Fund Code"]:
+    # Synchronize email changes
+    if "Email" in update_dict:
+        new_email = str(update_dict["Email"] or "").strip().lower()
+        if new_email and "@" in new_email and new_email != old_email:
+            update_dict["Donor ID"] = new_email
+            try:
+                conn_alloc = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+                conn_alloc.execute(
+                    "UPDATE sponsorship_allocations SET donor_email = ?, donor_id = ? WHERE LOWER(donor_email) = ? OR LOWER(donor_id) = ?",
+                    (new_email, new_email, old_email, old_did if old_did else old_email)
+                )
+                conn_alloc.commit()
+                conn_alloc.close()
+            except Exception as ex:
+                print(f"[Allocation Email Sync Notice]: {ex}")
+
+    # Auto-fill classification metadata from Code dictionary if Code was modified
+    new_code_val = update_dict.get("Code")
+    if new_code_val:
+        c_code_clean = str(new_code_val).strip().lower()
+        if c_code_clean not in ["unassigned", "nan", "none", "n/a", ""]:
+            c_map = get_code_to_classification_map()
+            if c_code_clean in c_map:
+                c_info = c_map[c_code_clean]
+                for col in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Programme Fund", "Fund Code"]:
+                    if col not in update_dict or update_dict[col] in [None, "", "Unassigned"]:
+                        val = c_info.get(col)
+                        if val:
+                            update_dict[col] = val
+
+    # 1. Targeted, Non-Destructive SQLite UPDATE (Preserves all indexes and constraints)
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        cursor.execute(f"PRAGMA table_info({target_table})")
+        db_cols = set(r[1] for r in cursor.fetchall())
+
+        valid_updates = {c: v for c, v in update_dict.items() if c in db_cols}
+        if valid_updates and target_donation_id:
+            set_clauses = [f'"{c}" = ?' for c in valid_updates.keys()]
+            params = list(valid_updates.values()) + [target_donation_id]
+            cursor.execute(f'UPDATE {target_table} SET {", ".join(set_clauses)} WHERE "Donation ID" = ?', params)
+            conn.commit()
+        conn.close()
+    except Exception as sql_err:
+        print(f"[SQL Targeted Update Notice]: {sql_err}")
+
+    # 2. Update In-Memory DataFrame
+    if target_idx is not None:
+        for col, val in update_dict.items():
+            if col in df_raw.columns:
+                df_raw.loc[target_idx, col] = val
+    elif target_donation_id and "Donation ID" in df_raw.columns:
+        mask = df_raw["Donation ID"].astype(str).str.strip().str.lower() == target_donation_id.lower()
+        if mask.any():
+            for col, val in update_dict.items():
                 if col in df_raw.columns:
-                    val = c_info.get(col, "Unassigned" if col not in ["Portfolio", "Programme Fund", "Fund Code"] else "")
-                    if val != "Unassigned" and val != "":
-                        if payload.updated_fields:
-                            if payload.updated_fields.get(col) in [None, "", "Unassigned"]:
-                                df_raw.loc[target_idx, col] = val
-                        else:
-                            df_raw.loc[target_idx, col] = val
+                    df_raw.loc[mask, col] = val
 
-    from core.data_processor import sanitize_df_dtypes_for_parquet
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
 
+    # 3. Atomic Parquet Update (Never corrupts file)
     if is_payout_target:
-        from core.data_processor import invalidate_payouts_cache
-        df_raw.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-        df_raw.to_sql("payout_settlements", con=conn, if_exists="replace", index=False)
-        conn.close()
+        atomic_write_parquet(df_raw, PAYOUTS_PARQUET_PATH)
         invalidate_payouts_cache()
     else:
-        from core.data_processor import invalidate_data_cache, sync_donors_to_classification_matrix
-        df_raw.to_parquet(PARQUET_PATH, index=False)
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-        df_raw.to_sql("donations", con=conn, if_exists="replace", index=False)
-        conn.close()
+        atomic_write_parquet(df_raw, PARQUET_PATH)
         invalidate_data_cache()
         sync_donors_to_classification_matrix(df_raw)
 
@@ -171,19 +242,24 @@ def update_single_donor_record(payload: UpdateSingleDonorRequest):
 
     return {
         "status": "success",
-        "message": f"Successfully updated record #{target_idx}."
+        "message": f"Successfully updated record (Donation ID: {target_donation_id or target_idx})."
     }
 
 
 @router.post("/bulk-edit")
-def bulk_edit_donors(payload: BulkEditDonorsRequest):
+def bulk_edit_donors(
+    payload: BulkEditDonorsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     if payload.company_id and str(payload.company_id).strip().lower() == "all":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Bulk edits are disabled in consolidated 'All Companies' mode. Please select a specific company to edit records."
         )
 
-    if payload.user_role != "super_admin" and not payload.can_edit_donors:
+    user_role = current_user.get("role", "admin")
+    can_edit = bool(current_user.get("can_edit_donors") or user_role == "super_admin" or payload.can_edit_donors)
+    if not can_edit:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Editing records is restricted to authorized accounts."
@@ -223,16 +299,25 @@ def bulk_edit_donors(payload: BulkEditDonorsRequest):
     if len(matching_indices) == 0:
         return {"status": "success", "message": "No matching records found to edit."}
 
+    bulk_updates = {}
     for col, val in zip(payload.target_columns, payload.new_values):
         if col and col in df_raw.columns:
             df_raw.loc[matching_indices, col] = val
+            bulk_updates[col] = val
 
-    # If 'Code' was among target columns, auto-fill Department, Office, Portfolio, Heading, Sub-Heading, Country, Zakat Eligibility, Programme Fund, Fund Code
+    # If 'Email' was among target columns, update Donor ID as well
+    if "Email" in payload.target_columns:
+        e_idx = payload.target_columns.index("Email")
+        new_email_val = str(payload.new_values[e_idx] or "").strip().lower()
+        if "@" in new_email_val and "Donor ID" in df_raw.columns:
+            df_raw.loc[matching_indices, "Donor ID"] = new_email_val
+            bulk_updates["Donor ID"] = new_email_val
+
+    # If 'Code' was among target columns, auto-fill classification metadata
     if "Code" in payload.target_columns:
         c_idx = payload.target_columns.index("Code")
         new_c_val = str(payload.new_values[c_idx] or "").strip().lower()
         if new_c_val and new_c_val not in ["unassigned", "nan", "none", "n/a", ""]:
-            from core.data_processor import get_code_to_classification_map
             c_map = get_code_to_classification_map()
             if new_c_val in c_map:
                 c_info = c_map[new_c_val]
@@ -241,28 +326,48 @@ def bulk_edit_donors(payload: BulkEditDonorsRequest):
                         t_val = c_info.get(tc, "Unassigned" if tc not in ["Portfolio", "Programme Fund", "Fund Code"] else "")
                         if t_val != "Unassigned" and t_val != "":
                             df_raw.loc[matching_indices, tc] = t_val
+                            bulk_updates[tc] = t_val
 
-    from core.data_processor import sanitize_df_dtypes_for_parquet
+    # 1. Non-Destructive Parameterized SQLite Batch UPDATE
+    target_table = "payout_settlements" if is_payout_bulk else "donations"
+    matching_don_ids = []
+    if "Donation ID" in df_raw.columns:
+        matching_don_ids = df_raw.loc[matching_indices, "Donation ID"].dropna().astype(str).tolist()
+
+    if matching_don_ids and bulk_updates:
+        try:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            cursor.execute(f"PRAGMA table_info({target_table})")
+            db_cols = set(r[1] for r in cursor.fetchall())
+
+            valid_updates = {c: v for c, v in bulk_updates.items() if c in db_cols}
+            if valid_updates:
+                set_clauses = [f'"{c}" = ?' for c in valid_updates.keys()]
+                set_sql = ", ".join(set_clauses)
+                chunk_size = 500
+                for i in range(0, len(matching_don_ids), chunk_size):
+                    chunk = matching_don_ids[i:i + chunk_size]
+                    placeholders = ", ".join(["?"] * len(chunk))
+                    cursor.execute(
+                        f'UPDATE {target_table} SET {set_sql} WHERE "Donation ID" IN ({placeholders})',
+                        list(valid_updates.values()) + chunk
+                    )
+                conn.commit()
+            conn.close()
+        except Exception as sql_bulk_err:
+            print(f"[SQL Bulk Update Notice]: {sql_bulk_err}")
+
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
 
+    # 2. Atomic Parquet Update
     if is_payout_bulk:
-        from core.data_processor import invalidate_payouts_cache
-        df_raw.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-        df_raw.to_sql("payout_settlements", con=conn, if_exists="replace", index=False)
-        conn.close()
+        atomic_write_parquet(df_raw, PAYOUTS_PARQUET_PATH)
         invalidate_payouts_cache()
     else:
-        from core.data_processor import invalidate_data_cache, sync_donors_to_classification_matrix
-        df_raw.to_parquet(PARQUET_PATH, index=False)
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-        df_raw.to_sql("donations", con=conn, if_exists="replace", index=False)
-        conn.close()
+        atomic_write_parquet(df_raw, PARQUET_PATH)
         invalidate_data_cache()
         sync_donors_to_classification_matrix(df_raw)
-
-        from core.database import sync_to_cloud_async
-        sync_to_cloud_async(df_raw, mode="replace")
 
     try:
         from backend.api.expenses import clear_expenses_cache
@@ -275,7 +380,7 @@ def bulk_edit_donors(payload: BulkEditDonorsRequest):
 
     return {
         "status": "success",
-        "message": f"Successfully updated {len(matching_indices):,} record(s) and synchronized classification matrix."
+        "message": f"Successfully updated {len(matching_indices):,} matching records across columns: {', '.join(payload.target_columns)}."
     }
 
 
@@ -416,15 +521,28 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
             elif val_str in ["no", "0", "false"]:
                 mask &= df[ga_col].astype(str).str.lower().isin(["no", "0", "0.0", "false"])
 
-    # High-speed ISO Date Filtering (sub-millisecond string comparison)
-    if "Created Date (UTC)" in df.columns:
-        date_col = df["Created Date (UTC)"].astype(str)
-        if isinstance(start_date, str) and start_date.strip():
-            s_date = start_date.strip()[:10]
-            mask &= (date_col >= s_date)
-        if isinstance(end_date, str) and end_date.strip():
-            e_date = end_date.strip()[:10]
-            mask &= (date_col <= e_date)
+    # High-speed ISO Date Filtering with resilient multi-column fallback
+    if (isinstance(start_date, str) and start_date.strip()) or (isinstance(end_date, str) and end_date.strip()):
+        s_date = start_date.strip()[:10] if isinstance(start_date, str) and start_date.strip() else None
+        e_date = end_date.strip()[:10] if isinstance(end_date, str) and end_date.strip() else None
+
+        date_col = None
+        for dcol in ["Created Date (UTC)", "_parsed_date", "Date", "Settled Date (UTC)", "Date of collection"]:
+            if dcol in df.columns:
+                cur_s = df[dcol].astype(str).str.strip().str.slice(0, 10)
+                valid = ~cur_s.str.lower().isin(["", "nan", "none", "nat", "<na>"])
+                if valid.any():
+                    if date_col is None:
+                        date_col = cur_s.where(valid)
+                    else:
+                        date_col = date_col.fillna(cur_s.where(valid))
+
+        if date_col is not None:
+            valid_mask = date_col.notna() & (~date_col.astype(str).str.lower().isin(["", "nan", "none", "nat", "<na>"]))
+            if s_date:
+                mask &= (valid_mask & (date_col.astype(str) >= s_date))
+            if e_date:
+                mask &= (valid_mask & (date_col.astype(str) <= e_date))
 
     if mask.all():
         return df
@@ -554,9 +672,9 @@ def get_donors_paginated(
                     if cs_col in avail_cols:
                         c_clauses.append(f'"{cs_col}" LIKE ?')
                         c_params.append(c_term)
-                    if c_clauses:
-                        where_clauses.append(f"({' OR '.join(c_clauses)})")
-                        params.extend(c_params)
+                if c_clauses:
+                    where_clauses.append(f"({' OR '.join(c_clauses)})")
+                    params.extend(c_params)
 
             if campaign and str(campaign).strip() and campaign != "All Campaigns" and "Campaign Name" in avail_cols:
                 where_clauses.append('LOWER("Campaign Name") = ?')
@@ -567,12 +685,14 @@ def get_donors_paginated(
                 params.extend([f"%{gift_aid}%", 1 if gift_aid.lower() == "yes" else 0])
 
             if start_date and str(start_date).strip():
-                where_clauses.append('date("Created Date (UTC)") >= date(?)')
-                params.append(start_date)
+                s_clean = str(start_date).strip()[:10]
+                where_clauses.append('("Created Date (UTC)" >= ? AND "Created Date (UTC)" != \'\' AND "Created Date (UTC)" != \'nan\')')
+                params.append(s_clean)
 
             if end_date and str(end_date).strip():
-                where_clauses.append('date("Created Date (UTC)") <= date(?)')
-                params.append(end_date)
+                e_clean = str(end_date).strip()[:10]
+                where_clauses.append('("Created Date (UTC)" <= ? AND "Created Date (UTC)" != \'\' AND "Created Date (UTC)" != \'nan\')')
+                params.append(e_clean)
 
             if search and search.strip():
                 id_tokens, raw_text = _parse_search_query(search)
@@ -962,6 +1082,26 @@ ANON_PLACEHOLDERS = {
 }
 
 
+DONOR_TITLE_PREFIXES = {
+    'dr', 'dr.', 'mr', 'mr.', 'mrs', 'mrs.', 'ms', 'ms.', 'miss', 
+    'prof', 'prof.', 'professor', 'sheikh', 'shaykh', 'shaykha', 'sheikha',
+    'haji', 'hajji', 'hajjah', 'haja', 'ustadh', 'ustad', 'ustadha',
+    'imam', 'mufti', 'brother', 'sister', 'dr/mr', 'dr/mrs', 'lord', 'lady', 'sir'
+}
+
+
+def _clean_name_for_match(s):
+    if not s or pd.isna(s):
+        return ""
+    raw = str(s).strip()
+    words = raw.split()
+    while words and words[0].lower().rstrip('.') in DONOR_TITLE_PREFIXES:
+        words.pop(0)
+    cleaned = ' '.join(words).strip().lower()
+    cleaned = re.sub(r'[^a-z\s]', '', cleaned).strip()
+    return re.sub(r'\s+', ' ', cleaned)
+
+
 def _get_donor_matching_mask(df: pd.DataFrame, donor_id_or_email: str) -> pd.Series:
     """Safely matches donor transactions without accidentally grouping 40k+ anonymous records."""
     if not donor_id_or_email or df.empty:
@@ -988,13 +1128,12 @@ def _get_donor_matching_mask(df: pd.DataFrame, donor_id_or_email: str) -> pd.Ser
                 return mask
         return pd.Series(False, index=df.index)
 
-    # 3. Match by exact Email
+    # 3. Match by exact Email (across all email-containing fields)
     if "@" in identity:
         mask = pd.Series(False, index=df.index)
-        if "Email" in df.columns:
-            mask |= (df["Email"].astype(str).str.strip().str.lower() == identity)
-        if "Donor ID" in df.columns:
-            mask |= (df["Donor ID"].astype(str).str.strip().str.lower() == identity)
+        for ec in ["Email", "Giving Level Email", "Email (for tax receipt)", "Donor ID"]:
+            if ec in df.columns:
+                mask |= (df[ec].astype(str).str.strip().str.lower() == identity)
         if mask.any():
             return mask
 
@@ -1010,15 +1149,32 @@ def _get_donor_matching_mask(df: pd.DataFrame, donor_id_or_email: str) -> pd.Ser
         if did_mask.any():
             return did_mask
 
-    # 6. Fallback: Match by authentic Full Name or Billing Name (only if not generic)
+    # 6. Match by Phone Number (if identity formatted as phone or digits)
+    clean_digits = re.sub(r'[^\d]', '', identity)
+    clean_digits = re.sub(r'^44', '', clean_digits).lstrip('0')
+    if identity.startswith("phone:") or (len(clean_digits) >= 7 and "@" not in identity):
+        p_mask = pd.Series(False, index=df.index)
+        for pc in ["Phone Number", "Phone", "phone_number", "Home phone number", "Contact Phone"]:
+            if pc in df.columns:
+                cand_digits = df[pc].astype(str).str.replace(r'[^\d]', '', regex=True).str.replace(r'^44', '', regex=True).str.lstrip('0')
+                p_mask |= (cand_digits == clean_digits)
+        if p_mask.any():
+            return p_mask
+
+    # 7. Fallback: Match by authentic Full Name or Billing Name (normalized, with title stripping)
     mask = pd.Series(False, index=df.index)
-    if "First Name" in df.columns and "Last Name" in df.columns:
-        full_names = (df["First Name"].fillna("").astype(str).str.strip() + " " + df["Last Name"].fillna("").astype(str).str.strip()).str.strip().str.lower()
-        mask |= (full_names == identity)
-    if "Billing Name" in df.columns:
-        mask |= (df["Billing Name"].astype(str).str.strip().str.lower() == identity)
-    if "Display Name" in df.columns and identity not in ANON_PLACEHOLDERS:
-        mask |= (df["Display Name"].astype(str).str.strip().str.lower() == identity)
+    clean_ident_name = _clean_name_for_match(identity)
+    if clean_ident_name and clean_ident_name not in ANON_PLACEHOLDERS and len(clean_ident_name) >= 3:
+        if "First Name" in df.columns and "Last Name" in df.columns:
+            raw_full = (df["First Name"].fillna("").astype(str).str.strip() + " " + df["Last Name"].fillna("").astype(str).str.strip()).str.strip()
+            clean_full = raw_full.apply(_clean_name_for_match)
+            mask |= (clean_full == clean_ident_name)
+        if "Billing Name" in df.columns:
+            clean_bn = df["Billing Name"].apply(_clean_name_for_match)
+            mask |= (clean_bn == clean_ident_name)
+        if "Display Name" in df.columns:
+            clean_disp = df["Display Name"].apply(_clean_name_for_match)
+            mask |= (clean_disp == clean_ident_name)
 
     return mask
 

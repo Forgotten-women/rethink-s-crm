@@ -5,7 +5,7 @@ import datetime
 import threading
 from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, status, Query, Depends
 import pandas as pd
 import numpy as np
 
@@ -15,10 +15,12 @@ from core.data_processor import (
     sanitize_df_dtypes_for_parquet,
     init_classification_db,
     fix_mojibake,
-    get_code_to_classification_map
+    get_code_to_classification_map,
+    atomic_write_parquet
 )
 from core.utils import classify_donor_amount
 from backend.api.events import broadcast_event_sync
+from backend.api.auth import require_super_admin
 
 router = APIRouter(prefix="/api/webhooks", tags=["Webhooks"])
 
@@ -67,16 +69,17 @@ def _log_webhook_event(company_id: str, event_type: str, event_id: str, payload:
         print(f"[Webhook Audit Log Notice]: {e}")
 
 
-def _lookup_givebrite_classification(campaign_name: str, company_id: str = "rethink") -> Dict[str, str]:
+def _lookup_givebrite_classification(campaign_name: str, company_id: str = "rethink", giving_level: str = "") -> Dict[str, str]:
     """
     Looks up the master classification details for a GiveBrite campaign by querying:
-    1. platform_campaign_mappings for any assigned code for this campaign & company
+    1. platform_campaign_mappings for (campaign_name, giving_level) match first, then campaign default
     2. master_project_codes (via get_code_to_classification_map) to retrieve official
        Department, Office, Portfolio, Country, and Zakat Eligibility.
     3. Keyword fallback rules if brand new / unassigned.
     """
     comp = str(company_id or "rethink").strip().lower()
     cname_clean = str(campaign_name or "").strip()
+    gl_clean = str(giving_level or "").strip().lower()
     if not cname_clean or cname_clean.lower() in ["nan", "none", "n/a", ""]:
         return {
             "Department": "Unassigned",
@@ -91,22 +94,38 @@ def _lookup_givebrite_classification(campaign_name: str, company_id: str = "reth
             "Zakat Eligibility": "Unassigned"
         }
 
-    # 1. Check if campaign already has an assigned code in platform_campaign_mappings
+    # 1. Check if (campaign_name, giving_level) or campaign default has an assigned code in platform_campaign_mappings
     assigned_code = None
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         cur = conn.cursor()
-        cur.execute("""
-            SELECT code FROM platform_campaign_mappings
-            WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
-              AND platform = 'givebright' 
-              AND LOWER(campaign_name) = ?
-            LIMIT 1
-        """, (comp, cname_clean.lower()))
-        row = cur.fetchone()
+        if gl_clean and gl_clean not in ["nan", "none", "n/a", "unassigned", ""]:
+            cur.execute("""
+                SELECT code FROM platform_campaign_mappings
+                WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
+                  AND platform = 'givebright' 
+                  AND LOWER(campaign_name) = ?
+                  AND LOWER(COALESCE(giving_level, '')) = ?
+                LIMIT 1
+            """, (comp, cname_clean.lower(), gl_clean))
+            row = cur.fetchone()
+            if row and row[0] and str(row[0]).strip().lower() not in ["", "unassigned", "nan", "none"]:
+                assigned_code = str(row[0]).strip().upper()
+
+        if not assigned_code:
+            cur.execute("""
+                SELECT code FROM platform_campaign_mappings
+                WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
+                  AND platform = 'givebright' 
+                  AND LOWER(campaign_name) = ?
+                  AND (LOWER(COALESCE(giving_level, '')) = '' OR is_primary = 1)
+                ORDER BY is_primary DESC
+                LIMIT 1
+            """, (comp, cname_clean.lower()))
+            row = cur.fetchone()
+            if row and row[0] and str(row[0]).strip().lower() not in ["", "unassigned", "nan", "none"]:
+                assigned_code = str(row[0]).strip().upper()
         conn.close()
-        if row and row[0] and str(row[0]).strip().lower() not in ["", "unassigned", "nan", "none"]:
-            assigned_code = str(row[0]).strip().upper()
     except Exception as e:
         print(f"[Campaign Mapping Lookup Notice]: {e}")
 
@@ -389,6 +408,8 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                 if not camp_name or camp_name.lower() in ["nan", "none", "null", "direct donation", "direct donation (unassigned)", ""]:
                     camp_name = "Unassigned"
 
+                giving_level = str(payload.get("giving_level") or payload.get("giving_level_title") or payload.get("variant") or payload.get("option") or "").strip()
+
                 fund_obj = payload.get("fundraiser") or {}
                 fund_name = str(fund_obj.get("name") or "").strip() if isinstance(fund_obj, dict) else str(fund_obj or "").strip()
 
@@ -422,7 +443,7 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                     _ensure_campaign_registered(camp_name, campaign_url=camp_url, company_id=target_cid)
 
                 # Classify donation using stored company matrix
-                class_info = _lookup_givebrite_classification(camp_name, company_id=target_cid)
+                class_info = _lookup_givebrite_classification(camp_name, company_id=target_cid, giving_level=giving_level)
 
                 # Auto-resolve mapped fundraiser from CRM records if campaign is mapped
                 mapped_fund = _lookup_fundraiser_for_campaign(camp_name, code=class_info.get("Code", ""), company_id=target_cid)
@@ -474,6 +495,7 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                     "Gift Aid (yes or no)": giftaid_str,
                     "Anonymous or Public": "Anonymous" if is_anon else "Public",
                     "Campaign Name": camp_name,
+                    "Giving Level Title": giving_level,
                     "Campaign URL": camp_url,
                     "Community Name": "GiveBright",
                     "fundraiser_name": fund_name,
@@ -524,7 +546,7 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                         df_save.loc[donor_mask, "Lifetime Donor Classification"] = lifetime_class
 
                 df_save = sanitize_df_dtypes_for_parquet(df_save)
-                df_save.to_parquet(PARQUET_PATH, index=False)
+                atomic_write_parquet(df_save, PARQUET_PATH)
 
                 # 2. Fast single-row upsert into SQLite donations table (deduplicating by Donation ID)
                 try:
@@ -573,9 +595,19 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
 
 # ── API Route Endpoints ────────────────────────────────────────────────────────
 
+def _verify_webhook_secret(request: Request):
+    expected_secret = os.getenv("GIVEBRITE_WEBHOOK_SECRET", "").strip()
+    if not expected_secret:
+        return
+    provided = request.headers.get("x-webhook-secret") or request.query_params.get("secret")
+    if not provided or provided != expected_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature/secret.")
+
+
 @router.post("/givebrite/rethink")
 async def givebrite_webhook_rethink(request: Request, background_tasks: BackgroundTasks):
     """Dedicated GiveBrite webhook receiver endpoint for Rethink Charity."""
+    _verify_webhook_secret(request)
     try:
         payload = await request.json()
     except Exception:
@@ -589,6 +621,7 @@ async def givebrite_webhook_rethink(request: Request, background_tasks: Backgrou
 @router.post("/givebrite/iqra")
 async def givebrite_webhook_iqra(request: Request, background_tasks: BackgroundTasks):
     """Dedicated GiveBrite webhook receiver endpoint for Iqra."""
+    _verify_webhook_secret(request)
     try:
         payload = await request.json()
     except Exception:
@@ -601,6 +634,7 @@ async def givebrite_webhook_iqra(request: Request, background_tasks: BackgroundT
 @router.post("/givebrite/{company_id}")
 async def givebrite_webhook_dynamic(company_id: str, request: Request, background_tasks: BackgroundTasks):
     """Dynamic GiveBrite webhook receiver endpoint for any registered company."""
+    _verify_webhook_secret(request)
     cid = company_id.strip().lower()
     if not cid or cid == "all":
         raise HTTPException(status_code=400, detail="Valid charity company_id is required.")
@@ -615,7 +649,7 @@ async def givebrite_webhook_dynamic(company_id: str, request: Request, backgroun
 
 
 @router.get("/givebrite/logs")
-def get_givebrite_webhook_logs(company_id: Optional[str] = Query("all"), limit: int = Query(50, ge=1, le=200)):
+def get_givebrite_webhook_logs(company_id: Optional[str] = Query("all"), limit: int = Query(50, ge=1, le=200), current_user = Depends(require_super_admin)):
     """Inspects recent GiveBrite webhook audit logs for troubleshooting and verification."""
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row

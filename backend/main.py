@@ -49,6 +49,11 @@ app.include_router(payouts.router)
 app.include_router(fundraisers.router)
 app.include_router(webhooks.router)
 
+# Mount logos directory for branded email assets
+logos_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache", "logos")
+if os.path.exists(logos_dir):
+    app.mount("/logos", StaticFiles(directory=logos_dir), name="logos")
+
 
 @app.get("/api/health", tags=["Health"])
 @app.get("/health", tags=["Health"])
@@ -72,13 +77,30 @@ def root_endpoint():
 
 
 @app.on_event("startup")
-def startup_event():
-    print("Crowdfunding Enterprise CRM API initialized and ready to receive requests.")
+async def startup_event():
+    import asyncio
+    from backend.api.events import set_main_event_loop
     try:
-        from core.database import seed_database_if_empty
+        set_main_event_loop(asyncio.get_running_loop())
+    except Exception as loop_err:
+        print(f"[WebSocket Loop Init Notice]: {loop_err}")
+
+    print("Crowdfunding Enterprise CRM API initialized and ready to receive requests.")
+
+    # 1. Cold-start restore: decrypt encrypted cache if plain parquet is not present
+    try:
+        from core.security import ensure_cache_decrypted
+        ensure_cache_decrypted()
+    except Exception as dec_err:
+        print(f"[Cold-start Decrypt Notice]: {dec_err}")
+
+    # 2. Seed database & build indexes if missing
+    try:
+        from core.database import seed_database_if_empty, ensure_database_indexes
         seed_database_if_empty()
+        ensure_database_indexes()
     except Exception as e:
-        print(f"[Startup Seed Notice]: {e}")
+        print(f"[Startup Seed & Index Notice]: {e}")
 
 
 

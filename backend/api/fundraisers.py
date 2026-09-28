@@ -25,9 +25,9 @@ def _sync_parquet_and_cache_from_sqlite():
         df_donations = pd.read_sql("SELECT * FROM donations", conn)
         conn.close()
 
-        from core.data_processor import sanitize_df_dtypes_for_parquet, invalidate_data_cache
+        from core.data_processor import sanitize_df_dtypes_for_parquet, invalidate_data_cache, atomic_write_parquet
         df_donations = sanitize_df_dtypes_for_parquet(df_donations)
-        df_donations.to_parquet(PARQUET_PATH, index=False)
+        atomic_write_parquet(df_donations, PARQUET_PATH)
         invalidate_data_cache()
     except Exception as e:
         print(f"[Fundraiser Sync Parquet Notice]: {e}")
@@ -89,8 +89,6 @@ init_fundraiser_db()
 
 def calculate_benchmark_goal(raised_amount: float) -> float:
     """Calculates an intelligent benchmark target goal based on raised amount."""
-    if raised_amount <= 0:
-        return 1000.0
     if raised_amount <= 500:
         return 500.0
     elif raised_amount <= 1000:
