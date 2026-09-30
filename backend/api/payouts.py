@@ -653,10 +653,14 @@ def get_payouts_summary(
         # Date Filters
         s_date = _clean_str(start_date)
         e_date = _clean_str(end_date)
-        if s_date and "Created Date (UTC)" in df.columns:
-            df = df[pd.to_datetime(df["Created Date (UTC)"], errors="coerce") >= pd.to_datetime(s_date)]
-        if e_date and "Created Date (UTC)" in df.columns:
-            df = df[pd.to_datetime(df["Created Date (UTC)"], errors="coerce") <= pd.to_datetime(e_date)]
+        if s_date or e_date:
+            date_col = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Date of collection", "Date Due"] if c in df.columns), None)
+            if date_col:
+                dt_series = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+                if s_date:
+                    df = df[dt_series >= pd.to_datetime(s_date)]
+                if e_date:
+                    df = df[dt_series <= pd.to_datetime(e_date + " 23:59:59")]
 
         if plat == "paysuite":
             paid_df = df[df["status"] == "Paid"]

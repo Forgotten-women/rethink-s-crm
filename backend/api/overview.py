@@ -38,7 +38,7 @@ def get_overview_timeline(
     df_raw = load_data(company_id=company_id)
     df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, company_id=company_id)
     col_amount = _get_amount_column(df)
-    col_date = "Created Date (UTC)"
+    col_date = "_parsed_date" if ("_parsed_date" in df.columns and df["_parsed_date"].dropna().astype(str).str.strip().ne("").any()) else ("Created Date (UTC)" if "Created Date (UTC)" in df.columns else "Date")
 
     if df.empty or not col_amount or col_date not in df.columns:
         return []

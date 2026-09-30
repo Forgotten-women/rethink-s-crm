@@ -2904,20 +2904,43 @@ def _ensure_two_tier_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Office" in df.columns and "Sub-Heading" not in df.columns:
         df["Sub-Heading"] = df["Office"]
 
-    # Ensure Created Date (UTC) and Date are always populated from fallbacks if empty
-    if "Created Date (UTC)" in df.columns:
-        empty_d = df["Created Date (UTC)"].isna() | df["Created Date (UTC)"].astype(str).str.strip().isin(["", "nan", "None", "NaT"])
-        if empty_d.any():
-            for dcol in ["_parsed_date", "Settled Date (UTC)", "Date of collection", "Date Due", "Date"]:
-                if dcol in df.columns:
-                    cur_s = df[dcol].astype(str).str.strip().str.slice(0, 10)
-                    valid = ~cur_s.str.lower().isin(["", "nan", "none", "nat", "<na>"])
-                    fill_mask = empty_d & valid
-                    if fill_mask.any():
-                        df.loc[fill_mask, "Created Date (UTC)"] = cur_s[fill_mask]
-                        empty_d = df["Created Date (UTC)"].isna() | df["Created Date (UTC)"].astype(str).str.strip().isin(["", "nan", "None", "NaT"])
-    if "Created Date (UTC)" in df.columns:
-        df["Date"] = df["Created Date (UTC)"]
+    # Resilient, High-Speed ISO Date Standardization across all fallback sources (Iqra & Rethink)
+    date_candidates = ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)", "Date of collection", "Date Due"]
+    res_date = pd.Series("", index=df.index, dtype=object)
+    for col in date_candidates:
+        if col not in df.columns:
+            continue
+        s = df[col].astype(str).str.strip()
+        unresolved = (res_date == "") | res_date.isna()
+        if not unresolved.any():
+            break
+        cur = s[unresolved]
+        valid = ~cur.str.lower().isin(["", "nan", "none", "nat", "<na>"])
+        if not valid.any():
+            continue
+        valid_cur = cur[valid]
+        # ISO format: YYYY-MM-DD
+        iso_mask = valid_cur.str.match(r"^\d{4}-\d{2}-\d{2}")
+        if iso_mask.any():
+            iso_dates = valid_cur[iso_mask].str.slice(0, 10)
+            res_date.loc[iso_dates.index] = iso_dates
+        # Slash format: D/M/YYYY or DD/MM/YYYY
+        slash_mask = valid_cur.str.match(r"^\d{1,2}/\d{1,2}/\d{4}")
+        if slash_mask.any():
+            slash_raw = valid_cur[slash_mask]
+            parts = slash_raw.str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
+            formatted = parts[2] + "-" + parts[1].str.zfill(2) + "-" + parts[0].str.zfill(2)
+            res_date.loc[slash_raw.index] = formatted
+
+    # Always ensure _parsed_date, Created Date (UTC), and Date are populated and synchronized
+    df["_parsed_date"] = res_date
+    if "Created Date (UTC)" not in df.columns or df["Created Date (UTC)"].isna().all():
+        df["Created Date (UTC)"] = res_date
+    else:
+        cd_str = df["Created Date (UTC)"].astype(str).str.strip()
+        invalid_cd = cd_str.str.lower().isin(["", "nan", "none", "nat", "<na>"]) | cd_str.str.contains("/")
+        df.loc[invalid_cd & (res_date != ""), "Created Date (UTC)"] = res_date[invalid_cd & (res_date != "")]
+    df["Date"] = df["Created Date (UTC)"]
     return df
 
 

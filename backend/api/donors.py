@@ -527,11 +527,21 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
         e_date = end_date.strip()[:10] if isinstance(end_date, str) and end_date.strip() else None
 
         date_col = None
-        for dcol in ["Created Date (UTC)", "_parsed_date", "Date", "Settled Date (UTC)", "Date of collection"]:
+        for dcol in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)", "Date of collection", "Date Due"]:
             if dcol in df.columns:
-                cur_s = df[dcol].astype(str).str.strip().str.slice(0, 10)
+                cur_s = df[dcol].astype(str).str.strip()
                 valid = ~cur_s.str.lower().isin(["", "nan", "none", "nat", "<na>"])
                 if valid.any():
+                    valid_cur = cur_s[valid]
+                    # If format has slashes DD/MM/YYYY, convert to YYYY-MM-DD
+                    slash_mask = valid_cur.str.match(r"^\d{1,2}/\d{1,2}/\d{4}")
+                    if slash_mask.any():
+                        parts = valid_cur[slash_mask].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
+                        norm = parts[2] + "-" + parts[1].str.zfill(2) + "-" + parts[0].str.zfill(2)
+                        cur_s = cur_s.copy()
+                        cur_s.loc[slash_mask.index[slash_mask]] = norm
+
+                    cur_s = cur_s.str.slice(0, 10)
                     if date_col is None:
                         date_col = cur_s.where(valid)
                     else:
@@ -684,14 +694,15 @@ def get_donors_paginated(
                 where_clauses.append('("Gift Aid (yes or no)" LIKE ? OR "is_giftaid" = ?)')
                 params.extend([f"%{gift_aid}%", 1 if gift_aid.lower() == "yes" else 0])
 
+            date_col_sql = 'COALESCE(NULLIF("Created Date (UTC)", ""), NULLIF("_parsed_date", ""), NULLIF("Date", ""))'
             if start_date and str(start_date).strip():
                 s_clean = str(start_date).strip()[:10]
-                where_clauses.append('("Created Date (UTC)" >= ? AND "Created Date (UTC)" != \'\' AND "Created Date (UTC)" != \'nan\')')
+                where_clauses.append(f'({date_col_sql} >= ? AND {date_col_sql} != \'nan\')')
                 params.append(s_clean)
 
             if end_date and str(end_date).strip():
                 e_clean = str(end_date).strip()[:10]
-                where_clauses.append('("Created Date (UTC)" <= ? AND "Created Date (UTC)" != \'\' AND "Created Date (UTC)" != \'nan\')')
+                where_clauses.append(f'({date_col_sql} <= ? AND {date_col_sql} != \'nan\')')
                 params.append(e_clean)
 
             if search and search.strip():

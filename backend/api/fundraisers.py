@@ -525,10 +525,14 @@ def get_fundraisers_list(
         df_work["code_lower"] = df_work["Code"].fillna("").astype(str).str.strip().str.lower() if "Code" in df_work.columns else ""
         df_work["net_num"] = pd.to_numeric(df_work[amount_col], errors="coerce").fillna(0.0) if amount_col in df_work.columns else 0.0
         
-        if "Created Date (UTC)" in df_work.columns:
-            df_work["_parsed_date"] = pd.to_datetime(df_work["Created Date (UTC)"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d")
+        if "_parsed_date" not in df_work.columns or df_work["_parsed_date"].dropna().astype(str).str.strip().isin(["", "nan", "none", "nat"]).all():
+            date_cand = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)"] if c in df_work.columns), None)
+            if date_cand:
+                df_work["_parsed_date"] = pd.to_datetime(df_work[date_cand], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d").fillna("")
+            else:
+                df_work["_parsed_date"] = ""
         else:
-            df_work["_parsed_date"] = ""
+            df_work["_parsed_date"] = df_work["_parsed_date"].fillna("").astype(str).str.strip()
 
         # Vectorized pre-aggregation for named fundraisers
         df_named = df_work[df_work["fn_lower"] != ""].copy()
@@ -775,10 +779,14 @@ def get_fundraiser_detail(
         df_work["code_lower"] = df_work["Code"].fillna("").astype(str).str.strip().str.lower() if "Code" in df_work.columns else ""
         df_work["net_num"] = pd.to_numeric(df_work[amount_col], errors="coerce").fillna(0.0) if amount_col in df_work.columns else 0.0
 
-        if "Created Date (UTC)" in df_work.columns:
-            df_work["_parsed_date"] = pd.to_datetime(df_work["Created Date (UTC)"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d")
+        if "_parsed_date" not in df_work.columns or df_work["_parsed_date"].dropna().astype(str).str.strip().isin(["", "nan", "none", "nat"]).all():
+            date_cand = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)"] if c in df_work.columns), None)
+            if date_cand:
+                df_work["_parsed_date"] = pd.to_datetime(df_work[date_cand], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d").fillna("")
+            else:
+                df_work["_parsed_date"] = ""
         else:
-            df_work["_parsed_date"] = ""
+            df_work["_parsed_date"] = df_work["_parsed_date"].fillna("").astype(str).str.strip()
 
         # If not found in SQLite by ID, resolve real-time fundraiser profile from live donor data
         if not fundraiser:
