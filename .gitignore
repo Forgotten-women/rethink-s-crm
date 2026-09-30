@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 
 scratch/
+node_modules/
 *.csv
 *.xlsx
 

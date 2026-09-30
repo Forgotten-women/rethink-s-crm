@@ -1,0 +1,13 @@
+{
+  "name": "iqra-playwright-scraper",
+  "version": "1.0.0",
+  "description": "Playwright automation to scrape campaign giving levels to CSV",
+  "main": "scripts/extract_giving_levels.js",
+  "scripts": {
+    "scrape": "node scripts/extract_giving_levels.js",
+    "scrape:links": "node scripts/extract_giving_levels.js links.txt"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}
