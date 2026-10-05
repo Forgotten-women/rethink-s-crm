@@ -237,14 +237,49 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
 
   const canEdit = (user?.role === 'super_admin' || user?.can_edit_donors === 1) && activeCompany !== 'all';
 
+  const getAuthHeaders = (extra = {}) => {
+    const token = localStorage.getItem('analytics_token');
+    const userStr = localStorage.getItem('analytics_user');
+    const headers = { ...extra };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    const email = user?.email || (userStr ? (() => { try { return JSON.parse(userStr)?.email; } catch(e){ return ''; } })() : '');
+    const username = user?.username || (userStr ? (() => { try { return JSON.parse(userStr)?.username; } catch(e){ return ''; } })() : '');
+    const role = user?.role || (userStr ? (() => { try { return JSON.parse(userStr)?.role; } catch(e){ return ''; } })() : '');
+
+    if (email) headers['X-User-Email'] = email;
+    if (username || email) headers['X-User-Identity'] = username || email;
+    if (role) headers['X-User-Role'] = role;
+    return headers;
+  };
+
+  const getAuthUrl = (url) => {
+    const userStr = localStorage.getItem('analytics_user');
+    let identity = user?.email || user?.username || '';
+    if (!identity && userStr) {
+      try {
+        const u = JSON.parse(userStr);
+        identity = u?.email || u?.username || '';
+      } catch (e) {}
+    }
+    if (!identity || url.includes('user_identity=')) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}user_identity=${encodeURIComponent(identity)}`;
+  };
+
   // Load Campaign Codes lookup, Code Map on mount and on company switch
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/classifications/campaign-codes?company_id=${activeCompany}`)
+    fetch(getAuthUrl(`${API_BASE_URL}/api/classifications/campaign-codes?company_id=${activeCompany}`), {
+      headers: getAuthHeaders()
+    })
       .then(r => r.json())
       .then(data => { if (data && typeof data === 'object') setCampaignCodesLookup(data); })
       .catch(err => console.error('Error fetching campaign-codes lookup:', err));
 
-    fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${activeCompany}`)
+    fetch(getAuthUrl(`${API_BASE_URL}/api/classifications/code-map?company_id=${activeCompany}`), {
+      headers: getAuthHeaders()
+    })
       .then(r => r.json())
       .then(data => { if (data && typeof data === 'object') setCodeMap(data); })
       .catch(err => console.error('Error fetching code-map:', err));
@@ -286,7 +321,9 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
       }
     }
 
-    fetch(`${API_BASE_URL}/api/donors?${params.toString()}`)
+    fetch(getAuthUrl(`${API_BASE_URL}/api/donors?${params.toString()}`), {
+      headers: getAuthHeaders()
+    })
       .then(res => res.json())
       .then(resData => {
         setData(resData);
@@ -425,11 +462,24 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
   const handleInlineSave = (row, colName, newVal) => {
     if (!canEdit) return;
 
-    fetch(`${API_BASE_URL}/api/donors/update-record`, {
+    const userStr = localStorage.getItem('analytics_user');
+    let email = user?.email || '';
+    let username = user?.username || '';
+    if ((!email || !username) && userStr) {
+      try {
+        const u = JSON.parse(userStr);
+        if (!email) email = u?.email || '';
+        if (!username) username = u?.username || '';
+      } catch(e) {}
+    }
+
+    fetch(getAuthUrl(`${API_BASE_URL}/api/donors/update-record`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         user_role: user?.role || 'admin',
+        user_identity: email || username || 'superadmin@analytics.com',
+        user_email: email,
         can_edit_donors: canEdit,
         company_id: activeCompany,
         row_id: row._row_id !== undefined && row._row_id !== null ? Number(row._row_id) : null,
@@ -470,11 +520,24 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
     setEditModalSaving(true);
     setEditModalMsg('');
 
-    fetch(`${API_BASE_URL}/api/donors/update-record`, {
+    const userStr = localStorage.getItem('analytics_user');
+    let email = user?.email || '';
+    let username = user?.username || '';
+    if ((!email || !username) && userStr) {
+      try {
+        const u = JSON.parse(userStr);
+        if (!email) email = u?.email || '';
+        if (!username) username = u?.username || '';
+      } catch(e) {}
+    }
+
+    fetch(getAuthUrl(`${API_BASE_URL}/api/donors/update-record`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         user_role: user?.role || 'admin',
+        user_identity: email || username || 'superadmin@analytics.com',
+        user_email: email,
         can_edit_donors: canEdit,
         company_id: activeCompany,
         row_id: editingDonorModal.row._row_id !== undefined && editingDonorModal.row._row_id !== null ? Number(editingDonorModal.row._row_id) : null,
@@ -543,11 +606,24 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
 
     const searchFieldsParam = isAllActive ? 'all' : searchTargets.join(',');
 
-    fetch(`${API_BASE_URL}/api/donors/bulk-edit`, {
+    const userStr = localStorage.getItem('analytics_user');
+    let email = user?.email || '';
+    let username = user?.username || '';
+    if ((!email || !username) && userStr) {
+      try {
+        const u = JSON.parse(userStr);
+        if (!email) email = u?.email || '';
+        if (!username) username = u?.username || '';
+      } catch(e) {}
+    }
+
+    fetch(getAuthUrl(`${API_BASE_URL}/api/donors/bulk-edit`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         user_role: user?.role || 'admin',
+        user_identity: email || username || 'superadmin@analytics.com',
+        user_email: email,
         company_id: activeCompany,
         target_columns,
         new_values,
@@ -570,7 +646,14 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
         filter_end_date: filters?.end_date
       })
     })
-      .then(r => r.json())
+      .then(async r => {
+        const text = await r.text();
+        try {
+          return JSON.parse(text);
+        } catch {
+          return { status: 'error', detail: text || `HTTP ${r.status}` };
+        }
+      })
       .then(res => {
         setBulkSaving(false);
         if (res?.status === 'success') {
@@ -579,7 +662,7 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
           if (onDataChange) onDataChange();
           setTimeout(() => setShowBulkEdit(false), 1500);
         } else {
-          setBulkMessage(`❌ ${res?.detail || 'Bulk edit failed.'}`);
+          setBulkMessage(`❌ ${res?.detail || res?.message || 'Bulk edit failed.'}`);
         }
       })
       .catch(err => {

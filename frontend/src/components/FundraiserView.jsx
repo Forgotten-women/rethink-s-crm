@@ -88,6 +88,15 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const [campaignBreakdownSearch, setCampaignBreakdownSearch] = useState('');
   const drawerBodyRef = useRef(null);
 
+  const selectedFundraiserIdRef = useRef(selectedFundraiserId);
+  const drilldownStartDateRef = useRef(drilldownStartDate);
+  const drilldownEndDateRef = useRef(drilldownEndDate);
+  useEffect(() => {
+    selectedFundraiserIdRef.current = selectedFundraiserId;
+    drilldownStartDateRef.current = drilldownStartDate;
+    drilldownEndDateRef.current = drilldownEndDate;
+  }, [selectedFundraiserId, drilldownStartDate, drilldownEndDate]);
+
   // Synchronize applied date filters based on preset buttons
   const handleDatePresetChange = (mode) => {
     setDateFilterMode(mode);
@@ -185,6 +194,8 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const loadDrilldown = (fid, sDate = drilldownStartDate, eDate = drilldownEndDate) => {
     if (!fid) return;
     setLoadingDrilldown(true);
+    if (sDate !== undefined) setDrilldownStartDate(sDate || '');
+    if (eDate !== undefined) setDrilldownEndDate(eDate || '');
     const params = new URLSearchParams();
     params.append('company_id', activeCompany);
     if (sDate) params.append('start_date', sDate);
@@ -226,6 +237,9 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
       if (!fallbackInterval) {
         fallbackInterval = setInterval(() => {
           loadFundraisers(true);
+          if (selectedFundraiserIdRef.current) {
+            loadDrilldown(selectedFundraiserIdRef.current, drilldownStartDateRef.current, drilldownEndDateRef.current);
+          }
         }, 30000);
       }
     };
@@ -238,6 +252,9 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
           if (['FUNDRAISER_UPDATED', 'DONORS_UPDATED', 'MATRIX_UPDATED', 'PAYOUTS_UPDATED'].includes(payload?.event)) {
             loadFundraisers(true);
             loadCampaignsList();
+            if (selectedFundraiserIdRef.current) {
+              loadDrilldown(selectedFundraiserIdRef.current, drilldownStartDateRef.current, drilldownEndDateRef.current);
+            }
           }
         } catch (e) {}
       };
@@ -253,6 +270,9 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
 
     const handleFocus = () => {
       loadFundraisers(true);
+      if (selectedFundraiserIdRef.current) {
+        loadDrilldown(selectedFundraiserIdRef.current, drilldownStartDateRef.current, drilldownEndDateRef.current);
+      }
     };
     window.addEventListener('focus', handleFocus);
 
@@ -1484,25 +1504,52 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                     {drilldownData?.fundraiser?.name || 'Fundraiser Performance'}
                   </h3>
                   <div className="text-[11px] flex items-center gap-2 flex-wrap" style={{ color: 'var(--text-muted)' }}>
-                    <span>First Gift: <strong>{drilldownData?.fundraiser?.first_donation_date || drilldownData?.fundraiser?.start_date || 'N/A'}</strong></span>
-                    {drilldownData?.fundraiser?.latest_donation_date && drilldownData?.fundraiser?.latest_donation_date !== 'N/A' && (
-                      <span>• Latest: <strong>{drilldownData?.fundraiser?.latest_donation_date}</strong></span>
+                    {(drilldownStartDate || drilldownEndDate || drilldownData?.fundraiser?.is_custom_filtered) ? (
+                      <>
+                        <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border border-cyan-500/20">
+                          Period
+                        </span>
+                        <span>First Gift: <strong>{drilldownData?.fundraiser?.first_donation_date || 'N/A'}</strong></span>
+                        {drilldownData?.fundraiser?.latest_donation_date && drilldownData?.fundraiser?.latest_donation_date !== 'N/A' && (
+                          <span>• Latest: <strong>{drilldownData?.fundraiser?.latest_donation_date}</strong></span>
+                        )}
+                        {drilldownData?.fundraiser?.first_donation_date_all_time && (
+                          <span className="opacity-70 text-[10px] hidden sm:inline">(All-Time: {drilldownData?.fundraiser?.first_donation_date_all_time} → {drilldownData?.fundraiser?.latest_donation_date_all_time})</span>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <span>First Gift: <strong>{drilldownData?.fundraiser?.first_donation_date || drilldownData?.fundraiser?.start_date || 'N/A'}</strong></span>
+                        {drilldownData?.fundraiser?.latest_donation_date && drilldownData?.fundraiser?.latest_donation_date !== 'N/A' && (
+                          <span>• Latest: <strong>{drilldownData?.fundraiser?.latest_donation_date}</strong></span>
+                        )}
+                      </>
                     )}
                     <span>• Goal: £{drilldownData?.fundraiser?.target_goal?.toLocaleString() || '0'}</span>
                   </div>
                 </div>
               </div>
-              <button
-                onClick={() => {
-                  setSelectedFundraiserId(null);
-                  setDrilldownData(null);
-                  setShowAllCampaigns(false);
-                  setCampaignBreakdownSearch('');
-                }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => loadDrilldown(selectedFundraiserId, drilldownStartDate, drilldownEndDate)}
+                  disabled={loadingDrilldown}
+                  title="Refresh fundraiser data"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-500 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-4 h-4 ${loadingDrilldown ? 'animate-spin text-cyan-500' : ''}`} />
+                </button>
+                <button
+                  onClick={() => {
+                    setSelectedFundraiserId(null);
+                    setDrilldownData(null);
+                    setShowAllCampaigns(false);
+                    setCampaignBreakdownSearch('');
+                  }}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
 
             {/* Drawer Filter Sub-bar */}

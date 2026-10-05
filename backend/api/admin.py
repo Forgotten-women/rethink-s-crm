@@ -281,6 +281,13 @@ def upload_raw_data_file(
         if isinstance(res, dict) and res.get("status") == "error":
             raise HTTPException(status_code=400, detail=res.get("message", "Upload failed."))
 
+        try:
+            from backend.api.events import broadcast_event_sync
+            broadcast_event_sync("DONORS_UPDATED", {"source": "upload", "filename": file.filename, "company_id": target_cid})
+            broadcast_event_sync("FUNDRAISER_UPDATED", {"source": "upload", "filename": file.filename, "company_id": target_cid})
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "message": f"Successfully processed '{file.filename}' for company '{target_cid}'! {res.get('added', 0):,} records imported and auto-classified.",

@@ -4,7 +4,7 @@ import {
   Check, X, ShieldAlert, Sparkles, Mail, Save, Upload, FileSpreadsheet, 
   RefreshCw, Building, Image, FileUp, Palette, Plus, Eye 
 } from 'lucide-react';
-import { API_BASE_URL } from '../config';
+import { API_BASE_URL, getAuthHeaders } from '../config';
 
 const COLOR_NAME_TO_HEX = {
   emerald: '#10B981',
@@ -92,7 +92,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/purge-payouts`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         confirm: true
@@ -131,7 +131,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/purge`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         confirm: true
@@ -163,13 +163,19 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     const formData = new FormData();
     formData.append('user_role', user?.role || 'admin');
+    if (user?.email) formData.append('user_email', user.email);
+    if (user?.username || user?.email) formData.append('user_identity', user?.username || user?.email);
     formData.append('upload_mode', uploadMode);
     formData.append('platform', uploadPlatform);
     formData.append('company_id', uploadTargetCompany);
     formData.append('file', uploadFile);
 
+    const headers = getAuthHeaders({}, user);
+    delete headers['Content-Type'];
+
     fetch(`${API_BASE_URL}/api/admin/upload-data`, {
       method: 'POST',
+      headers,
       body: formData,
     })
       .then(r => r.json())
@@ -193,13 +199,14 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
   const loadAdminData = (company = activeCompany) => {
     setLoading(true);
     const compQuery = company ? `?company_id=${encodeURIComponent(company)}` : '';
+    const headers = getAuthHeaders({}, user);
 
-    fetch(`${API_BASE_URL}/api/admin/status${compQuery}`)
+    fetch(`${API_BASE_URL}/api/admin/status${compQuery}`, { headers })
       .then(r => r.ok ? r.json() : null)
       .then(stData => { if (stData) setStatus(stData); })
       .catch(err => console.error('Status fetch error:', err));
 
-    fetch(`${API_BASE_URL}/api/admin/tags${compQuery}`)
+    fetch(`${API_BASE_URL}/api/admin/tags${compQuery}`, { headers })
       .then(r => r.ok ? r.json() : [])
       .then(tagData => {
         if (Array.isArray(tagData)) {
@@ -210,21 +217,21 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
       })
       .catch(err => console.error('Tags fetch error:', err));
 
-    fetch(`${API_BASE_URL}/api/admin/users`)
+    fetch(`${API_BASE_URL}/api/admin/users`, { headers })
       .then(r => r.ok ? r.json() : [])
       .then(uData => {
         if (Array.isArray(uData)) setUsersList(uData);
       })
       .catch(err => console.error('Users fetch error:', err));
 
-    fetch(`${API_BASE_URL}/api/expenses/settings`)
+    fetch(`${API_BASE_URL}/api/expenses/settings`, { headers })
       .then(r => r.ok ? r.json() : null)
       .then(expSettings => {
         if (expSettings?.approval_email) setApprovalEmail(expSettings.approval_email);
       })
       .catch(err => console.error('Settings fetch error:', err));
 
-    fetch(`${API_BASE_URL}/api/admin/companies`)
+    fetch(`${API_BASE_URL}/api/admin/companies`, { headers })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (d?.companies && Array.isArray(d.companies)) {
@@ -236,7 +243,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
   };
 
   const loadCompanies = () => {
-    fetch(`${API_BASE_URL}/api/admin/companies`)
+    fetch(`${API_BASE_URL}/api/admin/companies`, { headers: getAuthHeaders({}, user) })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (d?.companies && Array.isArray(d.companies)) {
@@ -255,7 +262,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/companies`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
         body: JSON.stringify({
           user_role: user?.role,
           id: companyModal.data.id.trim().toLowerCase(),
@@ -293,8 +300,12 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
     formData.append('user_role', user?.role || 'super_admin');
 
     try {
+      const logoHeaders = getAuthHeaders({}, user);
+      delete logoHeaders['Content-Type'];
+
       const res = await fetch(`${API_BASE_URL}/api/admin/companies/${uploadLogoModal.companyId}/logo?user_role=${encodeURIComponent(user?.role || 'super_admin')}`, {
         method: 'POST',
+        headers: logoHeaders,
         body: formData
       });
       const data = await res.json();
@@ -342,7 +353,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/users/permissions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify(updated)
     })
       .then(r => r.json())
@@ -362,7 +373,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/users/edit`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         user_id: editingUser.id,
@@ -392,7 +403,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/users/preset`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         target_email: targetEmail,
@@ -416,7 +427,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/tags/rename`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         old_tag: oldTag,
@@ -440,7 +451,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/admin/tags/delete`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         tag_name: oldTag
@@ -464,7 +475,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
     fetch(`${API_BASE_URL}/api/expenses/settings`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         user_role: user?.role,
         approval_email: approvalEmail

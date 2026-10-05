@@ -103,7 +103,7 @@ def _lookup_givebrite_classification(campaign_name: str, company_id: str = "reth
             cur.execute("""
                 SELECT code FROM platform_campaign_mappings
                 WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
-                  AND platform = 'givebright' 
+                  AND platform IN ('givebright', 'givebrite') 
                   AND LOWER(campaign_name) = ?
                   AND LOWER(COALESCE(giving_level, '')) = ?
                 LIMIT 1
@@ -116,7 +116,7 @@ def _lookup_givebrite_classification(campaign_name: str, company_id: str = "reth
             cur.execute("""
                 SELECT code FROM platform_campaign_mappings
                 WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
-                  AND platform = 'givebright' 
+                  AND platform IN ('givebright', 'givebrite') 
                   AND LOWER(campaign_name) = ?
                   AND (LOWER(COALESCE(giving_level, '')) = '' OR is_primary = 1)
                 ORDER BY is_primary DESC
@@ -269,9 +269,9 @@ def _lookup_fundraiser_for_campaign(campaign_name: str, code: str = "", company_
     return None
 
 
-def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", company_id: str = "rethink") -> None:
+def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", company_id: str = "rethink", giving_level: str = "") -> None:
     """
-    Registers a new campaign into platform_campaign_mappings if not present.
+    Registers a campaign and optional giving_level variant into platform_campaign_mappings if not present.
     If already present, updates campaign_url but STRICTLY PRESERVES all existing assigned codes.
     """
     comp = str(company_id or "rethink").strip().lower()
@@ -279,36 +279,66 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
     if not cname_clean or cname_clean.lower() in ["nan", "none", "n/a", ""]:
         return
 
+    gl_clean = str(giving_level or "").strip()
+    if gl_clean.lower() in ["nan", "none", "n/a", "unassigned", "default", "general"]:
+        gl_clean = ""
+
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         cur = conn.cursor()
+        # 1. Primary/General campaign record
         cur.execute("""
             SELECT code FROM platform_campaign_mappings
-            WHERE LOWER(company_id) = ? AND platform = 'givebright' AND LOWER(campaign_name) = ?
+            WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
+              AND platform IN ('givebright', 'givebrite') 
+              AND LOWER(campaign_name) = ?
+              AND (LOWER(COALESCE(giving_level, '')) = '' OR is_primary = 1)
             LIMIT 1
         """, (comp, cname_clean.lower()))
-        existing = cur.fetchone()
+        default_row = cur.fetchone()
 
-        if existing:
-            # Campaign already mapped! Update URL only if provided, NEVER overwrite existing code!
+        if default_row:
+            camp_code = default_row[0]
             if campaign_url and str(campaign_url).strip():
                 cur.execute("""
                     UPDATE platform_campaign_mappings
                     SET campaign_url = ?
-                    WHERE LOWER(company_id) = ? AND platform = 'givebright' AND LOWER(campaign_name) = ?
+                    WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
+                      AND platform IN ('givebright', 'givebrite') 
+                      AND LOWER(campaign_name) = ?
                 """, (campaign_url.strip(), comp, cname_clean.lower()))
                 conn.commit()
         else:
-            # Brand new campaign: auto-detect keyword code or 'Unassigned'
             class_info = _lookup_givebrite_classification(cname_clean, company_id=comp)
-            initial_code = class_info.get("Code") or "Unassigned"
+            camp_code = class_info.get("Code") or "Unassigned"
             cur.execute("""
                 INSERT INTO platform_campaign_mappings (
-                    platform, campaign_name, code, community_name, campaign_url, is_primary, company_id
-                ) VALUES ('givebright', ?, ?, 'GiveBright', ?, 1, ?)
-            """, (cname_clean, initial_code, campaign_url.strip() if campaign_url else "", comp))
+                    platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, company_id
+                ) VALUES ('givebright', ?, '', ?, 'GiveBright', ?, 1, ?)
+            """, (cname_clean, camp_code, campaign_url.strip() if campaign_url else "", comp))
             conn.commit()
             broadcast_event_sync("MATRIX_UPDATED", {"source": "givebrite_webhook", "company_id": comp, "campaign": cname_clean})
+
+        # 2. Specific giving level variant record if provided
+        if gl_clean:
+            cur.execute("""
+                SELECT code FROM platform_campaign_mappings
+                WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
+                  AND platform IN ('givebright', 'givebrite') 
+                  AND LOWER(campaign_name) = ? 
+                  AND LOWER(COALESCE(giving_level, '')) = ?
+                LIMIT 1
+            """, (comp, cname_clean.lower(), gl_clean.lower()))
+            var_row = cur.fetchone()
+            if not var_row:
+                var_code = camp_code if camp_code and str(camp_code).lower() not in ["unassigned", "nan", "none", ""] else "Unassigned"
+                cur.execute("""
+                    INSERT INTO platform_campaign_mappings (
+                        platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, company_id
+                    ) VALUES ('givebright', ?, ?, ?, 'GiveBright', ?, 0, ?)
+                """, (cname_clean, gl_clean, var_code, campaign_url.strip() if campaign_url else "", comp))
+                conn.commit()
+                broadcast_event_sync("MATRIX_UPDATED", {"source": "givebrite_webhook", "company_id": comp, "campaign": cname_clean, "giving_level": gl_clean})
 
         conn.close()
     except Exception as e:
@@ -408,7 +438,18 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                 if not camp_name or camp_name.lower() in ["nan", "none", "null", "direct donation", "direct donation (unassigned)", ""]:
                     camp_name = "Unassigned"
 
-                giving_level = str(payload.get("giving_level") or payload.get("giving_level_title") or payload.get("variant") or payload.get("option") or "").strip()
+                impact_val = payload.get("impact_name") or payload.get("impact")
+                if isinstance(impact_val, dict):
+                    impact_val = impact_val.get("name") or impact_val.get("title") or ""
+                giving_level = str(
+                    impact_val
+                    or payload.get("giving_level")
+                    or payload.get("giving_level_title")
+                    or payload.get("giving_levels")
+                    or payload.get("variant")
+                    or payload.get("option")
+                    or ""
+                ).strip()
 
                 fund_obj = payload.get("fundraiser") or {}
                 fund_name = str(fund_obj.get("name") or "").strip() if isinstance(fund_obj, dict) else str(fund_obj or "").strip()
@@ -438,9 +479,9 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                 gw_resp = payload.get("gateway_response") or {}
                 charge_id = str(gw_resp.get("charge_id") or "").strip() if isinstance(gw_resp, dict) else ""
 
-                # Register campaign in classification matrix if valid
+                # Register campaign and giving level in classification matrix if valid
                 if camp_name and camp_name.lower() not in ["unassigned", "nan", "none", ""]:
-                    _ensure_campaign_registered(camp_name, campaign_url=camp_url, company_id=target_cid)
+                    _ensure_campaign_registered(camp_name, campaign_url=camp_url, company_id=target_cid, giving_level=giving_level)
 
                 # Classify donation using stored company matrix
                 class_info = _lookup_givebrite_classification(camp_name, company_id=target_cid, giving_level=giving_level)

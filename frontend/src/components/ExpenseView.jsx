@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CreditCard, PlusCircle, Check, X, Mail, Filter, Wallet, Search, ChevronLeft, ChevronRight, LayoutGrid, List, Trash2, AlertTriangle, Settings, Eye, EyeOff, SendHorizonal, ChevronDown, ChevronUp, ShieldCheck, Wifi, WifiOff, RefreshCw, Download, FileSpreadsheet, ArrowRightLeft, History } from 'lucide-react';
-import { API_BASE_URL } from '../config';
+import { API_BASE_URL, getAuthHeaders } from '../config';
 import TransferFundsModal from './TransferFundsModal';
 import TransferHistoryModal from './TransferHistoryModal';
 
@@ -90,7 +90,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
   const isSuperAdmin = user?.role === 'super_admin' || user?.can_edit_donors === 1;
 
   const loadSettings = () => {
-    fetch(`${API_BASE_URL}/api/expenses/settings`)
+    fetch(`${API_BASE_URL}/api/expenses/settings`, { headers: getAuthHeaders({}, user) })
       .then(r => r.json())
       .then(data => {
         setSmtpSettings({
@@ -114,7 +114,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
     setSettingsMsg('');
     fetch(`${API_BASE_URL}/api/expenses/settings`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({ ...smtpSettings, user_role: user?.role })
     })
       .then(r => r.json())
@@ -136,7 +136,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
     setSettingsMsg('');
     fetch(`${API_BASE_URL}/api/expenses/test-email`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({ user_role: user?.role, can_edit_donors: true })
     })
       .then(r => r.json())
@@ -154,7 +154,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
   const loadCodes = (force = false) => {
     setCodesLoading(true);
-    fetch(`${API_BASE_URL}/api/expenses/codes?company_id=${encodeURIComponent(activeCompany)}${force ? '&force_reload=true' : ''}`)
+    fetch(`${API_BASE_URL}/api/expenses/codes?company_id=${encodeURIComponent(activeCompany)}${force ? '&force_reload=true' : ''}`, { headers: getAuthHeaders({}, user) })
       .then(res => res.json())
       .then(data => { setCodes(Array.isArray(data) ? data : []); setCodesLoading(false); })
       .catch(err => { console.error('Error fetching project codes:', err); setCodesLoading(false); });
@@ -162,7 +162,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
   const loadExpenses = () => {
     setLoading(true);
-    fetch(`${API_BASE_URL}/api/expenses/requests?status_filter=${statusFilter}&company_id=${encodeURIComponent(activeCompany)}`)
+    fetch(`${API_BASE_URL}/api/expenses/requests?status_filter=${statusFilter}&company_id=${encodeURIComponent(activeCompany)}`, { headers: getAuthHeaders({}, user) })
       .then(res => res.json())
       .then(data => {
         setExpensesData(data);
@@ -279,7 +279,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
     fetch(`${API_BASE_URL}/api/expenses/submit`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         company_id: activeCompany,
         code: selectedCode,
@@ -344,7 +344,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
     fetch(`${API_BASE_URL}/api/expenses/review`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         expense_id: expenseId,
         user_role: user?.role,
@@ -373,7 +373,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
     fetch(`${API_BASE_URL}/api/expenses/delete`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         expense_id: expenseId,
         user_role: user?.role,

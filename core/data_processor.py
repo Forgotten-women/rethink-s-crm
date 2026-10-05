@@ -374,6 +374,32 @@ def init_classification_db():
             if "giving_level" not in map_cols:
                 cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN giving_level TEXT NOT NULL DEFAULT ''")
 
+            # Purge duplicate unassigned ghost rows when an assigned row exists for that same (platform, company_id, campaign_name, giving_level)
+            try:
+                cur.execute("""
+                    DELETE FROM platform_campaign_mappings
+                    WHERE LOWER(code) IN ('unassigned', '', 'none', 'nan')
+                      AND EXISTS (
+                          SELECT 1 FROM platform_campaign_mappings p2
+                          WHERE p2.platform = platform_campaign_mappings.platform
+                            AND LOWER(COALESCE(p2.company_id, 'rethink')) = LOWER(COALESCE(platform_campaign_mappings.company_id, 'rethink'))
+                            AND LOWER(TRIM(p2.campaign_name)) = LOWER(TRIM(platform_campaign_mappings.campaign_name))
+                            AND LOWER(TRIM(COALESCE(p2.giving_level, ''))) = LOWER(TRIM(COALESCE(platform_campaign_mappings.giving_level, '')))
+                            AND LOWER(COALESCE(p2.code, 'unassigned')) NOT IN ('unassigned', '', 'none', 'nan')
+                      );
+                """)
+                # Purge exact duplicates in platform_campaign_mappings keeping the row with highest id
+                cur.execute("""
+                    DELETE FROM platform_campaign_mappings
+                    WHERE id NOT IN (
+                        SELECT MAX(id)
+                        FROM platform_campaign_mappings
+                        GROUP BY LOWER(platform), LOWER(COALESCE(company_id, 'rethink')), LOWER(TRIM(campaign_name)), LOWER(TRIM(COALESCE(giving_level, ''))), UPPER(TRIM(COALESCE(code, 'Unassigned')))
+                    );
+                """)
+            except Exception:
+                pass
+
             # 3. Create views if they don't exist
             cur.execute("SELECT name, type FROM sqlite_master WHERE name IN ('campaign_classifications', 'givebright_classifications', 'paysuite_classifications', 'rethink_website_classifications', 'madinah_classifications')")
             existing_objects = {row[0]: row[1] for row in cur.fetchall()}
@@ -792,6 +818,7 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                 FROM '{PARQUET_PATH.replace(chr(92), '/')}'
                 WHERE LOWER(COALESCE("Platform", '')) NOT IN ('givebright', 'givebrite', 'paysuite', 'madinah')
                   AND "Campaign Name" IS NOT NULL
+                  AND LOWER(TRIM(CAST("Campaign Name" AS VARCHAR))) NOT IN ('', 'nan', 'none', 'null', 'n/a', 'unassigned')
                   {company_filter}
                 GROUP BY "Campaign Name", "Giving Level", "Code"
             """).df()
@@ -842,19 +869,26 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
     # 3. Canonical Deduplication & Ghost Row Purging
     cleaned_rows = []
     if not merged_raw.empty:
-        cname_code_groups = merged_raw.groupby([merged_raw["Campaign Name"].astype(str).str.lower(), merged_raw["Giving Level"].astype(str).str.lower(), merged_raw["Code"].astype(str).str.upper()])
+        cname_gl_groups = merged_raw.groupby([
+            merged_raw["Campaign Name"].astype(str).str.strip().str.lower(),
+            merged_raw["Giving Level"].astype(str).str.strip().str.lower()
+        ])
+        for (c_low, gl_low), grp in cname_gl_groups:
+            assigned_rows = grp[~grp["Code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "N/A", "NONE", "NAN", ""])]
+            rows_to_process = assigned_rows if not assigned_rows.empty else grp.iloc[0:1]
 
-        for (c_low, gl_low, code_up), grp in cname_code_groups:
-            row = grp.iloc[0].copy()
-            if "Campaign URL" in grp.columns:
-                urls = [u for u in grp["Campaign URL"] if str(u).strip() and str(u).strip().startswith("http")]
-                if urls:
-                    row["Campaign URL"] = urls[0]
-            if "Community Name" in grp.columns:
-                comms = [c for c in grp["Community Name"] if str(c).strip().lower() not in ["n/a", "unassigned", "none", "nan", ""]]
-                if comms:
-                    row["Community Name"] = comms[0]
-            cleaned_rows.append(row)
+            code_groups = rows_to_process.groupby(rows_to_process["Code"].astype(str).str.upper())
+            for code_up, c_grp in code_groups:
+                row = c_grp.iloc[0].copy()
+                if "Campaign URL" in c_grp.columns:
+                    urls = [u for u in c_grp["Campaign URL"] if str(u).strip() and str(u).strip().startswith("http")]
+                    if urls:
+                        row["Campaign URL"] = urls[0]
+                if "Community Name" in c_grp.columns:
+                    comms = [c for c in c_grp["Community Name"] if str(c).strip().lower() not in ["n/a", "unassigned", "none", "nan", ""]]
+                    if comms:
+                        row["Community Name"] = comms[0]
+                cleaned_rows.append(row)
 
     deduped_df = pd.DataFrame(cleaned_rows) if cleaned_rows else merged_raw
 
@@ -870,6 +904,15 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                 fill_mask = mask_unassigned & mapped_vals.notna()
                 if fill_mask.any():
                     deduped_df.loc[fill_mask, tc] = mapped_vals[fill_mask]
+
+    if "donation_count" in deduped_df.columns:
+        deduped_df["donation_count"] = pd.to_numeric(deduped_df["donation_count"], errors="coerce").fillna(0).astype(int)
+    else:
+        deduped_df["donation_count"] = 0
+    if "total_amount" in deduped_df.columns:
+        deduped_df["total_amount"] = pd.to_numeric(deduped_df["total_amount"], errors="coerce").fillna(0.0).round(2)
+    else:
+        deduped_df["total_amount"] = 0.0
 
     return deduped_df
 
@@ -1752,9 +1795,21 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             "country": "Billing Country",
             "first_name": "First Name",
             "last_name": "Last Name",
-            "email": "Email"
+            "email": "Email",
+            "impact_name": "Giving Level Title",
+            "impact_amount": "Giving Level Amount",
+            "giving_level": "Giving Level Title",
+            "giving_levels": "Giving Level Title",
+            "giving_level_title": "Giving Level Title",
+            "variant": "Giving Level Title",
+            "option": "Giving Level Title"
         }
         df.rename(columns=col_map, inplace=True)
+        if "Giving Level Title" not in df.columns:
+            for cand in ["impact_name", "giving_level", "giving_levels", "giving_level_title", "variant", "option"]:
+                if cand in df.columns:
+                    df["Giving Level Title"] = df[cand]
+                    break
 
         if "subscription_id" in df.columns:
             df["Payment Frequency"] = df["subscription_id"].apply(
@@ -1776,21 +1831,41 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             df["Billing Country"] = df["Billing Country"].apply(safe_country)
 
         if "created_at" in df.columns:
-            parsed = pd.to_datetime(df["created_at"], errors="coerce", dayfirst=True)
-            if parsed.isna().sum() > 0:
-                parsed_fallback = pd.to_datetime(df["created_at"][parsed.isna()], errors="coerce", format="mixed")
-                parsed.update(parsed_fallback)
-            df["Created Date (UTC)"] = parsed.dt.date.astype(str)
-            df["Created Time (UTC)"] = parsed.dt.time.astype(str)
+            c_at_str = df["created_at"].fillna("").astype(str).str.strip()
+            slash_m = c_at_str.str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?")
+            has_slash = slash_m[0].notna() & slash_m[1].notna() & slash_m[2].notna()
+            if has_slash.any():
+                df.loc[has_slash, "Created Date (UTC)"] = (
+                    slash_m.loc[has_slash, 2] + "-" + slash_m.loc[has_slash, 1].str.zfill(2) + "-" + slash_m.loc[has_slash, 0].str.zfill(2)
+                )
+                time_h = slash_m.loc[has_slash, 3].fillna("00").str.zfill(2)
+                time_m = slash_m.loc[has_slash, 4].fillna("00").str.zfill(2)
+                time_s = slash_m.loc[has_slash, 5].fillna("00").str.zfill(2)
+                df.loc[has_slash, "Created Time (UTC)"] = time_h + ":" + time_m + ":" + time_s
+            non_slash = ~has_slash
+            if non_slash.any():
+                parsed = pd.to_datetime(df.loc[non_slash, "created_at"], errors="coerce", dayfirst=True)
+                df.loc[non_slash, "Created Date (UTC)"] = parsed.dt.date.astype(str)
+                df.loc[non_slash, "Created Time (UTC)"] = parsed.dt.time.astype(str)
 
-        # Vectorized classification rule mapping for GiveBright (< 5ms)
+        # Vectorized classification rule mapping for GiveBright with dual-tier (campaign + giving_level) lookup
         init_classification_db()
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
         try:
             db_matrix = pd.read_sql_query("SELECT * FROM givebright_classifications WHERE LOWER(company_id) = ?", conn, params=(target_cid,))
-            rule_dict = {str(r["campaign_name"]).strip().lower(): r for _, r in db_matrix.iterrows()}
+            rule_dict_gl = {}
+            rule_dict_camp = {}
+            for _, r in db_matrix.iterrows():
+                c_k = str(r["campaign_name"]).strip().lower()
+                gl_k = str(r.get("giving_level") or "").strip().lower()
+                if gl_k and gl_k not in ["nan", "none", "n/a", "unassigned", ""]:
+                    rule_dict_gl[(c_k, gl_k)] = r.to_dict()
+                else:
+                    if c_k not in rule_dict_camp or r.get("is_primary") in [1, True, "1", "true", "True"]:
+                        rule_dict_camp[c_k] = r.to_dict()
         except Exception:
-            rule_dict = {}
+            rule_dict_gl = {}
+            rule_dict_camp = {}
         finally:
             conn.close()
 
@@ -1799,32 +1874,49 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                 df[col] = "Unassigned"
 
         if "Campaign Name" in df.columns:
-            cname_series = df["Campaign Name"].astype(str).str.strip()
-            cname_lower = cname_series.str.lower()
+            cname_series = df["Campaign Name"].astype(str).str.strip().str.lower()
+            gl_series = df["Giving Level Title"].fillna("").astype(str).str.strip().str.lower() if "Giving Level Title" in df.columns else pd.Series("", index=df.index)
 
             for f in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
-                mapped_vals = cname_lower.map(lambda c: rule_dict.get(c, {}).get(db_f))
+                mapped_gl = [rule_dict_gl.get((c, g), {}).get(db_f) if g else None for c, g in zip(cname_series, gl_series)]
+                mapped_camp = cname_series.map(lambda c: rule_dict_camp.get(c, {}).get(db_f))
+                mapped_vals = pd.Series(mapped_gl, index=df.index).combine_first(mapped_camp)
                 valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
                 if valid_mask.any():
                     df.loc[valid_mask, f] = mapped_vals[valid_mask]
 
-            # Seed new GiveBright campaigns into platform_campaign_mappings database in 1 vectorized pass
-            unique_cnames = df[["Campaign Name"]].drop_duplicates(subset=["Campaign Name"])
+            # Seed new GiveBright campaigns into platform_campaign_mappings database with giving level support
+            c_curl_map = {}
+            if "Campaign URL" in df.columns:
+                for c_u, u_val in zip(df["Campaign Name"], df["Campaign URL"]):
+                    if str(u_val).strip() and str(c_u).strip().lower() not in c_curl_map:
+                        c_curl_map[str(c_u).strip().lower()] = str(u_val).strip()
+
+            unique_combos = df[["Campaign Name", "Giving Level Title"]].drop_duplicates() if "Giving Level Title" in df.columns else df[["Campaign Name"]].drop_duplicates()
             new_rules = []
-            for _, r in unique_cnames.iterrows():
+            for _, r in unique_combos.iterrows():
                 cn = str(r["Campaign Name"]).strip()
                 cn_l = cn.lower()
-                if cn and cn_l not in ["nan", "none", "n/a", ""] and cn_l not in rule_dict:
-                    curl = str(r.get("Campaign URL") or "").strip() if "Campaign URL" in r else ""
-                    new_rules.append((target_cid, "givebright", cn, "Unassigned", curl, 1))
+                gl = str(r.get("Giving Level Title") or "").strip() if "Giving Level Title" in r else ""
+                gl_l = gl.lower()
+                if not cn or cn_l in ["nan", "none", "n/a", ""]:
+                    continue
+
+                curl = c_curl_map.get(cn_l, "")
+                if gl_l and gl_l not in ["nan", "none", "n/a", ""]:
+                    if (cn_l, gl_l) not in rule_dict_gl:
+                        new_rules.append((target_cid, "givebright", cn, gl, "Unassigned", curl, 0))
+                else:
+                    if cn_l not in rule_dict_camp:
+                        new_rules.append((target_cid, "givebright", cn, "", "Unassigned", curl, 1))
 
             if new_rules:
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
                 try:
                     conn.executemany("""
-                        INSERT OR IGNORE INTO platform_campaign_mappings (company_id, platform, campaign_name, code, campaign_url, is_primary)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT OR IGNORE INTO platform_campaign_mappings (company_id, platform, campaign_name, giving_level, code, campaign_url, is_primary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, new_rules)
                     conn.commit()
                 except Exception as e:
@@ -2326,7 +2418,21 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
 
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     df_save.to_sql("donations", con=conn, if_exists="replace", index=False, chunksize=5000)
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_campaign_name ON donations ([Campaign Name]);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_fundraiser_name ON donations (fundraiser_name);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_code ON donations (Code);')
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
+
+    # Automatically synchronize fundraiser assigned campaigns for newly uploaded donations
+    try:
+        from backend.api.fundraisers import sync_assigned_campaigns_to_donations
+        sync_assigned_campaigns_to_donations(company_id=target_cid)
+    except Exception as e:
+        print(f"[Upload Fundraiser Auto-Sync Notice]: {e}")
 
     # Invalidate dataset cache so new rows show up instantly
     load_data(force_reload=True)
@@ -2904,7 +3010,29 @@ def _ensure_two_tier_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Office" in df.columns and "Sub-Heading" not in df.columns:
         df["Sub-Heading"] = df["Office"]
 
+    # Giving Level Title resolution across all platform aliases (GiveBright impact_name, Madinah Giving Levels)
+    if "Giving Level Title" not in df.columns:
+        df["Giving Level Title"] = ""
+    for gl_col in ["impact_name", "Giving Levels", "giving_levels", "giving_level", "variant", "option"]:
+        if gl_col in df.columns:
+            cur_gl = df["Giving Level Title"].fillna("").astype(str).str.strip()
+            cand_gl = df[gl_col].fillna("").astype(str).str.strip()
+            mask_fill = cur_gl.str.lower().isin(["", "nan", "none", "null", "n/a"]) & (~cand_gl.str.lower().isin(["", "nan", "none", "null", "n/a"]))
+            if mask_fill.any():
+                df.loc[mask_fill, "Giving Level Title"] = cand_gl[mask_fill]
+
     # Resilient, High-Speed ISO Date Standardization across all fallback sources (Iqra & Rethink)
+    # GiveBright or UK-formatted created_at (D/M/YYYY) ground-truth override
+    if "created_at" in df.columns:
+        c_at_str = df["created_at"].fillna("").astype(str).str.strip()
+        slash_m = c_at_str.str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
+        has_slash = slash_m[0].notna() & slash_m[1].notna() & slash_m[2].notna()
+        if has_slash.any():
+            corr_d = slash_m.loc[has_slash, 2] + "-" + slash_m.loc[has_slash, 1].str.zfill(2) + "-" + slash_m.loc[has_slash, 0].str.zfill(2)
+            df.loc[has_slash, "_parsed_date"] = corr_d
+            df.loc[has_slash, "Created Date (UTC)"] = corr_d
+            df.loc[has_slash, "Date"] = corr_d
+
     date_candidates = ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)", "Date of collection", "Date Due"]
     res_date = pd.Series("", index=df.index, dtype=object)
     for col in date_candidates:
@@ -3203,11 +3331,12 @@ def ensure_database_indexes():
 
 
 def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
-    """Returns GiveBright classification matrix DataFrame with (Campaign Name, Code) granularity for a company."""
-    target_cols_display = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    """Returns GiveBright classification matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for a company."""
+    init_classification_db()
+    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
     comp = str(company_id or "rethink").lower().strip()
 
-    # 1. Read SQLite stored GiveBright classifications
+    # 1. Read existing saved rules directly from SQLite
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
@@ -3215,62 +3344,294 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
         db_matrix = pd.read_sql_query(f"""
             SELECT 
                 campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
                 COALESCE(campaign_url, '') as "Campaign URL",
-                COALESCE(heading, 'Unassigned') as "Heading",
-                COALESCE(sub_heading, 'Unassigned') as "Sub-Heading",
+                COALESCE(community_name, 'N/A') as "Community Name",
+                COALESCE(department, heading, 'Unassigned') as "Department",
+                COALESCE(office, sub_heading, 'Unassigned') as "Office",
+                COALESCE(portfolio, '') as "Portfolio",
+                COALESCE(programme_fund, '') as "Programme Fund",
+                COALESCE(fund_code, '') as "Fund Code",
+                COALESCE(heading, department, 'Unassigned') as "Heading",
+                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
                 COALESCE(country, 'Unassigned') as "Country",
-                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility"
+                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
+                COALESCE(is_primary, 0) as "is_primary",
+                COALESCE(donor_name, '') as "Donor Name",
+                COALESCE(donor_email, '') as "Donor Email"
             FROM givebright_classifications
             {where_clause}
         """, conn, params=params)
     except Exception:
-        db_matrix = pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL"] + [c for c in target_cols_display if c != "Code"])
+        db_matrix = pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Campaign URL", "Community Name"] + [c for c in target_cols if c != "Code"])
     finally:
         conn.close()
 
-    # 2. Extract distinct GiveBright campaigns from in-memory cached donations
-    df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
-    if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
-        platform_s = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
-        source_s = df_donations.get("Source", pd.Series("", index=df_donations.index)).astype(str).str.lower()
-        gb_mask = (platform_s == "givebright") | source_s.str.contains("givebright|give_bright|file-", na=False)
-        gb_df = df_donations[gb_mask] if gb_mask.any() else df_donations.iloc[0:0]
+    if not db_matrix.empty:
+        db_matrix["Campaign Name"] = db_matrix["Campaign Name"].apply(fix_mojibake).str.strip()
+        db_matrix["Giving Level"] = db_matrix["Giving Level"].apply(fix_mojibake).str.strip()
 
-        if not gb_df.empty:
-            c_name = gb_df["Campaign Name"].astype(str).str.strip()
-            c_name = c_name[~c_name.str.lower().isin(['nan', 'none', 'n/a', '', 'unassigned'])]
-            code_val = gb_df.loc[c_name.index, "Code"].astype(str).str.strip().replace({'nan': 'Unassigned', '': 'Unassigned', 'None': 'Unassigned'}) if "Code" in gb_df.columns else pd.Series("Unassigned", index=c_name.index)
-            
-            url_series = pd.Series("", index=gb_df.index)
-            for u_col in ["Campaign URL", "campaign_url", "URL", "url"]:
-                if u_col in gb_df.columns:
-                    url_series = gb_df[u_col].fillna("").astype(str).replace({'nan': '', 'None': ''})
-                    break
+    # 2. Extract distinct (Campaign Name, Giving Level, Code) triples from real GiveBright donations
+    donor_distinct = None
+    try:
+        from core.analytics_engine import get_duckdb_connection
+        con = get_duckdb_connection()
+        if con and os.path.exists(PARQUET_PATH):
+            company_filter = f"AND LOWER(COALESCE(\"company_id\", 'rethink')) = '{comp}'" if comp != "all" else ""
+            donor_distinct = con.execute(f"""
+                SELECT 
+                    COALESCE(NULLIF(TRIM("Campaign Name"), ''), 'N/A') as "Campaign Name",
+                    CASE 
+                        WHEN "Giving Level Title" IS NOT NULL AND LOWER(TRIM("Giving Level Title")) NOT IN ('', 'nan', 'none', 'null', 'n/a') THEN TRIM("Giving Level Title")
+                        WHEN "impact_name" IS NOT NULL AND LOWER(TRIM("impact_name")) NOT IN ('', 'nan', 'none', 'null', 'n/a') THEN TRIM("impact_name")
+                        ELSE ''
+                    END as "Giving Level",
+                    COALESCE(NULLIF(TRIM("Code"), ''), 'Unassigned') as "Code",
+                    MAX(COALESCE(NULLIF(TRIM("Community Name"), ''), 'N/A')) as "Community Name",
+                    MAX(COALESCE(NULLIF(TRIM("Campaign URL"), ''), '')) as "Campaign URL",
+                    COUNT(*) as donation_count,
+                    SUM(TRY_CAST(REPLACE(REPLACE(COALESCE(CAST("Total Online Donation Gross Amount in Settled Currency" AS VARCHAR), CAST("Donation Amount (in Donation Currency)" AS VARCHAR), CAST("Amount" AS VARCHAR), '0'), '£', ''), ',', '') AS DOUBLE)) as total_amount
+                FROM '{PARQUET_PATH.replace(chr(92), '/')}'
+                WHERE LOWER(COALESCE("Platform", '')) IN ('givebright', 'givebrite')
+                  AND "Campaign Name" IS NOT NULL
+                  AND LOWER(TRIM(CAST("Campaign Name" AS VARCHAR))) NOT IN ('', 'nan', 'none', 'null', 'n/a', 'unassigned')
+                  {company_filter}
+                GROUP BY "Campaign Name", "Giving Level", "Code"
+            """).df()
+    except Exception as e:
+        print(f"[GiveBright DuckDB Notice]: {e}")
+        donor_distinct = None
 
-            donor_df = pd.DataFrame({"Campaign Name": c_name, "Code": code_val, "Campaign URL": url_series.loc[c_name.index]})
-            for tc in target_cols_display:
-                if tc in gb_df.columns and tc != "Code":
-                    donor_df[tc] = gb_df.loc[c_name.index, tc].values
+    if donor_distinct is None or donor_distinct.empty:
+        df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
+        if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
+            plat_series = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
+            source_series = df_donations.get("Source", pd.Series("", index=df_donations.index)).astype(str).str.lower()
+            gb_mask = plat_series.isin(["givebright", "givebrite"]) | source_series.str.contains("givebright|givebrite", na=False)
+            gb_df = df_donations[gb_mask] if gb_mask.any() else df_donations.iloc[0:0]
 
-            donor_distinct = donor_df.drop_duplicates(subset=["Campaign Name", "Code"])
+            if not gb_df.empty:
+                c_name = gb_df["Campaign Name"].astype(str).str.strip()
+                c_name = c_name[~c_name.str.lower().isin(['nan', 'none', 'n/a', '', 'unassigned'])]
+                gl_col = "Giving Level Title" if "Giving Level Title" in gb_df.columns else ("impact_name" if "impact_name" in gb_df.columns else None)
+                gl_name = gb_df.loc[c_name.index, gl_col].fillna("").astype(str).str.strip().replace({'nan': '', 'None': '', 'null': '', 'N/A': ''}) if gl_col else pd.Series("", index=c_name.index)
+                comm_name = gb_df.loc[c_name.index, "Community Name"].astype(str).str.strip().replace({'nan': 'N/A', '': 'N/A', 'None': 'N/A'}) if "Community Name" in gb_df.columns else pd.Series("N/A", index=c_name.index)
+                code_val = gb_df.loc[c_name.index, "Code"].astype(str).str.strip().replace({'nan': 'Unassigned', '': 'Unassigned', 'None': 'Unassigned'}) if "Code" in gb_df.columns else pd.Series("Unassigned", index=c_name.index)
+                donor_df = pd.DataFrame({"Campaign Name": c_name, "Giving Level": gl_name, "Code": code_val, "Community Name": comm_name})
+                donor_distinct = donor_df.drop_duplicates(subset=["Campaign Name", "Giving Level", "Code"])
 
-            if db_matrix.empty:
-                return donor_distinct.fillna("Unassigned").reset_index(drop=True)
+    if donor_distinct is not None and not donor_distinct.empty:
+        donor_distinct["Campaign Name"] = donor_distinct["Campaign Name"].apply(fix_mojibake).str.strip()
+        donor_distinct["Giving Level"] = donor_distinct["Giving Level"].apply(fix_mojibake).str.strip()
 
+        if db_matrix.empty:
+            merged_raw = donor_distinct.fillna("Unassigned").reset_index(drop=True)
+        else:
             merged = pd.merge(
-                donor_distinct[["Campaign Name", "Code", "Campaign URL"]],
+                donor_distinct,
                 db_matrix,
-                on=["Campaign Name", "Code"],
+                on=["Campaign Name", "Giving Level", "Code"],
                 how="outer",
                 suffixes=('', '_db')
             ).fillna("Unassigned")
-            return merged.drop_duplicates(subset=["Campaign Name", "Code"]).reset_index(drop=True)
+            if "Campaign URL_db" in merged.columns:
+                merged["Campaign URL"] = merged["Campaign URL"].replace("", "").combine_first(merged["Campaign URL_db"])
+                merged.drop(columns=["Campaign URL_db"], inplace=True)
+            merged_raw = merged
+    else:
+        merged_raw = db_matrix
+
+    # 3. Canonical Deduplication & Ghost Row Purging
+    cleaned_rows = []
+    if not merged_raw.empty:
+        cname_gl_groups = merged_raw.groupby([
+            merged_raw["Campaign Name"].astype(str).str.strip().str.lower(),
+            merged_raw["Giving Level"].astype(str).str.strip().str.lower()
+        ])
+        for (c_low, gl_low), grp in cname_gl_groups:
+            assigned_rows = grp[~grp["Code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "N/A", "NONE", "NAN", ""])]
+            rows_to_process = assigned_rows if not assigned_rows.empty else grp.iloc[0:1]
+
+            code_groups = rows_to_process.groupby(rows_to_process["Code"].astype(str).str.upper())
+            for code_up, c_grp in code_groups:
+                row = c_grp.iloc[0].copy()
+                if "Campaign URL" in c_grp.columns:
+                    urls = [u for u in c_grp["Campaign URL"] if str(u).strip() and str(u).strip().startswith("http")]
+                    if urls:
+                        row["Campaign URL"] = urls[0]
+                if "Community Name" in c_grp.columns:
+                    comms = [c for c in c_grp["Community Name"] if str(c).strip().lower() not in ["n/a", "unassigned", "none", "nan", ""]]
+                    if comms:
+                        row["Community Name"] = comms[0]
+                cleaned_rows.append(row)
+
+    deduped_df = pd.DataFrame(cleaned_rows) if cleaned_rows else merged_raw
+
+    # 4. Dynamic auto-assignment based on Code mapping
+    code_map = get_code_to_classification_map(company_id=comp)
+    if code_map and "Code" in deduped_df.columns:
+        code_clean = deduped_df["Code"].astype(str).str.strip().str.lower()
+        for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Programme Fund", "Fund Code"]:
+            if tc in deduped_df.columns:
+                target_map = {k: v[tc] for k, v in code_map.items() if tc in v and str(v[tc]).lower() != "unassigned"}
+                mask_unassigned = deduped_df[tc].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
+                mapped_vals = code_clean.map(target_map)
+                fill_mask = mask_unassigned & mapped_vals.notna()
+                if fill_mask.any():
+                    deduped_df.loc[fill_mask, tc] = mapped_vals[fill_mask]
+
+    if "donation_count" in deduped_df.columns:
+        deduped_df["donation_count"] = pd.to_numeric(deduped_df["donation_count"], errors="coerce").fillna(0).astype(int)
+    else:
+        deduped_df["donation_count"] = 0
+    if "total_amount" in deduped_df.columns:
+        deduped_df["total_amount"] = pd.to_numeric(deduped_df["total_amount"], errors="coerce").fillna(0.0).round(2)
+    else:
+        deduped_df["total_amount"] = 0.0
+
+    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary"]]
+    deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
+    return deduped_df.reset_index(drop=True)
+
+
+def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "iqra"):
+    """Returns Madinah classification matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for Iqra."""
+    init_classification_db()
+    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
+    comp = str(company_id or "iqra").lower().strip()
+
+    # 1. Read existing saved rules directly from SQLite
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'iqra')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+        db_matrix = pd.read_sql_query(f"""
+            SELECT 
+                campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
+                COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(campaign_url, '') as "Campaign URL",
+                COALESCE(department, heading, 'Unassigned') as "Department",
+                COALESCE(office, sub_heading, 'Unassigned') as "Office",
+                COALESCE(portfolio, '') as "Portfolio",
+                COALESCE(programme_fund, '') as "Programme Fund",
+                COALESCE(fund_code, '') as "Fund Code",
+                COALESCE(heading, department, 'Unassigned') as "Heading",
+                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
+                COALESCE(country, 'Unassigned') as "Country",
+                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
+                COALESCE(is_primary, 0) as "is_primary"
+            FROM madinah_classifications
+            {where_clause}
+        """, conn, params=params)
+    except Exception:
+        db_matrix = pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Campaign URL"] + [c for c in target_cols if c != "Code"])
+    finally:
+        conn.close()
 
     if not db_matrix.empty:
-        return db_matrix.fillna("Unassigned").reset_index(drop=True)
+        db_matrix["Campaign Name"] = db_matrix["Campaign Name"].apply(fix_mojibake).str.strip()
+        db_matrix["Giving Level"] = db_matrix["Giving Level"].apply(fix_mojibake).str.strip()
 
-    return pd.DataFrame(columns=["Campaign Name", "Code", "Campaign URL"] + [c for c in target_cols_display if c != "Code"])
+    # 2. Extract distinct (Campaign Name, Giving Level, Code) triples from real Madinah donations
+    donor_distinct = None
+    try:
+        from core.analytics_engine import get_duckdb_connection
+        con = get_duckdb_connection()
+        if con and os.path.exists(PARQUET_PATH):
+            company_filter = f"AND LOWER(COALESCE(\"company_id\", 'iqra')) = '{comp}'" if comp != "all" else ""
+            donor_distinct = con.execute(f"""
+                SELECT 
+                    COALESCE(NULLIF(TRIM("Campaign Name"), ''), 'N/A') as "Campaign Name",
+                    CASE 
+                        WHEN "Giving Level Title" IS NOT NULL AND LOWER(TRIM("Giving Level Title")) NOT IN ('', 'nan', 'none', 'null', 'n/a') THEN TRIM("Giving Level Title")
+                        WHEN "Giving Levels" IS NOT NULL AND LOWER(TRIM("Giving Levels")) NOT IN ('', 'nan', 'none', 'null', 'n/a') THEN TRIM("Giving Levels")
+                        ELSE ''
+                    END as "Giving Level",
+                    COALESCE(NULLIF(TRIM("Code"), ''), 'Unassigned') as "Code",
+                    MAX(COALESCE(NULLIF(TRIM("Campaign URL"), ''), '')) as "Campaign URL",
+                    COUNT(*) as donation_count,
+                    SUM(TRY_CAST(REPLACE(REPLACE(COALESCE(CAST("Total Online Donation Gross Amount in Settled Currency" AS VARCHAR), CAST("Donation Amount (in Donation Currency)" AS VARCHAR), CAST("Amount" AS VARCHAR), '0'), '£', ''), ',', '') AS DOUBLE)) as total_amount
+                FROM '{PARQUET_PATH.replace(chr(92), '/')}'
+                WHERE LOWER(COALESCE("Platform", '')) LIKE '%madinah%'
+                  AND "Campaign Name" IS NOT NULL
+                  AND LOWER(TRIM(CAST("Campaign Name" AS VARCHAR))) NOT IN ('', 'nan', 'none', 'null', 'n/a', 'unassigned')
+                  {company_filter}
+                GROUP BY "Campaign Name", "Giving Level", "Code"
+            """).df()
+    except Exception as e:
+        print(f"[Madinah DuckDB Notice]: {e}")
+        donor_distinct = None
+
+    if donor_distinct is not None and not donor_distinct.empty:
+        donor_distinct["Campaign Name"] = donor_distinct["Campaign Name"].apply(fix_mojibake).str.strip()
+        donor_distinct["Giving Level"] = donor_distinct["Giving Level"].apply(fix_mojibake).str.strip()
+
+        if db_matrix.empty:
+            merged_raw = donor_distinct.fillna("Unassigned").reset_index(drop=True)
+        else:
+            merged = pd.merge(
+                donor_distinct,
+                db_matrix,
+                on=["Campaign Name", "Giving Level", "Code"],
+                how="outer",
+                suffixes=('', '_db')
+            ).fillna("Unassigned")
+            if "Campaign URL_db" in merged.columns:
+                merged["Campaign URL"] = merged["Campaign URL"].replace("", "").combine_first(merged["Campaign URL_db"])
+                merged.drop(columns=["Campaign URL_db"], inplace=True)
+            merged_raw = merged
+    else:
+        merged_raw = db_matrix
+
+    # 3. Canonical Deduplication & Ghost Row Purging
+    cleaned_rows = []
+    if not merged_raw.empty:
+        cname_gl_groups = merged_raw.groupby([
+            merged_raw["Campaign Name"].astype(str).str.strip().str.lower(),
+            merged_raw["Giving Level"].astype(str).str.strip().str.lower()
+        ])
+        for (c_low, gl_low), grp in cname_gl_groups:
+            assigned_rows = grp[~grp["Code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "N/A", "NONE", "NAN", ""])]
+            rows_to_process = assigned_rows if not assigned_rows.empty else grp.iloc[0:1]
+
+            code_groups = rows_to_process.groupby(rows_to_process["Code"].astype(str).str.upper())
+            for code_up, c_grp in code_groups:
+                row = c_grp.iloc[0].copy()
+                if "Campaign URL" in c_grp.columns:
+                    urls = [u for u in c_grp["Campaign URL"] if str(u).strip() and str(u).strip().startswith("http")]
+                    if urls:
+                        row["Campaign URL"] = urls[0]
+                cleaned_rows.append(row)
+
+    deduped_df = pd.DataFrame(cleaned_rows) if cleaned_rows else merged_raw
+
+    # 4. Dynamic auto-assignment based on Code mapping
+    code_map = get_code_to_classification_map(company_id=comp)
+    if code_map and "Code" in deduped_df.columns:
+        code_clean = deduped_df["Code"].astype(str).str.strip().str.lower()
+        for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Programme Fund", "Fund Code"]:
+            if tc in deduped_df.columns:
+                target_map = {k: v[tc] for k, v in code_map.items() if tc in v and str(v[tc]).lower() != "unassigned"}
+                mask_unassigned = deduped_df[tc].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
+                mapped_vals = code_clean.map(target_map)
+                fill_mask = mask_unassigned & mapped_vals.notna()
+                if fill_mask.any():
+                    deduped_df.loc[fill_mask, tc] = mapped_vals[fill_mask]
+
+    if "donation_count" in deduped_df.columns:
+        deduped_df["donation_count"] = pd.to_numeric(deduped_df["donation_count"], errors="coerce").fillna(0).astype(int)
+    else:
+        deduped_df["donation_count"] = 0
+    if "total_amount" in deduped_df.columns:
+        deduped_df["total_amount"] = pd.to_numeric(deduped_df["total_amount"], errors="coerce").fillna(0.0).round(2)
+    else:
+        deduped_df["total_amount"] = 0.0
+
+    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary"]]
+    deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
+    return deduped_df.reset_index(drop=True)
 
 
 def save_givebright_classification_matrix(matrix_df, company_id: str = "rethink"):
@@ -3287,6 +3648,8 @@ def normalize_classification_import_df(raw_df):
             col_mapping[col] = "Campaign Name"
         elif c_clean in ["community", "community name", "fundraiser by", "platform source"]:
             col_mapping[col] = "Community Name"
+        elif c_clean in ["giving level", "giving level title", "giving levels", "impact name", "impact_name", "variant", "option", "tier", "giving_level", "giving_level_title"]:
+            col_mapping[col] = "Giving Level"
         elif c_clean in ["code", "campaign code", "project code", "cost code", "item code", "giving level fund code", "giving level campaign code", "fund code", "accounting code"]:
             col_mapping[col] = "Code"
         elif c_clean in ["heading", "main heading", "category", "main category"]:
@@ -3308,6 +3671,9 @@ def normalize_classification_import_df(raw_df):
     if "Campaign Name" not in df_norm.columns:
         if len(df_norm.columns) > 0:
             df_norm.rename(columns={df_norm.columns[0]: "Campaign Name"}, inplace=True)
+
+    if "Giving Level" not in df_norm.columns:
+        df_norm["Giving Level"] = ""
 
     if "Campaign URL" not in df_norm.columns:
         df_norm["Campaign URL"] = ""

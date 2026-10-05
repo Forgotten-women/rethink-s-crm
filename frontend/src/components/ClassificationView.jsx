@@ -1901,7 +1901,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-bold bg-indigo-50 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300 border border-indigo-300/40 shadow-xs truncate max-w-[220px]" title={r['Giving Level']}>
                                       🎁 {r['Giving Level']}
                                     </span>
-                                    {(r.donation_count > 0 || r.total_amount > 0) && (
+                                    {(Number(r.donation_count) > 0 || Number(r.total_amount) > 0) && (
                                       <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
                                         {r.donation_count || 0} donors • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
                                       </span>
@@ -1912,7 +1912,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     <span className="text-slate-400 dark:text-slate-500 text-[11px] italic font-medium">
                                       Default (General)
                                     </span>
-                                    {(r.donation_count > 0 || r.total_amount > 0) && (
+                                    {(Number(r.donation_count) > 0 || Number(r.total_amount) > 0) && (
                                       <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
                                         {r.donation_count || 0} donors • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
                                       </span>
@@ -2210,7 +2210,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                   <div className="flex items-center gap-2">
                                     <span className="text-cyan-500 font-mono font-bold text-sm">↳</span>
                                     <span className="truncate max-w-[200px] text-[11px]" title={rule['Giving Level'] || rule['Campaign Name']}>
-                                      {rule['Giving Level'] || 'General Default Variant'}
+                                      {rule['Giving Level'] 
+                                        ? rule['Giving Level'] 
+                                        : (rule.is_primary 
+                                            ? 'Primary Default Variant' 
+                                            : (rule['Code'] && rule['Code'] !== 'Unassigned' ? `Variant (${rule['Code']})` : 'General Variant'))}
                                     </span>
                                     {rule.is_primary && (
                                       <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[9px] font-extrabold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-400/40 shrink-0">
@@ -2236,7 +2240,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                         <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-bold bg-indigo-100 text-indigo-900 dark:bg-indigo-950/70 dark:text-indigo-300 border border-indigo-300/50 shadow-xs truncate max-w-[220px]" title={rule['Giving Level']}>
                                           🎁 {rule['Giving Level']}
                                         </span>
-                                        {(rule.donation_count > 0 || rule.total_amount > 0) && (
+                                        {(Number(rule.donation_count) > 0 || Number(rule.total_amount) > 0) && (
                                           <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
                                             {rule.donation_count || 0} donors • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
                                           </span>
@@ -2247,7 +2251,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                         <span className="text-slate-400 dark:text-slate-500 text-[11px] italic font-medium">
                                           Default (General)
                                         </span>
-                                        {(rule.donation_count > 0 || rule.total_amount > 0) && (
+                                        {(Number(rule.donation_count) > 0 || Number(rule.total_amount) > 0) && (
                                           <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
                                             {rule.donation_count || 0} donors • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
                                           </span>

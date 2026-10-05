@@ -19,6 +19,7 @@ from core.data_processor import (
     save_rethink_website_classification_matrix,
     get_givebright_classification_matrix,
     save_givebright_classification_matrix,
+    get_madinah_classification_matrix,
     normalize_classification_import_df,
     get_code_to_classification_map,
     sync_matrix_classifications_to_donors,
@@ -132,8 +133,12 @@ def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
         df["Giving Level"] = ""
     if "donation_count" not in df.columns:
         df["donation_count"] = 0
+    else:
+        df["donation_count"] = pd.to_numeric(df["donation_count"], errors="coerce").fillna(0).astype(int)
     if "total_amount" not in df.columns:
         df["total_amount"] = 0.0
+    else:
+        df["total_amount"] = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0.0).round(2)
 
     # Count distinct valid codes per campaign name
     c_series = df["Campaign Name"].astype(str).str.strip().str.lower()
@@ -627,51 +632,11 @@ def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
 
 
 @router.get("/givebright")
+@router.get("/givebrite")
 def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
-    """Returns GiveBright classification matrix rules with (Campaign Name, Code) granularity."""
+    """Returns GiveBright/GiveBrite classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
-    try:
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        query = """
-            SELECT 
-                campaign_name as "Campaign Name",
-                COALESCE(giving_level, '') as "Giving Level",
-                COALESCE(code, 'Unassigned') as "Code",
-                COALESCE(campaign_url, '') as "Campaign URL",
-                COALESCE(department, heading, 'Unassigned') as "Department",
-                COALESCE(office, sub_heading, 'Unassigned') as "Office",
-                COALESCE(portfolio, '') as "Portfolio",
-                COALESCE(heading, department, 'Unassigned') as "Heading",
-                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
-                COALESCE(country, 'Unassigned') as "Country",
-                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary",
-                company_id
-            FROM givebright_classifications
-        """
-        if comp != "all":
-            query += " WHERE company_id = ?"
-            df = pd.read_sql_query(query, conn, params=(comp,))
-        else:
-            df = pd.read_sql_query(query, conn)
-        conn.close()
-    except Exception as e:
-        print(f"[GiveBright Matrix Query Notice]: {e}")
-        df = get_givebright_classification_matrix(company_id=comp).fillna("Unassigned")
-
-    # Strict mapping: Code -> Department, Office, Portfolio, Country, Zakat Eligibility
-    code_map = get_code_to_classification_map(company_id=comp)
-    if code_map and "Code" in df.columns:
-        code_clean = df["Code"].astype(str).str.strip().str.lower()
-        for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"]:
-            if tc in df.columns:
-                target_map = {k: v[tc] for k, v in code_map.items() if tc in v and v[tc] != "Unassigned"}
-                mask_unassigned = df[tc].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
-                mapped_vals = code_clean.map(target_map)
-                fill_mask = mask_unassigned & mapped_vals.notna()
-                if fill_mask.any():
-                    df.loc[fill_mask, tc] = mapped_vals[fill_mask]
-
+    df = get_givebright_classification_matrix(company_id=comp).fillna("Unassigned")
     return _compute_matrix_summary(df, comp, "GiveBright")
 
 
@@ -751,56 +716,15 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
 
 @router.get("/madinah")
 def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
-    """Returns Madinah classification matrix rules with (Campaign Name, Code) granularity for Iqra."""
+    """Returns Madinah classification matrix rules with (Campaign Name, Giving Level, Code) granularity for Iqra."""
     comp = (company_id or "iqra").strip().lower()
-    try:
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
-        query = """
-            SELECT 
-                campaign_name as "Campaign Name",
-                COALESCE(giving_level, '') as "Giving Level",
-                COALESCE(code, 'Unassigned') as "Code",
-                COALESCE(campaign_url, '') as "Campaign URL",
-                COALESCE(department, heading, 'Unassigned') as "Department",
-                COALESCE(office, sub_heading, 'Unassigned') as "Office",
-                COALESCE(portfolio, '') as "Portfolio",
-                COALESCE(heading, department, 'Unassigned') as "Heading",
-                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
-                COALESCE(country, 'Unassigned') as "Country",
-                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary",
-                company_id
-            FROM madinah_classifications
-        """
-        if comp != "all":
-            query += " WHERE company_id = ?"
-            df = pd.read_sql_query(query, conn, params=(comp,))
-        else:
-            df = pd.read_sql_query(query, conn)
-        conn.close()
-    except Exception as e:
-        print(f"[Madinah Matrix Query Notice]: {e}")
-        df = pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Campaign URL", "Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "is_primary", "company_id"])
-
-    # Strict mapping: Code -> Department, Office, Portfolio, Country, Zakat Eligibility
-    code_map = get_code_to_classification_map(company_id=comp)
-    if code_map and "Code" in df.columns:
-        code_clean = df["Code"].astype(str).str.strip().str.lower()
-        for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"]:
-            if tc in df.columns:
-                target_map = {k: v[tc] for k, v in code_map.items() if tc in v and v[tc] != "Unassigned"}
-                mask_unassigned = df[tc].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
-                mapped_vals = code_clean.map(target_map)
-                fill_mask = mask_unassigned & mapped_vals.notna()
-                if fill_mask.any():
-                    df.loc[fill_mask, tc] = mapped_vals[fill_mask]
-
+    df = get_madinah_classification_matrix(company_id=comp).fillna("Unassigned")
     return _compute_matrix_summary(df, comp, "Madinah")
 
 
 @router.get("/export")
 def export_classifications(
-    platform: str = Query("launchgood", pattern="^(launchgood|givebright|madinah|paysuite|website|rethink_website|master)$"),
+    platform: str = Query("launchgood", pattern="^(launchgood|givebright|givebrite|madinah|paysuite|website|rethink_website|master)$"),
     format: str = Query("csv", pattern="^(csv|xlsx)$"),
     company_id: Optional[str] = Query("rethink")
 ):
@@ -839,7 +763,7 @@ def export_classifications(
             "total_raised": "Total Raised"
         })
     else:
-        if p_clean == "givebright":
+        if p_clean in ["givebright", "givebrite"]:
             res = get_givebright_matrix(company_id=comp)
         elif p_clean == "madinah":
             res = get_madinah_matrix(company_id=comp)
@@ -1035,7 +959,7 @@ def delete_single_rule(payload: DeleteRuleRequest):
     gl_name = sanitize_text((payload.giving_level or "").strip())
     code = sanitize_text(payload.code.strip()) if payload.code else None
     platform = payload.platform.lower()
-    plat_db = "givebright" if platform == "givebright" else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
+    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=60.0)
@@ -1130,7 +1054,7 @@ def clear_platform_rules(payload: ClearPlatformRequest):
         )
 
     platform = payload.platform.lower()
-    plat_db = "givebright" if platform == "givebright" else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
+    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=30.0)
@@ -1218,7 +1142,7 @@ async def import_classification_file(
     platform_clean = platform.lower()
 
     if mode == "merge":
-        if platform_clean == "givebright":
+        if platform_clean in ["givebright", "givebrite"]:
             existing = get_givebright_classification_matrix(company_id=comp).fillna("Unassigned")
             merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name"], keep="last")
         elif platform_clean == "madinah":
@@ -1234,7 +1158,7 @@ async def import_classification_file(
     else:
         merged = norm_df
 
-    if platform_clean in ["givebright", "madinah"]:
+    if platform_clean in ["givebright", "givebrite", "madinah"]:
         # Strict mapping: Code -> Heading, Sub-Heading, Country, Zakat
         code_map = get_code_to_classification_map(company_id=comp)
         for idx, row in merged.iterrows():

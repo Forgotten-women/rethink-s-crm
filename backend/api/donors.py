@@ -39,6 +39,8 @@ router = APIRouter(prefix="/api/donors", tags=["Donors & Explorer"])
 
 class BulkEditDonorsRequest(BaseModel):
     user_role: Optional[str] = "admin"
+    user_identity: Optional[str] = None
+    user_email: Optional[str] = None
     target_columns: List[str]
     new_values: List[str]
     company_id: Optional[str] = "rethink"
@@ -64,6 +66,8 @@ class BulkEditDonorsRequest(BaseModel):
 
 class UpdateSingleDonorRequest(BaseModel):
     user_role: Optional[str] = "admin"
+    user_identity: Optional[str] = None
+    user_email: Optional[str] = None
     company_id: Optional[str] = "rethink"
     row_id: Optional[int] = None
     donation_id: Optional[str] = None
