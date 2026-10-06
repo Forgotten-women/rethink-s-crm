@@ -34,3 +34,12 @@ node_modules/
 *.zip
 *.bak
 crm_database_backup.tar.gz
+
+# Internal API Reference & Token Caches
+madinah_api_reference.md
+givebrite_api_reference.md
+.madinah_token.json
+.givebrite_token.json
+givebrite_impacts.json
+data_cache/*.json
+scripts/*

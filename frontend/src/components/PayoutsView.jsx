@@ -2634,7 +2634,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                   type="text"
                   value={editingClassification.code}
                   onChange={(e) => handleSelectCodeInModal(e.target.value)}
-                  placeholder="e.g. GAZ-EMR, SHAM-SPN-HUF, ALL-DIV..."
+                  placeholder="e.g. GAZ-EMR, SHM-SPN-HUF, ALL-DIV..."
                   list="payout-modal-codes-list"
                   className="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-white/10 bg-white dark:bg-slate-800 text-xs font-mono font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 uppercase"
                 />

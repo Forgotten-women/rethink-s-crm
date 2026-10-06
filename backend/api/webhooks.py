@@ -161,19 +161,19 @@ def _lookup_givebrite_classification(campaign_name: str, company_id: str = "reth
     zakat = "Unassigned"
 
     if "orphan" in kw:
-        code = "SHAM-EDU-SPN-ORP" if comp == "rethink" else "IQRA-SPN-ORP"
+        code = "SHM-EDU-SPN-ORP" if comp == "rethink" else "IQRA-SPN-ORP"
         dept = "Sponsorships"
         off = "Orphan Sponsorship"
         country = "Shaam" if comp == "rethink" else "Bangladesh"
         zakat = "Zakat"
     elif "hafiz" in kw or "hafidh" in kw:
-        code = "SHAM-EDU-SPN-HUF" if comp == "rethink" else "IQRA-SPN-HUF"
+        code = "SHM-EDU-SPN-HUF" if comp == "rethink" else "IQRA-SPN-HUF"
         dept = "Sponsorships"
         off = "Huffaz Sponsorships"
         country = "Shaam" if comp == "rethink" else "Bangladesh"
         zakat = "Non-Zakat"
     elif "rising star" in kw or "school" in kw or "classroom" in kw or "nursery" in kw:
-        code = "SHAM-INF-VIL-SCH" if comp == "rethink" else "IQRA-EDU-SCH"
+        code = "SHM-INF-VIL-SCH" if comp == "rethink" else "IQRA-EDU-SCH"
         dept = "Village"
         off = "Village School"
         country = "Shaam" if comp == "rethink" else "Bangladesh"
@@ -185,7 +185,7 @@ def _lookup_givebrite_classification(campaign_name: str, company_id: str = "reth
         country = "Gaza"
         zakat = "Zakat"
     elif "widow" in kw or "family" in kw:
-        code = "SHAM-EDU-SPN-WID" if comp == "rethink" else "IQRA-SOC-WID"
+        code = "SHM-EDU-SPN-WID" if comp == "rethink" else "IQRA-SOC-WID"
         dept = "Sponsorships"
         off = "Widow Sponsorship"
         country = "Shaam" if comp == "rethink" else "Bangladesh"
