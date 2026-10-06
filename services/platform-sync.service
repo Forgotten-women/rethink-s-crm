@@ -1,0 +1,19 @@
+[Unit]
+Description=Crowdfunding CRM Platform Real-Time Sync Service (Madinah & Givebrite)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Python_Visualization
+ExecStart=/home/ubuntu/Python_Visualization/venv/bin/python -u /home/ubuntu/Python_Visualization/services/platform_sync_service.py
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=10
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
