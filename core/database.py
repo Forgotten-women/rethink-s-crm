@@ -265,9 +265,11 @@ def ensure_database_indexes():
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_email ON donations("Email");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_platform ON donations("Platform");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_tier ON donations("Lifetime Donor Classification");')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_heading ON donations("Heading");')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_donation_id ON donations("Donation ID");')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_charge_id ON donations(charge_id);')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_created_date ON donations("Created Date (UTC)");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_company_id ON donations("company_id");')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_pcm_comp_camp_level ON platform_campaign_mappings(company_id, campaign_name, giving_level);')
             conn.commit()
         conn.close()
     except Exception as e:

@@ -714,3 +714,81 @@ def get_givebrite_webhook_logs(company_id: Optional[str] = Query("all"), limit: 
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return {"status": "success", "total_logs": len(rows), "logs": rows}
+
+
+@router.post("/givebrite/sync-live")
+async def trigger_givebrite_live_sync(
+    company_id: Optional[str] = Query("iqra"),
+    limit: int = Query(50, ge=1, le=100),
+    current_user = Depends(require_super_admin)
+):
+    """
+    Manually triggers real-time GiveBrite API synchronization into CRM SQLite and Parquet cache.
+    Enforces strict company_id='iqra' isolation.
+    """
+    cid = str(company_id or "iqra").strip().lower()
+    if cid != "iqra":
+        raise HTTPException(status_code=400, detail="GiveBrite sync is strictly isolated to 'iqra'.")
+
+    from core.givebrite_ingestion import ingest_givebrite_donations, GIVEBRITE_API_BASE
+    from services.platform_sync_service import PlatformSyncService
+
+    try:
+        service = PlatformSyncService()
+        token = service.get_givebrite_token()
+        charity_id = os.environ.get("GIVEBRITE_IQRA_CHARITY_ID", "68625e0d6d1a99441e34e2ea")
+
+        headers = {
+            "Authorization": token,
+            "Accept": "application/json",
+            "Origin": "https://dashboard.givebrite.com",
+            "Referer": "https://dashboard.givebrite.com/"
+        }
+        url = f"{GIVEBRITE_API_BASE}/donations?charity_id={charity_id}&page=1&limit={limit}&sort_value=-1&sort_title=created_at"
+        import requests
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"GiveBrite API error: HTTP {r.status_code}")
+
+        data = r.json()
+        docs = data.get("docs", [])
+        result = ingest_givebrite_donations(docs, headers=headers, company_id="iqra")
+        return {
+            "status": "success",
+            "message": f"Successfully synced live GiveBrite donations: {result['inserted']} new, {result['skipped']} skipped.",
+            "details": result
+        }
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=str(ex))
+
+
+@router.post("/givebrite/backfill")
+async def trigger_givebrite_backfill(
+    days: int = Query(60, ge=1, le=180),
+    company_id: Optional[str] = Query("iqra"),
+    current_user = Depends(require_super_admin)
+):
+    """
+    Manually triggers historical backfill for GiveBrite donations.
+    Skips any donation already stored in the CRM database.
+    """
+    cid = str(company_id or "iqra").strip().lower()
+    if cid != "iqra":
+        raise HTTPException(status_code=400, detail="GiveBrite backfill is strictly isolated to 'iqra'.")
+
+    from core.givebrite_ingestion import run_historical_backfill
+    from services.platform_sync_service import PlatformSyncService
+
+    try:
+        service = PlatformSyncService()
+        token = service.get_givebrite_token()
+        charity_id = os.environ.get("GIVEBRITE_IQRA_CHARITY_ID", "68625e0d6d1a99441e34e2ea")
+        res = run_historical_backfill(token, days=days, charity_id=charity_id, company_id="iqra")
+        return {
+            "status": "success",
+            "message": f"Completed {days}-day historical backfill: {res['inserted']} inserted, {res['skipped']} already present.",
+            "details": res
+        }
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=str(ex))
+

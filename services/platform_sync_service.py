@@ -3,16 +3,19 @@
 Platform Synchronization Service (Madinah & Givebrite)
 -------------------------------------------------------
 Runs continuously in the background to scrape and sync real-time financial,
-transactional, and campaign metrics from both Givebrite and Madinah platforms
-using their internal REST APIs (Zero Playwright / Browser overhead).
+transactional, and campaign metrics from both Givebrite and Madinah platforms.
 
 Key Architecture:
-- 100% Pure HTTP REST API integration (fast, robust, lightweight).
-- Atomic File Replacement (os.replace): Guarantees zero file deadlocks and no partial reads.
-- Thread-safe write lock with automatic temp file cleanup.
-- Pure HTTP token auto-renewal (rolling 7-day refresh tokens for Madinah).
+- 100% Pure HTTP REST API integration for high-speed live donation retrieval.
+- Direct CRM Database & Parquet Persistence via core.givebrite_ingestion.
+- Strict Tenant Isolation (enforces company_id = 'iqra' for GiveBrite).
+- Native Currency & Amount Preservation (no synthetic exchange rates).
+- 2-Tier Classification Resolution (Giving Level -> Campaign Default -> Unassigned).
+- Automatic Token Life-Cycle Management:
+  * GiveBrite: Auto-renewed via headless Playwright script when <10m to expiry.
+  * Madinah: Pure HTTP token rolling via 7-day refresh token.
+- Non-destructive 60-day historical backfill on startup.
 - Ultra-low resource footprint (< 50MB RAM, < 0.2% CPU).
-- Paced API requests with gentle 250ms delays to eliminate server and endpoint load.
 """
 
 import os
@@ -22,24 +25,41 @@ import json
 import base64
 import logging
 import threading
+import subprocess
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
 import requests
+from dotenv import load_dotenv
 
 # Path setup
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+# Load environment variables
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+from core.givebrite_ingestion import (
+    ingest_givebrite_donations,
+    run_historical_backfill,
+    GIVEBRITE_API_BASE
+)
+from core.madinah_ingestion import (
+    ingest_madinah_donations,
+    MADINAH_APIM_BASE
+)
+
 DATA_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 MADINAH_TOKEN_FILE = os.path.join(BASE_DIR, ".madinah_token.json")
 GIVEBRITE_TOKEN_FILE = os.path.join(BASE_DIR, ".givebrite_token.json")
-
 MASTER_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "platform_sync_data.json")
 MADINAH_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "madinah_sync_data.json")
-GIVEBRITE_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "givebrite_sync_data.json")
-GIVEBRITE_DETAILS_FILE = os.path.join(DATA_CACHE_DIR, "givebrite_details_cache.json")
 
 # Service Configuration
 SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", 60))  # standard interval
 DEEP_SYNC_INTERVAL_SEC = 1800  # 30 minutes for deep campaign catalog scans
-GIVEBRITE_CHARITY_ID = "68625e0d6d1a99441e34e2ea"
+GIVEBRITE_CHARITY_ID = os.environ.get("GIVEBRITE_IQRA_CHARITY_ID", "68625e0d6d1a99441e34e2ea")
 MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
 
 # Logging setup
@@ -98,14 +118,7 @@ class PlatformSyncService:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Rethink-CRM-Sync/1.0"})
         self.last_deep_sync = 0.0
-        self.givebrite_details_cache = {}
-        if os.path.exists(GIVEBRITE_DETAILS_FILE):
-            try:
-                with open(GIVEBRITE_DETAILS_FILE, "r", encoding="utf-8") as f:
-                    self.givebrite_details_cache = json.load(f)
-                logger.info(f"Loaded {len(self.givebrite_details_cache)} cached Givebrite donation details.")
-            except Exception as e:
-                logger.warning(f"Could not load Givebrite details cache: {e}")
+        self.backfill_completed = False
 
     def get_today_str(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -113,58 +126,108 @@ class PlatformSyncService:
     # -------------------------------------------------------------------------
     # Token Management
     # -------------------------------------------------------------------------
-    def ensure_madinah_token(self) -> str:
-        """Loads and auto-renews Madinah token via pure HTTP if near expiration."""
-        if not os.path.exists(MADINAH_TOKEN_FILE):
-            raise FileNotFoundError(f"Missing {MADINAH_TOKEN_FILE}")
-
-        with open(MADINAH_TOKEN_FILE, "r", encoding="utf-8") as f:
-            token_data = json.load(f)
-
-        access_token = token_data.get("accessToken", "")
-        refresh_token = token_data.get("refreshToken", "")
-        exp = parse_jwt_exp(access_token)
+    def ensure_madinah_token(self, force_refresh: bool = False) -> str:
+        """Loads and auto-renews Madinah token via pure HTTP if near expiration (<1h) or force_refresh."""
         now = time.time()
+        need_script_refresh = False
+        access_token = ""
+        refresh_token = ""
 
-        # If token expires in less than 20 minutes and refresh token exists, refresh via HTTP
-        if exp and (exp - now < 1200) and refresh_token:
-            logger.info("Madinah token expiring soon (<20m). Refreshing via pure HTTP API...")
+        if not os.path.exists(MADINAH_TOKEN_FILE):
+            need_script_refresh = True
+        else:
             try:
-                r = self.session.post(
-                    f"{MADINAH_APIM_BASE}/main-server/api/v1/user/token",
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                    json={"refreshToken": refresh_token},
-                    timeout=12
-                )
-                if r.status_code == 200:
-                    resp_json = r.json()
-                    new_data = resp_json.get("data", {})
-                    if new_data.get("accessToken"):
-                        token_data["accessToken"] = new_data["accessToken"]
-                        if new_data.get("refreshToken"):
-                            token_data["refreshToken"] = new_data["refreshToken"]
-                        token_data["retrievedAt"] = datetime.now(timezone.utc).isoformat()
-                        atomic_write_json(MADINAH_TOKEN_FILE, token_data)
-                        logger.info("Successfully renewed Madinah tokens via HTTP.")
-                        access_token = token_data["accessToken"]
-                else:
-                    logger.warning(f"Madinah token refresh returned HTTP {r.status_code}: {r.text[:200]}")
+                with open(MADINAH_TOKEN_FILE, "r", encoding="utf-8") as f:
+                    token_data = json.load(f)
+                access_token = token_data.get("accessToken", "")
+                refresh_token = token_data.get("refreshToken", "")
+                exp = parse_jwt_exp(access_token)
+                time_left_sec = exp - now if exp else 0
+
+                # Auto-refresh via pure HTTP if < 1 hour remaining or explicitly forced
+                if (force_refresh or (exp and time_left_sec < 3600)) and refresh_token:
+                    logger.info(f"Madinah token refreshing via pure HTTP (Time remaining: {time_left_sec/60:.1f}m)...")
+                    r = self.session.post(
+                        f"{MADINAH_APIM_BASE}/main-server/api/v1/user/token",
+                        headers={"Content-Type": "application/json", "Accept": "application/json"},
+                        json={"refreshToken": refresh_token},
+                        timeout=12
+                    )
+                    if r.status_code == 200:
+                        resp_json = r.json()
+                        new_data = resp_json.get("data", {})
+                        if new_data.get("accessToken"):
+                            token_data["accessToken"] = new_data["accessToken"]
+                            if new_data.get("refreshToken"):
+                                token_data["refreshToken"] = new_data["refreshToken"]
+                            token_data["retrievedAt"] = datetime.now(timezone.utc).isoformat()
+                            atomic_write_json(MADINAH_TOKEN_FILE, token_data)
+                            logger.info("Successfully renewed Madinah tokens via pure HTTP API.")
+                            access_token = token_data["accessToken"]
+                    else:
+                        logger.warning(f"Madinah HTTP token refresh returned {r.status_code}. Falling back to script.")
+                        need_script_refresh = True
+                elif not access_token or (exp and exp <= now):
+                    need_script_refresh = True
             except Exception as ex:
-                logger.error(f"Madinah token refresh failed: {ex}")
+                logger.error(f"Madinah token evaluation error: {ex}")
+                need_script_refresh = True
+
+        if need_script_refresh:
+            logger.info("Madinah token expired or missing. Refreshing via login script...")
+            try:
+                script_path = os.path.join(BASE_DIR, "scripts", "get_madinah_jwt.js")
+                res = subprocess.run(["node", script_path], cwd=BASE_DIR, capture_output=True, text=True, timeout=60)
+                if res.returncode == 0:
+                    with open(MADINAH_TOKEN_FILE, "r", encoding="utf-8") as f:
+                        token_data = json.load(f)
+                    access_token = token_data.get("accessToken", "")
+                    logger.info("Madinah token auto-refreshed successfully via script.")
+                else:
+                    logger.error(f"Madinah script login notice: {res.stderr[:200]}")
+            except Exception as e:
+                logger.error(f"Madinah script login exception: {e}")
 
         if not access_token.startswith("Bearer "):
             access_token = f"Bearer {access_token}"
         return access_token
 
-    def get_givebrite_token(self) -> str:
-        """Loads Givebrite JWT Bearer token."""
+    def get_givebrite_token(self, force_refresh: bool = False) -> str:
+        """Loads and auto-renews Givebrite JWT Bearer token (<10m to expiry or force_refresh) via Playwright."""
+        now = time.time()
+        need_refresh = force_refresh
+        access_token = ""
+
         if not os.path.exists(GIVEBRITE_TOKEN_FILE):
-            raise FileNotFoundError(f"Missing {GIVEBRITE_TOKEN_FILE}")
+            need_refresh = True
+        elif not need_refresh:
+            try:
+                with open(GIVEBRITE_TOKEN_FILE, "r", encoding="utf-8") as f:
+                    token_data = json.load(f)
+                access_token = token_data.get("accessToken", "")
+                exp = parse_jwt_exp(access_token)
+                time_left_sec = exp - now if exp else 0
+                if not exp or time_left_sec < 600:  # Less than 10 minutes remaining
+                    logger.info(f"GiveBrite JWT expiring soon (Time remaining: {time_left_sec/60:.1f}m). Auto-renewing...")
+                    need_refresh = True
+            except Exception:
+                need_refresh = True
 
-        with open(GIVEBRITE_TOKEN_FILE, "r", encoding="utf-8") as f:
-            token_data = json.load(f)
+        if need_refresh:
+            logger.info("Initiating headless GiveBrite Playwright token auto-renewal...")
+            try:
+                script_path = os.path.join(BASE_DIR, "scripts", "get_givebrite_jwt.js")
+                res = subprocess.run(["node", script_path], cwd=BASE_DIR, capture_output=True, text=True, timeout=60)
+                if res.returncode == 0:
+                    with open(GIVEBRITE_TOKEN_FILE, "r", encoding="utf-8") as f:
+                        token_data = json.load(f)
+                    access_token = token_data.get("accessToken", "")
+                    logger.info("GiveBrite token auto-refreshed successfully via Playwright.")
+                else:
+                    logger.error(f"GiveBrite auto-refresh failed (code {res.returncode}): {res.stderr[:200]}")
+            except Exception as e:
+                logger.error(f"GiveBrite auto-refresh exception: {e}")
 
-        access_token = token_data.get("accessToken", "")
         if not access_token.startswith("Bearer "):
             access_token = f"Bearer {access_token}"
         return access_token
@@ -194,16 +257,27 @@ class PlatformSyncService:
         }
 
         # 1. Latest Real-Time Donations
+        url_madinah_donations = f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest?page=1&limit=50"
         try:
-            r = self.session.get(
-                f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest?page=1&limit=50",
-                headers=headers,
-                timeout=12
-            )
+            r = self.session.get(url_madinah_donations, headers=headers, timeout=12)
+            if r.status_code == 401:
+                logger.warning("[Madinah] Received HTTP 401. Performing immediate token renewal...")
+                auth_header = self.ensure_madinah_token(force_refresh=True)
+                headers["Authorization"] = auth_header
+                r = self.session.get(url_madinah_donations, headers=headers, timeout=12)
+
             if r.status_code == 200:
                 data = r.json().get("data", {})
-                result["donations_latest"] = data.get("donations", [])
+                raw_donations = data.get("donations", [])
+                result["donations_latest"] = raw_donations
                 result["status_counts"] = data.get("statusCounts", {})
+
+                # Direct CRM Ingestion (SQLite + Parquet atomic sync)
+                ingest_res = ingest_madinah_donations(raw_donations, company_id="iqra")
+                result["donations_ingested"] = ingest_res.get("inserted", 0)
+                result["donations_skipped"] = ingest_res.get("skipped", 0)
+                if ingest_res.get("inserted", 0) > 0:
+                    logger.info(f"[Madinah Live Ingest] Ingested {ingest_res['inserted']} new donations into CRM database & Parquet.")
             else:
                 logger.warning(f"Madinah donations HTTP {r.status_code}")
         except Exception as ex:
@@ -262,7 +336,7 @@ class PlatformSyncService:
         return result
 
     # -------------------------------------------------------------------------
-    # Sync Logic: Givebrite
+    # Sync Logic: Givebrite (Direct CRM Ingestion)
     # -------------------------------------------------------------------------
     def sync_givebrite(self, is_deep: bool = False) -> dict:
         auth_header = self.get_givebrite_token()
@@ -278,92 +352,44 @@ class PlatformSyncService:
             "platform": "givebrite",
             "synced_at": datetime.now(timezone.utc).isoformat(),
             "status": "ok",
-            "donations_latest": [],
-            "collection_stats": {},
+            "donations_ingested": 0,
+            "donations_skipped": 0,
             "total_donations_count": 0,
+            "collection_stats": {},
             "campaigns": []
         }
 
-        # 1. Latest Real-Time Donations Stream
+        # 1. Startup Historical Backfill (Non-destructive, skips existing IDs)
+        if not self.backfill_completed:
+            try:
+                logger.info("Executing initial 60-day non-destructive GiveBrite historical backfill...")
+                bf_res = run_historical_backfill(auth_header, days=60, charity_id=GIVEBRITE_CHARITY_ID, company_id="iqra")
+                self.backfill_completed = True
+                logger.info(f"Backfill finished: {bf_res['inserted']} inserted, {bf_res['skipped']} already present.")
+            except Exception as bf_ex:
+                logger.error(f"Initial backfill notice: {bf_ex}")
+
+        # 2. Latest Real-Time Donations Stream -> Direct CRM Ingestion (SQLite + Parquet)
+        url_gb_donations = f"{GIVEBRITE_API_BASE}/donations?charity_id={GIVEBRITE_CHARITY_ID}&page=1&limit=50&sort_value=-1&sort_title=created_at"
         try:
-            r = self.session.get(
-                f"https://api-dashboard.givebrite.com/v1/dashboard/donations?charity_id={GIVEBRITE_CHARITY_ID}&page=1&limit=50&sort_value=-1&sort_title=created_at",
-                headers=headers,
-                timeout=12
-            )
+            r = self.session.get(url_gb_donations, headers=headers, timeout=12)
+            if r.status_code == 401:
+                logger.warning("[GiveBrite] Received HTTP 401. Performing immediate token renewal...")
+                auth_header = self.get_givebrite_token(force_refresh=True)
+                headers["Authorization"] = auth_header
+                r = self.session.get(url_gb_donations, headers=headers, timeout=12)
+
             if r.status_code == 200:
                 data = r.json()
                 docs = data.get("docs", [])
-                
-                enriched_donations = []
-                cache_updated = False
-
-                for d in docs:
-                    d_id = d.get("_id")
-                    if not d_id:
-                        continue
-
-                    det = self.givebrite_details_cache.get(d_id)
-                    if not det:
-                        try:
-                            r_det = self.session.get(
-                                f"https://api-dashboard.givebrite.com/v1/dashboard/donations/{d_id}",
-                                headers=headers,
-                                timeout=10
-                            )
-                            if r_det.status_code == 200:
-                                det = r_det.json()
-                                self.givebrite_details_cache[d_id] = det
-                                cache_updated = True
-                                time.sleep(0.1)  # Polite pacing between API detail calls
-                        except Exception as det_ex:
-                            logger.warning(f"Failed fetching details for donation {d_id}: {det_ex}")
-
-                    if not det:
-                        det = d
-
-                    campaign_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (d.get("campaign") if isinstance(d.get("campaign"), dict) else {})
-                    user_obj = det.get("user") if isinstance(det.get("user"), dict) else (d.get("user") if isinstance(d.get("user"), dict) else {})
-                    gw_resp = det.get("gateway_response") if isinstance(det.get("gateway_response"), dict) else (d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {})
-                    fees_obj = det.get("fees") if isinstance(det.get("fees"), dict) else (d.get("fees") if isinstance(d.get("fees"), dict) else {})
-                    payment_obj = det.get("payment") if isinstance(det.get("payment"), dict) else (d.get("payment") if isinstance(d.get("payment"), dict) else {})
-                    billing_obj = det.get("billing") if isinstance(det.get("billing"), dict) else (d.get("billing") if isinstance(d.get("billing"), dict) else {})
-
-                    enriched_donations.append({
-                        "id": det.get("_id") or d.get("_id"),
-                        "mysqlID": det.get("mysqlID") or d.get("mysqlID"),
-                        "first_name": user_obj.get("first_name") or d.get("first_name"),
-                        "last_name": user_obj.get("last_name") or d.get("last_name"),
-                        "email": user_obj.get("email") or d.get("email"),
-                        "amount": det.get("amount", d.get("amount")),
-                        "currency": det.get("currency", d.get("currency")),
-                        "frequency": det.get("frequency", d.get("frequency")),
-                        "is_giftaid": det.get("is_giftaid", d.get("is_giftaid")),
-                        "is_anonymous": det.get("is_anonymous", False),
-                        "paid_with": payment_obj.get("method") or (det.get("gateway", {}).get("name") if isinstance(det.get("gateway"), dict) else d.get("gateway")),
-                        "stripe_payment_id": gw_resp.get("payment_intent_id"),
-                        "stripe_charge_id": gw_resp.get("charge_id"),
-                        "stripe_invoice_id": gw_resp.get("invoice_id"),
-                        "stripe_subscription_id": gw_resp.get("subscription_id"),
-                        "status": gw_resp.get("status") or ("succeeded" if (det.get("paid") or d.get("paid")) else "pending"),
-                        "campaign": campaign_obj.get("name") if campaign_obj else d.get("campaign"),
-                        "campaign_slug": campaign_obj.get("slug") if campaign_obj else d.get("campaign_slug"),
-                        "impacts": campaign_obj.get("impacts", []),
-                        "fundraiser": det.get("fundraiser") or d.get("fundraiser"),
-                        "team": det.get("team") or d.get("team"),
-                        "comment": det.get("comment") or d.get("comment"),
-                        "billing": billing_obj,
-                        "fees": fees_obj,
-                        "created_at": det.get("created_at") or d.get("created_at"),
-                        "raw_details": det
-                    })
-
-                if cache_updated:
-                    atomic_write_json(GIVEBRITE_DETAILS_FILE, self.givebrite_details_cache)
-                    logger.info(f"Updated Givebrite details cache (total entries: {len(self.givebrite_details_cache)}).")
-
-                result["donations_latest"] = enriched_donations
                 result["total_donations_count"] = data.get("total", 0)
+
+                # Direct persistence to SQLite and Parquet (strictly company_id='iqra')
+                ingest_res = ingest_givebrite_donations(docs, headers=headers, company_id="iqra")
+                result["donations_ingested"] = ingest_res.get("inserted", 0)
+                result["donations_skipped"] = ingest_res.get("skipped", 0)
+                if ingest_res.get("inserted", 0) > 0:
+                    logger.info(f"[GiveBrite Ingestion] Successfully persisted {ingest_res['inserted']} new donations into CRM DB & Parquet.")
             else:
                 logger.warning(f"Givebrite donations HTTP {r.status_code}")
         except Exception as ex:
@@ -371,7 +397,7 @@ class PlatformSyncService:
 
         time.sleep(0.2)
 
-        # 2. Financial Collections & Total Raised
+        # 3. Financial Collections & Total Raised
         try:
             r = self.session.get(
                 f"https://api-dashboard.givebrite.com/v1/statistics/app/collection?currency=GBP&start_date=2026-01-01&end_date={today}",
@@ -383,7 +409,7 @@ class PlatformSyncService:
         except Exception as ex:
             logger.error(f"Givebrite collection stats error: {ex}")
 
-        # 3. Campaign List (In deep sync)
+        # 4. Campaign List (In deep sync)
         if is_deep:
             try:
                 r = self.session.get(
@@ -424,17 +450,16 @@ class PlatformSyncService:
         try:
             givebrite_data = self.sync_givebrite(is_deep=is_deep)
             logger.info(
-                f"[Givebrite] Synced {len(givebrite_data.get('donations_latest', []))} recent donations "
-                f"(Total in DB: {givebrite_data.get('total_donations_count', 0)})."
+                f"[Givebrite] Processed live feed (New Ingested: {givebrite_data.get('donations_ingested', 0)}, "
+                f"Skipped: {givebrite_data.get('donations_skipped', 0)}, Total Platform: {givebrite_data.get('total_donations_count', 0)})."
             )
         except Exception as ex:
             logger.error(f"Givebrite sync failure: {ex}")
             givebrite_data = {"platform": "givebrite", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
 
-        # Atomic writes for platform-specific and unified master store
+        # Atomic writes for service status monitoring (No large intermediate JSON cache files)
         try:
             atomic_write_json(MADINAH_SYNC_FILE, madinah_data)
-            atomic_write_json(GIVEBRITE_SYNC_FILE, givebrite_data)
 
             master_data = {
                 "meta": {
@@ -447,25 +472,32 @@ class PlatformSyncService:
                 "summary": {
                     "madinah_recent_donations": len(madinah_data.get("donations_latest", [])),
                     "madinah_total_revenue": madinah_data.get("overview", {}).get("totalRevenue", 0),
-                    "givebrite_recent_donations": len(givebrite_data.get("donations_latest", [])),
+                    "givebrite_new_ingested": givebrite_data.get("donations_ingested", 0),
                     "givebrite_total_donations": givebrite_data.get("total_donations_count", 0),
                     "givebrite_total_raised_gbp": givebrite_data.get("collection_stats", {}).get("raised", 0)
                 },
                 "madinah": madinah_data,
-                "givebrite": givebrite_data
+                "givebrite": {
+                    "platform": "givebrite",
+                    "synced_at": givebrite_data.get("synced_at"),
+                    "status": givebrite_data.get("status"),
+                    "donations_ingested": givebrite_data.get("donations_ingested", 0),
+                    "total_donations_count": givebrite_data.get("total_donations_count", 0),
+                    "collection_stats": givebrite_data.get("collection_stats", {})
+                }
             }
 
             atomic_write_json(MASTER_SYNC_FILE, master_data)
-            logger.info(f"Consolidated platform data written atomically to {MASTER_SYNC_FILE}")
+            logger.info(f"Consolidated platform status written atomically to {MASTER_SYNC_FILE}")
         except Exception as ex:
-            logger.error(f"Failed writing atomic sync files: {ex}")
+            logger.error(f"Failed writing atomic sync status: {ex}")
 
 
 def main():
     logger.info("==========================================================")
-    logger.info("Starting Platform Sync Daemon (Pure API Mode)")
+    logger.info("Starting Platform Sync Daemon (Direct CRM & Pure API Mode)")
     logger.info(f"Polling Interval: {SYNC_INTERVAL_SEC}s | Deep Scan: {DEEP_SYNC_INTERVAL_SEC}s")
-    logger.info(f"Storage Directory: {DATA_CACHE_DIR}")
+    logger.info("Direct Persistence: SQLite 'donations' & Parquet 'donations_cache.parquet'")
     logger.info("==========================================================")
 
     service = PlatformSyncService()
