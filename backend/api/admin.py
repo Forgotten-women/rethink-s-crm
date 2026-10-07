@@ -1,7 +1,10 @@
 import io
 import os
+import logging
 import sqlite3
 from typing import Optional, List, Dict, Any
+
+logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -268,6 +271,8 @@ def upload_raw_data_file(
 
     try:
         file_bytes = file.file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty (0 bytes).")
         file_buffer = io.BytesIO(file_bytes)
 
         res = process_and_upload_excel(
@@ -288,14 +293,24 @@ def upload_raw_data_file(
         except Exception:
             pass
 
+        added_count = res.get('added', 0)
+        if added_count == 0:
+            msg = f"Successfully processed '{file.filename}' for company '{target_cid}'! All records already exist in the database and were preserved (0 new records added)."
+        else:
+            msg = f"Successfully processed '{file.filename}' for company '{target_cid}'! {added_count:,} new records imported and auto-classified."
+
         return {
             "status": "success",
-            "message": f"Successfully processed '{file.filename}' for company '{target_cid}'! {res.get('added', 0):,} records imported and auto-classified.",
+            "message": msg,
             "details": res
         }
     except HTTPException:
         raise
+    except ValueError as ve:
+        logger.warning(f"Validation error processing uploaded file {file.filename}: {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
+        logger.exception(f"Unexpected error processing uploaded file {file.filename}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
 
 

@@ -388,6 +388,25 @@ def bulk_edit_donors(
     }
 
 
+ALL_ID_COLUMNS = [
+    "Donation ID",
+    "Donor ID",
+    "charge_id",
+    "_id",
+    "subscription_id",
+    "sub_id",
+    "Transfer ID",
+    "Transaction ID",
+    "ID",
+    "campaign_id",
+    "campaign_uid",
+    "Customer Ref",
+    "Additional Ref",
+    "Subscription Reference",
+    "Invoice ID"
+]
+
+
 def _parse_search_query(search_str: str):
     """
     Parses user search query into:
@@ -408,7 +427,7 @@ def _parse_search_query(search_str: str):
 
 
 def _apply_search_to_df(df: pd.DataFrame, search_str: str, search_fields: str = None) -> pd.DataFrame:
-    """Applies multi-Donation ID and targeted or universal text search across scoped fields."""
+    """Applies multi-ID (Donor ID, charge_id, _id, Donation ID, etc.) and targeted or universal text search across scoped fields."""
     if not search_str or not str(search_str).strip() or df.empty:
         return df
 
@@ -418,15 +437,26 @@ def _apply_search_to_df(df: pd.DataFrame, search_str: str, search_fields: str = 
     active_targets = set([f.strip().lower() for f in search_fields.split(",") if f.strip()]) if search_fields else set()
     search_all = not active_targets or "all" in active_targets
 
-    # 1. Multi Donation ID match
-    if (search_all or "donation_id" in active_targets or "id" in active_targets) and id_tokens:
-        for id_col in ["Donation ID", "Donor ID", "Transaction ID", "ID", "Transfer ID"]:
-            if id_col in df.columns:
-                id_series = df[id_col].astype(str).str.strip().str.lstrip('#')
-                mask |= id_series.isin(id_tokens)
+    is_id_search = search_all or any(k in active_targets for k in ["donation_id", "id", "ids", "donor_id", "charge_id"])
 
-    # 2. General text match across selected targets
-    term = raw_text.strip().lower()
+    # 1. Multi ID match (exact token matching across all ID fields, case-insensitive, float/integer normalized)
+    if is_id_search and id_tokens:
+        lower_tokens = set(t.lower() for t in id_tokens)
+        expanded_tokens = set(lower_tokens)
+        for t in lower_tokens:
+            if t.endswith('.0'):
+                expanded_tokens.add(t[:-2])
+            elif t.isdigit():
+                expanded_tokens.add(f"{t}.0")
+
+        for id_col in ALL_ID_COLUMNS:
+            if id_col in df.columns:
+                id_series = df[id_col].astype(str).str.strip().str.lstrip('#').str.lower()
+                clean_no_dot_zero = id_series.str.replace(r'\.0$', '', regex=True)
+                mask |= id_series.isin(expanded_tokens) | clean_no_dot_zero.isin(expanded_tokens)
+
+    # 2. General text match across selected targets (case-insensitive substring)
+    clean_term = raw_text.strip().lstrip('#').lower()
     target_cols = []
     if search_all or "name" in active_targets or "donor" in active_targets:
         target_cols.extend(["First Name", "Last Name", "Display Name"])
@@ -440,12 +470,12 @@ def _apply_search_to_df(df: pd.DataFrame, search_str: str, search_fields: str = 
         target_cols.extend(["fundraiser_name", "Fundraiser Name"])
     if search_all or "code" in active_targets:
         target_cols.extend(["Code"])
-    if search_all:
-        target_cols.extend(["Donation ID", "Donor ID", "Transfer ID"])
+    if is_id_search:
+        target_cols.extend(ALL_ID_COLUMNS)
 
     search_cols = [c for c in dict.fromkeys(target_cols) if c in df.columns]
     for sc in search_cols:
-        mask |= df[sc].astype(str).str.lower().str.contains(term, na=False, regex=False)
+        mask |= df[sc].astype(str).str.lower().str.contains(clean_term, na=False, regex=False)
 
     return df.loc[mask]
 
@@ -721,17 +751,24 @@ def get_donors_paginated(
                     if "all" not in active_targets:
                         search_all = False
 
-                # Multi-Donation ID match
-                if id_tokens and (search_all or "donation_id" in active_targets or "id" in active_targets):
+                is_id_search = search_all or any(k in active_targets for k in ["donation_id", "id", "ids", "donor_id", "charge_id"])
+
+                # Multi-ID match (supports any ID: Donor ID, charge_id, _id, Donation ID, subscription_id, Transfer ID, etc.)
+                if id_tokens and is_id_search:
                     id_placeholders = ','.join(['?'] * len(id_tokens))
-                    id_cols = [c for c in ['"Donation ID"', '"Donor ID"', '"Transfer ID"'] if c.strip('"') in avail_cols]
+                    id_cols = [f'"{c}"' for c in ALL_ID_COLUMNS if c in avail_cols]
                     if id_cols:
-                        id_clause = " OR ".join([f"{col} IN ({id_placeholders})" for col in id_cols])
+                        id_clause = " OR ".join([
+                            f"(LOWER(CAST({col} AS TEXT)) IN ({id_placeholders}) OR REPLACE(LOWER(CAST({col} AS TEXT)), '.0', '') IN ({id_placeholders}))"
+                            for col in id_cols
+                        ])
                         search_parts.append(f"({id_clause})")
-                        search_subparams.extend(id_tokens * len(id_cols))
+                        clean_tokens = [t.lower() for t in id_tokens]
+                        search_subparams.extend(clean_tokens * (2 * len(id_cols)))
 
                 # General text match across selected target columns
-                text_term = f"%{raw_text.strip()}%"
+                clean_term = raw_text.strip().lstrip('#')
+                text_term = f"%{clean_term}%"
                 target_cols = []
                 if search_all or "name" in active_targets or "donor" in active_targets:
                     target_cols.extend(['"First Name"', '"Last Name"', '"Display Name"'])
@@ -745,12 +782,12 @@ def get_donors_paginated(
                     target_cols.extend(['"fundraiser_name"', '"Fundraiser Name"'])
                 if search_all or "code" in active_targets:
                     target_cols.extend(['"Code"'])
-                if search_all or "donation_id" in active_targets:
-                    target_cols.extend(['"Donation ID"', '"Donor ID"', '"Transfer ID"'])
+                if is_id_search:
+                    target_cols.extend([f'"{c}"' for c in ALL_ID_COLUMNS if c in avail_cols])
 
                 search_cols = [col for col in dict.fromkeys(target_cols) if col.strip('"') in avail_cols]
                 for col in search_cols:
-                    search_parts.append(f"{col} LIKE ?")
+                    search_parts.append(f"CAST({col} AS TEXT) LIKE ?")
                     search_subparams.append(text_term)
 
                 if search_parts:

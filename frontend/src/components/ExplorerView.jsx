@@ -76,7 +76,14 @@ const COLUMN_ALIASES = {
   'Code': 'Code',
   'code': 'Code',
   'Country': 'Project Country',
-  'Zakat Eligibility': 'Zakat'
+  'Zakat Eligibility': 'Zakat',
+  'charge_id': 'Stripe Charge ID',
+  'subscription_id': 'Subscription ID',
+  'sub_id': 'Subscription ID',
+  '_id': 'Platform ID',
+  'Donation ID': 'Donation ID',
+  'Donor ID': 'Donor ID',
+  'Transfer ID': 'Transfer ID'
 };
 
 const SEARCH_TARGET_OPTIONS = [
@@ -85,7 +92,7 @@ const SEARCH_TARGET_OPTIONS = [
   { id: 'community', label: 'Community', title: 'Search Community Name' },
   { id: 'name', label: 'Donor Name', title: 'Search First, Last, and Display Name' },
   { id: 'email', label: 'Email', title: 'Search Email Address' },
-  { id: 'donation_id', label: 'Donation ID', title: 'Search Donation ID, Donor ID, Transfer ID' },
+  { id: 'donation_id', label: 'IDs (Donor, Charge, etc.)', title: 'Search by Donor ID, Charge ID, Donation ID, Subscription ID, Transfer ID, etc.' },
   { id: 'fundraiser', label: 'Fundraiser', title: 'Search Fundraiser Name' },
   { id: 'code', label: 'Code', title: 'Search Project/Allocation Code' }
 ];
@@ -162,7 +169,7 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
 
   const searchPlaceholder = useMemo(() => {
     if (isAllActive) {
-      return '🔍 Search all fields (Name, Campaign, Community, Email, ID...)';
+      return '🔍 Search all fields (Name, Email, Donor ID, Charge ID, Donation ID, Campaign...)';
     }
     const activeLabels = SEARCH_TARGET_OPTIONS
       .filter(opt => opt.id !== 'all' && searchTargets.includes(opt.id))
@@ -1621,6 +1628,20 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
                               ) : (
                                 <span className="text-slate-600 text-xs">—</span>
                               )}
+                            </td>
+                          );
+                        }
+                        if (c === 'Donation ID' || c === '_id') {
+                          const isGiveBright = String(row['Platform'] || '').toLowerCase().includes('givebright') || String(row['Source'] || '').toLowerCase().includes('givebrite');
+                          const numId = row['_id'] && /^\d+$/.test(String(row['_id'])) ? String(row['_id']) : null;
+                          const displayId = (isGiveBright && numId) ? `#${numId}` : (val !== undefined && val !== null ? String(val) : '');
+                          return (
+                            <td 
+                              key={c} 
+                              className="max-w-[240px] truncate text-slate-300 font-mono text-xs"
+                              title={isGiveBright && numId ? `GiveBright ID: #${numId} | UID: ${row['Donation ID'] || val}` : String(val || '')}
+                            >
+                              {displayId}
                             </td>
                           );
                         }

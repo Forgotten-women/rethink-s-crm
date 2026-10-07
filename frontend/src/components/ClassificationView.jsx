@@ -995,7 +995,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         method: 'POST',
         body: formData
       });
-      const data = await res.json();
+      const ct = res.headers.get('content-type') || '';
+      let data = null;
+      if (ct.includes('application/json')) {
+        try { data = await res.json(); } catch (e) {}
+      }
       setImporting(false);
 
       if (res.ok && data?.status === 'success') {

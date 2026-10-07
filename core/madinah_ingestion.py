@@ -38,6 +38,7 @@ if BASE_DIR not in sys.path:
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH
 from core.database import get_db_connection
 from core.data_processor import atomic_write_parquet, invalidate_data_cache
+from core.utils import classify_donor_amount
 
 logger = logging.getLogger("madinah_ingestion")
 if not logger.handlers:
@@ -70,23 +71,56 @@ def parse_madinah_date(date_str: Optional[str]) -> Tuple[str, str, str]:
         return now_dt.strftime("%Y-%m-%d"), now_dt.strftime("%H:%M:%S"), str(date_str)
 
 
+def normalize_campaign_text(s: Optional[str]) -> str:
+    """Standardizes punctuation marks, dashes, quotes, and whitespace."""
+    if not s or pd.isna(s):
+        return ""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.replace("’", "'").replace("‘", "'").replace("`", "'").replace("´", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("–", "-").replace("—", "-").replace("‒", "-").replace("―", "-").replace("−", "-")
+    return " ".join(s.split()).strip()
+
+
 def resolve_madinah_classification(
     cursor,
     campaign_name: str,
+    giving_level: str = "",
     company_id: str = "iqra"
 ) -> Dict[str, Any]:
     """
-    Resolves project classification code for Madinah campaigns.
-    Checks platform_campaign_mappings for (company_id, campaign_name, '')
-    Auto-registers unseen campaigns as 'Unassigned'.
+    Resolves project classification code for Madinah campaigns using 2-Tier logic:
+    Tier 1: (campaign_name, giving_level) where giving_level != ''
+    Tier 2: (campaign_name, '')
+    Fallback: Auto-registers unseen campaigns as 'Unassigned'
+    All text is strictly standardized (punctuation, dashes, quotes).
     """
-    c_name = (campaign_name or "").strip()
+    c_name = normalize_campaign_text(campaign_name)
+    g_level = normalize_campaign_text(giving_level)
     resolved_code = None
 
-    if c_name:
+    # Tier 1: Look up exact normalized (campaign_name, giving_level)
+    if c_name and g_level:
         cursor.execute("""
             SELECT code FROM platform_campaign_mappings
-            WHERE company_id = ? AND TRIM(campaign_name) = TRIM(?)
+            WHERE company_id = ? AND LOWER(platform) = 'madinah'
+              AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(giving_level)) = LOWER(TRIM(?))
+            ORDER BY CASE WHEN code != 'Unassigned' THEN 0 ELSE 1 END
+            LIMIT 1
+        """, (company_id, c_name, g_level))
+        row = cursor.fetchone()
+        if row and row[0] and row[0] != 'Unassigned':
+            resolved_code = row[0].strip()
+
+    # Tier 2: Campaign default (giving_level is empty)
+    if not resolved_code and c_name:
+        cursor.execute("""
+            SELECT code FROM platform_campaign_mappings
+            WHERE company_id = ? AND LOWER(platform) = 'madinah'
+              AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(giving_level, ''))) = ''
             ORDER BY CASE WHEN code != 'Unassigned' THEN 0 ELSE 1 END
             LIMIT 1
         """, (company_id, c_name))
@@ -100,14 +134,16 @@ def resolve_madinah_classification(
             try:
                 cursor.execute("""
                     SELECT id FROM platform_campaign_mappings
-                    WHERE company_id = ? AND TRIM(campaign_name) = TRIM(?)
+                    WHERE company_id = ? AND LOWER(platform) = 'madinah'
+                      AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                      AND LOWER(TRIM(COALESCE(giving_level, ''))) = ''
                     LIMIT 1
                 """, (company_id, c_name))
                 if not cursor.fetchone():
                     cursor.execute("""
                         INSERT INTO platform_campaign_mappings (
                             company_id, platform, campaign_name, giving_level, code, created_at, updated_at
-                        ) VALUES (?, 'Madinah', ?, '', 'Unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ) VALUES (?, 'madinah', ?, '', 'Unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """, (company_id, c_name))
                     logger.info(f"Auto-registered new Madinah campaign in CRM: '{c_name}'")
             except Exception as reg_err:
@@ -158,13 +194,18 @@ def build_madinah_record(
     tx_id = str(doc.get("transactionId") or "").strip()
     created_date, created_time, iso_raw = parse_madinah_date(doc.get("date"))
 
-    # Financials (strictly native currency)
+    # Financials: native currency preserved in DC / Amount, settled currency is USD
     try:
         amount_val = float(doc.get("amount", 0.0) or 0.0)
     except (ValueError, TypeError):
         amount_val = 0.0
 
-    currency = str(doc.get("currencyCode") or "GBP").strip().upper()
+    try:
+        usd_amount = float(doc.get("usdAmount") if doc.get("usdAmount") is not None else amount_val)
+    except (ValueError, TypeError):
+        usd_amount = amount_val
+
+    currency = str(doc.get("currencyCode") or "USD").strip().upper()
 
     # Donor info
     is_anon = bool(doc.get("isAnonymous", False))
@@ -179,7 +220,8 @@ def build_madinah_record(
     pm_obj = doc.get("paymentMethod") if isinstance(doc.get("paymentMethod"), dict) else {}
     payment_method = str(pm_obj.get("label") or pm_obj.get("category") or "Credit card").strip()
 
-    status_str = "succeeded" if doc.get("status") == "success" else str(doc.get("status", "pending"))
+    status_raw = str(doc.get("status", "pending")).strip().lower()
+    status_str = "succeeded" if status_raw == "success" else status_raw
     campaign_name = str(doc.get("campaignName") or "").strip()
     campaign_id = str(doc.get("campaignId") or "").strip()
 
@@ -190,6 +232,15 @@ def build_madinah_record(
         "code": "Unassigned", "department": "", "office": "", "portfolio": "",
         "country": "", "programme_fund": "", "fund_code": "", "zakat_eligibility": ""
     }
+
+    # Dynamic donor classification
+    txn_class = classify_donor_amount(usd_amount)
+    lifetime_class = classify_donor_amount(usd_amount)
+
+    raw_gl = doc.get("givingLevelTitle") or (doc.get("givingLevel") if isinstance(doc.get("givingLevel"), dict) else {}).get("title") or doc.get("giving_level") or ""
+    gl_title = normalize_campaign_text(str(raw_gl)) if raw_gl else ""
+    if gl_title.lower() in ("none", "nan", "null"):
+        gl_title = ""
 
     record = {
         "Donation ID": doc_id,
@@ -204,9 +255,9 @@ def build_madinah_record(
         "Last Name": last_name,
         "Display Name": donor_name,
         "Email": donor_email,
-        "Marketing Consent": "No",
+        "Marketing Consent": "",
         "Gift Aid (yes or no)": "No",
-        "Tax Receipt requested": "No",
+        "Tax Receipt requested": "",
         "Billing Name": donor_name,
         "Billing Address": "",
         "Billing Address 2": "",
@@ -219,15 +270,15 @@ def build_madinah_record(
         "Donation Amount (in Donation Currency)": str(amount_val),
         "Project Currency": currency,
         "Donation Amount in Project Currency (May be approx.)": str(amount_val),
-        "Settlement Currency": currency,
-        "Total Online Donation Gross Amount in Settled Currency": str(amount_val),
+        "Settlement Currency": "USD",
+        "Total Online Donation Gross Amount in Settled Currency": str(usd_amount),
         "Total Processing Fees Paid by CC In Settled Currency": 0.0,
-        "Total Online Donations Net Amount in Settled Currency": amount_val,
+        "Total Online Donations Net Amount in Settled Currency": usd_amount,
         "Transfer ID": None,
         "Zakat (yes or no)": "Yes" if "ZAKAT" in campaign_name.upper() else "No",
         "Zakat Amount (in Donation Currency)": amount_val if "ZAKAT" in campaign_name.upper() else 0.0,
-        "Has Giving Level": "No",
-        "Giving Level Title": "",
+        "Has Giving Level": "Yes" if gl_title else "No",
+        "Giving Level Title": gl_title,
         "Giving Level Description": "",
         "Giving Level Type": "",
         "Giving Level Qty": 1.0,
@@ -241,7 +292,7 @@ def build_madinah_record(
         "Shipping State": "",
         "Shipping Zip": "",
         "Shipping Country": "",
-        "Campaign Name": campaign_name,
+        "Campaign Name": normalize_campaign_text(campaign_name),
         "Campaign URL": "",
         "Project Impact Location": meta.get("country") or "",
         "Community Name": "",
@@ -255,9 +306,9 @@ def build_madinah_record(
         "Platform": "Madinah",
         "Source": "Madinah Sync",
         "Donor ID": donor_email or doc_id,
-        "Total LTV": amount_val,
-        "Lifetime Donor Classification": "Low End",
-        "Transaction Donor Classification": "Low End",
+        "Total LTV": usd_amount,
+        "Lifetime Donor Classification": lifetime_class,
+        "Transaction Donor Classification": txn_class,
         "Payment Frequency": frequency,
         "subscription_id": None,
         "_id": doc_id,
@@ -339,23 +390,75 @@ def ingest_madinah_donations(
         existing_tx_ids = {r[0] for r in cursor.fetchall()}
 
     new_donations = []
+    updated_records = []
+
     for d in donations:
         did = str(d.get("donationId", "")).strip()
         txid = str(d.get("transactionId", "")).strip()
+        status_val = str(d.get("status", "")).strip().lower()
+
+        # If incoming donation failed or cancelled, do not ingest as active revenue
+        if status_val and status_val != "success":
+            if did in existing_d_ids:
+                try:
+                    cursor.execute("""
+                        UPDATE donations
+                        SET Status = 'failed',
+                            "Total Online Donation Gross Amount in Settled Currency" = '0.0',
+                            "Total Online Donations Net Amount in Settled Currency" = 0.0,
+                            Amount = 0.0
+                        WHERE company_id = ? AND "Donation ID" = ?
+                    """, (company_id, did))
+                    if cursor.rowcount > 0:
+                        updated_records.append(did)
+                except Exception as f_err:
+                    logger.warning(f"Error zeroing out failed donation {did}: {f_err}")
+            continue
+
         if did not in existing_d_ids and txid not in existing_tx_ids:
             new_donations.append(d)
+        elif did in existing_d_ids:
+            # Check and self-heal any discrepancies in settled currency or usdAmount
+            try:
+                amt_val = float(d.get("amount", 0.0) or 0.0)
+                u_amt = float(d.get("usdAmount") if d.get("usdAmount") is not None else amt_val)
+                curr = str(d.get("currencyCode") or "USD").strip().upper()
+                t_cls = classify_donor_amount(u_amt)
+                cursor.execute("""
+                    UPDATE donations
+                    SET "Settlement Currency" = 'USD',
+                        "Total Online Donation Gross Amount in Settled Currency" = ?,
+                        "Total Online Donations Net Amount in Settled Currency" = ?,
+                        "Total LTV" = ?,
+                        "Lifetime Donor Classification" = ?,
+                        "Transaction Donor Classification" = ?,
+                        "Donation Currency (DC)" = ?,
+                        "Donation Amount (in Donation Currency)" = ?,
+                        "Amount" = ?,
+                        "Currency" = ?
+                    WHERE company_id = ? AND "Donation ID" = ?
+                      AND ("Settlement Currency" != 'USD' OR "Total Online Donation Gross Amount in Settled Currency" != ?)
+                """, (str(u_amt), u_amt, u_amt, t_cls, t_cls, curr, str(amt_val), amt_val, curr, company_id, did, str(u_amt)))
+                if cursor.rowcount > 0:
+                    updated_records.append(did)
+            except Exception as u_err:
+                logger.warning(f"Error checking settled amount for existing {did}: {u_err}")
 
-    if not new_donations:
+    if updated_records:
+        conn.commit()
+        logger.info(f"Self-healed {len(updated_records)} existing Madinah records to settled USD amounts in SQLite.")
+
+    if not new_donations and not updated_records:
         conn.close()
-        logger.info(f"All {len(donations)} incoming Madinah donations already exist in CRM. Zero insertions needed.")
-        return {"total_incoming": len(donations), "inserted": 0, "skipped": len(donations)}
-
-    logger.info(f"Found {len(new_donations)} NEW Madinah donations to ingest out of {len(donations)} incoming.")
+        logger.info(f"All {len(donations)} incoming Madinah donations up-to-date in CRM. Zero insertions needed.")
+        return {"total_incoming": len(donations), "inserted": 0, "skipped": len(donations), "updated": 0}
 
     records_to_insert = []
     for d in new_donations:
-        c_name = d.get("campaignName", "")
-        cls_meta = resolve_madinah_classification(cursor, c_name, company_id=company_id)
+        c_name = normalize_campaign_text(d.get("campaignName", ""))
+        gl_obj = d.get("givingLevel") if isinstance(d.get("givingLevel"), dict) else {}
+        g_level = normalize_campaign_text(str(d.get("givingLevelTitle") or gl_obj.get("title") or d.get("giving_level") or ""))
+        cls_meta = resolve_madinah_classification(cursor, c_name, giving_level=g_level, company_id=company_id)
         rec = build_madinah_record(d, classification_meta=cls_meta, company_id=company_id)
         records_to_insert.append(rec)
 
@@ -377,10 +480,27 @@ def ingest_madinah_donations(
 
     conn.close()
 
-    # Update Parquet cache
-    if records_to_insert:
+    # Update Parquet cache for both inserted and self-healed records
+    all_parquet_sync = list(records_to_insert)
+    if updated_records:
         try:
-            update_madinah_parquet_cache(records_to_insert)
+            conn_u = get_db_connection()
+            cur_u = conn_u.cursor()
+            placeholders_u = ",".join(["?"] * len(updated_records))
+            cur_u.execute(f"""
+                SELECT * FROM donations
+                WHERE company_id = ? AND "Donation ID" IN ({placeholders_u})
+            """, [company_id] + updated_records)
+            cols = [c[0] for c in cur_u.description]
+            for row in cur_u.fetchall():
+                all_parquet_sync.append(dict(zip(cols, row)))
+            conn_u.close()
+        except Exception as u_fetch_err:
+            logger.warning(f"Failed fetching updated rows for Parquet: {u_fetch_err}")
+
+    if all_parquet_sync:
+        try:
+            update_madinah_parquet_cache(all_parquet_sync)
         except Exception as p_err:
             logger.error(f"Failed to update Parquet cache for Madinah: {p_err}")
 
@@ -417,7 +537,12 @@ def update_madinah_parquet_cache(new_records: List[Dict[str, Any]]) -> None:
 
     df_new = df_new[df_existing.columns]
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-    df_combined = df_combined.drop_duplicates(subset=["company_id", "Donation ID"], keep="last")
+
+    # Deduplicate safely: only collapse rows with non-empty Donation IDs
+    mask_has_id = df_combined["Donation ID"].notna() & (df_combined["Donation ID"].astype(str).str.strip() != "")
+    df_with_id = df_combined[mask_has_id].drop_duplicates(subset=["company_id", "Donation ID"], keep="last")
+    df_no_id = df_combined[~mask_has_id]
+    df_combined = pd.concat([df_with_id, df_no_id], ignore_index=True)
     atomic_write_parquet(df_combined, PARQUET_PATH)
     invalidate_data_cache()
     logger.info(f"Parquet cache updated successfully with Madinah records. Total rows now: {len(df_combined):,}")

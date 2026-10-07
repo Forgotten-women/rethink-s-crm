@@ -188,10 +188,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       socket.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
-          if ([
-            'PAYOUTS_UPDATED', 'DONORS_UPDATED', 'DONOR_RECORD_UPDATED',
-            'BULK_DONORS_UPDATED', 'MATRIX_UPDATED'
-          ].includes(payload?.event)) {
+          if (['PAYOUTS_UPDATED', 'MATRIX_UPDATED'].includes(payload?.event)) {
             fetchPlatformCounts();
             fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current);
             if (activeTabRef.current === 'donors') {
@@ -259,7 +256,9 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           disbursement_summary: sumRes?.disbursement_summary || ledgerRes?.disbursement_summary || {},
           ledger_breakdown: sumRes?.ledger_breakdown || ledgerRes?.ledger || []
         });
-        setBatchesData(batchRes || { total_batches: 0, page: 1, page_size: 25, batches: [] });
+        if (batchRes && Array.isArray(batchRes.batches) && batchRes.batches.length > 0) {
+          setBatchesData(batchRes);
+        }
         setCampaignData(campRes?.campaigns || []);
         setCodeGroups(campRes?.code_groups || []);
         setHeadingGroups(campRes?.heading_groups || []);

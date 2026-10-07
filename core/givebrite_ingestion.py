@@ -35,6 +35,7 @@ if BASE_DIR not in sys.path:
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH
 from core.database import get_db_connection
 from core.data_processor import atomic_write_parquet, invalidate_data_cache
+from core.utils import classify_donor_amount
 
 logger = logging.getLogger("givebrite_ingestion")
 if not logger.handlers:
@@ -45,6 +46,24 @@ if not logger.handlers:
 
 GIVEBRITE_API_BASE = "https://api-dashboard.givebrite.com/v1/dashboard"
 DEFAULT_CHARITY_ID = "68625e0d6d1a99441e34e2ea"  # Iqra Charity GiveBrite ID
+
+# Standard benchmark exchange rates to GBP for GiveBrite multi-currency settlement
+FX_BENCHMARKS: Dict[str, float] = {
+    "GBP": 1.0,
+    "USD": 0.77,
+    "EUR": 0.86,
+    "CAD": 0.57,
+    "AUD": 0.51,
+    "SAR": 0.20,
+    "AED": 0.21,
+    "QAR": 0.21,
+    "ZAR": 0.043,
+    "SGD": 0.59,
+    "NZD": 0.47,
+    "INR": 0.0091,
+    "TRY": 0.022,
+    "MYR": 0.17
+}
 
 
 def parse_givebrite_date(created_at_str: Optional[str]) -> Tuple[str, str, str]:
@@ -69,6 +88,18 @@ def parse_givebrite_date(created_at_str: Optional[str]) -> Tuple[str, str, str]:
         return now_dt.strftime("%Y-%m-%d"), now_dt.strftime("%H:%M:%S"), str(created_at_str)
 
 
+def normalize_campaign_text(s: Optional[str]) -> str:
+    """Standardizes punctuation marks, dashes, quotes, and whitespace."""
+    if not s or pd.isna(s):
+        return ""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.replace("’", "'").replace("‘", "'").replace("`", "'").replace("´", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("–", "-").replace("—", "-").replace("‒", "-").replace("―", "-").replace("−", "-")
+    return " ".join(s.split()).strip()
+
+
 def resolve_classification(
     cursor,
     campaign_name: str,
@@ -83,8 +114,8 @@ def resolve_classification(
     
     Enriches with metadata from master_project_codes.
     """
-    c_name = (campaign_name or "").strip()
-    g_level = (giving_level or "").strip()
+    c_name = normalize_campaign_text(campaign_name)
+    g_level = normalize_campaign_text(giving_level)
 
     resolved_code = None
     tier_info = "Fallback (Unassigned)"
@@ -182,6 +213,7 @@ def build_donation_record(
         det = doc
 
     doc_id = str(doc.get("_id") or det.get("_id") or "").strip()
+    mysql_id = str(det.get("mysqlID") or doc.get("mysqlID") or "").strip()
     created_at_raw = det.get("created_at") or doc.get("created_at")
     created_date, created_time, iso_raw = parse_givebrite_date(created_at_raw)
 
@@ -194,8 +226,9 @@ def build_donation_record(
     currency = str(det.get("currency") or doc.get("currency") or "GBP").strip().upper()
 
     fees_obj = det.get("fees") if isinstance(det.get("fees"), dict) else {}
+    raw_fee = fees_obj.get("gateway") or fees_obj.get("total") or det.get("fee_amount") or doc.get("fee_amount") or 0.0
     try:
-        fee_amount = float(fees_obj.get("gateway", 0.0) or 0.0)
+        fee_amount = float(raw_fee or 0.0)
     except (ValueError, TypeError):
         fee_amount = 0.0
 
@@ -214,11 +247,15 @@ def build_donation_record(
 
     payment_obj = det.get("payment") if isinstance(det.get("payment"), dict) else {}
     gw_obj = det.get("gateway") if isinstance(det.get("gateway"), dict) else (doc.get("gateway") if isinstance(doc.get("gateway"), dict) else {})
-    payment_method = str(payment_obj.get("method") or gw_obj.get("name") or "Card").strip()
+    gw_name = str(gw_obj.get("name") or "Stripe").strip() if gw_obj else "Stripe"
+    payment_method = str(payment_obj.get("method") or doc.get("payment_method_type") or "card").strip()
 
     gw_resp = det.get("gateway_response") if isinstance(det.get("gateway_response"), dict) else (doc.get("gateway_response") if isinstance(doc.get("gateway_response"), dict) else {})
     status = str(gw_resp.get("status") or ("succeeded" if (det.get("paid") or doc.get("paid")) else "pending")).strip()
     charge_id = str(gw_resp.get("charge_id") or "").strip()
+    payment_intent_id = str(gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id") or "").strip()
+    if not charge_id and payment_intent_id:
+        charge_id = payment_intent_id
 
     # Campaign & Giving Level
     camp_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (doc.get("campaign") if isinstance(doc.get("campaign"), dict) else {})
@@ -226,16 +263,43 @@ def build_donation_record(
     campaign_slug = str(camp_obj.get("slug", "")).strip()
     campaign_url = f"https://donate.iqracharity.org/{campaign_slug}" if campaign_slug else ""
 
-    # Giving Level extraction
+    # Giving Level extraction: check cart items explicitly chosen by donor!
     giving_level_title = ""
+    giving_level_amount = 0.0
+    giving_level_qty = 1.0
+    cart_obj = det.get("cart") if isinstance(det.get("cart"), dict) else (doc.get("cart") if isinstance(doc.get("cart"), dict) else {})
+    cart_items = cart_obj.get("items", []) if isinstance(cart_obj, dict) else []
+    chosen_impact_id = None
+    if cart_items and isinstance(cart_items, list) and len(cart_items) > 0 and isinstance(cart_items[0], dict):
+        first_item = cart_items[0]
+        chosen_impact_id = str(first_item.get("impact") or "").strip()
+        try:
+            giving_level_amount = float(first_item.get("amount") or 0.0)
+        except (ValueError, TypeError):
+            giving_level_amount = 0.0
+        try:
+            giving_level_qty = float(first_item.get("qty") or 1.0)
+        except (ValueError, TypeError):
+            giving_level_qty = 1.0
+
     impacts = camp_obj.get("impacts", []) if isinstance(camp_obj, dict) else []
-    if impacts and isinstance(impacts, list) and len(impacts) > 0 and isinstance(impacts[0], dict):
-        giving_level_title = str(impacts[0].get("name", "")).strip()
+    if chosen_impact_id and impacts and isinstance(impacts, list):
+        for imp in impacts:
+            if isinstance(imp, dict) and str(imp.get("_id") or "").strip() == chosen_impact_id:
+                giving_level_title = str(imp.get("name") or "").strip()
+                break
+
+    # Fallback if giving level was passed as string (e.g. from webhook or CSV import)
+    if not giving_level_title:
+        raw_gl = det.get("giving_level_title") or det.get("giving_level") or doc.get("giving_level_title") or doc.get("giving_level")
+        if raw_gl and str(raw_gl).strip() and str(raw_gl).strip().lower() not in ("none", "nan", ""):
+            giving_level_title = str(raw_gl).strip()
+            giving_level_amount = amount_val
 
     # Billing Details
     billing = det.get("billing") if isinstance(det.get("billing"), dict) else {}
     b_addr1 = str(billing.get("address_line_1") or "").strip()
-    b_city = str(billing.get("town_or_city") or "").strip()
+    b_city = str(billing.get("town_or_city") or billing.get("town") or "").strip()
     b_zip = str(billing.get("postcode") or "").strip()
     b_country = str(billing.get("country") or "GB").strip()
 
@@ -260,6 +324,66 @@ def build_donation_record(
         "country": "", "programme_fund": "", "fund_code": "", "zakat_eligibility": ""
     }
 
+    # Financial Settlement: GiveBrite settles in GBP for UK charities (Iqra)
+    settlement_currency = "GBP"
+    camp_amt = det.get("amount_campaign", doc.get("amount_campaign"))
+    settled_gross = None
+    if camp_amt is not None and str(camp_amt).strip() != "":
+        try:
+            settled_gross = round(float(camp_amt), 2)
+        except (ValueError, TypeError):
+            pass
+
+    ex_obj = det.get("exchange") if isinstance(det.get("exchange"), dict) else (doc.get("exchange") if isinstance(doc.get("exchange"), dict) else {})
+    ex_rate = None
+    if isinstance(ex_obj, dict) and ex_obj.get("exchange_rate") is not None:
+        try:
+            ex_rate = float(ex_obj.get("exchange_rate"))
+        except (ValueError, TypeError):
+            pass
+    if ex_rate is None and doc.get("exchange_rate") is not None:
+        try:
+            ex_rate = float(doc.get("exchange_rate"))
+        except (ValueError, TypeError):
+            pass
+
+    if settled_gross is None:
+        if currency == "GBP":
+            settled_gross = amount_val
+        elif ex_rate and ex_rate > 0 and ex_rate != 1.0:
+            settled_gross = round(amount_val * ex_rate, 2)
+        else:
+            rate = FX_BENCHMARKS.get(currency, 1.0)
+            settled_gross = round(amount_val * rate, 2)
+
+    settled_net = round(settled_gross - fee_amount, 2) if settled_gross >= fee_amount else round(settled_gross, 2)
+
+    # Marketing Consent: extract optin properly
+    optin_raw = det.get("optin") if det and "optin" in det else doc.get("optin")
+    optin_val = ""
+    marketing_consent = ""
+    if isinstance(optin_raw, dict):
+        is_optin = bool(optin_raw.get("app") or optin_raw.get("charity"))
+        marketing_consent = "Yes" if is_optin else "No"
+        optin_val = "True" if is_optin else "False"
+    elif optin_raw is not None and str(optin_raw).strip() != "":
+        is_optin = str(optin_raw).strip().lower() in ("true", "1", "yes")
+        marketing_consent = "Yes" if is_optin else "No"
+        optin_val = "True" if is_optin else "False"
+
+    # Zakat determination: explicit flag first, then keyword match
+    is_zakat_flag = bool(det.get("is_zakat", doc.get("is_zakat", False)))
+    if not is_zakat_flag and giving_level_title:
+        is_zakat_flag = any(k in giving_level_title.upper() for k in ("ZAKAT", "ZAKAH"))
+    if not is_zakat_flag and campaign_name:
+        is_zakat_flag = any(k in campaign_name.upper() for k in ("ZAKAT", "ZAKAH"))
+    zakat_str = "Yes" if is_zakat_flag else "No"
+
+    # Dynamic Donor Classification
+    txn_class = classify_donor_amount(settled_gross)
+    total_ltv = settled_gross
+    lifetime_class = classify_donor_amount(total_ltv)
+
     record = {
         "Donation ID": doc_id,
         "Created Date (UTC)": created_date,
@@ -273,9 +397,9 @@ def build_donation_record(
         "Last Name": last_name,
         "Display Name": display_name,
         "Email": email,
-        "Marketing Consent": "No",
+        "Marketing Consent": marketing_consent,
         "Gift Aid (yes or no)": gift_aid_str,
-        "Tax Receipt requested": "No",
+        "Tax Receipt requested": "",
         "Billing Name": display_name,
         "Billing Address": b_addr1,
         "Billing Address 2": "",
@@ -288,18 +412,18 @@ def build_donation_record(
         "Donation Amount (in Donation Currency)": str(amount_val),
         "Project Currency": currency,
         "Donation Amount in Project Currency (May be approx.)": str(amount_val),
-        "Settlement Currency": currency,
-        "Total Online Donation Gross Amount in Settled Currency": str(amount_val),
+        "Settlement Currency": settlement_currency,
+        "Total Online Donation Gross Amount in Settled Currency": str(settled_gross),
         "Total Processing Fees Paid by CC In Settled Currency": fee_amount,
-        "Total Online Donations Net Amount in Settled Currency": net_amount,
+        "Total Online Donations Net Amount in Settled Currency": settled_net,
         "Transfer ID": None,
-        "Zakat (yes or no)": "Yes" if "ZAKAT" in (giving_level_title + campaign_name).upper() else "No",
-        "Zakat Amount (in Donation Currency)": amount_val if "ZAKAT" in (giving_level_title + campaign_name).upper() else 0.0,
+        "Zakat (yes or no)": zakat_str,
+        "Zakat Amount (in Donation Currency)": amount_val if zakat_str == "Yes" else 0.0,
         "Has Giving Level": "Yes" if giving_level_title else "No",
         "Giving Level Title": giving_level_title,
         "Giving Level Description": "",
         "Giving Level Type": "",
-        "Giving Level Qty": 1.0,
+        "Giving Level Qty": giving_level_qty,
         "Giving Level Notes": "",
         "Giving Level Email": "",
         "Giving Level Campaign Code": meta.get("code") or "Unassigned",
@@ -324,15 +448,16 @@ def build_donation_record(
         "Platform": "GiveBright",
         "Source": "GiveBrite Sync",
         "Donor ID": email,
-        "Total LTV": amount_val,
-        "Lifetime Donor Classification": "Low End",
-        "Transaction Donor Classification": "Low End",
+        "Total LTV": total_ltv,
+        "Lifetime Donor Classification": lifetime_class,
+        "Transaction Donor Classification": txn_class,
         "Payment Frequency": det.get("frequency", "one-off"),
         "subscription_id": gw_resp.get("subscription_id"),
-        "_id": doc_id,
+        "_id": mysql_id if mysql_id else doc_id,
         "charge_id": charge_id,
+        "Customer Ref": payment_intent_id or "",
         "fee_amount": str(fee_amount),
-        "gateway": "Stripe",
+        "gateway": gw_name,
         "is_giftaid": "true" if is_giftaid else "false",
         "created_at": iso_raw,
         "offline": "true" if offline_flag else "false",
@@ -363,10 +488,14 @@ def build_donation_record(
         "Fund Code": meta.get("fund_code") or "",
         "company_id": company_id,
         "Target Country": meta.get("country") or "",
-        "Giving Level Amount": amount_val if giving_level_title else 0.0
+        "Giving Level Amount": giving_level_amount if giving_level_title else 0.0,
+        "optin": optin_val
     }
 
     return record
+
+
+build_givebrite_record = build_donation_record
 
 
 def ingest_givebrite_donations(
@@ -390,44 +519,66 @@ def ingest_givebrite_donations(
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Step 1: Identify incoming IDs and query DB for existing records
-    incoming_ids = [str(d.get("_id")).strip() for d in docs if d.get("_id")]
+    # Step 1: Identify incoming IDs (both MongoDB _id and mysqlID) and query DB for existing records
+    incoming_ids = []
+    for d in docs:
+        if d.get("_id"):
+            incoming_ids.append(str(d.get("_id")).strip())
+        if d.get("mysqlID"):
+            incoming_ids.append(str(d.get("mysqlID")).strip())
+    incoming_ids = list(dict.fromkeys(incoming_ids))
+
     if not incoming_ids:
         conn.close()
         return {"total_incoming": 0, "inserted": 0, "skipped": 0}
 
-    # Query existing IDs using index
+    # Query existing IDs using index across both Donation ID and _id
     placeholders = ",".join(["?"] * len(incoming_ids))
     cursor.execute(f"""
-        SELECT "Donation ID" FROM donations 
-        WHERE company_id = ? AND "Donation ID" IN ({placeholders})
-    """, [company_id] + incoming_ids)
-    existing_ids = {str(row[0]).strip() for row in cursor.fetchall() if row[0]}
+        SELECT "Donation ID", _id FROM donations 
+        WHERE company_id = ? AND ("Donation ID" IN ({placeholders}) OR _id IN ({placeholders}))
+    """, [company_id] + incoming_ids + incoming_ids)
+    existing_ids = set()
+    for row in cursor.fetchall():
+        if row[0]:
+            existing_ids.add(str(row[0]).strip())
+        if row[1]:
+            existing_ids.add(str(row[1]).strip())
 
-    # Also check charge_id to prevent duplicates across webhook & live sync
+    # Also check charge_id and payment_intent_id to prevent duplicates across webhook & live sync
     incoming_tx_ids = []
     for d in docs:
         gw_resp = d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {}
         ch_id = gw_resp.get("charge_id") or d.get("charge_id")
+        pi_id = gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id")
         if ch_id:
             incoming_tx_ids.append(str(ch_id).strip())
+        if pi_id:
+            incoming_tx_ids.append(str(pi_id).strip())
+    incoming_tx_ids = list(dict.fromkeys(incoming_tx_ids))
 
     existing_tx_ids = set()
     if incoming_tx_ids:
         tx_placeholders = ",".join(["?"] * len(incoming_tx_ids))
         cursor.execute(f"""
-            SELECT charge_id FROM donations 
-            WHERE company_id = ? AND charge_id IS NOT NULL AND charge_id != '' AND charge_id IN ({tx_placeholders})
-        """, [company_id] + incoming_tx_ids)
-        existing_tx_ids = {str(row[0]).strip() for row in cursor.fetchall() if row[0]}
+            SELECT charge_id, "Customer Ref" FROM donations 
+            WHERE company_id = ? AND (charge_id IN ({tx_placeholders}) OR "Customer Ref" IN ({tx_placeholders}))
+        """, [company_id] + incoming_tx_ids + incoming_tx_ids)
+        for row in cursor.fetchall():
+            if row[0]:
+                existing_tx_ids.add(str(row[0]).strip())
+            if row[1]:
+                existing_tx_ids.add(str(row[1]).strip())
 
     def _is_existing(d):
-        d_id = str(d.get("_id")).strip()
-        if d_id in existing_ids:
+        d_id = str(d.get("_id") or "").strip()
+        m_id = str(d.get("mysqlID") or "").strip()
+        if (d_id and d_id in existing_ids) or (m_id and m_id in existing_ids):
             return True
         gw_resp = d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {}
         ch_id = str(gw_resp.get("charge_id") or d.get("charge_id") or "").strip()
-        if ch_id and ch_id in existing_tx_ids:
+        pi_id = str(gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id") or "").strip()
+        if (ch_id and ch_id in existing_tx_ids) or (pi_id and pi_id in existing_tx_ids):
             return True
         return False
 
@@ -538,9 +689,12 @@ def update_parquet_cache(new_records: List[Dict[str, Any]]) -> None:
     # Reorder to match existing
     df_new = df_new[df_existing.columns]
 
-    # Concatenate, deduplicate and write atomically
+    # Concatenate, deduplicate safely and write atomically
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-    df_combined = df_combined.drop_duplicates(subset=["company_id", "Donation ID"], keep="last")
+    mask_has_id = df_combined["Donation ID"].notna() & (df_combined["Donation ID"].astype(str).str.strip() != "")
+    df_with_id = df_combined[mask_has_id].drop_duplicates(subset=["company_id", "Donation ID"], keep="last")
+    df_no_id = df_combined[~mask_has_id]
+    df_combined = pd.concat([df_with_id, df_no_id], ignore_index=True)
     atomic_write_parquet(df_combined, PARQUET_PATH)
     invalidate_data_cache()
     logger.info(f"Parquet cache updated successfully. Total rows now: {len(df_combined):,}")

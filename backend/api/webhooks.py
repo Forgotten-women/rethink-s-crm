@@ -19,6 +19,7 @@ from core.data_processor import (
     atomic_write_parquet
 )
 from core.utils import classify_donor_amount
+from core.givebrite_ingestion import FX_BENCHMARKS
 from backend.api.events import broadcast_event_sync
 from backend.api.auth import require_super_admin
 
@@ -388,179 +389,326 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
         else:
             return {"status": "success", "action": "noop", "message": "Campaign event missing campaign name."}
 
+def build_webhook_donation_record(payload: Dict[str, Any], target_cid: str = "rethink") -> Dict[str, Any]:
+    """
+    Standardizes a GiveBrite webhook donation payload into the unified CRM schema:
+    - Enforces Settlement Currency = 'GBP' with proper FX conversion for non-GBP donations.
+    - Accurately deducts processing fees (settled_net = settled_gross - fee).
+    - Extracts marketing consent (optin.app or optin.charity -> 'Yes' / 'No').
+    - Fixes billing town_or_city and standardizes country code ('GB').
+    - Dynamically resolves payment method and gateway.
+    - Resolves chosen giving level or impact.
+    - Dynamically computes transaction and lifetime donor classifications.
+    """
+    don_id = str(payload.get("_id") or f"GB-{int(datetime.datetime.now().timestamp())}").strip()
+    mysql_id = str(payload.get("mysqlID") or "").strip()
+    created_raw = payload.get("created_at")
+    if created_raw:
+        try:
+            dt = pd.to_datetime(created_raw)
+            created_date = dt.strftime("%Y-%m-%d")
+            created_time = dt.strftime("%H:%M:%S")
+        except Exception:
+            created_date = datetime.date.today().strftime("%Y-%m-%d")
+            created_time = "00:00:00"
+    else:
+        created_date = datetime.date.today().strftime("%Y-%m-%d")
+        created_time = "00:00:00"
+
+    first_name = str(payload.get("first_name") or "").strip()
+    last_name = str(payload.get("last_name") or "").strip()
+    is_anon = bool(payload.get("is_anonymous", False))
+    display_name = "Anonymous Donor" if is_anon else (f"{first_name} {last_name}".strip() or "Anonymous Donor")
+
+    email = str(payload.get("email") or "").strip().lower()
+    try:
+        amount_val = float(pd.to_numeric(payload.get("amount", 0.0), errors="coerce") or 0.0)
+    except (ValueError, TypeError):
+        amount_val = 0.0
+
+    currency = str(payload.get("currency") or "GBP").strip().upper()
+
+    freq_raw = str(payload.get("frequency") or "one-off").lower()
+    payment_freq = "Recurring Payment" if freq_raw in ["monthly", "regular", "recurring"] else "One-Time Payment"
+
+    is_zakat_flag = bool(payload.get("is_zakat", False)) or str(payload.get("donation_type") or "").lower() == "zakat"
+    giftaid_str = "Yes" if bool(payload.get("is_giftaid", False)) else "No"
+
+    # Campaign & Attribution
+    camp_obj = payload.get("campaign") or {}
+    if isinstance(camp_obj, dict):
+        camp_name = str(camp_obj.get("name") or "Unassigned").strip()
+        camp_url = str(camp_obj.get("url") or camp_obj.get("slug") or "").strip()
+    else:
+        camp_name = str(camp_obj or "Unassigned").strip()
+        camp_url = ""
+
+    if not camp_name or camp_name.lower() in ["nan", "none", "null", "direct donation", "direct donation (unassigned)", ""]:
+        camp_name = "Unassigned"
+
+    # Giving Level / Impact resolution
+    giving_level = ""
+    giving_level_amount = 0.0
+    giving_level_qty = 1.0
+
+    cart_obj = payload.get("cart") if isinstance(payload.get("cart"), dict) else {}
+    cart_items = cart_obj.get("items", []) if isinstance(cart_obj, dict) else []
+    chosen_impact_id = None
+    if cart_items and isinstance(cart_items, list) and len(cart_items) > 0 and isinstance(cart_items[0], dict):
+        first_item = cart_items[0]
+        chosen_impact_id = str(first_item.get("impact") or "").strip()
+        try:
+            giving_level_amount = float(first_item.get("amount") or 0.0)
+        except (ValueError, TypeError):
+            giving_level_amount = 0.0
+        try:
+            giving_level_qty = float(first_item.get("qty") or 1.0)
+        except (ValueError, TypeError):
+            giving_level_qty = 1.0
+
+    impacts = camp_obj.get("impacts", []) if isinstance(camp_obj, dict) else []
+    if chosen_impact_id and impacts and isinstance(impacts, list):
+        for imp in impacts:
+            if isinstance(imp, dict) and str(imp.get("_id") or "").strip() == chosen_impact_id:
+                giving_level = str(imp.get("name") or "").strip()
+                break
+
+    if not giving_level:
+        impact_val = payload.get("impact_name") or payload.get("impact")
+        if isinstance(impact_val, dict):
+            impact_val = impact_val.get("name") or impact_val.get("title") or ""
+        raw_gl = (
+            impact_val
+            or payload.get("giving_level")
+            or payload.get("giving_level_title")
+            or payload.get("giving_levels")
+            or payload.get("variant")
+            or payload.get("option")
+            or ""
+        )
+        if raw_gl and str(raw_gl).strip().lower() not in ("none", "nan", "null", ""):
+            giving_level = str(raw_gl).strip()
+            giving_level_amount = amount_val
+
+    # Zakat determination fallback
+    if not is_zakat_flag and giving_level:
+        is_zakat_flag = any(k in giving_level.upper() for k in ("ZAKAT", "ZAKAH"))
+    if not is_zakat_flag and camp_name:
+        is_zakat_flag = any(k in camp_name.upper() for k in ("ZAKAT", "ZAKAH"))
+    zakat_str = "Yes" if is_zakat_flag else "No"
+
+    fund_obj = payload.get("fundraiser") or {}
+    fund_name = str(fund_obj.get("name") or "").strip() if isinstance(fund_obj, dict) else str(fund_obj or "").strip()
+
+    team_obj = payload.get("team") or {}
+    team_name = str(team_obj.get("name") or "").strip() if isinstance(team_obj, dict) else str(team_obj or "").strip()
+
+    # Billing / Geo details
+    billing = payload.get("billing") or {}
+    if isinstance(billing, dict):
+        b_addr1 = str(billing.get("address_line_1") or "").strip()
+        b_addr2 = str(billing.get("address_line_2") or "").strip()
+        b_addr = f"{b_addr1}, {b_addr2}".strip(", ") if b_addr2 else b_addr1
+        b_city = str(billing.get("town_or_city") or billing.get("town") or "").strip()
+        b_zip = str(billing.get("postcode") or "").strip()
+        b_country = str(billing.get("country") or "GB").strip()
+        if b_country.lower() in ("united kingdom", "uk"):
+            b_country = "GB"
+        phone = str(billing.get("phone_number") or "").strip()
+    else:
+        b_addr = ""
+        b_city = ""
+        b_zip = ""
+        b_country = "GB"
+        phone = ""
+
+    # Comments & Charge ID
+    comment = str(payload.get("comment") or "").strip()
+    gw_resp = payload.get("gateway_response") or {}
+    charge_id = str(gw_resp.get("charge_id") or "").strip() if isinstance(gw_resp, dict) else ""
+    payment_intent_id = str(gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id") or "").strip() if isinstance(gw_resp, dict) else ""
+    if not charge_id and payment_intent_id:
+        charge_id = payment_intent_id
+
+    # Gateway & Payment method
+    gw_obj = payload.get("gateway") if isinstance(payload.get("gateway"), dict) else {}
+    gw_name = str(gw_obj.get("name") or "Stripe").strip() if gw_obj else "Stripe"
+    payment_obj = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
+    payment_method = str(payment_obj.get("method") or payload.get("payment_method_type") or "card").strip()
+
+    # Classification matrix resolution
+    if camp_name and camp_name.lower() not in ["unassigned", "nan", "none", ""]:
+        _ensure_campaign_registered(camp_name, campaign_url=camp_url, company_id=target_cid, giving_level=giving_level)
+
+    class_info = _lookup_givebrite_classification(camp_name, company_id=target_cid, giving_level=giving_level)
+    mapped_fund = _lookup_fundraiser_for_campaign(camp_name, code=class_info.get("Code", ""), company_id=target_cid)
+    if mapped_fund:
+        fund_name = mapped_fund
+
+    # Settlement Currency & FX Conversion
+    settlement_currency = "GBP"
+    camp_amt = payload.get("amount_campaign")
+    settled_gross = None
+    if camp_amt is not None and str(camp_amt).strip() != "":
+        try:
+            settled_gross = round(float(camp_amt), 2)
+        except (ValueError, TypeError):
+            pass
+
+    ex_obj = payload.get("exchange") if isinstance(payload.get("exchange"), dict) else {}
+    ex_rate = None
+    if isinstance(ex_obj, dict) and ex_obj.get("exchange_rate") is not None:
+        try:
+            ex_rate = float(ex_obj.get("exchange_rate"))
+        except (ValueError, TypeError):
+            pass
+    if ex_rate is None and payload.get("exchange_rate") is not None:
+        try:
+            ex_rate = float(payload.get("exchange_rate"))
+        except (ValueError, TypeError):
+            pass
+
+    if settled_gross is None:
+        if currency == "GBP":
+            settled_gross = amount_val
+        elif ex_rate and ex_rate > 0 and ex_rate != 1.0:
+            settled_gross = round(amount_val * ex_rate, 2)
+        else:
+            rate = FX_BENCHMARKS.get(currency, 1.0)
+            settled_gross = round(amount_val * rate, 2)
+
+    # Fee extraction or benchmark calculation
+    fees_obj = payload.get("fees") if isinstance(payload.get("fees"), dict) else {}
+    raw_fee = fees_obj.get("gateway") or fees_obj.get("total") or payload.get("fee_amount")
+    if raw_fee is not None and str(raw_fee).strip() != "":
+        try:
+            fee_val = round(float(raw_fee), 2)
+        except (ValueError, TypeError):
+            fee_val = 0.0
+    else:
+        # Standard GiveBrite Stripe UK benchmark processing fee (1.5% + £0.20)
+        fee_val = round(settled_gross * 0.015 + 0.20, 2)
+
+    settled_net = round(settled_gross - fee_val, 2) if settled_gross >= fee_val else round(settled_gross, 2)
+
+    # Marketing Consent: extract optin
+    optin_raw = payload.get("optin")
+    optin_val = ""
+    marketing_consent = ""
+    if isinstance(optin_raw, dict):
+        is_optin = bool(optin_raw.get("app") or optin_raw.get("charity"))
+        marketing_consent = "Yes" if is_optin else "No"
+        optin_val = "True" if is_optin else "False"
+    elif optin_raw is not None and str(optin_raw).strip() != "":
+        is_optin = str(optin_raw).strip().lower() in ("true", "1", "yes")
+        marketing_consent = "Yes" if is_optin else "No"
+        optin_val = "True" if is_optin else "False"
+
+    # Donor ID, Classifications & LTV
+    donor_id = email if email else (f"{first_name} {last_name}".strip().lower() or don_id)
+    txn_class = classify_donor_amount(settled_gross)
+
+    prior_ltv = 0.0
+    if os.path.exists(LOCAL_DB_PATH) and donor_id:
+        try:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=5.0)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT SUM(CAST(COALESCE("Total Online Donations Net Amount in Settled Currency", Amount, 0) AS REAL))
+                FROM donations
+                WHERE LOWER(TRIM(COALESCE("Donor ID", ''))) = ?
+                  AND LOWER(TRIM(COALESCE(company_id, 'rethink'))) = ?
+            """, (donor_id, target_cid.lower()))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                prior_ltv = float(row[0])
+            conn.close()
+        except Exception:
+            prior_ltv = 0.0
+
+    total_ltv = round(prior_ltv + settled_net, 2)
+    lifetime_class = classify_donor_amount(total_ltv)
+
+    community_name = str(payload.get("community_name") or payload.get("community") or "").strip()
+
+    row_data = {
+        "Donation ID": don_id,
+        "Created Date (UTC)": created_date,
+        "Created Time (UTC)": created_time,
+        "First Name": first_name,
+        "Last Name": last_name,
+        "Display Name": display_name,
+        "Email": email,
+        "Donor ID": donor_id,
+        "Donation Amount (in Donation Currency)": amount_val,
+        "Donation Currency (DC)": currency,
+        "Amount": settled_gross,
+        "Total Online Donations Net Amount in Settled Currency": settled_net,
+        "Total Online Donation Gross Amount in Settled Currency": settled_gross,
+        "Total Processing Fees Paid by CC In Settled Currency": fee_val,
+        "fee_amount": str(fee_val),
+        "Total LTV": total_ltv,
+        "Lifetime Donor Classification": lifetime_class,
+        "Transaction Donor Classification": txn_class,
+        "Settlement Currency": settlement_currency,
+        "Platform": "GiveBright",
+        "Payment Type": payment_method,
+        "Payment Frequency": payment_freq,
+        "Zakat (yes or no)": zakat_str,
+        "Gift Aid (yes or no)": giftaid_str,
+        "Anonymous or Public": "Anonymous" if is_anon else "Public",
+        "Campaign Name": camp_name,
+        "Giving Level Title": giving_level,
+        "Has Giving Level": "Yes" if giving_level else "No",
+        "Giving Level Amount": giving_level_amount if giving_level else 0.0,
+        "Giving Level Qty": giving_level_qty,
+        "Giving Level Campaign Code": class_info.get("Code", "Unassigned"),
+        "Campaign URL": camp_url,
+        "Community Name": community_name,
+        "fundraiser_name": fund_name,
+        "team_name": team_name,
+        "Billing Address": b_addr,
+        "Billing City": b_city,
+        "Billing Zip": b_zip,
+        "Billing Country": b_country,
+        "Phone Number": phone,
+        "Comments": comment,
+        "charge_id": charge_id,
+        "_id": mysql_id if mysql_id else don_id,
+        "Customer Ref": payment_intent_id or "",
+        "gateway": gw_name,
+        "Tax Receipt requested": "",
+        "Marketing Consent": marketing_consent,
+        "optin": optin_val,
+        "Source": "GiveBrite Webhook",
+        "company_id": target_cid,
+        "Code": class_info.get("Code", "Unassigned"),
+        "Department": class_info.get("Department", class_info.get("Heading", "Unassigned")),
+        "Office": class_info.get("Office", class_info.get("Sub-Heading", "Unassigned")),
+        "Portfolio": class_info.get("Portfolio", ""),
+        "Programme Fund": class_info.get("Programme Fund", ""),
+        "Heading": class_info.get("Heading", class_info.get("Department", "Unassigned")),
+        "Sub-Heading": class_info.get("Sub-Heading", class_info.get("Office", "Unassigned")),
+        "Country": class_info.get("Country", "Unassigned"),
+        "Target Country": class_info.get("Target Country", class_info.get("Country", "Unassigned")),
+        "Zakat Eligibility": class_info.get("Zakat Eligibility", "Unassigned")
+    }
+
+    return row_data
+
+
     # 3. Donation Create
     if event_type == "donation.create" or ("amount" in payload and "email" in payload):
         with _WEBHOOK_LOCK:
             try:
-                # Extract fields
-                don_id = str(payload.get("_id") or f"GB-{int(datetime.datetime.now().timestamp())}").strip()
-                created_raw = payload.get("created_at")
-                if created_raw:
-                    try:
-                        dt = pd.to_datetime(created_raw)
-                        created_date = dt.strftime("%Y-%m-%d")
-                        created_time = dt.strftime("%H:%M:%S")
-                    except Exception:
-                        created_date = datetime.date.today().strftime("%Y-%m-%d")
-                        created_time = "00:00:00"
-                else:
-                    created_date = datetime.date.today().strftime("%Y-%m-%d")
-                    created_time = "00:00:00"
-
-                first_name = str(payload.get("first_name") or "").strip()
-                last_name = str(payload.get("last_name") or "").strip()
-                is_anon = bool(payload.get("is_anonymous", False))
-                if is_anon:
-                    display_name = "Anonymous Donor"
-                else:
-                    display_name = f"{first_name} {last_name}".strip() or "Anonymous Donor"
-
-                email = str(payload.get("email") or "").strip()
-                amount = float(pd.to_numeric(payload.get("amount", 0.0), errors="coerce") or 0.0)
-                currency = str(payload.get("currency") or "GBP").upper()
-
-                freq_raw = str(payload.get("frequency") or "one-off").lower()
-                payment_freq = "Recurring Payment" if freq_raw in ["monthly", "regular", "recurring"] else "One-Time Payment"
-
-                is_zakat_flag = bool(payload.get("is_zakat", False)) or str(payload.get("donation_type") or "").lower() == "zakat"
-                zakat_str = "Yes" if is_zakat_flag else "No"
-                giftaid_str = "Yes" if bool(payload.get("is_giftaid", False)) else "No"
-
-                # Campaign & Attribution
-                camp_obj = payload.get("campaign") or {}
-                if isinstance(camp_obj, dict):
-                    camp_name = str(camp_obj.get("name") or "Unassigned").strip()
-                    camp_url = str(camp_obj.get("url") or camp_obj.get("slug") or "").strip()
-                else:
-                    camp_name = str(camp_obj or "Unassigned").strip()
-                    camp_url = ""
-
-                if not camp_name or camp_name.lower() in ["nan", "none", "null", "direct donation", "direct donation (unassigned)", ""]:
-                    camp_name = "Unassigned"
-
-                impact_val = payload.get("impact_name") or payload.get("impact")
-                if isinstance(impact_val, dict):
-                    impact_val = impact_val.get("name") or impact_val.get("title") or ""
-                giving_level = str(
-                    impact_val
-                    or payload.get("giving_level")
-                    or payload.get("giving_level_title")
-                    or payload.get("giving_levels")
-                    or payload.get("variant")
-                    or payload.get("option")
-                    or ""
-                ).strip()
-
-                fund_obj = payload.get("fundraiser") or {}
-                fund_name = str(fund_obj.get("name") or "").strip() if isinstance(fund_obj, dict) else str(fund_obj or "").strip()
-
-                team_obj = payload.get("team") or {}
-                team_name = str(team_obj.get("name") or "").strip() if isinstance(team_obj, dict) else str(team_obj or "").strip()
-
-                # Billing / Geo
-                billing = payload.get("billing") or {}
-                if isinstance(billing, dict):
-                    b_addr1 = str(billing.get("address_line_1") or "").strip()
-                    b_addr2 = str(billing.get("address_line_2") or "").strip()
-                    b_addr = f"{b_addr1}, {b_addr2}".strip(", ") if b_addr2 else b_addr1
-                    b_city = str(billing.get("town") or "").strip()
-                    b_zip = str(billing.get("postcode") or "").strip()
-                    b_country = str(billing.get("country") or "United Kingdom").strip()
-                    phone = str(billing.get("phone_number") or "").strip()
-                else:
-                    b_addr = ""
-                    b_city = ""
-                    b_zip = ""
-                    b_country = "United Kingdom"
-                    phone = ""
-
-                # Comments & Charge ID
-                comment = str(payload.get("comment") or "").strip()
-                gw_resp = payload.get("gateway_response") or {}
-                charge_id = str(gw_resp.get("charge_id") or "").strip() if isinstance(gw_resp, dict) else ""
-
-                # Register campaign and giving level in classification matrix if valid
-                if camp_name and camp_name.lower() not in ["unassigned", "nan", "none", ""]:
-                    _ensure_campaign_registered(camp_name, campaign_url=camp_url, company_id=target_cid, giving_level=giving_level)
-
-                # Classify donation using stored company matrix
-                class_info = _lookup_givebrite_classification(camp_name, company_id=target_cid, giving_level=giving_level)
-
-                # Auto-resolve mapped fundraiser from CRM records if campaign is mapped
-                mapped_fund = _lookup_fundraiser_for_campaign(camp_name, code=class_info.get("Code", ""), company_id=target_cid)
-                if mapped_fund:
-                    fund_name = mapped_fund
-
-                # Calculate Donor ID, LTV and Classifications
-                donor_id = email.strip().lower() if email.strip() else (f"{first_name} {last_name}".strip().lower() or don_id)
-                txn_class = classify_donor_amount(amount)
-
-                prior_ltv = 0.0
-                if os.path.exists(PARQUET_PATH):
-                    try:
-                        df_chk = pd.read_parquet(PARQUET_PATH, columns=["Donor ID", "Total Online Donations Net Amount in Settled Currency", "Amount", "company_id"])
-                        if df_chk is not None and not df_chk.empty:
-                            amt_s = pd.to_numeric(df_chk.get("Total Online Donations Net Amount in Settled Currency", df_chk.get("Amount", 0.0)), errors="coerce").fillna(0.0)
-                            did_s = df_chk.get("Donor ID", pd.Series("", index=df_chk.index)).astype(str).str.strip().str.lower()
-                            cid_s = df_chk.get("company_id", pd.Series("rethink", index=df_chk.index)).astype(str).str.strip().str.lower()
-                            prior_ltv = float(amt_s[(did_s == donor_id) & (cid_s == target_cid)].sum())
-                    except Exception:
-                        prior_ltv = 0.0
-
-                total_ltv = round(prior_ltv + amount, 2)
-                lifetime_class = classify_donor_amount(total_ltv)
-
-                # Create standardized record
-                row_data = {
-                    "Donation ID": don_id,
-                    "Created Date (UTC)": created_date,
-                    "Created Time (UTC)": created_time,
-                    "First Name": first_name,
-                    "Last Name": last_name,
-                    "Display Name": display_name,
-                    "Email": email,
-                    "Donor ID": donor_id,
-                    "Donation Amount (in Donation Currency)": amount,
-                    "Donation Currency (DC)": currency,
-                    "Amount": amount,
-                    "Total Online Donations Net Amount in Settled Currency": amount,
-                    "Total Online Donation Gross Amount in Settled Currency": amount,
-                    "Total LTV": total_ltv,
-                    "Lifetime Donor Classification": lifetime_class,
-                    "Transaction Donor Classification": txn_class,
-                    "Settlement Currency": currency,
-                    "Platform": "GiveBright",
-                    "Payment Type": "Card / Stripe",
-                    "Payment Frequency": payment_freq,
-                    "Zakat (yes or no)": zakat_str,
-                    "Gift Aid (yes or no)": giftaid_str,
-                    "Anonymous or Public": "Anonymous" if is_anon else "Public",
-                    "Campaign Name": camp_name,
-                    "Giving Level Title": giving_level,
-                    "Campaign URL": camp_url,
-                    "Community Name": "GiveBright",
-                    "fundraiser_name": fund_name,
-                    "team_name": team_name,
-                    "Billing Address": b_addr,
-                    "Billing City": b_city,
-                    "Billing Zip": b_zip,
-                    "Billing Country": b_country,
-                    "Phone Number": phone,
-                    "Comments": comment,
-                    "charge_id": charge_id,
-                    "Source": "GiveBrite Webhook",
-                    "company_id": target_cid,
-                    "Code": class_info.get("Code", "Unassigned"),
-                    "Department": class_info.get("Department", class_info.get("Heading", "Unassigned")),
-                    "Office": class_info.get("Office", class_info.get("Sub-Heading", "Unassigned")),
-                    "Portfolio": class_info.get("Portfolio", ""),
-                    "Programme Fund": class_info.get("Programme Fund", ""),
-                    "Heading": class_info.get("Heading", class_info.get("Department", "Unassigned")),
-                    "Sub-Heading": class_info.get("Sub-Heading", class_info.get("Office", "Unassigned")),
-                    "Country": class_info.get("Country", "Unassigned"),
-                    "Target Country": class_info.get("Target Country", class_info.get("Country", "Unassigned")),
-                    "Zakat Eligibility": class_info.get("Zakat Eligibility", "Unassigned")
-                }
+                row_data = build_webhook_donation_record(payload, target_cid=target_cid)
+                don_id = row_data["Donation ID"]
+                donor_id = row_data["Donor ID"]
+                total_ltv = row_data["Total LTV"]
+                lifetime_class = row_data["Lifetime Donor Classification"]
+                gross_amount = row_data["Total Online Donation Gross Amount in Settled Currency"]
+                camp_name = row_data["Campaign Name"]
+                class_code = row_data["Code"]
 
                 df_new_row = pd.DataFrame([row_data])
 
@@ -608,7 +756,7 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                     "source": "givebrite_webhook",
                     "company_id": target_cid,
                     "donation_id": don_id,
-                    "amount": amount,
+                    "amount": gross_amount,
                     "campaign": camp_name
                 })
 
@@ -618,10 +766,10 @@ def process_givebrite_webhook_payload(company_id: str, payload: dict) -> Dict[st
                     "status": "success",
                     "action": "donation_ingested",
                     "donation_id": don_id,
-                    "amount": amount,
+                    "amount": gross_amount,
                     "company_id": target_cid,
                     "campaign": camp_name,
-                    "code": class_info["Code"]
+                    "code": class_code
                 }
 
             except Exception as e:

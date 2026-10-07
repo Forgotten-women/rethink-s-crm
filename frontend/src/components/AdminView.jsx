@@ -178,7 +178,32 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
       headers,
       body: formData,
     })
-      .then(r => r.json())
+      .then(async r => {
+        const ct = r.headers.get('content-type') || '';
+        let resData = null;
+        if (ct.includes('application/json')) {
+          try {
+            resData = await r.json();
+          } catch (e) {
+            // failed parsing json
+          }
+        }
+        if (!r.ok) {
+          const detail = resData?.detail || resData?.message || (
+            r.status === 524
+              ? 'Gateway timeout (HTTP 524): Server took longer than 100s to process the dataset.'
+              : r.status === 502
+              ? 'Bad gateway (HTTP 502): Backend server process is restarting or unavailable.'
+              : r.status === 504
+              ? 'Gateway timeout (HTTP 504): Server took too long to respond.'
+              : r.status === 413
+              ? 'Payload too large (HTTP 413): The uploaded file exceeds the server limit.'
+              : `Server error (HTTP ${r.status})`
+          );
+          throw new Error(detail);
+        }
+        return resData || { status: 'success', message: 'Dataset uploaded and processed successfully.' };
+      })
       .then(res => {
         setUploading(false);
         if (res.status === 'success') {
@@ -308,7 +333,11 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
         headers: logoHeaders,
         body: formData
       });
-      const data = await res.json();
+      const ct = res.headers.get('content-type') || '';
+      let data = null;
+      if (ct.includes('application/json')) {
+        try { data = await res.json(); } catch (e) {}
+      }
       setUploadingLogo(false);
       if (res.ok && data?.status === 'success') {
         setCompanyMsg(`✅ ${data.message || 'Brand logo uploaded successfully.'}`);

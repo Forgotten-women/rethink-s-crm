@@ -41,21 +41,27 @@ _CLASSIFIED_PAYOUTS_CACHE = {}
 _CLASSIFIED_PAYSUITE_CACHE = {}
 _CLASSIFICATION_MATRIX_CACHE = {}
 _PAYSUITE_MATRIX_CACHE = {}
+_CACHE_PAYOUTS_MTIME = {}
+_CACHE_PAYSUITE_MTIME = {}
 
 def invalidate_payouts_cache(company_id: Optional[str] = None):
     """Invalidates the in-memory cache for payout reconciliation."""
-    global _CLASSIFIED_PAYOUTS_CACHE, _CLASSIFIED_PAYSUITE_CACHE, _CLASSIFICATION_MATRIX_CACHE, _PAYSUITE_MATRIX_CACHE
+    global _CLASSIFIED_PAYOUTS_CACHE, _CLASSIFIED_PAYSUITE_CACHE, _CLASSIFICATION_MATRIX_CACHE, _PAYSUITE_MATRIX_CACHE, _CACHE_PAYOUTS_MTIME, _CACHE_PAYSUITE_MTIME
     if company_id:
         cid = str(company_id).strip().lower()
         _CLASSIFIED_PAYOUTS_CACHE.pop(cid, None)
         _CLASSIFIED_PAYSUITE_CACHE.pop(cid, None)
         _CLASSIFICATION_MATRIX_CACHE.pop(cid, None)
         _PAYSUITE_MATRIX_CACHE.pop(cid, None)
+        _CACHE_PAYOUTS_MTIME.pop(cid, None)
+        _CACHE_PAYSUITE_MTIME.pop(cid, None)
     else:
         _CLASSIFIED_PAYOUTS_CACHE = {}
         _CLASSIFIED_PAYSUITE_CACHE = {}
         _CLASSIFICATION_MATRIX_CACHE = {}
         _PAYSUITE_MATRIX_CACHE = {}
+        _CACHE_PAYOUTS_MTIME = {}
+        _CACHE_PAYSUITE_MTIME = {}
     _core_invalidate_payouts_cache()
     _core_invalidate_paysuite_payouts_cache()
 
@@ -165,14 +171,14 @@ def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Op
                         "zakat_eligibility": r[4] or "Unassigned"
                     }
 
-            # 2. Platform campaign mappings for LaunchGood
-            where_pcm = "WHERE (platform = 'launchgood' OR platform IS NULL OR platform = '') AND LOWER(COALESCE(company_id, 'rethink')) = ?" if cid != "all" else "WHERE (platform = 'launchgood' OR platform IS NULL OR platform = '')"
+            # 2. Platform campaign mappings for LaunchGood (including website fallback)
+            where_pcm = "WHERE (platform IN ('launchgood', 'website') OR platform IS NULL OR platform = '') AND LOWER(COALESCE(company_id, 'rethink')) = ?" if cid != "all" else "WHERE (platform IN ('launchgood', 'website') OR platform IS NULL OR platform = '')"
             params_pcm = (cid,) if cid != "all" else ()
             cur.execute(f"""
                 SELECT campaign_name, code, is_primary, COALESCE(giving_level, '')
                 FROM platform_campaign_mappings
                 {where_pcm}
-                ORDER BY is_primary ASC
+                ORDER BY CASE WHEN platform = 'launchgood' THEN 2 WHEN platform IS NULL OR platform = '' THEN 1 ELSE 0 END, is_primary ASC
             """, params_pcm)
             
             cache = {}
@@ -342,8 +348,16 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
 
     else:
         # LaunchGood Payouts
+        cur_mtime = 0.0
+        if os.path.exists(PAYOUTS_PARQUET_PATH):
+            try:
+                cur_mtime = os.path.getmtime(PAYOUTS_PARQUET_PATH)
+            except Exception:
+                cur_mtime = 0.0
+
         if not force_reload and cid in _CLASSIFIED_PAYOUTS_CACHE and not _CLASSIFIED_PAYOUTS_CACHE[cid].empty:
-            return _CLASSIFIED_PAYOUTS_CACHE[cid]
+            if _CACHE_PAYOUTS_MTIME.get(cid, 0.0) == cur_mtime and cur_mtime > 0.0:
+                return _CLASSIFIED_PAYOUTS_CACHE[cid]
 
         try:
             df_p = load_payouts_data(force_reload=force_reload, company_id=cid)
@@ -387,13 +401,28 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
 
                 for idx, (cn, cc) in enumerate(zip(c_keys, code_keys)):
                     entry = rule_dict.get(cn, {})
-                    raw_new_code = entry.get("code") or LEGACY_PAYOUT_CODE_MAP.get(cc, cc)
+                    entry_code = entry.get("code")
+                    clean_cc = str(cc).strip().upper() if pd.notna(cc) else ""
+                    if clean_cc in ["NAN", "NONE", "NULL", "", "UNASSIGNED"]:
+                        clean_cc = None
+                    raw_new_code = entry_code or (LEGACY_PAYOUT_CODE_MAP.get(clean_cc, clean_cc) if clean_cc else "Unassigned")
                     new_code = LEGACY_PAYOUT_CODE_MAP.get(raw_new_code, raw_new_code)
+                    if str(new_code).strip().upper() in ["NAN", "NONE", "NULL", "", "UNASSIGNED"]:
+                        new_code = "Unassigned"
                     
                     heading = entry.get("heading") or df.iloc[idx]["heading"]
                     sub_heading = entry.get("sub_heading") or df.iloc[idx]["sub_heading"]
                     country = entry.get("country") or df.iloc[idx]["country"]
                     zakat = entry.get("zakat_eligibility") or df.iloc[idx]["zakat"]
+
+                    if str(heading).strip().upper() in ["NAN", "NONE", "NULL", ""]:
+                        heading = "Unassigned"
+                    if str(sub_heading).strip().upper() in ["NAN", "NONE", "NULL", ""]:
+                        sub_heading = "Unassigned"
+                    if str(country).strip().upper() in ["NAN", "NONE", "NULL", ""]:
+                        country = "Unassigned"
+                    if str(zakat).strip().upper() in ["NAN", "NONE", "NULL", ""]:
+                        zakat = "Unassigned"
 
                     updated_codes.append(fix_mojibake(new_code))
                     updated_headings.append(fix_mojibake(heading))
@@ -413,9 +442,11 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["Zakat Eligibility"] = updated_zakats
 
                 _CLASSIFIED_PAYOUTS_CACHE[cid] = df
+                _CACHE_PAYOUTS_MTIME[cid] = cur_mtime
                 return _CLASSIFIED_PAYOUTS_CACHE[cid]
 
             _CLASSIFIED_PAYOUTS_CACHE[cid] = pd.DataFrame()
+            _CACHE_PAYOUTS_MTIME[cid] = cur_mtime
             return _CLASSIFIED_PAYOUTS_CACHE[cid]
         except Exception as e:
             print(f"[Error] Reading cached launchgood payout data: {e}")
@@ -636,16 +667,14 @@ def get_payouts_summary(
 
         df = df_all.copy()
 
-        # Currency Filter
-        if curr_selected in ["GBP", "USD"]:
-            df = df[df["settlement_currency"] == curr_selected]
-        else:
-            curr_selected = "ALL"
-
         # Batch / Transfer ID Filter
         if target_batch and target_batch.upper() != "ALL":
             target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
             df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+        elif curr_selected in ["GBP", "USD"]:
+            df = df[df["settlement_currency"] == curr_selected]
+        else:
+            curr_selected = "ALL"
 
         # Pre-status filter metrics for active batch/cycle
         batch_total_tx = int(len(df))
@@ -913,12 +942,11 @@ def get_campaign_payout_breakdown(
                 "batch": target_batch
             }
 
-        if curr_selected in ["GBP", "USD"]:
-            df = df[df["settlement_currency"] == curr_selected]
-
         if target_batch and target_batch.upper() != "ALL":
             target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
             df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+        elif curr_selected in ["GBP", "USD"]:
+            df = df[df["settlement_currency"] == curr_selected]
 
         # Status filter
         if status_filter in ["Paid", "Unpaid"]:
@@ -1257,14 +1285,12 @@ def get_payout_donors(
 
         df = df_all.copy()
 
-        # Currency Filter
-        if curr_selected in ["GBP", "USD"]:
-            df = df[df["settlement_currency"] == curr_selected]
-
         # Batch / Transfer ID Filter
         if target_batch and target_batch.upper() != "ALL":
             target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
             df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+        elif curr_selected in ["GBP", "USD"]:
+            df = df[df["settlement_currency"] == curr_selected]
 
         # Status Filter
         if status_filter in ["Paid", "Unpaid"]:

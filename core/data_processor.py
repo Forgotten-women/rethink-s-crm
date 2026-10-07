@@ -1782,34 +1782,119 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
 
     elif is_givebright:
         df["Platform"] = "GiveBright"
-        col_map = {
+        gb_aliases = {
+            "id": "Donation ID",
+            "_id": "Donation ID",
             "donation_id": "Donation ID",
+            "donation id": "Donation ID",
+            "transaction_id": "Donation ID",
+            "transaction id": "Donation ID",
+            "reference": "Donation ID",
+            "campaign": "Campaign Name",
             "campaign_name": "Campaign Name",
+            "campaign name": "Campaign Name",
             "fundraiser_by": "Community Name",
+            "fundraiser by": "Community Name",
+            "fundraiser_name": "fundraiser_name",
+            "fundraiser": "fundraiser_name",
             "campaign_url": "Campaign URL",
             "fundraiser_url": "Fundraiser URL",
             "url": "Campaign URL",
             "amount": "Donation Amount in Project Currency (May be approx.)",
+            "gross_amount": "Total Online Donation Gross Amount in Settled Currency",
+            "gross amount": "Total Online Donation Gross Amount in Settled Currency",
+            "net_amount": "Total Online Donations Net Amount in Settled Currency",
+            "net amount": "Total Online Donations Net Amount in Settled Currency",
+            "fee": "fee_amount",
+            "fees": "fee_amount",
+            "fee_amount": "fee_amount",
             "currency": "Donation Currency (DC)",
+            "currency_code": "Donation Currency (DC)",
+            "currency code": "Donation Currency (DC)",
             "is_anonymous": "Anonymous or Public",
+            "anonymous": "Anonymous or Public",
+            "anonymous?": "Anonymous or Public",
+            "is_giftaid": "Gift Aid (yes or no)",
+            "giftaid": "Gift Aid (yes or no)",
+            "gift_aid": "Gift Aid (yes or no)",
+            "gift aid": "Gift Aid (yes or no)",
+            "gift aid?": "Gift Aid (yes or no)",
             "country": "Billing Country",
+            "billing_country": "Billing Country",
+            "billing country": "Billing Country",
             "first_name": "First Name",
+            "first name": "First Name",
+            "firstname": "First Name",
             "last_name": "Last Name",
+            "last name": "Last Name",
+            "lastname": "Last Name",
+            "surname": "Last Name",
             "email": "Email",
+            "email_address": "Email",
+            "email address": "Email",
+            "phone": "Phone Number",
+            "phone_number": "Phone Number",
             "impact_name": "Giving Level Title",
             "impact_amount": "Giving Level Amount",
             "giving_level": "Giving Level Title",
             "giving_levels": "Giving Level Title",
+            "giving level": "Giving Level Title",
             "giving_level_title": "Giving Level Title",
+            "giving level title": "Giving Level Title",
             "variant": "Giving Level Title",
-            "option": "Giving Level Title"
+            "option": "Giving Level Title",
+            "optin": "Marketing Consent",
+            "opt_in": "Marketing Consent",
+            "opt-in": "Marketing Consent",
+            "marketing_consent": "Marketing Consent",
+            "frequency": "Payment Frequency",
+            "status": "Status"
         }
-        df.rename(columns=col_map, inplace=True)
+        rename_map = {}
+        for c in df.columns:
+            c_norm = str(c).strip().lower()
+            if c_norm in gb_aliases and gb_aliases[c_norm] not in df.columns and gb_aliases[c_norm] not in rename_map.values():
+                rename_map[c] = gb_aliases[c_norm]
+        if rename_map:
+            df.rename(columns=rename_map, inplace=True)
+
         if "Giving Level Title" not in df.columns:
             for cand in ["impact_name", "giving_level", "giving_levels", "giving_level_title", "variant", "option"]:
                 if cand in df.columns:
                     df["Giving Level Title"] = df[cand]
                     break
+
+        if "Donation ID" not in df.columns:
+            for cand in ["_id", "id", "ID", "donation_id", "Customer Ref"]:
+                if cand in df.columns:
+                    df["Donation ID"] = df[cand].astype(str)
+                    break
+
+        # Standardize Amounts
+        if "Total Online Donation Gross Amount in Settled Currency" not in df.columns:
+            if "Donation Amount in Project Currency (May be approx.)" in df.columns:
+                df["Total Online Donation Gross Amount in Settled Currency"] = pd.to_numeric(df["Donation Amount in Project Currency (May be approx.)"], errors="coerce").fillna(0.0)
+            elif "Amount" in df.columns:
+                df["Total Online Donation Gross Amount in Settled Currency"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+                df["Donation Amount in Project Currency (May be approx.)"] = df["Total Online Donation Gross Amount in Settled Currency"]
+
+        if "Total Online Donations Net Amount in Settled Currency" not in df.columns:
+            if "fee_amount" in df.columns:
+                fees = pd.to_numeric(df["fee_amount"], errors="coerce").fillna(0.0)
+                gross = pd.to_numeric(df.get("Total Online Donation Gross Amount in Settled Currency", 0.0), errors="coerce").fillna(0.0)
+                df["Total Online Donations Net Amount in Settled Currency"] = gross - fees
+            else:
+                df["Total Online Donations Net Amount in Settled Currency"] = df.get("Total Online Donation Gross Amount in Settled Currency", 0.0)
+
+        if "Donation Amount (in Donation Currency)" not in df.columns and "Total Online Donation Gross Amount in Settled Currency" in df.columns:
+            df["Donation Amount (in Donation Currency)"] = df["Total Online Donation Gross Amount in Settled Currency"]
+
+        # Settlement Currency
+        if "Settlement Currency" not in df.columns:
+            if "Donation Currency (DC)" in df.columns:
+                df["Settlement Currency"] = df["Donation Currency (DC)"]
+            else:
+                df["Settlement Currency"] = "GBP"
 
         if "subscription_id" in df.columns:
             df["Payment Frequency"] = df["subscription_id"].apply(
@@ -1830,8 +1915,14 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
 
             df["Billing Country"] = df["Billing Country"].apply(safe_country)
 
-        if "created_at" in df.columns:
-            c_at_str = df["created_at"].fillna("").astype(str).str.strip()
+        # Dates resolution
+        date_col = None
+        for cand in ["created_at", "Created At", "created at", "Date", "date", "Created Date", "Timestamp"]:
+            if cand in df.columns:
+                date_col = cand
+                break
+        if date_col and "Created Date (UTC)" not in df.columns:
+            c_at_str = df[date_col].fillna("").astype(str).str.strip()
             slash_m = c_at_str.str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?")
             has_slash = slash_m[0].notna() & slash_m[1].notna() & slash_m[2].notna()
             if has_slash.any():
@@ -1844,13 +1935,13 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                 df.loc[has_slash, "Created Time (UTC)"] = time_h + ":" + time_m + ":" + time_s
             non_slash = ~has_slash
             if non_slash.any():
-                parsed = pd.to_datetime(df.loc[non_slash, "created_at"], errors="coerce", dayfirst=True)
+                parsed = pd.to_datetime(df.loc[non_slash, date_col], errors="coerce", dayfirst=True)
                 df.loc[non_slash, "Created Date (UTC)"] = parsed.dt.date.astype(str)
                 df.loc[non_slash, "Created Time (UTC)"] = parsed.dt.time.astype(str)
 
         # Vectorized classification rule mapping for GiveBright with dual-tier (campaign + giving_level) lookup
         init_classification_db()
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        conn = get_db_connection(timeout=60.0)
         try:
             db_matrix = pd.read_sql_query("SELECT * FROM givebright_classifications WHERE LOWER(company_id) = ?", conn, params=(target_cid,))
             rule_dict_gl = {}
@@ -1912,7 +2003,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                         new_rules.append((target_cid, "givebright", cn, "", "Unassigned", curl, 1))
 
             if new_rules:
-                conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+                conn = get_db_connection(timeout=60.0)
                 try:
                     conn.executemany("""
                         INSERT OR IGNORE INTO platform_campaign_mappings (company_id, platform, campaign_name, giving_level, code, campaign_url, is_primary)
@@ -2323,9 +2414,16 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
 
     df = None
     if is_csv:
-        try:
-            df = pd.read_csv(file_buffer)
-        except Exception:
+        read_success = False
+        for enc in ['utf-8-sig', 'utf-8', 'latin1', 'cp1252']:
+            try:
+                file_buffer.seek(0)
+                df = pd.read_csv(file_buffer, encoding=enc, on_bad_lines='skip')
+                read_success = True
+                break
+            except Exception:
+                continue
+        if not read_success:
             file_buffer.seek(0)
             try:
                 sheets_dict = pd.read_excel(file_buffer, sheet_name=None)
@@ -2345,10 +2443,15 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
             df = pd.concat(list_of_dfs, ignore_index=True)
         except Exception:
             file_buffer.seek(0)
-            try:
-                df = pd.read_csv(file_buffer)
-            except Exception as ex:
-                raise ValueError(f"Could not parse uploaded Excel/CSV file: {ex}")
+            for enc in ['utf-8-sig', 'utf-8', 'latin1', 'cp1252']:
+                try:
+                    file_buffer.seek(0)
+                    df = pd.read_csv(file_buffer, encoding=enc, on_bad_lines='skip')
+                    break
+                except Exception:
+                    continue
+            if df is None or df.empty:
+                raise ValueError("Could not parse uploaded Excel/CSV file.")
 
     if df is None or df.empty:
         raise ValueError("Uploaded file contains no valid data rows.")
@@ -2380,6 +2483,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
     sync_donors_to_classification_matrix(df_new, company_id=target_cid)
 
     # Merge or Replace dataset with strict company isolation (other companies' data is NEVER touched)
+    df_to_add = df_new
     if os.path.exists(PARQUET_PATH):
         try:
             existing_df = pd.read_parquet(PARQUET_PATH)
@@ -2392,40 +2496,90 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
                 same_comp_df = existing_df[existing_df["company_id"].astype(str).str.lower() == target_cid]
 
                 if upload_mode in ["merge", "append"]:
-                    df_combined_target = pd.concat([same_comp_df, df_new], ignore_index=True)
-                    if "Donation ID" in df_combined_target.columns:
-                        valid_mask = df_combined_target["Donation ID"].notna() & (~df_combined_target["Donation ID"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "n/a", "<na>"]))
-                        df_valid = df_combined_target[valid_mask].drop_duplicates(subset=["Donation ID"], keep="last")
-                        df_invalid = df_combined_target[~valid_mask]
-                        df_target_final = pd.concat([df_valid, df_invalid], ignore_index=True)
+                    # Deduplicate within df_new itself
+                    if "Donation ID" in df_new.columns:
+                        val_m = df_new["Donation ID"].notna() & (~df_new["Donation ID"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "n/a", "<na>"]))
+                        df_new_valid = df_new[val_m].drop_duplicates(subset=["Donation ID"], keep="first")
+                        df_new_invalid = df_new[~val_m]
+                        df_new_dedup = pd.concat([df_new_valid, df_new_invalid], ignore_index=True)
+
+                        existing_ids = set()
+                        if not same_comp_df.empty and "Donation ID" in same_comp_df.columns:
+                            existing_ids = set(same_comp_df["Donation ID"].dropna().astype(str).str.strip().str.lower())
+                            existing_ids = {i for i in existing_ids if i not in ["", "nan", "none", "n/a", "<na>"]}
+
+                        # Existing rows are ignored/preserved, NEVER deleted or overwritten
+                        if existing_ids:
+                            new_mask = ~df_new_dedup["Donation ID"].astype(str).str.strip().str.lower().isin(existing_ids)
+                            df_to_add = df_new_dedup[new_mask].copy()
+                        else:
+                            df_to_add = df_new_dedup
                     else:
-                        df_target_final = df_combined_target
+                        df_to_add = df_new
+
+                    if not df_to_add.empty:
+                        df_target_final = pd.concat([same_comp_df, df_to_add], ignore_index=True)
+                    else:
+                        df_target_final = same_comp_df
                 else:
                     # Replace mode: replaces ONLY this company's donations
+                    df_to_add = df_new
                     df_target_final = df_new
 
                 df_save = pd.concat([other_comp_df, df_target_final], ignore_index=True)
             else:
+                df_to_add = df_new
                 df_save = df_new
         except Exception as e:
             print(f"[Merge Data Notice]: {e}")
+            df_to_add = df_new
             df_save = df_new
     else:
+        df_to_add = df_new
         df_save = df_new
 
     df_save = sanitize_df_dtypes_for_parquet(df_save)
-    df_save.to_parquet(PARQUET_PATH, index=False)
+    atomic_write_parquet(df_save, PARQUET_PATH)
 
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-    df_save.to_sql("donations", con=conn, if_exists="replace", index=False, chunksize=5000)
     try:
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_campaign_name ON donations ([Campaign Name]);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_fundraiser_name ON donations (fundraiser_name);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_code ON donations (Code);')
-        conn.commit()
-    except Exception:
-        pass
-    conn.close()
+        conn = get_db_connection(timeout=60.0)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='donations'")
+        table_exists = cur.fetchone() is not None
+
+        if not table_exists:
+            df_save.to_sql("donations", con=conn, if_exists="replace", index=False, chunksize=5000)
+        else:
+            cur.execute("PRAGMA table_info(donations)")
+            existing_cols = {r[1] for r in cur.fetchall()}
+            for col in df_new.columns:
+                if col not in existing_cols:
+                    try:
+                        conn.execute(f'ALTER TABLE donations ADD COLUMN [{col}] TEXT;')
+                        existing_cols.add(col)
+                    except Exception:
+                        pass
+
+            if upload_mode in ["merge", "append"]:
+                # Existing rows are NOT deleted; duplicate IDs are simply ignored.
+                # Only insert new rows that do not already exist in the database.
+                if not df_to_add.empty:
+                    df_to_add.to_sql("donations", con=conn, if_exists="append", index=False, chunksize=2000)
+            else:
+                # Replace mode: replaces this company's donations
+                conn.execute('DELETE FROM donations WHERE LOWER(COALESCE(company_id, "rethink")) = ?', (target_cid,))
+                df_new.to_sql("donations", con=conn, if_exists="append", index=False, chunksize=2000)
+
+        try:
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_campaign_name ON donations ([Campaign Name]);')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_fundraiser_name ON donations (fundraiser_name);')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_donations_code ON donations (Code);')
+            conn.commit()
+        except Exception:
+            pass
+        conn.close()
+    except Exception as e:
+        print(f"[Upload SQLite Update Notice]: {e}")
 
     # Automatically synchronize fundraiser assigned campaigns for newly uploaded donations
     try:
@@ -2446,7 +2600,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
 
     return {
         "status": "success",
-        "added": len(df_new),
+        "added": len(df_to_add),
         "total_records": len(df_save)
     }
 
@@ -2589,11 +2743,14 @@ def process_payout_settlement_upload(df_raw, source_name="LaunchGood Payout.xlsx
         df_save = df_new
 
     df_save = sanitize_df_dtypes_for_parquet(df_save)
-    df_save.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
+    atomic_write_parquet(df_save, PAYOUTS_PARQUET_PATH)
 
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-    df_save.to_sql("payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
-    conn.close()
+    try:
+        conn = get_db_connection(timeout=60.0)
+        df_save.to_sql("payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
+        conn.close()
+    except Exception as e:
+        print(f"[Payout Settlement DB Save Notice]: {e}")
 
     # 3. Fast Vectorized Update on raw donor records in Parquet and SQLite DB (< 0.5s)
     try:
@@ -2772,11 +2929,14 @@ def process_paysuite_payout_settlement_upload(df_enriched, source_name="Paysuite
         df_save = df_ps
 
     df_save = sanitize_df_dtypes_for_parquet(df_save)
-    df_save.to_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH, index=False)
+    atomic_write_parquet(df_save, PAYSUITE_PAYOUTS_PARQUET_PATH)
 
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-    df_save.to_sql("paysuite_payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
-    conn.close()
+    try:
+        conn = get_db_connection(timeout=60.0)
+        df_save.to_sql("paysuite_payout_settlements", con=conn, if_exists="replace", index=False, chunksize=5000)
+        conn.close()
+    except Exception as e:
+        print(f"[Paysuite Payout Settlement DB Save Notice]: {e}")
 
     invalidate_paysuite_payouts_cache()
     load_paysuite_payouts_data(force_reload=True)
@@ -3213,6 +3373,7 @@ def load_payouts_data(force_reload: bool = False, company_id: Optional[str] = No
                     if "company_id" not in df.columns:
                         df["company_id"] = "rethink"
                     _CACHED_PAYOUTS_DF = df
+                    _CACHE_PAYOUTS_MTIME = current_mtime
                     return _filter_cached_by_company(_CACHED_PAYOUTS_DF, company_id)
             except Exception as e:
                 print(f"[CACHE NOTICE] Payouts parquet read fallback: {e}")
@@ -3546,7 +3707,6 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
                     COALESCE(NULLIF(TRIM("Campaign Name"), ''), 'N/A') as "Campaign Name",
                     CASE 
                         WHEN "Giving Level Title" IS NOT NULL AND LOWER(TRIM("Giving Level Title")) NOT IN ('', 'nan', 'none', 'null', 'n/a') THEN TRIM("Giving Level Title")
-                        WHEN "Giving Levels" IS NOT NULL AND LOWER(TRIM("Giving Levels")) NOT IN ('', 'nan', 'none', 'null', 'n/a') THEN TRIM("Giving Levels")
                         ELSE ''
                     END as "Giving Level",
                     COALESCE(NULLIF(TRIM("Code"), ''), 'Unassigned') as "Code",

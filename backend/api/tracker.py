@@ -1303,10 +1303,19 @@ def search_any_donor(
                 break
         phone_col = df[phone_col_name].fillna("").astype(str).str.lstrip("'") if phone_col_name else pd.Series("", index=df.index)
 
+        id_cols_to_check = [did_col]
+        for idc in ["Donation ID", "charge_id", "_id", "subscription_id", "sub_id", "Transfer ID", "campaign_uid"]:
+            if idc in df.columns:
+                id_cols_to_check.append(df[idc].fillna("").astype(str))
+
+        id_mask = pd.Series(False, index=df.index)
+        for icol in id_cols_to_check:
+            id_mask |= icol.str.contains(q_low, case=False, na=False)
+
         search_mask = (
             name_col.str.contains(q_low, case=False, na=False) |
             email_col.str.contains(q_low, case=False, na=False) |
-            did_col.str.contains(q_low, case=False, na=False)
+            id_mask
         )
         if clean_q_digits and len(clean_q_digits) >= 3:
             clean_phone_series = phone_col.str.replace(r"\D", "", regex=True)
