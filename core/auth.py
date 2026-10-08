@@ -11,7 +11,40 @@ from jose import JWTError, jwt
 from config.settings import LOCAL_DB_PATH, SUPABASE_KEY, SUPABASE_URL
 
 # JWT Configuration
-JWT_SECRET = os.environ.get("JWT_SECRET") or os.environ.get("APP_SECRET_KEY", "RethinkCharityCRM_SecretKey_2026!")
+def _load_jwt_secret() -> str:
+    """Env secret if set; otherwise a random secret persisted (0600) next to the DB.
+    Never fall back to a hard-coded value: anyone reading the source could forge tokens."""
+    env_secret = os.environ.get("JWT_SECRET") or os.environ.get("APP_SECRET_KEY")
+    if env_secret:
+        return env_secret
+    secret_path = os.path.join(os.path.dirname(os.path.abspath(LOCAL_DB_PATH)), ".jwt_secret")
+    try:
+        with open(secret_path, "r", encoding="utf-8") as f:
+            existing = f.read().strip()
+            if existing:
+                return existing
+    except FileNotFoundError:
+        pass
+    import secrets
+    new_secret = secrets.token_urlsafe(48)
+    try:
+        fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another worker created it first; use theirs so all workers agree.
+        import time
+        for _ in range(20):
+            with open(secret_path, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+            if existing:
+                return existing
+            time.sleep(0.05)
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(new_secret)
+    return new_secret
+
+
+JWT_SECRET = _load_jwt_secret()
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 

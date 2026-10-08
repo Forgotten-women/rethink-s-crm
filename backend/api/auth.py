@@ -1,8 +1,11 @@
+import logging
+import os
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
+from core.event_log import log_event
 from core.auth import (
     authenticate_user,
     change_user_password,
@@ -14,35 +17,36 @@ from core.auth import (
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 security_bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger("auth")
 
 
-async def get_current_user(
-    request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
-    user_identity: Optional[str] = Query(None)
-) -> Dict[str, Any]:
-    """
-    Dependency that resolves the authenticated user.
-    1. Verifies JWT Bearer token when provided (via credentials or Authorization header).
-    2. Fallback to X-User-Email / X-User-Identity / X-User-Role headers.
-    3. Fallback to user_identity / user_email query parameters.
-    4. Fallback to JSON request body (user_identity, user_email, email, username, user_role).
-    """
-    token_str = None
-    if credentials and credentials.credentials:
-        token_str = credentials.credentials
-    elif request:
-        auth_hdr = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-        if auth_hdr.strip().lower().startswith("bearer "):
-            token_str = auth_hdr.strip()[7:].strip()
+def _legacy_auth_fallback_enabled() -> bool:
+    """Header/query/body identity fallbacks are spoofable (no password, no signature).
+    Off by default; set LEGACY_AUTH_FALLBACK=1 only as a temporary escape hatch."""
+    return os.environ.get("LEGACY_AUTH_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
-    if token_str:
-        payload = decode_access_token(token_str)
-        if payload and "sub" in payload:
-            user = get_user_by_identity(payload["sub"])
-            if user:
-                return user
 
+def _user_from_claims(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Builds a session user from verified JWT claims (e.g. Supabase-backed accounts
+    that have no row in the local users table)."""
+    role = payload.get("role") or "admin"
+    is_super = role == "super_admin"
+    return {
+        "id": None,
+        "username": payload.get("username") or str(payload["sub"]).split("@")[0],
+        "email": payload["sub"],
+        "role": role,
+        "can_edit_donors": 1 if is_super else 0,
+        "can_edit_matrix": 1 if is_super else 0,
+        "can_manage_tags": 1 if is_super else 0,
+        "can_purge_data": 1 if is_super else 0,
+        "allowed_companies": payload.get("allowed_companies") or ["ALL"],
+        "provider": "token",
+    }
+
+
+async def _resolve_legacy_identity(request: Request, user_identity: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Pre-JWT identity resolution kept only behind LEGACY_AUTH_FALLBACK."""
     # Fallback 1: Custom Headers
     if request:
         hdr_identity = (
@@ -129,16 +133,79 @@ async def get_current_user(
         except Exception:
             pass
 
+    return None
+
+
+async def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
+    user_identity: Optional[str] = Query(None)
+) -> Dict[str, Any]:
+    """
+    Dependency that resolves the authenticated user from a signed JWT Bearer token.
+    Unsigned identity hints (X-User-* headers, user_identity query/body, user_role)
+    are ignored unless LEGACY_AUTH_FALLBACK is enabled.
+    """
+    token_str = None
+    if credentials and credentials.credentials:
+        token_str = credentials.credentials
+    elif request:
+        auth_hdr = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+        if auth_hdr.strip().lower().startswith("bearer "):
+            token_str = auth_hdr.strip()[7:].strip()
+
     if token_str:
+        payload = decode_access_token(token_str)
+        if payload and payload.get("sub"):
+            return get_user_by_identity(payload["sub"]) or _user_from_claims(payload)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session token has expired or is invalid. Please log in again."
         )
 
+    if _legacy_auth_fallback_enabled():
+        user = await _resolve_legacy_identity(request, user_identity)
+        if user:
+            logger.warning(
+                "LEGACY_AUTH_FALLBACK used for %s %s (resolved %s). Send a Bearer token instead.",
+                request.method if request else "?", request.url.path if request else "?", user.get("email")
+            )
+            return user
+
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Authentication credentials were not provided."
     )
+
+
+def user_company_ids(user: Dict[str, Any]) -> Optional[set]:
+    """Companies a user may access; None means all (super admin or ["ALL"])."""
+    if user.get("role") == "super_admin":
+        return None
+    allowed = user.get("allowed_companies") or ["ALL"]
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    normalized = {str(c).strip().lower() for c in allowed if str(c).strip()}
+    if not normalized or "all" in normalized:
+        return None
+    return normalized
+
+
+def require_company_access(user: Dict[str, Any], company_id: Optional[str]) -> str:
+    """Raises 403 unless the user may act for company_id. 'all' requires access to every company.
+    Returns the normalized company id."""
+    comp = (company_id or "").strip().lower()
+    if not comp:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="company_id is required.")
+    allowed = user_company_ids(user)
+    if allowed is None:
+        return comp
+    if comp == "all" or comp not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Your account does not have access to company '{comp}'."
+        )
+    return comp
 
 
 def require_super_admin(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
@@ -177,6 +244,8 @@ def login_endpoint(payload: LoginRequest):
         )
     user = authenticate_user(user_id, payload.password)
     if not user:
+        log_event("auth.login_failed", category="security", level="warning", actor=user_id,
+                  message=f"Failed login for {user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials or user not found."
@@ -189,6 +258,8 @@ def login_endpoint(payload: LoginRequest):
         "role": user["role"]
     }
     access_token = create_access_token(token_claims)
+    log_event("auth.login", category="security", actor=user["email"], role=user["role"],
+              message=f"{user['email']} logged in")
 
     return {
         "status": "success",

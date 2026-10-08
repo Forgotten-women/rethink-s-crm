@@ -28,6 +28,7 @@ import {
   Sparkles
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
 
 // Robust frontend text cleaner to repair mojibake / corrupted UTF-8 and strip zero-width characters
 function cleanText(val) {
@@ -186,6 +187,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         legacy_non_zakat_code: '',
         legacy_zakat_code: '',
         old_codes: '',
+        special_treatment: '',
         description: '',
         is_active: 1,
         project_status: 'Continuing'
@@ -209,6 +211,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         legacy_non_zakat_code: rule.legacy_non_zakat_code || rule['Legacy Non-Zakat GL Code'] || '',
         legacy_zakat_code: rule.legacy_zakat_code || rule['Legacy Zakat GL Code'] || '',
         old_codes: rule.old_codes || rule['Old Code(s)'] || '',
+        special_treatment: rule.special_treatment || rule['Special Treatment'] || '',
         description: rule.description || rule['Description'] || '',
         is_active: rule.is_active !== undefined ? rule.is_active : 1,
         project_status: rule.project_status || rule['Project Status'] || 'Continuing'
@@ -270,6 +273,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           legacy_non_zakat_code: masterCodeModal.data.legacy_non_zakat_code || '',
           legacy_zakat_code: masterCodeModal.data.legacy_zakat_code || '',
           old_codes: masterCodeModal.data.old_codes || '',
+          special_treatment: masterCodeModal.data.special_treatment || '',
           description: masterCodeModal.data.description || '',
           is_active: masterCodeModal.data.is_active !== undefined ? masterCodeModal.data.is_active : 1,
           project_status: masterCodeModal.data.project_status || 'Continuing'
@@ -368,6 +372,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             'Legacy Non-Zakat GL Code': cleanText(r.legacy_non_zakat_code || ''),
             'Legacy Zakat GL Code': cleanText(r.legacy_zakat_code || ''),
             'Old Code(s)': cleanText(r.old_codes || ''),
+            'Special Treatment': cleanText(r.special_treatment || r['Special Treatment'] || ''),
             'Description': cleanText(r.description || ''),
             'Campaign Count': r.campaign_count || 0,
             'Total Raised': r.total_raised || 0,
@@ -393,26 +398,32 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     fetch(`${API_BASE_URL}/api/classifications/${platform}?company_id=${encodeURIComponent(activeCompany)}`)
       .then(res => res.json())
       .then(data => {
-        let rules = (data.rules || []).map((r, i) => ({
-          ...r,
-          _row_id: `${r['Campaign Name'] || r['campaign_name']}__${r['Giving Level'] || r['giving_level'] || ''}__${r['Code'] || r['code'] || i}__${i}`,
-          'Campaign Name': cleanText(r['Campaign Name']),
-          'Giving Level': cleanText(r['Giving Level'] || r['giving_level'] || ''),
-          'Community Name': cleanText(r['Community Name']),
-          'Donor Name': cleanText(r['Donor Name'] || r['donor_name'] || ''),
-          'Donor Email': cleanText(r['Donor Email'] || r['donor_email'] || ''),
-          'Department': cleanText(r['Department'] || r['Heading']),
-          'Office': cleanText(r['Office'] || r['Sub-Heading']),
-          'Portfolio': cleanText(r['Portfolio'] || ''),
-          'Heading': cleanText(r['Department'] || r['Heading']),
-          'Sub-Heading': cleanText(r['Office'] || r['Sub-Heading']),
-          'Country': cleanText(r['Country']),
-          'Code': cleanText(r['Code']),
-          'Zakat Eligibility': cleanText(r['Zakat Eligibility']),
-          'Campaign URL': r['Campaign URL'] || r['campaign_url'] || '',
-          'donation_count': r.donation_count || 0,
-          'total_amount': r.total_amount || 0
-        }));
+        let rules = (data.rules || []).map((r, i) => {
+          const rawSpec = cleanText(r['Special Case'] || r['special_case'] || '');
+          const cleanSpec = canonicalizeSpecialCase(rawSpec);
+          return {
+            ...r,
+            _row_id: `${r['Campaign Name'] || r['campaign_name']}__${r['Giving Level'] || r['giving_level'] || ''}__${r['Code'] || r['code'] || i}__${i}`,
+            'Campaign Name': cleanText(r['Campaign Name']),
+            'Giving Level': cleanText(r['Giving Level'] || r['giving_level'] || ''),
+            'Community Name': cleanText(r['Community Name']),
+            'Donor Name': cleanText(r['Donor Name'] || r['donor_name'] || ''),
+            'Donor Email': cleanText(r['Donor Email'] || r['donor_email'] || ''),
+            'Department': cleanText(r['Department'] || r['Heading']),
+            'Office': cleanText(r['Office'] || r['Sub-Heading']),
+            'Portfolio': cleanText(r['Portfolio'] || ''),
+            'Heading': cleanText(r['Department'] || r['Heading']),
+            'Sub-Heading': cleanText(r['Office'] || r['Sub-Heading']),
+            'Country': cleanText(r['Country']),
+            'Code': cleanText(r['Code']),
+            'Special Case': cleanSpec,
+            'Special Treatment': cleanText(r['Special Treatment'] || r['special_treatment'] || ''),
+            'Zakat Eligibility': cleanText(r['Zakat Eligibility']),
+            'Campaign URL': r['Campaign URL'] || r['campaign_url'] || '',
+            'donation_count': r.donation_count || 0,
+            'total_amount': r.total_amount || 0
+          };
+        });
 
         setMatrixData({
           ...data,
@@ -434,22 +445,77 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     loadMatrixData();
   }, [platform, activeCompany]);
 
-  // Dynamic list of all known unique codes (from central code map + active rules + any newly typed codes)
+  // Dynamic list of all known unique codes (from central code map + active rules + smart case variants)
   const knownCodes = useMemo(() => {
-    const codeSet = new Set();
+    const codeMapCanonical = new Map();
+
+    const addCode = (raw) => {
+      if (!raw) return;
+      const str = String(raw).trim();
+      if (!str || ['UNASSIGNED', 'N/A', 'NONE', 'NAN', ''].includes(str.toUpperCase())) return;
+
+      const bracketMatch = str.match(/^([A-Za-z0-9_-]+)\s*\[(.*?)\]$/);
+      if (bracketMatch) {
+        const base = bracketMatch[1].trim().toUpperCase();
+        const sc = canonicalizeSpecialCase(bracketMatch[2]);
+        const key = `${base.toLowerCase()} [${sc.toLowerCase()}]`;
+        if (!codeMapCanonical.has(key)) {
+          codeMapCanonical.set(key, `${base} [${sc}]`);
+        }
+        if (!codeMapCanonical.has(base.toLowerCase())) {
+          codeMapCanonical.set(base.toLowerCase(), base);
+        }
+      } else {
+        const base = str.toUpperCase();
+        if (!codeMapCanonical.has(base.toLowerCase())) {
+          codeMapCanonical.set(base.toLowerCase(), base);
+        }
+      }
+    };
+
+    // 1. Central code dictionary
     Object.keys(codeMap || {}).forEach(c => {
-      const clean = String(c).trim().toUpperCase();
-      if (clean && !['UNASSIGNED', 'N/A', 'NONE', 'NAN', ''].includes(clean)) {
-        codeSet.add(clean);
+      const item = codeMap[c];
+      const base = (item?.['Code'] || item?.['Display Code'] || c).trim().toUpperCase();
+      addCode(base);
+      if (item && Array.isArray(item['Special Cases'])) {
+        item['Special Cases'].forEach(sc => {
+          if (sc) addCode(`${base} [${canonicalizeSpecialCase(sc)}]`);
+        });
+      }
+      if (item && item['Special Case']) {
+        addCode(`${base} [${canonicalizeSpecialCase(item['Special Case'])}]`);
       }
     });
+
+    // 2. Active classification matrix rules
     (matrixData?.rules || []).forEach(r => {
-      const cd = String(r['Code'] || r['code'] || '').trim().toUpperCase();
-      if (cd && !['UNASSIGNED', 'N/A', 'NONE', 'NAN', ''].includes(cd)) {
-        codeSet.add(cd);
-      }
+      const cd = String(r['Code'] || r['code'] || '').trim();
+      addCode(cd);
     });
-    return Array.from(codeSet).sort();
+
+    // 3. For all known base codes, add Sheet10 special cases variants
+    const baseCodes = Array.from(codeMapCanonical.values()).filter(c => !c.includes('['));
+    baseCodes.forEach(base => {
+      ALL_SHEET10_SPECIAL_CASES.forEach(sc => {
+        const key = `${base.toLowerCase()} [${sc.toLowerCase()}]`;
+        if (!codeMapCanonical.has(key)) {
+          codeMapCanonical.set(key, `${base} [${sc}]`);
+        }
+      });
+    });
+
+    return Array.from(codeMapCanonical.values()).sort((a, b) => {
+      const aBase = a.split(' ')[0];
+      const bBase = b.split(' ')[0];
+      if (aBase === bBase) {
+        const aIsBracket = a.includes('[');
+        const bIsBracket = b.includes('[');
+        if (!aIsBracket && bIsBracket) return -1;
+        if (aIsBracket && !bIsBracket) return 1;
+      }
+      return a.localeCompare(b);
+    });
   }, [codeMap, matrixData?.rules]);
 
   // Dynamic cell change handler with Code -> Classification Auto-Fill & Same-Code Auto-Propagation
@@ -457,13 +523,44 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     if (!isSuperAdmin) return;
     const valClean = cleanText(value);
 
+    // 0. If user is changing Special Case on a row:
+    if (field === 'Special Case') {
+      const canonCase = canonicalizeSpecialCase(valClean);
+      setMatrixData(prev => {
+        const targetRow = (prev.rules || []).find(r => r._row_id === rowId);
+        const targetCampaign = cleanText(targetRow?.['Campaign Name'] || targetRow?.campaign_name || '').trim().toLowerCase();
+        return {
+          ...prev,
+          rules: (prev.rules || []).map(r => {
+            const rCamp = cleanText(r['Campaign Name'] || r.campaign_name || '').trim().toLowerCase();
+            if (r._row_id === rowId || (targetCampaign && rCamp === targetCampaign)) {
+              return { ...r, 'Special Case': canonCase };
+            }
+            return r;
+          })
+        };
+      });
+      return;
+    }
+
     // 1. If user is changing Code on a row:
     if (field === 'Code') {
-      const newCodeClean = valClean.trim().toUpperCase();
-      const newCodeLower = valClean.trim().toLowerCase();
+      let newCodeClean = valClean.trim().toUpperCase();
+      let newSpecialCase = undefined;
+      // Approach 1: Parse smart bracket syntax CODE [Special Case]
+      const bracketMatch = valClean.match(/^([A-Za-z0-9_-]+)\s*\[(.*?)\]$/);
+      if (bracketMatch) {
+        newCodeClean = bracketMatch[1].trim().toUpperCase();
+        newSpecialCase = canonicalizeSpecialCase(bracketMatch[2].trim());
+      }
+      const newCodeLower = newCodeClean.toLowerCase();
 
       // Find if we already have classification metadata for this code in codeMap or elsewhere in rules
       let existingInfo = codeMap[newCodeLower];
+      const rec = existingInfo?.['Special Case'] || (existingInfo?.['Special Cases'] && existingInfo['Special Cases'][0]) || existingInfo?.['Special Treatment'];
+      if (rec && newSpecialCase === undefined) {
+        newSpecialCase = canonicalizeSpecialCase(rec);
+      }
       if (!existingInfo || Object.values(existingInfo).every(v => !v || v === 'Unassigned')) {
         const matchingRule = (matrixData.rules || []).find(r => {
           const cd = (r['Code'] || r['code'] || '').trim().toLowerCase();
@@ -486,9 +583,17 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       }
 
       setMatrixData(prev => {
+        const targetRow = (prev.rules || []).find(r => r._row_id === rowId);
+        const targetCampaign = cleanText(targetRow?.['Campaign Name'] || targetRow?.campaign_name || '').trim().toLowerCase();
+
         const updatedRules = prev.rules.map(r => {
-          if (r._row_id === rowId) {
+          const rCamp = cleanText(r['Campaign Name'] || r.campaign_name || '').trim().toLowerCase();
+          const isTarget = r._row_id === rowId || (targetCampaign && rCamp === targetCampaign);
+          if (isTarget) {
             const currentRow = { ...r, Code: newCodeClean };
+            if (newSpecialCase !== undefined) {
+              currentRow['Special Case'] = newSpecialCase;
+            }
             if (existingInfo) {
               const dept = existingInfo.Department || existingInfo.Heading;
               const off = existingInfo.Office || existingInfo['Sub-Heading'];
@@ -1662,6 +1767,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 <thead>
                   <tr>
                     <th className="w-36 text-left">Code (Master Link)</th>
+                    <th className="min-w-[150px] text-left">Special Treatment</th>
                     <th className="min-w-[130px] text-left">Programme Fund</th>
                     <th className="min-w-[110px] text-left">Fund Code</th>
                     <th className="min-w-[150px] text-left">Department</th>
@@ -1680,7 +1786,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 <tbody>
                   {paginatedCampaigns.length === 0 ? (
                     <tr>
-                      <td colSpan={14} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={15} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No master project codes match the active search.
                       </td>
                     </tr>
@@ -1691,6 +1797,15 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                           <span className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-400 px-2.5 py-1 bg-emerald-100/60 dark:bg-emerald-950/60 rounded-lg border border-emerald-400/40 shadow-xs">
                             {r['Code']}
                           </span>
+                        </td>
+                        <td className="py-3 px-3 min-w-[150px] text-xs">
+                          {r['Special Treatment'] ? (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-md font-bold text-[11px] bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-400/40" title={r['Special Treatment']}>
+                              🏷️ {r['Special Treatment']}
+                            </span>
+                          ) : (
+                            <span className="text-slate-400 italic text-[11px]">—</span>
+                          )}
                         </td>
                         <td className="py-3 px-3 min-w-[130px] text-xs">
                           {r['Programme Fund'] ? (
@@ -1851,6 +1966,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                     )}
                     
                     <th className="w-36 text-left">Code (Master Link)</th>
+                    <th className="min-w-[150px] text-left">Special Case</th>
                     <th className="min-w-[170px] text-left">Department</th>
                     <th className="min-w-[190px] text-left">Office</th>
                     <th className="min-w-[150px] text-left">Portfolio</th>
@@ -1862,7 +1978,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 <tbody>
                   {paginatedCampaigns.length === 0 ? (
                     <tr>
-                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'madinah' ? 9 : 10} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'madinah' ? 10 : 11} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No classification rules match the active search or status filter.
                       </td>
                     </tr>
@@ -1971,7 +2087,19 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                 onChange={e => handleCellChange(r._row_id, 'Code', e.target.value)}
                                 placeholder="Type Code..."
                                 className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
-                                title="Changing Code automatically auto-fills Department, Office, Portfolio, Country, and Zakat!"
+                                title="Changing Code automatically auto-fills Department, Office, Portfolio, Country, and Zakat! Type CODE [Special Case] to autofill both."
+                              />
+                            </td>
+
+                            {/* Special Case Column */}
+                            <td className="py-2 px-2 min-w-[170px]">
+                              <SpecialCaseCombobox
+                                disabled={!isSuperAdmin}
+                                value={r['Special Case'] || ''}
+                                code={r['Code'] || ''}
+                                codeMap={codeMap}
+                                allCases={ALL_SHEET10_SPECIAL_CASES}
+                                onChange={(newSc) => handleCellChange(r._row_id, 'Special Case', newSc)}
                               />
                             </td>
 
@@ -2170,7 +2298,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                             )}
 
                             {/* Summary span across code and classification columns */}
-                            <td colSpan={6} className="py-2.5 px-3 text-slate-500 dark:text-slate-400 text-xs font-medium italic">
+                            <td colSpan={7} className="py-2.5 px-3 text-slate-500 dark:text-slate-400 text-xs font-medium italic">
                               <div className="flex items-center justify-between gap-2">
                                 <span>
                                   {isExpanded 
@@ -2310,6 +2438,19 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     onChange={e => handleCellChange(rule._row_id, 'Code', e.target.value)}
                                     placeholder="Type Code..."
                                     className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
+                                  />
+                                </td>
+
+                                {/* Special Case Column */}
+                                <td className="py-2 px-2 min-w-[170px]">
+                                  <SpecialCaseCombobox
+                                    disabled={!isSuperAdmin}
+                                    value={rule['Special Case'] || ''}
+                                    code={rule['Code'] || ''}
+                                    codeMap={codeMap}
+                                    allCases={ALL_SHEET10_SPECIAL_CASES}
+                                    onChange={(newSc) => handleCellChange(rule._row_id, 'Special Case', newSc)}
+                                    compact={true}
                                   />
                                 </td>
 

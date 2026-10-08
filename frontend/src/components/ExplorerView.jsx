@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal, Globe } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
 
 const DEFAULT_EXPLORER_COLUMNS = [
   'First Name',
@@ -17,6 +18,7 @@ const DEFAULT_EXPLORER_COLUMNS = [
   'Portfolio',
   'Country',
   'Code',
+  'Special Case',
   'Old Code',
   'Zakat Eligibility'
 ];
@@ -75,6 +77,8 @@ const COLUMN_ALIASES = {
   'old_code': 'Old Code',
   'Code': 'Code',
   'code': 'Code',
+  'Special Case': 'Special Case',
+  'special_case': 'Special Case',
   'Country': 'Project Country',
   'Zakat Eligibility': 'Zakat',
   'charge_id': 'Stripe Charge ID',
@@ -1279,64 +1283,100 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 text-xs">
                 {Object.keys(editingDonorModal.fields).map(field => {
                   const isCodeField = field === 'Code';
+                  const isSpecialCaseField = field === 'Special Case' || field === 'special_case';
+
                   return (
                     <div key={field} className="flex flex-col gap-1.5">
                       <label className="text-slate-400 font-bold uppercase tracking-wider text-[10px]">
                         {COLUMN_ALIASES[field] || field}
                       </label>
-                      <input
-                        type="text"
-                        list={isCodeField ? "explorer-modal-codes-list" : undefined}
-                        value={editingDonorModal.fields[field] || ''}
-                        onChange={e => {
-                          const val = e.target.value;
-                          let updatedFields = {
-                            ...editingDonorModal.fields,
-                            [field]: val
-                          };
-                          // If user typed/selected a Code, auto-fill recognized fields
-                          if (isCodeField) {
-                            const codeKey = (val || '').trim().toLowerCase();
-                            if (codeMap[codeKey]) {
-                              const cInfo = codeMap[codeKey];
-                              const dept = cInfo.Department || cInfo.Heading;
-                              const off = cInfo.Office || cInfo['Sub-Heading'];
-                              if (dept && dept !== 'Unassigned') {
-                                updatedFields['Department'] = dept;
-                                updatedFields['Heading'] = dept;
+                      {isSpecialCaseField ? (
+                        <SpecialCaseCombobox
+                          value={editingDonorModal.fields[field] || ''}
+                          code={editingDonorModal.fields['Code'] || ''}
+                          codeMap={codeMap}
+                          allCases={ALL_SHEET10_SPECIAL_CASES}
+                          onChange={(newSc) => {
+                            setEditingDonorModal({
+                              ...editingDonorModal,
+                              fields: {
+                                ...editingDonorModal.fields,
+                                [field]: newSc
                               }
-                              if (off && off !== 'Unassigned') {
-                                updatedFields['Office'] = off;
-                                updatedFields['Sub-Heading'] = off;
+                            });
+                          }}
+                        />
+                      ) : (
+                        <input
+                          type="text"
+                          list={isCodeField ? "explorer-modal-codes-list" : undefined}
+                          value={editingDonorModal.fields[field] || ''}
+                          onChange={e => {
+                            const val = e.target.value;
+                            let updatedFields = {
+                              ...editingDonorModal.fields,
+                              [field]: val
+                            };
+                            // If user typed/selected a Code, auto-fill recognized fields
+                            if (isCodeField) {
+                              let cleanCodeVal = val.trim();
+                              let specialCaseFromCode = undefined;
+                              // Parse smart bracketed code: CODE [Special Case]
+                              const bracketMatch = cleanCodeVal.match(/^([A-Za-z0-9_-]+)\s*\[(.*?)\]$/);
+                              if (bracketMatch) {
+                                cleanCodeVal = bracketMatch[1].trim().toUpperCase();
+                                specialCaseFromCode = canonicalizeSpecialCase(bracketMatch[2].trim());
+                                updatedFields['Code'] = cleanCodeVal;
+                                updatedFields['Special Case'] = specialCaseFromCode;
                               }
-                              if (cInfo.Portfolio !== undefined) {
-                                updatedFields['Portfolio'] = cInfo.Portfolio;
+                              const codeKey = (cleanCodeVal || '').trim().toLowerCase();
+                              if (codeMap[codeKey]) {
+                                const cInfo = codeMap[codeKey];
+                                const recSc = cInfo['Special Case'] || (cInfo['Special Cases'] && cInfo['Special Cases'][0]) || cInfo['Special Treatment'];
+                                if (recSc && specialCaseFromCode === undefined) {
+                                  updatedFields['Special Case'] = canonicalizeSpecialCase(recSc);
+                                }
+                                const dept = cInfo.Department || cInfo.Heading;
+                                const off = cInfo.Office || cInfo['Sub-Heading'];
+                                if (dept && dept !== 'Unassigned') {
+                                  updatedFields['Department'] = dept;
+                                  updatedFields['Heading'] = dept;
+                                }
+                                if (off && off !== 'Unassigned') {
+                                  updatedFields['Office'] = off;
+                                  updatedFields['Sub-Heading'] = off;
+                                }
+                                if (cInfo.Portfolio !== undefined) {
+                                  updatedFields['Portfolio'] = cInfo.Portfolio;
+                                }
+                                if (cInfo['Programme Fund'] !== undefined) updatedFields['Programme Fund'] = cInfo['Programme Fund'];
+                                if (cInfo['Fund Code'] !== undefined) updatedFields['Fund Code'] = cInfo['Fund Code'];
+                                if (cInfo['Old Code'] !== undefined) updatedFields['Old Code'] = cInfo['Old Code'];
+                                if (cInfo.Country && cInfo.Country !== 'Unassigned') updatedFields['Country'] = cInfo.Country;
+                                if (cInfo['Zakat Eligibility'] && cInfo['Zakat Eligibility'] !== 'Unassigned') updatedFields['Zakat Eligibility'] = cInfo['Zakat Eligibility'];
                               }
-                              if (cInfo['Programme Fund'] !== undefined) updatedFields['Programme Fund'] = cInfo['Programme Fund'];
-                              if (cInfo['Fund Code'] !== undefined) updatedFields['Fund Code'] = cInfo['Fund Code'];
-                              if (cInfo['Old Code'] !== undefined) updatedFields['Old Code'] = cInfo['Old Code'];
-                              if (cInfo.Country && cInfo.Country !== 'Unassigned') updatedFields['Country'] = cInfo.Country;
-                              if (cInfo['Zakat Eligibility'] && cInfo['Zakat Eligibility'] !== 'Unassigned') updatedFields['Zakat Eligibility'] = cInfo['Zakat Eligibility'];
                             }
-                          }
-                          setEditingDonorModal({
-                            ...editingDonorModal,
-                            fields: updatedFields
-                          });
-                        }}
-                        className={`bg-slate-950 border border-white/10 rounded-xl px-3 py-2 text-white text-xs focus:outline-none focus:border-cyan-400 transition-all ${
-                          isCodeField ? 'font-mono uppercase font-bold text-cyan-400 border-cyan-500/40' : ''
-                        }`}
-                      />
+                            setEditingDonorModal({
+                              ...editingDonorModal,
+                              fields: updatedFields
+                            });
+                          }}
+                          className={`bg-slate-950 border border-white/10 rounded-xl px-3 py-2 text-white text-xs focus:outline-none focus:border-cyan-400 transition-all ${
+                            isCodeField ? 'font-mono uppercase font-bold text-cyan-400 border-cyan-500/40' : ''
+                          }`}
+                        />
+                      )}
                     </div>
                   );
                 })}
               </div>
 
               <datalist id="explorer-modal-codes-list">
-                {Object.keys(codeMap).map(k => (
-                  <option key={k} value={k.toUpperCase()} />
-                ))}
+                {Object.keys(codeMap).map(k => {
+                  const item = codeMap[k];
+                  const disp = item?.['Display Code'] || k.toUpperCase();
+                  return <option key={k} value={disp} />;
+                })}
               </datalist>
 
               <div className="flex items-center justify-end gap-3 pt-4 border-t border-white/10">

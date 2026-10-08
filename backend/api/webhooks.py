@@ -57,6 +57,12 @@ init_webhooks_db()
 
 def _log_webhook_event(company_id: str, event_type: str, event_id: str, payload: dict, status: str = "received", error: str = None):
     """Persists a raw incoming webhook payload to SQLite for 100% audit durability."""
+    from core.event_log import log_event
+    log_event(f"webhook.givebrite.{status}", category="webhook", level="error" if error else "info",
+              company_id=company_id, webhook_event=event_type, event_id=event_id, detail=error,
+              amount=payload.get("amount") if isinstance(payload, dict) else None,
+              campaign=(payload.get("campaign") or {}).get("name") if isinstance(payload, dict) and isinstance(payload.get("campaign"), dict) else None,
+              message=f"GiveBrite {event_type} {status}" + (f": {error}" if error else ""))
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         cursor = conn.cursor()

@@ -49,12 +49,16 @@ from core.madinah_ingestion import (
     ingest_madinah_donations,
     MADINAH_APIM_BASE
 )
+from core.event_log import log_event, set_service_name
+
+set_service_name("platform-sync")
 
 DATA_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 MADINAH_TOKEN_FILE = os.path.join(BASE_DIR, ".madinah_token.json")
 GIVEBRITE_TOKEN_FILE = os.path.join(BASE_DIR, ".givebrite_token.json")
 MASTER_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "platform_sync_data.json")
 MADINAH_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "madinah_sync_data.json")
+HEALTH_FILE = os.path.join(DATA_CACHE_DIR, "platform_health.json")
 
 # Service Configuration
 SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", 60))  # standard interval
@@ -119,6 +123,66 @@ class PlatformSyncService:
         self.session.headers.update({"User-Agent": "Rethink-CRM-Sync/1.0"})
         self.last_deep_sync = 0.0
         self.backfill_completed = False
+        self.health: Dict[str, Dict[str, Any]] = {}
+        try:
+            with open(HEALTH_FILE, "r", encoding="utf-8") as f:
+                self.health = json.load(f)
+        except Exception:
+            self.health = {}
+        for p in ("givebrite", "madinah"):
+            self.health.setdefault(p, {})
+            self.health[p]["consecutive_failures"] = 0
+
+    # -------------------------------------------------------------------------
+    # Health tracking (read by the hidden ops console via /api/ops/status)
+    # -------------------------------------------------------------------------
+    def _note_token_refresh(self, platform: str, error: Optional[str], method: str = "http-refresh"):
+        h = self.health.setdefault(platform, {})
+        now = datetime.now(timezone.utc).isoformat()
+        if error:
+            h["last_token_refresh_error"] = error
+            h["last_token_refresh_error_at"] = now
+            log_event("session.refresh_failed", category="session", level="error", platform=platform, method=method,
+                      detail=error, message=f"{platform} session renewal failed ({method}): {error}")
+        else:
+            h["last_token_refresh_at"] = now
+            h.pop("last_token_refresh_error", None)
+            log_event("session.refreshed", category="session", platform=platform, method=method,
+                      message=f"{platform} session renewed ({method})")
+
+    def _record_cycle(self, platform: str, ok: bool, http_status: Optional[int], error: Optional[str],
+                      ingested: int = 0, fetched: int = 0):
+        h = self.health.setdefault(platform, {})
+        now = datetime.now(timezone.utc).isoformat()
+        was_failing = h.get("consecutive_failures", 0) >= 3
+        h["last_cycle_at"] = now
+        h["last_http_status"] = http_status
+        h["last_fetched"] = fetched
+        if ok:
+            h["last_ok_at"] = now
+            h["consecutive_failures"] = 0
+            if ingested:
+                h["last_ingested_at"] = now
+                h["last_ingested_count"] = ingested
+                log_event("sync.donations_ingested", category="sync", platform=platform, count=ingested,
+                          company_id="iqra", message=f"{platform}: {ingested} new donation(s) ingested")
+            if was_failing:
+                log_event("sync.recovered", category="sync", platform=platform,
+                          message=f"{platform} API sync is working again")
+        else:
+            h["consecutive_failures"] = h.get("consecutive_failures", 0) + 1
+            h["last_error"] = error
+            h["last_error_at"] = now
+            # Log the first failure and then every 10th, so an outage is visible without flooding the log.
+            n = h["consecutive_failures"]
+            if n == 1 or n == 3 or n % 10 == 0:
+                log_event("sync.failed", category="sync", level="error" if n >= 3 else "warning", platform=platform,
+                          http_status=http_status, consecutive_failures=n, detail=error,
+                          message=f"{platform} sync failed ({n} in a row): {error}")
+        try:
+            atomic_write_json(HEALTH_FILE, self.health)
+        except Exception as ex:
+            logger.error(f"Failed writing health file: {ex}")
 
     def get_today_str(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -162,10 +226,13 @@ class PlatformSyncService:
                                 token_data["refreshToken"] = new_data["refreshToken"]
                             token_data["retrievedAt"] = datetime.now(timezone.utc).isoformat()
                             atomic_write_json(MADINAH_TOKEN_FILE, token_data)
+                            os.chmod(MADINAH_TOKEN_FILE, 0o600)
                             logger.info("Successfully renewed Madinah tokens via pure HTTP API.")
+                            self._note_token_refresh("madinah", None)
                             access_token = token_data["accessToken"]
                     else:
                         logger.warning(f"Madinah HTTP token refresh returned {r.status_code}. Falling back to script.")
+                        self._note_token_refresh("madinah", f"HTTP refresh returned {r.status_code}")
                         need_script_refresh = True
                 elif not access_token or (exp and exp <= now):
                     need_script_refresh = True
@@ -183,10 +250,13 @@ class PlatformSyncService:
                         token_data = json.load(f)
                     access_token = token_data.get("accessToken", "")
                     logger.info("Madinah token auto-refreshed successfully via script.")
+                    self._note_token_refresh("madinah", None, method="browser-login")
                 else:
                     logger.error(f"Madinah script login notice: {res.stderr[:200]}")
+                    self._note_token_refresh("madinah", f"Browser login failed: {res.stderr[:150]}", method="browser-login")
             except Exception as e:
                 logger.error(f"Madinah script login exception: {e}")
+                self._note_token_refresh("madinah", f"Browser login error: {e}", method="browser-login")
 
         if not access_token.startswith("Bearer "):
             access_token = f"Bearer {access_token}"
@@ -223,10 +293,14 @@ class PlatformSyncService:
                         token_data = json.load(f)
                     access_token = token_data.get("accessToken", "")
                     logger.info("GiveBrite token auto-refreshed successfully via Playwright.")
+                    self._note_token_refresh("givebrite", None, method="browser-login")
                 else:
                     logger.error(f"GiveBrite auto-refresh failed (code {res.returncode}): {res.stderr[:200]}")
+                    self._note_token_refresh("givebrite", f"Browser login failed (code {res.returncode}): {res.stderr[:150]}",
+                                             method="browser-login")
             except Exception as e:
                 logger.error(f"GiveBrite auto-refresh exception: {e}")
+                self._note_token_refresh("givebrite", f"Browser login error: {e}", method="browser-login")
 
         if not access_token.startswith("Bearer "):
             access_token = f"Bearer {access_token}"
@@ -278,10 +352,13 @@ class PlatformSyncService:
                 result["donations_skipped"] = ingest_res.get("skipped", 0)
                 if ingest_res.get("inserted", 0) > 0:
                     logger.info(f"[Madinah Live Ingest] Ingested {ingest_res['inserted']} new donations into CRM database & Parquet.")
+                self._record_cycle("madinah", True, 200, None, result["donations_ingested"], len(raw_donations))
             else:
                 logger.warning(f"Madinah donations HTTP {r.status_code}")
+                self._record_cycle("madinah", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
         except Exception as ex:
             logger.error(f"Madinah donations fetch error: {ex}")
+            self._record_cycle("madinah", False, None, f"Donations fetch error: {ex}")
 
         time.sleep(0.2)
 
@@ -390,10 +467,13 @@ class PlatformSyncService:
                 result["donations_skipped"] = ingest_res.get("skipped", 0)
                 if ingest_res.get("inserted", 0) > 0:
                     logger.info(f"[GiveBrite Ingestion] Successfully persisted {ingest_res['inserted']} new donations into CRM DB & Parquet.")
+                self._record_cycle("givebrite", True, 200, None, result["donations_ingested"], len(docs))
             else:
                 logger.warning(f"Givebrite donations HTTP {r.status_code}")
+                self._record_cycle("givebrite", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
         except Exception as ex:
             logger.error(f"Givebrite donations error: {ex}")
+            self._record_cycle("givebrite", False, None, f"Donations fetch error: {ex}")
 
         time.sleep(0.2)
 
@@ -443,6 +523,7 @@ class PlatformSyncService:
             logger.info(f"[Madinah] Synced {len(madinah_data.get('donations_latest', []))} recent donations.")
         except Exception as ex:
             logger.error(f"Madinah sync failure: {ex}")
+            self._record_cycle("madinah", False, None, f"Sync crashed: {ex}")
             madinah_data = {"platform": "madinah", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
 
         time.sleep(0.5)
@@ -455,6 +536,7 @@ class PlatformSyncService:
             )
         except Exception as ex:
             logger.error(f"Givebrite sync failure: {ex}")
+            self._record_cycle("givebrite", False, None, f"Sync crashed: {ex}")
             givebrite_data = {"platform": "givebrite", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
 
         # Atomic writes for service status monitoring (No large intermediate JSON cache files)
@@ -501,12 +583,16 @@ def main():
     logger.info("==========================================================")
 
     service = PlatformSyncService()
+    log_event("service.started", category="sync", message="platform-sync service started",
+              interval_seconds=SYNC_INTERVAL_SEC)
 
     while True:
         try:
             service.run_cycle()
         except Exception as e:
             logger.critical(f"Unexpected error in sync cycle: {e}", exc_info=True)
+            log_event("sync.cycle_crashed", category="sync", level="critical", detail=str(e),
+                      message=f"Sync cycle crashed: {e}")
 
         time.sleep(SYNC_INTERVAL_SEC)
 

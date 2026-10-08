@@ -170,12 +170,25 @@ def update_single_donor_record(
         new_email = str(update_dict["Email"] or "").strip().lower()
         if new_email and "@" in new_email and new_email != old_email:
             update_dict["Donor ID"] = new_email
+            # Only the edited donation's charity: the same email may be a different
+            # person's sponsorship record in the other charity.
+            row_company = ""
+            if target_idx is not None and "company_id" in df_raw.columns and pd.notna(df_raw.loc[target_idx, "company_id"]):
+                row_company = str(df_raw.loc[target_idx, "company_id"]).strip().lower()
             try:
                 conn_alloc = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+                old_key = old_did if old_did else old_email
                 conn_alloc.execute(
-                    "UPDATE sponsorship_allocations SET donor_email = ?, donor_id = ? WHERE LOWER(donor_email) = ? OR LOWER(donor_id) = ?",
-                    (new_email, new_email, old_email, old_did if old_did else old_email)
+                    "UPDATE sponsorship_allocations SET donor_email = ?, donor_id = ? WHERE company_id = ? AND (LOWER(donor_email) = ? OR LOWER(donor_id) = ?)",
+                    (new_email, new_email, row_company, old_email, old_key)
                 )
+                try:
+                    conn_alloc.execute(
+                        "UPDATE sponsorship_allocation_donors SET donor_email = ?, donor_id = ? WHERE company_id = ? AND (LOWER(donor_email) = ? OR LOWER(donor_id) = ?)",
+                        (new_email, new_email, row_company, old_email, old_key)
+                    )
+                except sqlite3.OperationalError:
+                    pass  # table not created yet on this deployment
                 conn_alloc.commit()
                 conn_alloc.close()
             except Exception as ex:

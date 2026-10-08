@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.api import admin, auth, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, payouts, tracker, webhooks
+from backend.api import admin, auth, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, tracker, webhooks
 
 app = FastAPI(
     title="Crowdfunding Analytics & Enterprise CRM API",
@@ -33,7 +33,48 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+# Audit trail: every change (POST/PUT/PATCH/DELETE), every server error and every denied request is
+# recorded via core.event_log (local table + Axiom). Read-only traffic is not logged.
+_AUDIT_SKIP_PREFIXES = ("/api/tracker/email-tracking/pixel/", "/api/tracker/outlook/webhook", "/api/ops/logs", "/ws/")
+
+
+@app.middleware("http")
+async def audit_log_middleware(request, call_next):
+    import asyncio
+    import time as _time
+    from core.event_log import log_event
+    start = _time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        path = request.url.path
+        mutating = request.method in ("POST", "PUT", "PATCH", "DELETE")
+        if path.startswith("/api/") and not path.startswith(_AUDIT_SKIP_PREFIXES) and (
+                mutating or status_code >= 500 or status_code in (401, 403)):
+            actor = None
+            auth_hdr = request.headers.get("authorization", "")
+            if auth_hdr.lower().startswith("bearer "):
+                from core.auth import decode_access_token
+                claims = decode_access_token(auth_hdr[7:].strip()) or {}
+                actor = claims.get("sub")
+            level = "error" if status_code >= 500 else ("warning" if status_code in (401, 403) else "info")
+            category = "security" if status_code in (401, 403) else "audit"
+            event = "http.denied" if status_code in (401, 403) else ("http.error" if status_code >= 500 else "http.change")
+            await asyncio.to_thread(
+                log_event, event, category=category, level=level,
+                message=f"{request.method} {path} -> {status_code}",
+                company_id=request.query_params.get("company_id"), actor=actor,
+                method=request.method, path=path, status=status_code,
+                duration_ms=round((_time.perf_counter() - start) * 1000),
+                client_ip=request.headers.get("x-forwarded-for", request.client.host if request.client else None),
+            )
+
+
 # Register API Routers
+app.include_router(ops.router)
 app.include_router(auth.router)
 app.include_router(metrics.router)
 app.include_router(overview.router)
@@ -106,3 +147,21 @@ async def startup_event():
 
 
 
+
+    # 3. Daily sponsorship email-queue refresh: only creates PENDING items for staff to review;
+    #    nothing is emailed until someone presses Send in the tracker's Email Queue.
+    asyncio.get_running_loop().create_task(_sponsorship_queue_daily_loop())
+
+
+async def _sponsorship_queue_daily_loop():
+    import asyncio
+    from backend.api.tracker import generate_email_queue
+    await asyncio.sleep(120)  # let startup finish and the cache warm
+    while True:
+        for company in ("rethink", "iqra"):
+            try:
+                created = await asyncio.to_thread(generate_email_queue, company)
+                print(f"[Sponsorship Queue] {company}: {created}")
+            except Exception as queue_err:
+                print(f"[Sponsorship Queue Notice] {company}: {queue_err}")
+        await asyncio.sleep(24 * 60 * 60)

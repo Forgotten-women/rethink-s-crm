@@ -105,6 +105,7 @@ class MasterProjectCodeRequest(BaseModel):
     legacy_non_zakat_code: Optional[str] = ""
     legacy_zakat_code: Optional[str] = ""
     old_codes: Optional[str] = ""
+    special_treatment: Optional[str] = ""
 
 
 class UpdateMasterCodeStatusRequest(BaseModel):
@@ -283,6 +284,7 @@ def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
                 "legacy_non_zakat_code": sanitize_text(r.get("legacy_non_zakat_code", "")),
                 "legacy_zakat_code": sanitize_text(r.get("legacy_zakat_code", "")),
                 "old_codes": sanitize_text(r.get("old_codes", "")),
+                "special_treatment": sanitize_text(r.get("special_treatment", "")),
                 "campaign_count": int(links_map.get(c_code, 0)),
                 "total_raised": float(raised_map.get(c_code, 0.0)),
                 "created_at": str(r.get("created_at", "")),
@@ -331,6 +333,7 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
     non_zkt_gl = sanitize_text((payload.legacy_non_zakat_code or "").strip())
     zkt_gl = sanitize_text((payload.legacy_zakat_code or "").strip())
     old_cds = sanitize_text((payload.old_codes or "").strip())
+    spec_treat = sanitize_text((payload.special_treatment or "").strip())
     proj_status = sanitize_text((payload.project_status or "Continuing").strip())
 
     with _DB_LOCK:
@@ -341,9 +344,9 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                     INSERT INTO master_project_codes (
                         code, department, office, portfolio, country, zakat_eligibility, 
                         description, is_active, programme_fund, fund_code, 
-                        legacy_non_zakat_code, legacy_zakat_code, old_codes, project_status, updated_at, company_id
+                        legacy_non_zakat_code, legacy_zakat_code, old_codes, special_treatment, project_status, updated_at, company_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                     ON CONFLICT(company_id, code) DO UPDATE SET
                         department = excluded.department,
                         office = excluded.office,
@@ -357,9 +360,10 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                         legacy_non_zakat_code = excluded.legacy_non_zakat_code,
                         legacy_zakat_code = excluded.legacy_zakat_code,
                         old_codes = excluded.old_codes,
+                        special_treatment = excluded.special_treatment,
                         project_status = excluded.project_status,
                         updated_at = CURRENT_TIMESTAMP;
-                """, (clean_code, dept, off, port, cntry, zkt, desc, act, prog_fund, f_code, non_zkt_gl, zkt_gl, old_cds, proj_status, comp))
+                """, (clean_code, dept, off, port, cntry, zkt, desc, act, prog_fund, f_code, non_zkt_gl, zkt_gl, old_cds, spec_treat, proj_status, comp))
         finally:
             conn.close()
 
@@ -565,6 +569,39 @@ def get_campaign_codes_lookup(platform: str = "all", company_id: Optional[str] =
     return lookup
 
 
+ALL_SHEET10_SPECIAL_CASES = [
+    'Zarang bike',
+    'Umm Abdullah',
+    'Umm Alaa',
+    'Umm Habib',
+    'Umm Suleiman',
+    'Umm Hamza',
+    'Aunt Sahr',
+    'Umm Lofti',
+    'Umm Muhammad',
+    'Umm Saeed',
+    'Eid Clothes',
+    'Eid Party',
+    'LUFS',
+    'Most Needy',
+    'Qurbani',
+    'Tent2Home',
+    'Special Case'
+]
+
+
+def canonicalize_special_case(sc_str: str) -> str:
+    if not sc_str:
+        return ""
+    trimmed = str(sc_str).strip()
+    if trimmed.lower() in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]:
+        return ""
+    for known in ALL_SHEET10_SPECIAL_CASES:
+        if known.lower() == trimmed.lower():
+            return known
+    return trimmed
+
+
 @router.get("/code-map")
 def get_code_map(company_id: Optional[str] = Query("rethink")):
     """Returns the central mapping of Code -> {Department, Office, Portfolio, Heading, Sub-Heading, Country, Zakat Eligibility, Programme Fund, Fund Code}."""
@@ -575,7 +612,17 @@ def get_code_map(company_id: Optional[str] = Query("rethink")):
         dept = sanitize_text(info.get("Department") or info.get("Heading", "Unassigned"))
         off = sanitize_text(info.get("Office") or info.get("Sub-Heading", "Unassigned"))
         port = sanitize_text(info.get("Portfolio", ""))
+        sc_val = sanitize_text(info.get("Special Case") or info.get("Special Treatment") or "")
+        if not sc_val and info.get("Special Cases") and len(info["Special Cases"]) > 0:
+            sc_val = info["Special Cases"][0]
+        sc_val = canonicalize_special_case(sc_val)
+
         clean_map[code.strip().lower()] = {
+            "Code": sanitize_text(info.get("Code", "")),
+            "Display Code": sanitize_text(info.get("Display Code", info.get("Code", ""))),
+            "Special Case": sc_val,
+            "Special Treatment": sanitize_text(info.get("Special Treatment", "")),
+            "Special Cases": [canonicalize_special_case(sc) for sc in info.get("Special Cases", []) if sc],
             "Department": dept,
             "Office": off,
             "Portfolio": port,
@@ -623,11 +670,32 @@ def _compute_matrix_summary(df: pd.DataFrame, comp: str, platform_name: str) -> 
     }
 
 
+def _clean_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    sc_col = None
+    if "Special Case" in df.columns:
+        sc_col = df["Special Case"].fillna("").astype(str).str.strip()
+        sc_col = sc_col.replace({"Unassigned": "", "unassigned": "", "None": "", "none": "", "None (Standard)": "", "none (standard)": "", "nan": "", "NaN": "", "null": "", "N/A": "", "n/a": ""})
+    elif "special_case" in df.columns:
+        sc_col = df["special_case"].fillna("").astype(str).str.strip()
+        sc_col = sc_col.replace({"Unassigned": "", "unassigned": "", "None": "", "none": "", "None (Standard)": "", "none (standard)": "", "nan": "", "NaN": "", "null": "", "N/A": "", "n/a": ""})
+
+    df_clean = df.fillna("Unassigned")
+    if sc_col is not None:
+        df_clean["Special Case"] = sc_col
+        df_clean["special_case"] = sc_col
+    else:
+        df_clean["Special Case"] = ""
+        df_clean["special_case"] = ""
+    return df_clean
+
+
 @router.get("/launchgood")
 def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns LaunchGood classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
-    df = get_classification_matrix(company_id=comp).fillna("Unassigned")
+    df = _clean_matrix_df(get_classification_matrix(company_id=comp))
     return _compute_matrix_summary(df, comp, "LaunchGood")
 
 
@@ -636,7 +704,7 @@ def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
 def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns GiveBright/GiveBrite classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
-    df = get_givebright_classification_matrix(company_id=comp).fillna("Unassigned")
+    df = _clean_matrix_df(get_givebright_classification_matrix(company_id=comp))
     return _compute_matrix_summary(df, comp, "GiveBright")
 
 
@@ -651,6 +719,8 @@ def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
                 campaign_name as "Campaign Name",
                 COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(special_case, '') as "Special Case",
+                COALESCE(special_treatment, '') as "Special Treatment",
                 COALESCE(community_name, 'N/A') as "Community Name",
                 COALESCE(department, heading, 'Unassigned') as "Department",
                 COALESCE(office, sub_heading, 'Unassigned') as "Office",
@@ -673,9 +743,9 @@ def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
         conn.close()
     except Exception as e:
         print(f"[Paysuite Matrix Query Notice]: {e}")
-        df = get_paysuite_classification_matrix(company_id=comp).fillna("Unassigned")
+        df = get_paysuite_classification_matrix(company_id=comp)
 
-    return _compute_matrix_summary(df, comp, "Paysuite")
+    return _compute_matrix_summary(_clean_matrix_df(df), comp, "Paysuite")
 
 
 @router.get("/website")
@@ -709,16 +779,16 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
         conn.close()
     except Exception as e:
         print(f"[Website Matrix Query Notice]: {e}")
-        df = get_rethink_website_classification_matrix(company_id=comp).fillna("Unassigned")
+        df = get_rethink_website_classification_matrix(company_id=comp)
 
-    return _compute_matrix_summary(df, comp, "Rethink Website")
+    return _compute_matrix_summary(_clean_matrix_df(df), comp, "Rethink Website")
 
 
 @router.get("/madinah")
 def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
     """Returns Madinah classification matrix rules with (Campaign Name, Giving Level, Code) granularity for Iqra."""
     comp = (company_id or "iqra").strip().lower()
-    df = get_madinah_classification_matrix(company_id=comp).fillna("Unassigned")
+    df = _clean_matrix_df(get_madinah_classification_matrix(company_id=comp))
     return _compute_matrix_summary(df, comp, "Madinah")
 
 
@@ -874,7 +944,19 @@ def save_matrix_rules(payload: SaveRulesRequest):
     # 2. Build DataFrame and auto-fill any row that has a recognized Code
     rules_dict = []
     for r in payload.rules:
-        code_raw = sanitize_text(r.get("Code") or r.get("code", "Unassigned"))
+        code_raw = sanitize_text(r.get("Code") or r.get("code", "Unassigned")).strip()
+        spec_case_val = sanitize_text(r.get("Special Case") or r.get("special_case") or "").strip()
+        if spec_case_val.lower() in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]:
+            spec_case_val = ""
+        else:
+            spec_case_val = canonicalize_special_case(spec_case_val)
+
+        if "[" in code_raw and code_raw.endswith("]"):
+            b_parts = code_raw.split("[", 1)
+            code_raw = b_parts[0].strip().upper()
+            if not spec_case_val:
+                spec_case_val = canonicalize_special_case(b_parts[1].rstrip("]").strip())
+
         code_lower = code_raw.strip().lower()
         
         dept = sanitize_text(r.get("Department") or r.get("department") or r.get("Heading") or r.get("heading", "Unassigned"))
@@ -893,7 +975,9 @@ def save_matrix_rules(payload: SaveRulesRequest):
 
         d_name = sanitize_text(r.get("Donor Name") or r.get("donor_name", ""))
         d_email = sanitize_text(r.get("Donor Email") or r.get("donor_email", ""))
-        gl_val = sanitize_text(r.get("Giving Level") or r.get("giving_level") or "")
+        gl_val = sanitize_text(r.get("Giving Level") or r.get("giving_level") or "").strip()
+        if gl_val.lower() in ["nan", "none", "n/a", "campaign default / general", "campaign default", "default (general)"]:
+            gl_val = ""
 
         rules_dict.append({
             "Campaign Name": sanitize_text(r.get("Campaign Name") or r.get("campaign_name", "N/A")),
@@ -909,11 +993,17 @@ def save_matrix_rules(payload: SaveRulesRequest):
             "Sub-Heading": off,
             "Country": c,
             "Code": code_raw,
+            "Special Case": spec_case_val,
             "Zakat Eligibility": z,
             "is_primary": 1 if r.get("is_primary") in [1, True, "1", "true", "True"] else 0
         })
     matrix_df = pd.DataFrame(rules_dict)
-    matrix_df = matrix_df.drop_duplicates(subset=["Campaign Name", "Giving Level", "Code"], keep="last")
+    matrix_df["_has_spec"] = matrix_df["Special Case"].apply(
+        lambda s: 1 if str(s).strip() and str(s).strip().lower() not in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""] else 0
+    )
+    matrix_df = matrix_df.sort_values(by="_has_spec", ascending=True).drop_duplicates(
+        subset=["Campaign Name", "Giving Level", "Code"], keep="last"
+    ).drop(columns=["_has_spec"])
 
     plat = payload.platform.lower().strip()
     if plat in ["website", "rethink_website", "rethink website"]:

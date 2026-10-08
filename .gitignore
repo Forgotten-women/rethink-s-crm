@@ -44,3 +44,5 @@ givebrite_impacts.json
 data_cache/*.json
 scripts/*
 test_*
+# Locally generated JWT signing secret (core/auth.py)
+.jwt_secret

@@ -42,6 +42,33 @@ import {
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
+const ALL_SHEET10_SPECIAL_CASES = [
+  'Zarang bike',
+  'Umm Alaa',
+  'Umm Habib',
+  'Umm Suleiman',
+  'Umm Hamza',
+  'Aunt Sahr',
+  'Umm Lofti',
+  'Umm Muhammad',
+  'Umm Saeed',
+  'Umm Abdullah',
+  'Eid Clothes',
+  'Eid Party',
+  'LUFS',
+  'Most Needy',
+  'Qurbani',
+  'Tent2Home',
+  'Special Case'
+];
+
+const canonicalizeCase = (scStr) => {
+  if (!scStr) return '';
+  const trimmed = String(scStr).trim();
+  const match = ALL_SHEET10_SPECIAL_CASES.find(c => c.toLowerCase() === trimmed.toLowerCase());
+  return match || trimmed;
+};
+
 export default function PayoutsView({ user, accentColor, onDataChange, activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
   const currency = 'GBP'; // Unified GBP (£) settlement
@@ -190,18 +217,22 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           const payload = JSON.parse(event.data);
           if (['PAYOUTS_UPDATED', 'MATRIX_UPDATED'].includes(payload?.event)) {
             fetchPlatformCounts();
-            fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current);
+            fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current, true);
             if (activeTabRef.current === 'donors') {
-              fetchDonorsData(debouncedSearchRef.current, selectedBatchRef.current, donorPageRef.current, donorPageSizeRef.current, selectedPlatformRef.current, statusFilterRef.current);
+              fetchDonorsData(debouncedSearchRef.current, selectedBatchRef.current, donorPageRef.current, donorPageSizeRef.current, selectedPlatformRef.current, statusFilterRef.current, true);
             }
           }
         } catch (e) {}
       };
     } catch (e) {}
 
+    let lastFocusTime = 0;
     const handleFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusTime < 30000) return; // throttle: at most once every 30s
+      lastFocusTime = now;
       fetchPlatformCounts();
-      fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current);
+      fetchPayoutData(debouncedSearchRef.current, selectedBatchRef.current, selectedPlatformRef.current, statusFilterRef.current, true);
     };
     window.addEventListener('focus', handleFocus);
 
@@ -237,8 +268,10 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
     }
   }, [saveNotification]);
 
-  const fetchPayoutData = (searchQuery = debouncedSearch, batchVal = selectedBatch, plat = selectedPlatform, st = statusFilter) => {
-    setLoading(true);
+  const fetchPayoutData = (searchQuery = debouncedSearch, batchVal = selectedBatch, plat = selectedPlatform, st = statusFilter, silent = false) => {
+    if (!silent) {
+      setLoading(true);
+    }
     const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
     const batchParam = batchVal && batchVal !== 'ALL' ? `&batch=${encodeURIComponent(batchVal)}` : '';
     const statusParam = st && st !== 'ALL' ? `&status=${encodeURIComponent(st)}` : '';
@@ -271,8 +304,10 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       });
   };
 
-  const fetchDonorsData = (searchQuery = debouncedSearch, batchVal = selectedBatch, pageNum = donorPage, pSize = donorPageSize, plat = selectedPlatform, st = statusFilter) => {
-    setDonorLoading(true);
+  const fetchDonorsData = (searchQuery = debouncedSearch, batchVal = selectedBatch, pageNum = donorPage, pSize = donorPageSize, plat = selectedPlatform, st = statusFilter, silent = false) => {
+    if (!silent) {
+      setDonorLoading(true);
+    }
     const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
     const batchParam = batchVal && batchVal !== 'ALL' ? `&batch=${encodeURIComponent(batchVal)}` : '';
     const codeParam = donorCodeFilter && donorCodeFilter !== 'ALL' ? `&code=${encodeURIComponent(donorCodeFilter)}` : '';
@@ -394,6 +429,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
     setEditingClassification({
       campaign_name: camp.campaign_name || '',
       code: camp.code || '',
+      special_case: camp.special_case || camp['Special Case'] || '',
       heading: camp.heading || '',
       sub_heading: camp.sub_heading || '',
       country: camp.country || (isPaysuite ? 'ALL' : ''),
@@ -404,19 +440,27 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
 
   // Handle Quick Code Pick within Edit Modal
   const handleSelectCodeInModal = (newCode) => {
-    const cleanCode = String(newCode).trim().toUpperCase();
+    let raw = String(newCode).trim();
+    let specialCase = '';
+    const bracketMatch = raw.match(/^(.+?)\s*\[(.*?)\]$/);
+    if (bracketMatch) {
+      raw = bracketMatch[1].trim();
+      specialCase = bracketMatch[2].trim();
+    }
+    const cleanCode = raw.toUpperCase();
     const mapped = codeMap[cleanCode.toLowerCase()];
     if (mapped) {
       setEditingClassification(prev => ({
         ...prev,
         code: cleanCode,
+        special_case: specialCase || prev.special_case || '',
         heading: mapped.Heading || prev.heading,
         sub_heading: mapped['Sub-Heading'] || prev.sub_heading,
         country: mapped.Country || prev.country,
         zakat_eligibility: mapped['Zakat Eligibility'] || prev.zakat_eligibility
       }));
     } else {
-      setEditingClassification(prev => ({ ...prev, code: cleanCode }));
+      setEditingClassification(prev => ({ ...prev, code: cleanCode, special_case: specialCase || prev.special_case || '' }));
     }
   };
 
@@ -435,6 +479,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           user_role: user?.role || 'admin',
           campaign_name: editingClassification.campaign_name,
           code: editingClassification.code,
+          special_case: editingClassification.special_case || '',
           heading: editingClassification.heading,
           sub_heading: editingClassification.sub_heading,
           country: editingClassification.country,
@@ -455,8 +500,8 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           timestamp: new Date().toLocaleTimeString()
         });
         setEditingClassification(null);
-        fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter);
-        fetchDonorsData(debouncedSearch, selectedBatch, donorPage, donorPageSize, selectedPlatform, statusFilter);
+        fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter, true);
+        fetchDonorsData(debouncedSearch, selectedBatch, donorPage, donorPageSize, selectedPlatform, statusFilter, true);
         if (typeof onDataChange === 'function') {
           onDataChange();
         }
@@ -1015,7 +1060,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       </div>
 
       {/* Main Content Area */}
-      {loading ? (
+      {loading && campaignData.length === 0 ? (
         <div className="p-12 text-center text-xs font-bold text-slate-500 dark:text-slate-400 animate-pulse flex flex-col items-center gap-3">
           <RefreshCw className={`w-6 h-6 animate-spin ${isPaysuite ? 'text-amber-500' : 'text-emerald-500'}`} />
           <span>Loading {isPaysuite ? 'Paysuite' : 'LaunchGood'} Payout Reconciliation Data...</span>
@@ -1246,7 +1291,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                       const batchLabel = isPaysuite ? batch.batch_label : `#${cleanId}`;
                       return (
                         <tr 
-                          key={idx} 
+                          key={cleanId || idx} 
                           className={`transition-colors cursor-pointer ${
                             isSelected 
                               ? isPaysuite ? 'bg-amber-500/10 hover:bg-amber-500/15' : 'bg-emerald-500/10 hover:bg-emerald-500/15'
@@ -1446,7 +1491,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                     const sortedSubs = sortItems(cg.campaigns || []);
                     return (
                       <div 
-                        key={idx} 
+                        key={cg.code || idx} 
                         className="rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm overflow-hidden transition-all"
                       >
                         {/* Group Header Card */}
@@ -1650,7 +1695,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                     const sortedSubs = sortItems(hg.campaigns || []);
                     return (
                       <div 
-                        key={idx} 
+                        key={hg.heading || idx} 
                         className="rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm overflow-hidden transition-all"
                       >
                         {/* Heading Header Card */}
@@ -1856,7 +1901,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                     const sortedSubs = sortItems(ctg.campaigns || []);
                     return (
                       <div 
-                        key={idx} 
+                        key={ctg.country || idx} 
                         className="rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm overflow-hidden transition-all"
                       >
                         {/* Country Header Card */}
@@ -2125,7 +2170,14 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                                     </span>
                                   )}
                                 </div>
-                                <span className={`${isPaysuite ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'} text-[10px] font-mono font-black`}>{camp.code}</span>
+                                <div className="flex items-center gap-1">
+                                  <span className={`${isPaysuite ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'} text-[10px] font-mono font-black`}>{camp.code}</span>
+                                  {camp.special_case && (
+                                    <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-300">
+                                      {camp.special_case}
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                             </td>
                             <td className="p-3.5 font-bold font-mono text-slate-900 dark:text-white">
@@ -2271,7 +2323,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               </span>
             </div>
             <div className="p-3.5 rounded-xl border border-slate-200 dark:border-white/10 bg-white/60 dark:bg-slate-900/60 backdrop-blur-md">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">Gross Presented</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">{isPaysuite ? 'Gross Presented' : 'Gross Donations'}</span>
               <span className="text-lg font-black text-slate-900 dark:text-white font-mono">
                 {currSymbol}{Number(donorsData.summary?.total_gross || 0).toLocaleString('en-GB', { minimumFractionDigits: 2 })}
               </span>
@@ -2285,7 +2337,11 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             <div className="p-3.5 rounded-xl border border-slate-200 dark:border-white/10 bg-white/60 dark:bg-slate-900/60 backdrop-blur-md">
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">Net Settlement</span>
               <span className={`text-lg font-black ${isPaysuite ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'} font-mono`}>
-                {currSymbol}{Number(donorsData.summary?.total_net || 0).toLocaleString('en-GB', { minimumFractionDigits: 2 })}
+                {currSymbol}{Number(
+                  (donorsData.summary?.total_net != null && donorsData.summary?.total_net !== 0)
+                    ? donorsData.summary.total_net
+                    : ((donorsData.summary?.total_gross || 0) - (donorsData.summary?.total_fees || 0))
+                ).toLocaleString('en-GB', { minimumFractionDigits: 2 })}
               </span>
             </div>
           </div>
@@ -2434,6 +2490,11 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                             </div>
                             <div className="flex items-center gap-1">
                               <span className={`${isPaysuite ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'} text-[10px] font-mono font-black`}>{d.code}</span>
+                              {d.special_case && (
+                                <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-300">
+                                  {d.special_case}
+                                </span>
+                              )}
                               {d.country && d.country !== 'Unassigned' && (
                                 <span className="text-slate-400 text-[10px]">({d.country})</span>
                               )}
@@ -2633,17 +2694,75 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                   type="text"
                   value={editingClassification.code}
                   onChange={(e) => handleSelectCodeInModal(e.target.value)}
-                  placeholder="e.g. GAZ-EMR, SHM-SPN-HUF, ALL-DIV..."
+                  placeholder="e.g. GAZ-EMR, SHM-SOC-AID-GEN, ALL-DIV..."
                   list="payout-modal-codes-list"
                   className="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-white/10 bg-white dark:bg-slate-800 text-xs font-mono font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 uppercase"
                 />
                 <datalist id="payout-modal-codes-list">
-                  {Object.keys(codeMap).map((k) => (
-                    <option key={k} value={k.toUpperCase()}>
-                      {codeMap[k].Heading} • {codeMap[k]['Sub-Heading']} ({codeMap[k].Country})
-                    </option>
-                  ))}
+                  {Object.keys(codeMap).map((k) => {
+                    const item = codeMap[k];
+                    const base = k.toUpperCase();
+                    const rec = item?.['Special Cases'] || [];
+                    return (
+                      <React.Fragment key={k}>
+                        <option value={base}>
+                          {item.Heading} • {item['Sub-Heading']} ({item.Country})
+                        </option>
+                        {rec.map(sc => (
+                          <option key={`${k}-${sc}`} value={`${base} [${canonicalizeCase(sc)}]`}>
+                            ↳ {base} [{canonicalizeCase(sc)}] (Recommended)
+                          </option>
+                        ))}
+                      </React.Fragment>
+                    );
+                  })}
                 </datalist>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400 block mb-1">
+                  Special Case / Sub-Category
+                </label>
+                {(() => {
+                  const currentCode = editingClassification.code?.toLowerCase();
+                  const recList = (codeMap[currentCode]?.['Special Cases'] || []).map(canonicalizeCase);
+                  if (currentCode === 'afg-soc-aid-gen' && !recList.includes('Zarang bike')) recList.push('Zarang bike');
+                  const otherList = ALL_SHEET10_SPECIAL_CASES.filter(sc => !recList.includes(sc));
+                  const currentVal = editingClassification.special_case || '';
+                  const isCustom = currentVal && !recList.includes(currentVal) && !otherList.includes(currentVal) && !['none', 'unassigned', 'n/a', 'nan', ''].includes(currentVal.toLowerCase());
+                  return (
+                    <select
+                      value={currentVal}
+                      onChange={(e) => {
+                        if (e.target.value === '__CUSTOM__') {
+                          const customInput = window.prompt('Enter custom special case name:', currentVal);
+                          if (customInput !== null) {
+                            setEditingClassification(prev => ({ ...prev, special_case: customInput.trim() }));
+                          }
+                        } else {
+                          setEditingClassification(prev => ({ ...prev, special_case: e.target.value }));
+                        }
+                      }}
+                      className="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-white/10 bg-white dark:bg-slate-800 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+                    >
+                      <option value="">-- None (Standard) --</option>
+                      {isCustom && <option value={currentVal}>{currentVal} (Custom)</option>}
+                      {recList.length > 0 && (
+                        <optgroup label="Recommended for Code">
+                          {recList.map(sc => (
+                            <option key={sc} value={sc}>{sc}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      <optgroup label={recList.length > 0 ? "Other Special Cases (Sheet10)" : "All Special Cases (Sheet10)"}>
+                        {otherList.map(sc => (
+                          <option key={sc} value={sc}>{sc}</option>
+                        ))}
+                      </optgroup>
+                      <option value="__CUSTOM__">+ Enter Custom Case...</option>
+                    </select>
+                  );
+                })()}
               </div>
 
               <div className="grid grid-cols-2 gap-3">

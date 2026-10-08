@@ -134,6 +134,64 @@ def fix_mojibake(text):
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
+
+ALL_SHEET10_SPECIAL_CASES = [
+    'Zarang bike',
+    'Umm Abdullah',
+    'Umm Alaa',
+    'Umm Habib',
+    'Umm Suleiman',
+    'Umm Hamza',
+    'Aunt Sahr',
+    'Umm Lofti',
+    'Umm Muhammad',
+    'Umm Saeed',
+    'Eid Clothes',
+    'Eid Party',
+    'LUFS',
+    'Most Needy',
+    'Qurbani',
+    'Tent2Home',
+    'Special Case'
+]
+
+
+def canonicalize_special_case(sc_str) -> str:
+    if not sc_str:
+        return ""
+    trimmed = str(sc_str).strip()
+    if trimmed.lower() in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]:
+        return ""
+    for known in ALL_SHEET10_SPECIAL_CASES:
+        if known.lower() == trimmed.lower():
+            return known
+    return trimmed
+
+
+def canonical_campaign_key(text: Any) -> str:
+    """
+    Produces a normalized canonical key for campaign name matching:
+    - Repairs mojibake
+    - Strips accents/diacritics (macrons like ā -> a, é -> e) via NFKD decomposition
+    - Strips community/platform suffixes (| ..., - ..., – ..., — ...)
+    - Strips all punctuation (!, ?, quotes, periods, commas, colons, brackets, hyphens)
+    - Collapses multiple whitespace
+    """
+    if not text:
+        return ""
+    import unicodedata
+    import re
+    s = fix_mojibake(str(text)).strip().lower()
+    s = unicodedata.normalize('NFKD', s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    for sep in ["|", " - ", " – ", " — "]:
+        if sep in s:
+            s = s.split(sep)[0].strip()
+    s = s.replace("’", "").replace("‘", "").replace("'", "").replace('"', "")
+    s = re.sub(r"[^\w\s]", " ", s)
+    return " ".join(s.split())
+
+
 def deduplicate_dataframe_columns(df_input):
     """
     Finds and merges duplicate columns case-insensitively.
@@ -199,6 +257,8 @@ def get_code_to_classification_map(force_reload: bool = False, company_id: Optio
             select_cols = ["code", "department", "office", "portfolio", "country", "zakat_eligibility"]
             if "programme_fund" in mpc_cols:
                 select_cols.extend(["programme_fund", "fund_code", "legacy_non_zakat_code", "legacy_zakat_code", "old_codes"])
+            if "special_treatment" in mpc_cols:
+                select_cols.append("special_treatment")
 
             where_clause = ""
             params = []
@@ -222,6 +282,8 @@ def get_code_to_classification_map(force_reload: bool = False, company_id: Optio
                 non_zakat_gl = str(row.get("legacy_non_zakat_code") or "").strip()
                 zakat_gl = str(row.get("legacy_zakat_code") or "").strip()
                 old_raw = str(row.get("old_codes") or "").strip()
+                spec_treat_raw = str(row.get("special_treatment") or "").strip() if "special_treatment" in mpc_cols else ""
+                spec_cases = [s.strip() for s in spec_treat_raw.replace(",", ";").split(";") if s.strip()]
 
                 entry = {
                     "Code": code,
@@ -233,6 +295,9 @@ def get_code_to_classification_map(force_reload: bool = False, company_id: Optio
                     "Legacy Non-Zakat Code": non_zakat_gl,
                     "Legacy Zakat Code": zakat_gl,
                     "Old Code": old_raw,
+                    "Special Treatment": spec_treat_raw,
+                    "Special Case": canonicalize_special_case(spec_cases[0] if spec_cases else spec_treat_raw),
+                    "Special Cases": [canonicalize_special_case(s) for s in spec_cases if s],
                     # Backward-compatible aliases
                     "Heading": dept if dept.lower() not in ["unassigned", ""] else "Unassigned",
                     "Sub-Heading": off if off.lower() not in ["unassigned", ""] else "Unassigned",
@@ -241,6 +306,14 @@ def get_code_to_classification_map(force_reload: bool = False, company_id: Optio
                 }
 
                 code_map[code_lower] = entry
+
+                # Register smart variants for special cases: code [special case]
+                for sc in spec_cases:
+                    variant_key = f"{code_lower} [{sc.lower()}]"
+                    variant_entry = dict(entry)
+                    variant_entry["Special Case"] = sc
+                    variant_entry["Display Code"] = f"{code} [{sc}]"
+                    code_map[variant_key] = variant_entry
 
                 # Also alias each legacy code from old_codes to point to this entry
                 if old_raw:
@@ -361,6 +434,7 @@ def init_classification_db():
                     is_primary INTEGER DEFAULT 0,
                     donor_name TEXT DEFAULT '',
                     donor_email TEXT DEFAULT '',
+                    special_case TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (platform, company_id, campaign_name, giving_level, code)
@@ -373,6 +447,8 @@ def init_classification_db():
                 cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN company_id TEXT NOT NULL DEFAULT 'rethink'")
             if "giving_level" not in map_cols:
                 cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN giving_level TEXT NOT NULL DEFAULT ''")
+            if "special_case" not in map_cols:
+                cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN special_case TEXT DEFAULT ''")
 
             # Purge duplicate unassigned ghost rows when an assigned row exists for that same (platform, company_id, campaign_name, giving_level)
             try:
@@ -388,7 +464,6 @@ def init_classification_db():
                             AND LOWER(COALESCE(p2.code, 'unassigned')) NOT IN ('unassigned', '', 'none', 'nan')
                       );
                 """)
-                # Purge exact duplicates in platform_campaign_mappings keeping the row with highest id
                 cur.execute("""
                     DELETE FROM platform_campaign_mappings
                     WHERE id NOT IN (
@@ -396,6 +471,14 @@ def init_classification_db():
                         FROM platform_campaign_mappings
                         GROUP BY LOWER(platform), LOWER(COALESCE(company_id, 'rethink')), LOWER(TRIM(campaign_name)), LOWER(TRIM(COALESCE(giving_level, ''))), UPPER(TRIM(COALESCE(code, 'Unassigned')))
                     );
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_pcm_p_c_c_g_c 
+                    ON platform_campaign_mappings(platform, company_id, campaign_name, giving_level, code);
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_pcm_c_p_c_g_c 
+                    ON platform_campaign_mappings(company_id, platform, campaign_name, giving_level, code);
                 """)
             except Exception:
                 pass
@@ -422,6 +505,8 @@ def init_classification_db():
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
                     m.code,
+                    COALESCE(m.special_case, '') AS special_case,
+                    COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
                     COALESCE(m.campaign_url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
@@ -453,6 +538,8 @@ def init_classification_db():
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
                     m.code,
+                    COALESCE(m.special_case, '') AS special_case,
+                    COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
                     COALESCE(m.campaign_url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
@@ -484,6 +571,8 @@ def init_classification_db():
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
                     m.code,
+                    COALESCE(m.special_case, '') AS special_case,
+                    COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
                     COALESCE(m.campaign_url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
@@ -515,6 +604,8 @@ def init_classification_db():
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
                     m.code,
+                    COALESCE(m.special_case, '') AS special_case,
+                    COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
                     COALESCE(c.department, 'Unassigned') AS department,
                     COALESCE(c.office, 'Unassigned') AS office,
@@ -545,6 +636,8 @@ def init_classification_db():
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
                     m.code,
+                    COALESCE(m.special_case, '') AS special_case,
+                    COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
                     COALESCE(m.campaign_url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
@@ -691,7 +784,8 @@ def init_classification_db():
                 );
             """)
 
-            # Seed default Microsoft Azure App credentials for organizations if configured
+            # Seed default Microsoft Azure App credentials for organizations if configured.
+            # Only fills blanks: credentials saved per charity in the tracker UI must survive restarts.
             azure_client_id = os.getenv("AZURE_CLIENT_ID", "")
             azure_client_secret = os.getenv("AZURE_CLIENT_SECRET", "")
             azure_tenant_id = os.getenv("AZURE_TENANT_ID", "common")
@@ -701,9 +795,9 @@ def init_classification_db():
                         INSERT INTO sponsorship_outlook_auth (company_id, client_id, client_secret, tenant_id)
                         VALUES (?, ?, ?, ?)
                         ON CONFLICT(company_id) DO UPDATE SET
-                            client_id = excluded.client_id,
-                            client_secret = excluded.client_secret,
-                            tenant_id = excluded.tenant_id
+                            client_id = CASE WHEN COALESCE(client_id, '') = '' THEN excluded.client_id ELSE client_id END,
+                            client_secret = CASE WHEN COALESCE(client_secret, '') = '' THEN excluded.client_secret ELSE client_secret END,
+                            tenant_id = CASE WHEN COALESCE(tenant_id, '') IN ('', 'common') THEN excluded.tenant_id ELSE tenant_id END
                     """, (cid, azure_client_id, azure_client_secret, azure_tenant_id))
 
             # 6. Sponsorship Email Templates Table
@@ -769,6 +863,8 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                 campaign_name as "Campaign Name",
                 COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(special_case, '') as "Special Case",
+                COALESCE(special_treatment, '') as "Special Treatment",
                 COALESCE(campaign_url, '') as "Campaign URL",
                 COALESCE(community_name, 'N/A') as "Community Name",
                 COALESCE(department, heading, 'Unassigned') as "Department",
@@ -792,7 +888,7 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
         conn.close()
 
     if not db_matrix.empty:
-        db_matrix["Campaign Name"] = db_matrix["Campaign Name"].apply(fix_mojibake).str.strip()
+        db_matrix["Campaign Name"] = db_matrix["Campaign Name"].apply(fix_mojibake).str.strip().str.replace("’", "'").str.replace("‘", "'")
         db_matrix["Community Name"] = db_matrix["Community Name"].apply(fix_mojibake).str.strip()
         db_matrix["Giving Level"] = db_matrix["Giving Level"].apply(fix_mojibake).str.strip()
 
@@ -803,16 +899,25 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
         con = get_duckdb_connection()
         if con and os.path.exists(PARQUET_PATH):
             company_filter = f"AND LOWER(COALESCE(\"company_id\", 'rethink')) = '{comp}'" if comp != "all" else ""
+            has_sc = False
+            try:
+                cols_check = con.execute(f"DESCRIBE SELECT * FROM '{PARQUET_PATH.replace(chr(92), '/')}' LIMIT 1").df()
+                has_sc = "Special Case" in cols_check["column_name"].values
+            except Exception:
+                has_sc = False
+            sc_sql = 'MAX(COALESCE(NULLIF(TRIM("Special Case"), \'\'), \'\')) as "Special Case",' if has_sc else "'' as \"Special Case\","
+
             donor_distinct = con.execute(f"""
                 SELECT 
                     COALESCE(NULLIF(TRIM("Campaign Name"), ''), 'N/A') as "Campaign Name",
                     CASE 
-                        WHEN "Giving Level Title" IS NULL OR LOWER(TRIM("Giving Level Title")) IN ('', 'nan', 'none', 'null', 'n/a') THEN ''
+                        WHEN "Giving Level Title" IS NULL OR LOWER(TRIM("Giving Level Title")) IN ('', 'nan', 'none', 'null', 'n/a', 'default (general)') THEN ''
                         ELSE TRIM("Giving Level Title")
                     END as "Giving Level",
                     COALESCE(NULLIF(TRIM("Code"), ''), 'Unassigned') as "Code",
                     MAX(COALESCE(NULLIF(TRIM("Community Name"), ''), 'N/A')) as "Community Name",
                     MAX(COALESCE(NULLIF(TRIM("Campaign URL"), ''), '')) as "Campaign URL",
+                    {sc_sql}
                     COUNT(*) as donation_count,
                     SUM(TRY_CAST(REPLACE(REPLACE(COALESCE(CAST("Total Online Donation Gross Amount in Settled Currency" AS VARCHAR), CAST("Donation Amount (in Donation Currency)" AS VARCHAR), '0'), '£', ''), ',', '') AS DOUBLE)) as total_amount
                 FROM '{PARQUET_PATH.replace(chr(92), '/')}'
@@ -833,35 +938,62 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
             lg_df = df_donations[lg_mask] if lg_mask.any() else df_donations.iloc[0:0]
 
             if not lg_df.empty:
-                c_name = lg_df["Campaign Name"].astype(str).str.strip()
+                c_name = lg_df["Campaign Name"].astype(str).str.strip().str.replace("’", "'").str.replace("‘", "'")
                 c_name = c_name[~c_name.str.lower().isin(['nan', 'none', 'n/a', '', 'unassigned'])]
-                gl_name = lg_df.loc[c_name.index, "Giving Level Title"].fillna("").astype(str).str.strip().replace({'nan': '', 'None': '', 'null': '', 'N/A': ''}) if "Giving Level Title" in lg_df.columns else pd.Series("", index=c_name.index)
+                gl_name = lg_df.loc[c_name.index, "Giving Level Title"].fillna("").astype(str).str.strip().replace({'nan': '', 'None': '', 'null': '', 'N/A': '', 'Default (General)': ''}) if "Giving Level Title" in lg_df.columns else pd.Series("", index=c_name.index)
                 comm_name = lg_df.loc[c_name.index, "Community Name"].astype(str).str.strip().replace({'nan': 'N/A', '': 'N/A', 'None': 'N/A'}) if "Community Name" in lg_df.columns else pd.Series("N/A", index=c_name.index)
                 code_val = lg_df.loc[c_name.index, "Code"].astype(str).str.strip().replace({'nan': 'Unassigned', '': 'Unassigned', 'None': 'Unassigned'}) if "Code" in lg_df.columns else pd.Series("Unassigned", index=c_name.index)
                 donor_df = pd.DataFrame({"Campaign Name": c_name, "Giving Level": gl_name, "Code": code_val, "Community Name": comm_name})
+                if "Special Case" in lg_df.columns:
+                    donor_df["Special Case"] = lg_df.loc[c_name.index, "Special Case"].fillna("").astype(str).str.strip().replace({'nan': '', 'None': '', 'Unassigned': ''})
+                else:
+                    donor_df["Special Case"] = ""
                 donor_distinct = donor_df.drop_duplicates(subset=["Campaign Name", "Giving Level", "Code"])
 
     if donor_distinct is not None and not donor_distinct.empty:
-        donor_distinct["Campaign Name"] = donor_distinct["Campaign Name"].apply(fix_mojibake).str.strip()
+        donor_distinct["Campaign Name"] = donor_distinct["Campaign Name"].apply(fix_mojibake).str.strip().str.replace("’", "'").str.replace("‘", "'")
         donor_distinct["Community Name"] = donor_distinct["Community Name"].apply(fix_mojibake).str.strip()
-        donor_distinct["Giving Level"] = donor_distinct["Giving Level"].apply(fix_mojibake).str.strip()
+        donor_distinct["Giving Level"] = donor_distinct["Giving Level"].apply(fix_mojibake).str.strip().replace({'nan': '', 'None': '', 'null': '', 'N/A': '', 'Default (General)': ''})
+        if "Special Case" not in donor_distinct.columns:
+            donor_distinct["Special Case"] = ""
 
         if db_matrix.empty:
-            merged_raw = donor_distinct.fillna("Unassigned").reset_index(drop=True)
+            merged_raw = donor_distinct.copy()
+            for c in target_cols:
+                if c not in merged_raw.columns:
+                    merged_raw[c] = "Unassigned" if c not in ["Portfolio", "Programme Fund", "Fund Code", "Special Case"] else ""
         else:
+            db_matrix["Campaign Name"] = db_matrix["Campaign Name"].apply(fix_mojibake).str.strip().str.replace("’", "'").str.replace("‘", "'")
+            db_matrix["Giving Level"] = db_matrix["Giving Level"].apply(fix_mojibake).str.strip().replace({'nan': '', 'None': '', 'null': '', 'N/A': '', 'Default (General)': ''})
+
             merged = pd.merge(
                 donor_distinct,
                 db_matrix,
                 on=["Campaign Name", "Giving Level", "Code"],
                 how="outer",
                 suffixes=('', '_db')
-            ).fillna("Unassigned")
+            )
             if "Community Name_db" in merged.columns:
                 merged["Community Name"] = merged["Community Name"].replace("N/A", "").combine_first(merged["Community Name_db"]).replace("", "N/A")
                 merged.drop(columns=["Community Name_db"], inplace=True)
             if "Campaign URL_db" in merged.columns:
                 merged["Campaign URL"] = merged["Campaign URL"].replace("", "").combine_first(merged["Campaign URL_db"])
                 merged.drop(columns=["Campaign URL_db"], inplace=True)
+            if "Special Case_db" in merged.columns:
+                invalid_sc = ["", "unassigned", "none", "none (standard)", "nan", "null", "n/a"]
+                sc_db = merged["Special Case_db"].fillna("").astype(str).str.strip()
+                sc_donor = merged["Special Case"].fillna("").astype(str).str.strip()
+                clean_db = sc_db.replace({v: "" for v in invalid_sc})
+                clean_donor = sc_donor.replace({v: "" for v in invalid_sc})
+                # db_matrix (user saved rules) takes precedence over donor transactions
+                merged["Special Case"] = np.where(clean_db != "", clean_db, clean_donor)
+                merged.drop(columns=["Special Case_db"], inplace=True)
+            for c in target_cols:
+                if c in merged.columns:
+                    if c not in ["Portfolio", "Programme Fund", "Fund Code", "Special Case"]:
+                        merged[c] = merged[c].fillna("Unassigned")
+                    else:
+                        merged[c] = merged[c].fillna("")
             merged_raw = merged
     else:
         merged_raw = db_matrix
@@ -888,6 +1020,22 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                     comms = [c for c in c_grp["Community Name"] if str(c).strip().lower() not in ["n/a", "unassigned", "none", "nan", ""]]
                     if comms:
                         row["Community Name"] = comms[0]
+                if "Special Case" in c_grp.columns:
+                    scs = [s for s in c_grp["Special Case"] if str(s).strip() and str(s).strip().lower() not in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]]
+                    if scs:
+                        row["Special Case"] = scs[0]
+                    else:
+                        grp_scs = [s for s in grp["Special Case"] if str(s).strip() and str(s).strip().lower() not in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]] if "Special Case" in grp.columns else []
+                        row["Special Case"] = grp_scs[0] if grp_scs else ""
+                # Inherit donation metrics from grp if row was filled from db_matrix without donation metrics
+                if (pd.isna(row.get("donation_count")) or row.get("donation_count") == 0) and "donation_count" in grp.columns:
+                    d_sum = grp["donation_count"].dropna().sum()
+                    if d_sum > 0:
+                        row["donation_count"] = int(d_sum)
+                if (pd.isna(row.get("total_amount")) or row.get("total_amount") == 0.0) and "total_amount" in grp.columns:
+                    t_sum = grp["total_amount"].dropna().sum()
+                    if t_sum > 0:
+                        row["total_amount"] = round(float(t_sum), 2)
                 cleaned_rows.append(row)
 
     deduped_df = pd.DataFrame(cleaned_rows) if cleaned_rows else merged_raw
@@ -904,6 +1052,42 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                 fill_mask = mask_unassigned & mapped_vals.notna()
                 if fill_mask.any():
                     deduped_df.loc[fill_mask, tc] = mapped_vals[fill_mask]
+
+    # Ensure Special Case from platform_campaign_mappings is preserved if deduped row has an assigned code
+    if not deduped_df.empty and "Special Case" in deduped_df.columns:
+        sc_missing_mask = deduped_df["Special Case"].fillna("").astype(str).str.strip().isin(["", "none", "unassigned", "none (standard)"])
+        assigned_mask = ~deduped_df["Code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "NONE", "NAN", "", "N/A"])
+        to_lookup_mask = sc_missing_mask & assigned_mask
+        if to_lookup_mask.any():
+            try:
+                conn_sc = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
+                sc_map_df = pd.read_sql_query("""
+                    SELECT campaign_name, code, special_case 
+                    FROM platform_campaign_mappings 
+                    WHERE special_case IS NOT NULL AND TRIM(special_case) NOT IN ('', 'none', 'unassigned', 'none (standard)', 'nan', 'null')
+                      AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                      AND LOWER(platform) = 'launchgood'
+                """, conn_sc, params=(comp,))
+                conn_sc.close()
+                if not sc_map_df.empty:
+                    sc_lookup = {}
+                    for _, sc_r in sc_map_df.iterrows():
+                        c_canon = canonical_campaign_key(sc_r["campaign_name"])
+                        code_up = str(sc_r["code"] or "").strip().upper()
+                        val = canonicalize_special_case(fix_mojibake(str(sc_r["special_case"])))
+                        if val:
+                            sc_lookup[(c_canon, code_up)] = val
+                            if c_canon not in sc_lookup:
+                                sc_lookup[c_canon] = val
+                    for l_idx in deduped_df[to_lookup_mask].index:
+                        l_cname = deduped_df.at[l_idx, "Campaign Name"]
+                        l_code = str(deduped_df.at[l_idx, "Code"]).strip().upper()
+                        l_canon = canonical_campaign_key(l_cname)
+                        found_sc = sc_lookup.get((l_canon, l_code), sc_lookup.get(l_canon))
+                        if found_sc:
+                            deduped_df.at[l_idx, "Special Case"] = found_sc
+            except Exception:
+                pass
 
     if "donation_count" in deduped_df.columns:
         deduped_df["donation_count"] = pd.to_numeric(deduped_df["donation_count"], errors="coerce").fillna(0).astype(int)
@@ -1025,10 +1209,12 @@ def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink
 
                 comm = str(r.get("Community Name") or "N/A").strip()
                 curl = str(r.get("Campaign URL") or "").strip()
-                fname = str(r.get("First Name") or "").strip()
-                lname = str(r.get("Last Name") or "").strip()
-                d_name = f"{fname} {lname}".strip()
-                d_email = str(r.get("Email") or "").strip()
+                # These rows are aggregated from DONATIONS, so First/Last Name and Email belong to
+                # whichever donor gave last - not the campaign's organizer. Never store them as the
+                # campaign contact; organizers live in the Fundraisers registry. Empty values leave
+                # any existing (manually set) contact untouched via the ON CONFLICT rule below.
+                d_name = ""
+                d_email = ""
 
                 mapping_rows.append((plat_name, cname, code, comm, curl, d_name, d_email, comp))
 
@@ -1084,7 +1270,13 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
     if not comp_mask.any():
         return 0
 
-    campaign_series = df_raw["Campaign Name"].astype(str).str.strip().str.lower().str.replace("’", "'").str.replace("‘", "'")
+    def _norm_campaign_title(name_val):
+        if not name_val:
+            return ""
+        return fix_mojibake(str(name_val)).strip().lower().replace("’", "'").replace("‘", "'")
+
+    campaign_series = df_raw["Campaign Name"].apply(_norm_campaign_title)
+    base_campaign_series = campaign_series.apply(lambda s: s.split("|")[0].strip() if "|" in s else s)
     gl_series = df_raw["Giving Level Title"].fillna("").astype(str).str.strip().str.lower().str.replace("’", "'").str.replace("‘", "'") if "Giving Level Title" in df_raw.columns else pd.Series("", index=df_raw.index)
 
     # 1. Load all platform mappings for this company from DB to guarantee complete coverage
@@ -1106,7 +1298,8 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 COALESCE(c.country, 'Unassigned') as "Country",
                 COALESCE(c.zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(c.programme_fund, '') as "Programme Fund",
-                COALESCE(c.fund_code, '') as "Fund Code"
+                COALESCE(c.fund_code, '') as "Fund Code",
+                COALESCE(m.special_case, '') as "Special Case"
             FROM platform_campaign_mappings m
             LEFT JOIN master_project_codes c 
                 ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code)) 
@@ -1127,11 +1320,19 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
     # Prepare fast lookup maps
     gl_rule_map = {}
     camp_default_rule_map = {}
+    cname_to_rules = {}
 
     for _, row in all_rules.iterrows():
-        cname = str(row.get("Campaign Name", "")).strip().lower().replace("’", "'").replace("‘", "'")
+        cname = _norm_campaign_title(row.get("Campaign Name", ""))
         if not cname or cname in ["n/a", "none", "nan", ""]:
             continue
+        cname_to_rules.setdefault(cname, []).append(row.to_dict())
+        c_base = cname.split("|")[0].strip() if "|" in cname else cname
+        if c_base != cname:
+            cname_to_rules.setdefault(c_base, []).append(row.to_dict())
+        c_canon = canonical_campaign_key(cname)
+        if c_canon:
+            cname_to_rules.setdefault(c_canon, []).append(row.to_dict())
         
         r_gl = str(row.get("Giving Level") or row.get("giving_level") or "").strip().lower().replace("’", "'").replace("‘", "'")
         r_dept = str(row.get("Department") or row.get("Heading", "Unassigned"))
@@ -1142,49 +1343,88 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
         r_zakat = str(row.get("Zakat Eligibility", "Unassigned"))
         r_prog = str(row.get("Programme Fund", ""))
         r_fund = str(row.get("Fund Code", ""))
+        r_spec = str(row.get("Special Case") or row.get("special_case") or "").strip()
+        if r_spec.lower() in ["unassigned", "none", "none (standard)", "nan", "null", "n/a"]:
+            r_spec = ""
         r_url = str(row.get("Campaign URL") or "").strip()
 
         col_vals = {
             "Department": r_dept, "Office": r_off, "Portfolio": r_port,
             "Heading": r_dept, "Sub-Heading": r_off, "Country": r_cntry,
             "Code": r_code, "Zakat Eligibility": r_zakat,
-            "Programme Fund": r_prog, "Fund Code": r_fund
+            "Programme Fund": r_prog, "Fund Code": r_fund,
+            "Special Case": r_spec
         }
         if r_url:
             col_vals["Campaign URL"] = r_url
 
-        if r_gl and r_gl not in ["nan", "none", "n/a", "campaign default / general", "campaign default", ""]:
+        if r_gl and r_gl not in ["nan", "none", "n/a", "campaign default / general", "campaign default", "default (general)", ""]:
             gl_rule_map[(cname, r_gl)] = col_vals
+            if c_base != cname:
+                gl_rule_map[(c_base, r_gl)] = col_vals
+            if c_canon:
+                gl_rule_map[(c_canon, r_gl)] = col_vals
         else:
-            if cname not in camp_default_rule_map or bool(row.get("is_primary") in [1, True, "1", "true", "True"]):
-                camp_default_rule_map[cname] = col_vals
+            def _update_camp_default(key, vals, is_pri):
+                if key not in camp_default_rule_map:
+                    camp_default_rule_map[key] = dict(vals)
+                else:
+                    existing = camp_default_rule_map[key]
+                    if vals.get("Special Case") and not existing.get("Special Case"):
+                        existing["Special Case"] = vals["Special Case"]
+                    existing_assigned = str(existing.get("Code", "")).strip().upper() not in ["", "UNASSIGNED", "NONE", "NAN", "N/A"]
+                    incoming_assigned = str(vals.get("Code", "")).strip().upper() not in ["", "UNASSIGNED", "NONE", "NAN", "N/A"]
+                    if is_pri or (not existing_assigned and incoming_assigned):
+                        for k, v in vals.items():
+                            if k == "Special Case" and not v and existing.get("Special Case"):
+                                continue
+                            existing[k] = v
+
+            is_p = bool(row.get("is_primary") in [1, True, "1", "true", "True"])
+            _update_camp_default(cname, col_vals, is_p)
+            if c_base != cname:
+                _update_camp_default(c_base, col_vals, is_p)
+            if c_canon:
+                _update_camp_default(c_canon, col_vals, is_p)
 
     # Apply vectorized mapping for this company's donations
     comp_indices = df_raw[comp_mask].index
     c_sub = campaign_series.loc[comp_indices]
+    b_sub = base_campaign_series.loc[comp_indices]
+    cn_sub = df_raw.loc[comp_indices, "Campaign Name"].apply(canonical_campaign_key)
     g_sub = gl_series.loc[comp_indices]
 
     keys = list(zip(c_sub, g_sub))
+    b_keys = list(zip(b_sub, g_sub))
+    cn_keys = list(zip(cn_sub, g_sub))
     
-    target_cols = ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Programme Fund", "Fund Code"]
+    target_cols = ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Programme Fund", "Fund Code", "Special Case"]
     if "Campaign URL" in df_raw.columns:
         target_cols.append("Campaign URL")
 
     for col in target_cols:
         if col not in df_raw.columns:
-            df_raw[col] = "Unassigned" if col != "Portfolio" else ""
+            df_raw[col] = "Unassigned" if col not in ["Portfolio", "Programme Fund", "Fund Code", "Special Case"] else ""
 
-        # Giving level specific lookup
-        gl_mapped = [gl_rule_map.get(k, {}).get(col) for k in keys]
-        # Campaign default lookup
-        camp_mapped = [camp_default_rule_map.get(c, {}).get(col) for c in c_sub]
+        # Giving level specific lookup (exact or base or canonical)
+        gl_mapped = [gl_rule_map.get(k, gl_rule_map.get(bk, gl_rule_map.get(cnk, {}))).get(col) for k, bk, cnk in zip(keys, b_keys, cn_keys)]
+        # Campaign default lookup (exact or base or canonical)
+        camp_mapped = [camp_default_rule_map.get(c, camp_default_rule_map.get(b, camp_default_rule_map.get(cn, {}))).get(col) for c, b, cn in zip(c_sub, b_sub, cn_sub)]
 
         mapped_series = pd.Series(gl_mapped, index=comp_indices).combine_first(pd.Series(camp_mapped, index=comp_indices))
-        valid_mask = mapped_series.notna() & (~mapped_series.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
-        
-        if valid_mask.any():
-            valid_idx = valid_mask[valid_mask].index
-            df_raw.loc[valid_idx, col] = mapped_series.loc[valid_idx]
+        if col == "Special Case":
+            is_matched = [bool(camp_default_rule_map.get(c) or camp_default_rule_map.get(b) or camp_default_rule_map.get(cn) or gl_rule_map.get(k) or gl_rule_map.get(bk) or gl_rule_map.get(cnk)) for c, b, cn, k, bk, cnk in zip(c_sub, b_sub, cn_sub, keys, b_keys, cn_keys)]
+            match_mask = pd.Series(is_matched, index=comp_indices)
+            if match_mask.any():
+                sc_to_set = mapped_series.fillna("")
+                invalid_sc = ["nan", "none", "none (standard)", "unassigned", "null"]
+                sc_cleaned = sc_to_set.replace({v: "" for v in invalid_sc})
+                df_raw.loc[match_mask[match_mask].index, col] = sc_cleaned.loc[match_mask[match_mask].index]
+        else:
+            valid_mask = mapped_series.notna() & (~mapped_series.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
+            if valid_mask.any():
+                valid_idx = valid_mask[valid_mask].index
+                df_raw.loc[valid_idx, col] = mapped_series.loc[valid_idx]
 
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
     df_raw.to_parquet(PARQUET_PATH, index=False)
@@ -1209,18 +1449,40 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                     pdf["company_id"] = "rethink"
                 p_comp_mask = (pdf["company_id"].astype(str).str.lower() == comp)
                 if p_comp_mask.any():
-                    p_cname = pdf.get("Campaign Name", pdf.get("Project Name", pd.Series("", index=pdf.index))).astype(str).str.strip().str.lower()
+                    p_cname = pdf.get("Campaign Name", pdf.get("Project Name", pd.Series("", index=pdf.index))).apply(_norm_campaign_title)
+                    p_base = p_cname.apply(lambda s: s.split("|")[0].strip() if "|" in s else s)
+                    p_canon = pdf.get("Campaign Name", pdf.get("Project Name", pd.Series("", index=pdf.index))).apply(canonical_campaign_key)
                     p_code = pdf.get("Code", pd.Series("unassigned", index=pdf.index)).astype(str).str.strip().str.lower()
 
+                    if "Special Case" not in pdf.columns:
+                        pdf["Special Case"] = ""
+
                     for cname, rules_list in cname_to_rules.items():
-                        pc_mask = p_comp_mask & (p_cname == cname)
+                        c_base = cname.split("|")[0].strip() if "|" in cname else cname
+                        c_canon = canonical_campaign_key(cname)
+                        c_base_canon = canonical_campaign_key(c_base)
+                        pc_mask = p_comp_mask & ((p_cname == cname) | (p_cname == c_base) | (p_base == cname) | (p_base == c_base) | (p_canon == c_canon) | (p_canon == c_base_canon))
                         if not pc_mask.any():
                             continue
 
-                        primary_row = next((r for r in rules_list if bool(r.get("is_primary") in [1, True, "1", "true", "True"])), rules_list[0])
-                        for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]:
+                        assigned_candidates = [r for r in rules_list if str(r.get("Code", "")).strip().upper() not in ["", "UNASSIGNED", "NONE", "NAN", "N/A", "NULL"]]
+                        pri_candidates = [r for r in assigned_candidates if bool(r.get("is_primary") in [1, True, "1", "true", "True"])]
+                        primary_row = pri_candidates[0] if pri_candidates else (assigned_candidates[0] if assigned_candidates else next((r for r in rules_list if bool(r.get("is_primary") in [1, True, "1", "true", "True"])), rules_list[0]))
+
+                        spec_candidates = [str(r.get("Special Case") or "").strip() for r in rules_list if str(r.get("Special Case") or "").strip().lower() not in ["", "unassigned", "none", "none (standard)", "nan", "null", "n/a"]]
+                        chosen_sc = spec_candidates[0] if spec_candidates else str(primary_row.get("Special Case") or "").strip()
+                        if chosen_sc.lower() in ["unassigned", "none", "none (standard)", "nan", "null", "n/a"]:
+                            chosen_sc = ""
+
+                        for col in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Special Case"]:
                             if col in pdf.columns:
-                                pdf.loc[pc_mask, col] = str(primary_row.get(col, "Unassigned"))
+                                if col == "Special Case":
+                                    pdf.loc[pc_mask, col] = chosen_sc
+                                else:
+                                    val = primary_row.get(col, "")
+                                    if not val or str(val).lower() in ["none", "nan"]:
+                                        val = "Unassigned"
+                                    pdf.loc[pc_mask, col] = str(val or "")
 
                     pdf = sanitize_df_dtypes_for_parquet(pdf)
                     atomic_write_parquet(pdf, PAYOUTS_PARQUET_PATH)
@@ -1264,18 +1526,53 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
         return 0
 
     clean_matrix = matrix_df.copy()
+
+    # Propagate non-empty Special Case across rows with matching canonical campaign key
+    canon_to_spec = {}
+    for _, r in clean_matrix.iterrows():
+        c_name = str(r.get("Campaign Name", "")).strip()
+        c_canon = canonical_campaign_key(c_name)
+        sc = canonicalize_special_case(r.get("Special Case") or r.get("special_case") or "")
+        if sc and c_canon:
+            canon_to_spec[c_canon] = sc
+
+    if canon_to_spec:
+        for idx in clean_matrix.index:
+            c_name = str(clean_matrix.at[idx, "Campaign Name"] or "").strip()
+            c_canon = canonical_campaign_key(c_name)
+            curr_sc = canonicalize_special_case(clean_matrix.at[idx, "Special Case"] if "Special Case" in clean_matrix.columns else clean_matrix.at[idx, "special_case"])
+            if not curr_sc and c_canon in canon_to_spec:
+                if "Special Case" in clean_matrix.columns:
+                    clean_matrix.at[idx, "Special Case"] = canon_to_spec[c_canon]
+                if "special_case" in clean_matrix.columns:
+                    clean_matrix.at[idx, "special_case"] = canon_to_spec[c_canon]
+
     cname_gl_to_codes = {}
     master_code_rows = []
     mapping_rows = []
 
     for _, row in clean_matrix.iterrows():
-        cname = str(row.get("Campaign Name", "Unassigned")).strip().replace("’", "'").replace("‘", "'")
+        cname = fix_mojibake(str(row.get("Campaign Name", "Unassigned"))).strip().replace("’", "'").replace("‘", "'")
         gl = str(row.get("Giving Level") or row.get("giving_level") or "").strip().replace("’", "'").replace("‘", "'")
-        if gl.lower() in ["nan", "none", "n/a", "campaign default / general", "campaign default"]:
+        if gl.lower() in ["nan", "none", "n/a", "campaign default / general", "campaign default", "default (general)"]:
             gl = ""
-        code = str(row.get("Code", "Unassigned")).strip().upper()
+        raw_code = str(row.get("Code", "Unassigned")).strip().upper()
         if not cname or cname.lower() in ["nan", "none", "n/a", "", "campaign_name", "campaign name"]:
             continue
+
+        c_canon = canonical_campaign_key(cname)
+        spec_case = canonicalize_special_case(row.get("Special Case") or row.get("special_case") or "")
+        if not spec_case and c_canon in canon_to_spec:
+            spec_case = canon_to_spec[c_canon]
+
+        # Parse bracket syntax CODE [Special Case]
+        code = raw_code
+        if "[" in raw_code and raw_code.endswith("]"):
+            parts = raw_code.split("[", 1)
+            code = parts[0].strip().upper()
+            if not spec_case:
+                spec_case = canonicalize_special_case(parts[1].rstrip("]").strip())
+
         cname_gl_to_codes.setdefault((cname.lower(), gl.lower()), set()).add(code.lower())
 
         dept = str(row.get("Department") or row.get("Heading", "Unassigned")).strip()
@@ -1289,13 +1586,13 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
         if code and code not in ["UNASSIGNED", "NAN", "NONE", "N/A", ""]:
             master_code_rows.append((code, dept, off, port, country, zakat, comp))
 
-        comm = str(row.get("Community Name", "N/A")).strip()
+        comm = fix_mojibake(str(row.get("Community Name", "N/A"))).strip()
         curl = str(row.get("Campaign URL", "") or "").strip()
         is_prim = 1 if row.get("is_primary") in [1, True, "1", "true", "True"] else 0
         d_name = str(row.get("Donor Name", "") or "").strip()
         d_email = str(row.get("Donor Email", "") or "").strip()
 
-        mapping_rows.append((platform.lower(), cname, gl, code, comm, curl, is_prim, d_name, d_email, comp))
+        mapping_rows.append((platform.lower(), comp, cname, gl, code, comm, curl, is_prim, d_name, d_email, spec_case))
 
     import time
     for attempt in range(5):
@@ -1303,6 +1600,17 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
             with _DB_LOCK:
                 conn = get_db_connection(timeout=60.0)
                 with conn:
+                    # Clean up any legacy mojibake names in platform_campaign_mappings
+                    try:
+                        cur_pcm = conn.cursor()
+                        cur_pcm.execute("SELECT id, campaign_name FROM platform_campaign_mappings WHERE campaign_name LIKE '%Ä%' OR campaign_name LIKE '%Ã%' OR campaign_name LIKE '%â%' OR campaign_name LIKE '%\xad%'")
+                        for m_id, m_cname in cur_pcm.fetchall():
+                            fixed_name = fix_mojibake(m_cname).strip()
+                            if fixed_name != m_cname:
+                                conn.execute("UPDATE OR IGNORE platform_campaign_mappings SET campaign_name = ? WHERE id = ?", (fixed_name, m_id))
+                    except Exception:
+                        pass
+
                     # 1. Upsert master project codes
                     if master_code_rows:
                         conn.executemany("""
@@ -1321,16 +1629,64 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                         placeholders = ','.join(['?'] * len(codes))
                         conn.execute(f"DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ? AND LOWER(COALESCE(giving_level, '')) = ? AND LOWER(code) NOT IN ({placeholders})", [comp, platform.lower(), cname_lower, gl_lower] + list(codes))
 
+                    # Deduplicate mapping_rows by (platform, comp, cname, gl, code), preserving non-empty special_case
+                    deduped_mapping_rows = {}
+                    for row in mapping_rows:
+                        m_key = (row[0], row[1], row[2].lower(), row[3].lower(), row[4].upper())
+                        if m_key not in deduped_mapping_rows:
+                            deduped_mapping_rows[m_key] = row
+                        else:
+                            existing = deduped_mapping_rows[m_key]
+                            if not existing[10] and row[10]:
+                                deduped_mapping_rows[m_key] = row
+                    mapping_rows = list(deduped_mapping_rows.values())
+
                     conn.executemany("""
-                        INSERT INTO platform_campaign_mappings (platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, donor_name, donor_email, company_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(company_id, platform, campaign_name, giving_level, code) DO UPDATE SET
+                        INSERT INTO platform_campaign_mappings (platform, company_id, campaign_name, giving_level, code, community_name, campaign_url, is_primary, donor_name, donor_email, special_case)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(platform, company_id, campaign_name, giving_level, code) DO UPDATE SET
                             community_name = COALESCE(NULLIF(excluded.community_name, 'N/A'), platform_campaign_mappings.community_name),
                             campaign_url = COALESCE(NULLIF(excluded.campaign_url, ''), platform_campaign_mappings.campaign_url),
                             is_primary = excluded.is_primary,
                             donor_name = CASE WHEN excluded.donor_name != '' THEN excluded.donor_name ELSE platform_campaign_mappings.donor_name END,
-                            donor_email = CASE WHEN excluded.donor_email != '' THEN excluded.donor_email ELSE platform_campaign_mappings.donor_email END;
+                            donor_email = CASE WHEN excluded.donor_email != '' THEN excluded.donor_email ELSE platform_campaign_mappings.donor_email END,
+                            special_case = CASE WHEN excluded.special_case != '' THEN excluded.special_case ELSE platform_campaign_mappings.special_case END,
+                            updated_at = CURRENT_TIMESTAMP;
                     """, mapping_rows)
+
+                    # Propagate non-empty special_case to matching campaigns / base campaign titles in platform_campaign_mappings
+                    spec_updates = {}
+                    for row in mapping_rows:
+                        sc_val = row[10]
+                        if sc_val and sc_val.lower() not in ["", "none", "none (standard)", "unassigned", "nan", "null"]:
+                            c_name = row[2]
+                            c_canon = canonical_campaign_key(c_name)
+                            if c_canon:
+                                spec_updates[c_canon] = sc_val
+
+                    if spec_updates:
+                        cur_pcm = conn.cursor()
+                        cur_pcm.execute("SELECT id, campaign_name, special_case FROM platform_campaign_mappings WHERE company_id = ? AND platform = ?", (comp, platform.lower()))
+                        pcm_rows = cur_pcm.fetchall()
+                        for p_id, p_cname, p_sc in pcm_rows:
+                            p_canon = canonical_campaign_key(p_cname)
+                            if p_canon in spec_updates:
+                                target_sc = spec_updates[p_canon]
+                                if (p_sc or "").strip() != target_sc:
+                                    conn.execute("UPDATE platform_campaign_mappings SET special_case = ? WHERE id = ?", (target_sc, p_id))
+
+                    # Purge ghost unassigned mappings where a valid assigned code exists for the campaign
+                    conn.execute("""
+                        DELETE FROM platform_campaign_mappings
+                        WHERE company_id = ? AND platform = ?
+                          AND UPPER(TRIM(COALESCE(code, ''))) IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+                          AND LOWER(TRIM(campaign_name)) IN (
+                              SELECT LOWER(TRIM(campaign_name))
+                              FROM platform_campaign_mappings
+                              WHERE company_id = ? AND platform = ?
+                                AND UPPER(TRIM(COALESCE(code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+                          )
+                    """, (comp, platform.lower(), comp, platform.lower()))
                 conn.close()
             break
         except sqlite3.OperationalError as e:
@@ -1339,9 +1695,21 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                 continue
             raise
 
-    # 3. Synchronize to active donor records
-    sync_matrix_classifications_to_donors(clean_matrix, company_id=comp)
+    # 3. Synchronize to active donor records in the background so API responds immediately (< 50ms)
+    clean_matrix_copy = clean_matrix.copy()
+    def _bg_matrix_sync():
+        try:
+            sync_matrix_classifications_to_donors(clean_matrix_copy, company_id=comp)
+        except Exception as e:
+            print(f"[Background matrix sync notice]: {e}")
+
+    threading.Thread(target=_bg_matrix_sync, daemon=True).start()
     invalidate_code_map(comp)
+    try:
+        from backend.api.payouts import invalidate_payouts_cache as _inv_p_cache
+        _inv_p_cache(comp)
+    except Exception:
+        pass
     return len(clean_matrix)
 
 
@@ -3507,6 +3875,8 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
                 campaign_name as "Campaign Name",
                 COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(special_case, '') as "Special Case",
+                COALESCE(special_treatment, '') as "Special Treatment",
                 COALESCE(campaign_url, '') as "Campaign URL",
                 COALESCE(community_name, 'N/A') as "Community Name",
                 COALESCE(department, heading, 'Unassigned') as "Department",

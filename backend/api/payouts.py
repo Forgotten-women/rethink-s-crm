@@ -8,6 +8,7 @@ import math
 import os
 import io
 import re
+import threading
 from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -22,6 +23,7 @@ from core.data_processor import (
     load_payouts_data,
     load_paysuite_payouts_data,
     fix_mojibake,
+    canonical_campaign_key,
     get_code_to_classification_map,
     sync_matrix_classifications_to_donors,
     get_classification_matrix,
@@ -171,22 +173,52 @@ def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Op
                         "zakat_eligibility": r[4] or "Unassigned"
                     }
 
+            def _is_valid_code(c: Optional[str]) -> bool:
+                if not c:
+                    return False
+                return str(c).strip().upper() not in ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+
+            def _should_update(existing, new_entry):
+                if not existing:
+                    return True
+                existing_valid = _is_valid_code(existing.get("code"))
+                new_valid = _is_valid_code(new_entry.get("code"))
+                # If existing entry has a valid code and incoming entry is unassigned, NEVER overwrite
+                if existing_valid and not new_valid:
+                    return False
+                # If existing is unassigned and incoming has a valid code, ALWAYS upgrade
+                if not existing_valid and new_valid:
+                    return True
+                # If both valid: primary entry takes precedence
+                if existing.get("is_primary") and not new_entry.get("is_primary"):
+                    return False
+                if new_entry.get("is_primary") and not existing.get("is_primary"):
+                    return True
+                # If both valid and neither is primary, keep existing
+                if existing_valid and new_valid:
+                    return False
+                return True
+
             # 2. Platform campaign mappings for LaunchGood (including website fallback)
             where_pcm = "WHERE (platform IN ('launchgood', 'website') OR platform IS NULL OR platform = '') AND LOWER(COALESCE(company_id, 'rethink')) = ?" if cid != "all" else "WHERE (platform IN ('launchgood', 'website') OR platform IS NULL OR platform = '')"
             params_pcm = (cid,) if cid != "all" else ()
             cur.execute(f"""
-                SELECT campaign_name, code, is_primary, COALESCE(giving_level, '')
+                SELECT campaign_name, code, is_primary, COALESCE(giving_level, ''), COALESCE(special_case, '')
                 FROM platform_campaign_mappings
                 {where_pcm}
-                ORDER BY CASE WHEN platform = 'launchgood' THEN 2 WHEN platform IS NULL OR platform = '' THEN 1 ELSE 0 END, is_primary ASC
+                AND UPPER(TRIM(COALESCE(code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+                ORDER BY 
+                    CASE WHEN platform = 'launchgood' THEN 2 WHEN platform IS NULL OR platform = '' THEN 1 ELSE 0 END ASC,
+                    is_primary ASC
             """, params_pcm)
             
             cache = {}
-            for cname, code, is_pri, gl in cur.fetchall():
+            for cname, code, is_pri, gl, spec in cur.fetchall():
                 c_clean = fix_mojibake(cname).strip().lower()
                 raw_code = str(code or "").strip().upper()
                 mapped_code = LEGACY_PAYOUT_CODE_MAP.get(raw_code, raw_code)
                 gl_clean = fix_mojibake(gl).strip().lower()
+                spec_clean = fix_mojibake(spec).strip() if spec and str(spec).strip().lower() not in ["unassigned", "none", "nan", "null", "n/a"] else ""
 
                 meta = master_codes_map.get(mapped_code, {
                     "code": mapped_code,
@@ -203,27 +235,46 @@ def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Op
                     "sub_heading": meta["sub_heading"],
                     "country": meta["country"],
                     "zakat_eligibility": meta["zakat_eligibility"],
+                    "special_case": spec_clean,
                     "is_primary": is_pri
                 }
 
                 if c_clean:
                     if gl_clean:
-                        cache[(c_clean, gl_clean)] = entry
-                    cache[c_clean] = entry
+                        k = (c_clean, gl_clean)
+                        if _should_update(cache.get(k), entry):
+                            cache[k] = entry
+                    if _should_update(cache.get(c_clean), entry):
+                        cache[c_clean] = entry
+
+                    c_canon = canonical_campaign_key(cname)
+                    if c_canon and _should_update(cache.get(c_canon), entry):
+                        cache[c_canon] = entry
+
+                    for sep in ["|", " - ", " – ", " — "]:
+                        if sep in c_clean:
+                            base_part = c_clean.split(sep)[0].strip()
+                            if base_part and _should_update(cache.get(base_part), entry):
+                                cache[base_part] = entry
+                            base_canon = canonical_campaign_key(base_part)
+                            if base_canon and _should_update(cache.get(base_canon), entry):
+                                cache[base_canon] = entry
 
             # 3. Campaign classifications overlay
             where_cc = "WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if cid != "all" else ""
             params_cc = (cid,) if cid != "all" else ()
+            where_clause_cc = f"WHERE {where_cc[6:]} AND " if where_cc else "WHERE "
             cur.execute(f"""
-                SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary 
+                SELECT campaign_name, heading, sub_heading, country, code, zakat_eligibility, is_primary, COALESCE(special_case, '')
                 FROM campaign_classifications
-                {where_cc}
+                {where_clause_cc} UPPER(TRIM(COALESCE(code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
                 ORDER BY is_primary ASC
             """, params_cc)
-            for cname, heading, sub_heading, country, code, zakat, is_pri in cur.fetchall():
+            for cname, heading, sub_heading, country, code, zakat, is_pri, spec in cur.fetchall():
                 c_clean = fix_mojibake(cname).strip().lower()
                 raw_code = str(code or "").strip().upper()
                 mapped_code = LEGACY_PAYOUT_CODE_MAP.get(raw_code, raw_code)
+                spec_clean = fix_mojibake(spec).strip() if spec and str(spec).strip().lower() not in ["unassigned", "none", "nan", "null", "n/a"] else ""
                 meta = master_codes_map.get(mapped_code, {
                     "code": mapped_code,
                     "heading": heading or "Unassigned",
@@ -238,10 +289,23 @@ def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Op
                     "sub_heading": meta["sub_heading"],
                     "country": meta["country"],
                     "zakat_eligibility": meta["zakat_eligibility"],
+                    "special_case": spec_clean,
                     "is_primary": is_pri
                 }
-                if c_clean and c_clean not in cache:
-                    cache[c_clean] = entry
+                if c_clean:
+                    if _should_update(cache.get(c_clean), entry):
+                        cache[c_clean] = entry
+                    c_canon = canonical_campaign_key(cname)
+                    if c_canon and _should_update(cache.get(c_canon), entry):
+                        cache[c_canon] = entry
+                    for sep in ["|", " - ", " – ", " — "]:
+                        if sep in c_clean:
+                            base_part = c_clean.split(sep)[0].strip()
+                            if base_part and _should_update(cache.get(base_part), entry):
+                                cache[base_part] = entry
+                            base_canon = canonical_campaign_key(base_part)
+                            if base_canon and _should_update(cache.get(base_canon), entry):
+                                cache[base_canon] = entry
 
             conn.close()
             _CLASSIFICATION_MATRIX_CACHE[cid] = cache
@@ -322,7 +386,7 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 if rule_dict:
                     c_keys = df["campaign_name"].astype(str).str.strip().str.lower().tolist()
                     code_keys = df["code"].astype(str).str.strip().str.lower().tolist()
-                    for f, db_f in [("heading", "heading"), ("sub_heading", "sub_heading"), ("country", "country"), ("code", "code"), ("zakat", "zakat_eligibility")]:
+                    for f, db_f in [("heading", "heading"), ("sub_heading", "sub_heading"), ("country", "country"), ("code", "code"), ("zakat", "zakat_eligibility"), ("special_case", "special_case"), ("Special Case", "special_case")]:
                         updated_vals = []
                         for cn, cc in zip(c_keys, code_keys):
                             entry = rule_dict.get((cn, cc), rule_dict.get(cn, {}))
@@ -330,7 +394,7 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                             if val and str(val).strip().lower() not in ["", "nan", "none", "unassigned"]:
                                 updated_vals.append(fix_mojibake(val))
                             else:
-                                updated_vals.append(None)
+                                updated_vals.append("" if "special" in f.lower() else None)
                         series_updated = pd.Series(updated_vals, index=df.index)
                         mask_valid = series_updated.notna()
                         if mask_valid.any():
@@ -356,8 +420,23 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 cur_mtime = 0.0
 
         if not force_reload and cid in _CLASSIFIED_PAYOUTS_CACHE and not _CLASSIFIED_PAYOUTS_CACHE[cid].empty:
+            cached_df = _CLASSIFIED_PAYOUTS_CACHE[cid]
             if _CACHE_PAYOUTS_MTIME.get(cid, 0.0) == cur_mtime and cur_mtime > 0.0:
-                return _CLASSIFIED_PAYOUTS_CACHE[cid]
+                unassigned_mask = cached_df["code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "NAN", "NONE", "NULL", ""])
+                if unassigned_mask.any():
+                    rule_dict = _get_classification_matrix_dict("launchgood", company_id=cid)
+                    if rule_dict:
+                        needs_reclass = False
+                        for cn in cached_df.loc[unassigned_mask, "campaign_name"].unique():
+                            cn_str = str(cn or "").strip().lower()
+                            cn_canon = canonical_campaign_key(cn)
+                            if cn_str in rule_dict or cn_canon in rule_dict:
+                                needs_reclass = True
+                                break
+                        if not needs_reclass:
+                            return cached_df
+                else:
+                    return cached_df
 
         try:
             df_p = load_payouts_data(force_reload=force_reload, company_id=cid)
@@ -367,9 +446,16 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["campaign_name"] = c_name
                 df["Campaign Name"] = c_name
                 df["row_type"] = df.get("Type", df.get("Transaction Type", pd.Series("donation", index=df.index))).fillna("donation").astype(str).str.lower()
-                df["gross_amt"] = pd.to_numeric(df.get("Total Online Donation Gross Amount in Settled Currency", 0.0), errors="coerce").fillna(0.0)
-                df["fee_amt"] = pd.to_numeric(df.get("Total Processing Fees Paid by CC In Settled Currency", 0.0), errors="coerce").fillna(0.0)
-                df["net_amt"] = pd.to_numeric(df.get("Total Online Donations Net Amount in Settled Currency", 0.0), errors="coerce").fillna(0.0)
+                gross_series = pd.to_numeric(df.get("Total Online Donation Gross Amount in Settled Currency", df.get("Gross Amount", df.get("Amount", 0.0))), errors="coerce").fillna(0.0)
+                fee_series = pd.to_numeric(df.get("Total Processing Fees Paid by CC In Settled Currency", df.get("fee_amount", df.get("Fees", 0.0))), errors="coerce").fillna(0.0)
+                net_series = pd.to_numeric(df.get("Total Online Donations Net Amount in Settled Currency", df.get("Net Amount", 0.0)), errors="coerce").fillna(0.0)
+                
+                # Robust fallback: if net_amt is 0.0, calculate net as gross - fee
+                net_series = np.where(net_series != 0.0, net_series, (gross_series - fee_series))
+
+                df["gross_amt"] = gross_series
+                df["fee_amt"] = fee_series
+                df["net_amt"] = net_series
                 
                 t_ids = df.get("Transfer ID", pd.Series("N/A", index=df.index)).fillna("N/A").astype(str).str.replace(".0", "", regex=False).str.strip()
                 df["transfer_id"] = t_ids
@@ -398,22 +484,52 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 updated_subheadings = []
                 updated_countries = []
                 updated_zakats = []
+                updated_special_cases = []
 
                 for idx, (cn, cc) in enumerate(zip(c_keys, code_keys)):
-                    entry = rule_dict.get(cn, {})
+                    entry = rule_dict.get(cn)
+                    if not entry:
+                        cn_canon = canonical_campaign_key(cn)
+                        entry = rule_dict.get(cn_canon)
+                    if not entry:
+                        for sep in ["|", " - ", " – ", " — "]:
+                            if sep in cn:
+                                base_part = cn.split(sep)[0].strip()
+                                entry = rule_dict.get(base_part) or rule_dict.get(canonical_campaign_key(base_part))
+                                if entry:
+                                    break
+                    if not entry:
+                        cn_canon = canonical_campaign_key(cn)
+                        if len(cn_canon) >= 6:
+                            for k, v in rule_dict.items():
+                                if isinstance(k, str) and (cn_canon == k or cn_canon in k or k in cn_canon):
+                                    entry = v
+                                    break
+                    if not entry:
+                        entry = {}
                     entry_code = entry.get("code")
+                    clean_entry_code = str(entry_code or "").strip().upper()
+                    if clean_entry_code in ["NAN", "NONE", "NULL", "", "UNASSIGNED", "N/A"]:
+                        clean_entry_code = None
                     clean_cc = str(cc).strip().upper() if pd.notna(cc) else ""
-                    if clean_cc in ["NAN", "NONE", "NULL", "", "UNASSIGNED"]:
+                    if clean_cc in ["NAN", "NONE", "NULL", "", "UNASSIGNED", "N/A"]:
                         clean_cc = None
-                    raw_new_code = entry_code or (LEGACY_PAYOUT_CODE_MAP.get(clean_cc, clean_cc) if clean_cc else "Unassigned")
+
+                    if clean_entry_code:
+                        raw_new_code = clean_entry_code
+                    elif clean_cc:
+                        raw_new_code = LEGACY_PAYOUT_CODE_MAP.get(clean_cc, clean_cc)
+                    else:
+                        raw_new_code = "Unassigned"
                     new_code = LEGACY_PAYOUT_CODE_MAP.get(raw_new_code, raw_new_code)
-                    if str(new_code).strip().upper() in ["NAN", "NONE", "NULL", "", "UNASSIGNED"]:
+                    if str(new_code).strip().upper() in ["NAN", "NONE", "NULL", "", "UNASSIGNED", "N/A"]:
                         new_code = "Unassigned"
                     
                     heading = entry.get("heading") or df.iloc[idx]["heading"]
                     sub_heading = entry.get("sub_heading") or df.iloc[idx]["sub_heading"]
                     country = entry.get("country") or df.iloc[idx]["country"]
                     zakat = entry.get("zakat_eligibility") or df.iloc[idx]["zakat"]
+                    spec = entry.get("special_case") or (df.iloc[idx]["special_case"] if "special_case" in df.columns else "")
 
                     if str(heading).strip().upper() in ["NAN", "NONE", "NULL", ""]:
                         heading = "Unassigned"
@@ -423,12 +539,15 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                         country = "Unassigned"
                     if str(zakat).strip().upper() in ["NAN", "NONE", "NULL", ""]:
                         zakat = "Unassigned"
+                    if str(spec).strip().lower() in ["nan", "none", "null", "unassigned"]:
+                        spec = ""
 
                     updated_codes.append(fix_mojibake(new_code))
                     updated_headings.append(fix_mojibake(heading))
                     updated_subheadings.append(fix_mojibake(sub_heading))
                     updated_countries.append(fix_mojibake(country))
                     updated_zakats.append(fix_mojibake(zakat))
+                    updated_special_cases.append(fix_mojibake(spec))
 
                 df["code"] = updated_codes
                 df["Code"] = updated_codes
@@ -440,6 +559,8 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["Country"] = updated_countries
                 df["zakat"] = updated_zakats
                 df["Zakat Eligibility"] = updated_zakats
+                df["special_case"] = updated_special_cases
+                df["Special Case"] = updated_special_cases
 
                 _CLASSIFIED_PAYOUTS_CACHE[cid] = df
                 _CACHE_PAYOUTS_MTIME[cid] = cur_mtime
@@ -760,7 +881,7 @@ def get_payouts_summary(
             "total_fees": round(total_fees, 2),
             "total_reserves": round(total_reserves, 2),
             "net_payout": round(net_payout, 2),
-            "total_transactions": len(df),
+            "total_transactions": len(donations_df) if not donations_df.empty else len(df),
             "settled_donations_count": len(donations_df),
             "disbursement_summary": disbursement_summary,
             "ledger_breakdown": ledger_breakdown,
@@ -1285,6 +1406,12 @@ def get_payout_donors(
 
         df = df_all.copy()
 
+        # Isolate donor contribution transactions (exclude bank payout disbursals and reserve hold summaries)
+        if "row_type" in df.columns:
+            don_mask = df["row_type"] == "donation"
+            if don_mask.any():
+                df = df[don_mask].copy()
+
         # Batch / Transfer ID Filter
         if target_batch and target_batch.upper() != "ALL":
             target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
@@ -1340,6 +1467,10 @@ def get_payout_donors(
         total_gross = round(float(df["gross_amt"].sum()), 2) if not df.empty else 0.0
         total_fees = round(float(df["fee_amt"].sum()), 2) if not df.empty else 0.0
         total_net = round(float(df["net_amt"].sum()), 2) if not df.empty else 0.0
+
+        # Fallback for total_net if net_amt sums to 0.0 but gross exists
+        if total_net == 0.0 and total_gross > 0.0:
+            total_net = round(total_gross - total_fees, 2)
 
         if total_records == 0:
             return {
@@ -1557,6 +1688,7 @@ class UpdatePayoutClassificationRequest(BaseModel):
     campaign_name: str
     code: str
     company_id: Optional[str] = "rethink"
+    special_case: Optional[str] = ""
     heading: Optional[str] = "Unassigned"
     sub_heading: Optional[str] = "Unassigned"
     country: Optional[str] = "Unassigned"
@@ -1585,7 +1717,19 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
     target_cid = _clean_str(payload.company_id, "rethink").lower()
     plat = _clean_str(payload.platform, "launchgood").lower()
     cname = fix_mojibake(payload.campaign_name).strip()
-    code = str(payload.code).strip().upper()
+    raw_code = str(payload.code).strip()
+    special_case = (payload.special_case or "").strip()
+
+    # Parse bracketed format: CODE [Special Case]
+    import re
+    bracket_m = re.match(r"^([A-Za-z0-9_-]+)\s*\[(.*?)\]$", raw_code)
+    if bracket_m:
+        code = bracket_m.group(1).strip().upper()
+        if not special_case:
+            special_case = bracket_m.group(2).strip()
+    else:
+        code = raw_code.upper()
+
     heading = fix_mojibake(payload.heading).strip() if payload.heading else "Unassigned"
     sub_heading = fix_mojibake(payload.sub_heading).strip() if payload.sub_heading else "Unassigned"
     country = fix_mojibake(payload.country).strip() if payload.country else ("ALL" if plat == "paysuite" else "Unassigned")
@@ -1597,6 +1741,8 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
     code_map = get_code_to_classification_map(company_id=target_cid)
     if code_map and code.lower() in code_map:
         cm = code_map[code.lower()]
+        if not special_case and cm.get("Special Case"):
+            special_case = cm["Special Case"]
         if heading in ["", "Unassigned"] and cm.get("Heading"):
             heading = cm["Heading"]
         if sub_heading in ["", "Unassigned"] and cm.get("Sub-Heading"):
@@ -1612,28 +1758,56 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
         try:
             with conn:
                 cur = conn.cursor()
+                c_canon = canonical_campaign_key(cname)
+                # Purge unassigned entries for this campaign name or canonical key
+                if code and str(code).strip().upper() not in ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL'):
+                    cur.execute("""
+                        DELETE FROM platform_campaign_mappings
+                        WHERE LOWER(COALESCE(company_id, 'rethink')) = LOWER(?)
+                          AND LOWER(COALESCE(platform, 'launchgood')) = LOWER(?)
+                          AND (
+                              LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                              OR UPPER(TRIM(COALESCE(code, ''))) IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+                          )
+                          AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                    """, (target_cid, plat, cname, cname))
+
                 cur.execute("""
-                    INSERT INTO platform_campaign_mappings (company_id, platform, campaign_name, code, community_name, is_primary)
-                    VALUES (?, ?, ?, ?, 'Payouts', 1)
-                    ON CONFLICT(company_id, platform, campaign_name, giving_level, code) DO UPDATE SET
+                    INSERT INTO platform_campaign_mappings (platform, company_id, campaign_name, giving_level, code, special_case, community_name, is_primary)
+                    VALUES (?, ?, ?, '', ?, ?, 'Payouts', 1)
+                    ON CONFLICT(platform, company_id, campaign_name, giving_level, code) DO UPDATE SET
+                        special_case = excluded.special_case,
                         is_primary = 1,
                         updated_at = CURRENT_TIMESTAMP
-                """, (target_cid, plat, cname, code))
+                """, (plat, target_cid, cname, code, special_case))
+
+                # Propagate special_case to matching canonical campaigns in platform_campaign_mappings
+                if special_case:
+                    cur.execute("SELECT id, campaign_name FROM platform_campaign_mappings WHERE company_id = ? AND platform = ?", (target_cid, plat))
+                    for p_id, p_cname in cur.fetchall():
+                        if canonical_campaign_key(p_cname) == c_canon:
+                            cur.execute("UPDATE platform_campaign_mappings SET special_case = ? WHERE id = ?", (special_case, p_id))
         finally:
             conn.close()
 
-    # 2. Synchronize to donations and payout settlements
-    if plat == "paysuite":
-        ps_matrix = get_paysuite_classification_matrix(company_id=target_cid)
-        sync_matrix_classifications_to_donors(ps_matrix, company_id=target_cid)
-    else:
-        matrix_df = get_classification_matrix(company_id=target_cid)
-        sync_matrix_classifications_to_donors(matrix_df, company_id=target_cid)
-
-    # 3. Invalidate caches
+    # 2. Invalidate in-memory caches immediately so data is real-time accessible
     invalidate_payouts_cache(company_id=target_cid)
     invalidate_data_cache(company_id=target_cid)
     get_code_to_classification_map(force_reload=True, company_id=target_cid)
+
+    # 3. Synchronize heavy parquet files in the background daemon thread
+    def _bg_payout_sync():
+        try:
+            if plat == "paysuite":
+                ps_matrix = get_paysuite_classification_matrix(company_id=target_cid)
+                sync_matrix_classifications_to_donors(ps_matrix, company_id=target_cid)
+            else:
+                matrix_df = get_classification_matrix(company_id=target_cid)
+                sync_matrix_classifications_to_donors(matrix_df, company_id=target_cid)
+        except Exception as e:
+            print(f"[Background payout sync notice]: {e}")
+
+    threading.Thread(target=_bg_payout_sync, daemon=True).start()
 
     try:
         from backend.api.events import broadcast_event_sync

@@ -18,11 +18,110 @@ from pydantic import BaseModel
 
 from core.data_processor import load_data, LOCAL_DB_PATH
 from core.security import encrypt_string, decrypt_string
-from backend.api.auth import get_current_user, require_super_admin
+from backend.api.auth import get_current_user, require_super_admin, require_company_access, user_company_ids
+from core.event_log import log_event
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/tracker", tags=["Sponsorship Target Tracker & Allocations"])
+# Email themes are stored in the company_id column of sponsorship_email_templates.
+# Each theme belongs to exactly one charity's workspace.
+THEME_OWNER_COMPANY = {"rethink": "rethink", "sp_rethink": "rethink", "iqra": "iqra", "sp": "iqra"}
+
+# Routes reachable without a session: the open-tracking pixel is loaded by mail clients
+# and the Graph webhook is called by Microsoft.
+_PUBLIC_TRACKER_PATHS = ("/api/tracker/email-tracking/pixel/", "/api/tracker/outlook/webhook")
+
+# Path-parameter -> (table, id column, owner column) for ownership checks.
+_OWNED_RESOURCES = {
+    "beneficiary_id": ("sponsorship_beneficiaries", "id", "company_id"),
+    "allocation_id": ("sponsorship_allocations", "id", "company_id"),
+    "feedback_id": ("sponsorship_feedbacks", "id", "company_id"),
+    "donor_id": ("sponsorship_manual_donors", "id", "company_id"),
+    "template_id": ("sponsorship_email_templates", "id", "company_id"),
+    "tracking_id": ("sponsorship_communications", "tracking_id", "company_id"),
+    "allocation_donor_id": ("sponsorship_allocation_donors", "id", "company_id"),
+    "queue_id": ("sponsorship_email_queue", "id", "company_id"),
+}
+
+
+def _owner_company(raw_company: Optional[str]) -> str:
+    comp = (raw_company or "").strip().lower()
+    return THEME_OWNER_COMPANY.get(comp, comp)
+
+
+def _lookup_owner(param: str, value: str) -> Optional[str]:
+    table, id_col, owner_col = _OWNED_RESOURCES[param]
+    if param == "donor_id":
+        value = str(value).replace("manual_", "")
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        row = conn.execute(f"SELECT {owner_col} FROM {table} WHERE {id_col} = ?", (value,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+    return _owner_company(row[0]) if row else None
+
+
+def _allocation_company(allocation_id: Any) -> str:
+    owner = _lookup_owner("allocation_id", allocation_id)
+    if not owner:
+        raise HTTPException(status_code=404, detail="Allocation not found.")
+    return owner
+
+
+async def tracker_access_guard(request: Request) -> Optional[dict]:
+    """Router-wide isolation: every tracker call needs a valid session, may only name a
+    company the user can access, and may only touch records owned by that company.
+    A record from another charity is reported as not found."""
+    path = request.url.path
+    if path.startswith(_PUBLIC_TRACKER_PATHS):
+        return None
+
+    user = await get_current_user(request, None, None)
+    allowed = user_company_ids(user)
+
+    body = {}
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        try:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            pass
+
+    requested = request.query_params.get("company_id") or body.get("company_id")
+    requested_owner = _owner_company(requested) if requested else None
+    if requested_owner:
+        require_company_access(user, requested_owner)
+
+    referenced = dict(request.path_params)
+    for key in ("allocation_id", "beneficiary_id", "allocation_donor_id"):
+        if body.get(key) not in (None, "") and key not in referenced:
+            referenced[key] = body[key]
+
+    for param, value in referenced.items():
+        if param not in _OWNED_RESOURCES:
+            continue
+        owner = _lookup_owner(param, value)
+        if owner is None:
+            continue  # let the endpoint return its own 404
+        if (allowed is not None and owner not in allowed) or (
+                requested_owner and requested_owner != "all" and owner != requested_owner):
+            log_event("access.cross_company_blocked", category="security", level="warning", actor=user.get("email"),
+                      company_id=requested_owner, record=f"{param}={value}", record_company=owner, path=path,
+                      message=f"Blocked access to {owner} record {param}={value}")
+            raise HTTPException(status_code=404, detail="Record not found for this charity.")
+
+    request.state.tracker_user = user
+    return user
+
+
+router = APIRouter(
+    prefix="/api/tracker",
+    tags=["Sponsorship Target Tracker & Allocations"],
+    dependencies=[Depends(tracker_access_guard)],
+)
 
 TRANSPARENT_1PX_GIF = bytes.fromhex(
     "47494638396101000100800000ffffff00000021f90401000000002c00000000010001000002024401003b"
@@ -143,6 +242,63 @@ def _ensure_tracker_tables_migrated():
             );
         """)
 
+        # 7. Donors per allocation (collective sponsorships). sponsorship_allocations keeps
+        # one row per beneficiary; its donor_* columns mirror the primary donor here.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sponsorship_allocation_donors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                allocation_id INTEGER NOT NULL REFERENCES sponsorship_allocations(id) ON DELETE CASCADE,
+                company_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'donor',
+                donor_id TEXT DEFAULT '',
+                donor_name TEXT DEFAULT '',
+                donor_email TEXT DEFAULT '',
+                donor_phone TEXT DEFAULT '',
+                contribution_amount REAL NOT NULL DEFAULT 0.0,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                is_manual INTEGER NOT NULL DEFAULT 0,
+                source TEXT DEFAULT 'manual',
+                needs_review INTEGER NOT NULL DEFAULT 0,
+                review_note TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_alloc_donors_alloc ON sponsorship_allocation_donors(allocation_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_alloc_donors_company_email ON sponsorship_allocation_donors(company_id, donor_email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_alloc_donors_company_donor ON sponsorship_allocation_donors(company_id, donor_id)")
+
+        if comm_cols and "allocation_donor_id" not in comm_cols:
+            cur.execute("ALTER TABLE sponsorship_communications ADD COLUMN allocation_donor_id INTEGER")
+        if comm_cols and "template_type" not in comm_cols:
+            cur.execute("ALTER TABLE sponsorship_communications ADD COLUMN template_type TEXT")
+
+        # 8. Review queue of system-triggered emails (nothing is sent without a person approving it).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sponsorship_email_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id TEXT NOT NULL,
+                allocation_id INTEGER NOT NULL,
+                allocation_donor_id INTEGER NOT NULL,
+                template_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                trigger_key TEXT NOT NULL,
+                due_date TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                sent_comm_id INTEGER,
+                error_message TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(allocation_donor_id, template_type, trigger_key)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_queue_company_status ON sponsorship_email_queue(company_id, status)")
+
+        cur.execute("PRAGMA table_info(sponsorship_alert_settings)")
+        alert_cols = [r[1] for r in cur.fetchall()]
+        if "renewal_lead_days" not in alert_cols:
+            cur.execute("ALTER TABLE sponsorship_alert_settings ADD COLUMN renewal_lead_days INTEGER DEFAULT 30")
+
         conn.commit()
         conn.close()
     except Exception as e:
@@ -200,8 +356,29 @@ class BeneficiaryUpdateRequest(BaseModel):
     video_link: Optional[str] = None
     status: Optional[str] = None
 
+class AllocationDonorInput(BaseModel):
+    donor_id: Optional[str] = ""
+    donor_name: Optional[str] = ""
+    donor_email: Optional[str] = ""
+    donor_phone: Optional[str] = ""
+    contribution_amount: Optional[float] = 0.0
+    is_primary: Optional[bool] = False
+    is_manual: Optional[bool] = False
+    role: Optional[str] = None  # 'donor' | 'organizer'; defaults from allocation type
+    company_id: Optional[str] = None
+
+class AllocationDonorUpdate(BaseModel):
+    donor_name: Optional[str] = None
+    donor_email: Optional[str] = None
+    donor_phone: Optional[str] = None
+    contribution_amount: Optional[float] = None
+    is_primary: Optional[bool] = None
+    needs_review: Optional[bool] = None
+    company_id: Optional[str] = None
+
 class AllocationCreateRequest(BaseModel):
     beneficiary_id: int
+    donors: Optional[List[AllocationDonorInput]] = None  # several donors share one sponsorship
     donor_email: Optional[str] = ""
     donor_phone: Optional[str] = ""
     donor_name: Optional[str] = "Anonymous Donor"
@@ -256,11 +433,25 @@ class OutlookExchangeTokenRequest(BaseModel):
 class OutlookSendRequest(BaseModel):
     allocation_id: int
     template_type: Optional[str] = "profile_intro"
-    recipient_email: str
+    company_id: Optional[str] = "rethink"  # email theme; the mailbox always follows the allocation
+    # Per-donor sending (preferred): each listed donor receives their own personalised email.
+    allocation_donor_ids: Optional[List[int]] = None
+    subject_template: Optional[str] = None  # edited template text with {placeholders}; defaults to the saved template
+    body_template: Optional[str] = None
+    queue_item_ids: Optional[List[int]] = None
+    # Legacy single-message fields (pre-rendered by the browser).
+    recipient_email: Optional[str] = ""
     recipient_name: Optional[str] = "Donor"
-    subject: str
-    body_html: str
-    company_id: Optional[str] = "rethink"
+    subject: Optional[str] = ""
+    body_html: Optional[str] = ""
+
+class EmailPreviewRequest(BaseModel):
+    allocation_id: int
+    allocation_donor_id: Optional[int] = None
+    template_type: Optional[str] = "profile_intro"
+    company_id: Optional[str] = None  # email theme
+    subject_template: Optional[str] = None
+    body_template: Optional[str] = None
 
 class OutlookTestEmailRequest(BaseModel):
     company_id: Optional[str] = "rethink"
@@ -327,9 +518,9 @@ def get_targets(company_id: Optional[str] = Query("rethink")):
         conn.close()
 
 @router.post("/targets")
-def update_targets(payload: UpdateTargetsRequest):
+def update_targets(payload: UpdateTargetsRequest, current_user: dict = Depends(get_current_user)):
     """Updates target values (restricted to super_admin)."""
-    if payload.user_role != "super_admin":
+    if current_user.get("role") != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Updating target values is restricted to Super Admin accounts."
@@ -558,12 +749,44 @@ def get_tracker_stats(
 # 4. BENEFICIARIES DIRECTORY CRUD
 # ==========================================
 
+def _attach_donors_and_funding(cur, rows: List[Dict[str, Any]], alloc_key: str) -> None:
+    """Adds donors[], funded_amount, target_amount and funding_status to allocation/beneficiary rows."""
+    targets_by_company: Dict[str, Dict[str, float]] = {}
+    donors_map = _load_allocation_donors(cur, [r.get(alloc_key) for r in rows if r.get(alloc_key)])
+    for r in rows:
+        comp = (r.get("company_id") or "rethink").lower()
+        if comp not in targets_by_company:
+            try:
+                targets_by_company[comp] = {k: float(v) for k, v in get_targets(company_id=comp).items()}
+            except Exception:
+                targets_by_company[comp] = {}
+        target = float(targets_by_company[comp].get(r.get("sponsorship_type"), 0.0) or 0.0)
+        donors = donors_map.get(r.get(alloc_key), []) if r.get(alloc_key) else []
+        funded = round(sum(float(d["contribution_amount"] or 0.0) for d in donors), 2)
+        r["donors"] = donors
+        r["donor_count"] = len(donors)
+        r["funded_amount"] = funded
+        r["target_amount"] = target
+        if not donors:
+            r["funding_status"] = "unfunded"
+        elif target and funded + 0.005 < target:
+            r["funding_status"] = "partial"
+        else:
+            r["funding_status"] = "full"
+        r["needs_review"] = any(d["needs_review"] for d in donors)
+
+
 @router.get("/beneficiaries")
 def get_beneficiaries(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    search: Optional[str] = Query(None)
+    search: Optional[str] = Query(None),
+    donor: Optional[str] = Query(None),
+    campaign: Optional[str] = Query(None),
+    location: Optional[str] = Query(None),
+    funded_status: Optional[str] = Query(None),
+    needs_review: Optional[bool] = Query(None),
 ):
     """Returns list of beneficiaries with allocation status and feedback counts."""
     comp = (company_id or "rethink").strip().lower()
@@ -616,13 +839,30 @@ def get_beneficiaries(
                 query += " AND b.status = ?"
                 params.append(status)
         if search:
-            query += " AND (b.name LIKE ? OR b.project_code LIKE ? OR b.location LIKE ? OR a.donor_name LIKE ? OR a.donor_email LIKE ?)"
+            query += (" AND (b.name LIKE ? OR b.project_code LIKE ? OR b.location LIKE ? OR a.donor_name LIKE ? OR a.donor_email LIKE ?"
+                      " OR EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
+                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ?)))")
             s_param = f"%{search.strip()}%"
-            params.extend([s_param, s_param, s_param, s_param, s_param])
+            params.extend([s_param] * 7)
+        if donor:
+            query += (" AND EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
+                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?))")
+            params.extend([f"%{donor.strip()}%"] * 3)
+        if campaign:
+            query += " AND a.campaign_name LIKE ?"
+            params.append(f"%{campaign.strip()}%")
+        if location:
+            query += " AND b.location LIKE ?"
+            params.append(f"%{location.strip()}%")
 
         query += " ORDER BY b.created_at DESC"
         cur.execute(query, params)
         rows = [dict(r) for r in cur.fetchall()]
+        _attach_donors_and_funding(cur, rows, alloc_key="allocation_id")
+        if funded_status and funded_status != "all":
+            rows = [r for r in rows if r["funding_status"] == funded_status]
+        if needs_review is not None:
+            rows = [r for r in rows if r["needs_review"] == needs_review]
         return {"count": len(rows), "beneficiaries": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -753,6 +993,43 @@ def _parse_bool(v, default=False):
     return default
 
 
+def _donor_slot_allocations(cur, comp: str, s_type: Optional[str], targets: Dict[str, float]) -> List[Dict[str, Any]]:
+    """One row per (allocation, donor) for this sponsorship type. slot_share is the fraction of a
+    beneficiary's target this donor funds, so three donors sharing one orphan use 1 slot between them,
+    and an Orphan allocation never consumes a Widow slot."""
+    query = """
+        SELECT a.id, d.id AS allocation_donor_id, d.donor_email, d.donor_phone, d.donor_id, d.contribution_amount,
+               (SELECT COUNT(*) FROM sponsorship_allocation_donors x WHERE x.allocation_id = a.id) AS donor_count,
+               a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type
+        FROM sponsorship_allocation_donors d
+        JOIN sponsorship_allocations a ON a.id = d.allocation_id
+        JOIN sponsorship_beneficiaries b ON a.beneficiary_id = b.id
+        WHERE 1=1
+    """
+    params: List[Any] = []
+    if comp != "all":
+        query += " AND a.company_id = ?"
+        params.append(comp)
+    if s_type and s_type.lower() != "all":
+        query += " AND b.sponsorship_type = ?"
+        params.append(s_type)
+    cur.execute(query, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        target = float(targets.get(r.get("sponsorship_type"), 0.0) or 0.0)
+        contribution = float(r.get("contribution_amount") or 0.0)
+        if target > 0 and contribution > 0:
+            r["slot_share"] = round(min(1.0, contribution / target), 4)
+        else:
+            r["slot_share"] = round(1.0 / max(1, int(r.get("donor_count") or 1)), 4)
+    return rows
+
+
+def _slots_used(items: List[Dict[str, Any]]) -> float:
+    used = round(sum(float(i.get("slot_share", 1.0)) for i in items), 2)
+    return int(used) if float(used).is_integer() else used
+
+
 @router.get("/qualifying-donors")
 def get_qualifying_donors(
     company_id: Optional[str] = Query("rethink"),
@@ -783,18 +1060,7 @@ def get_qualifying_donors(
         for r in cur.fetchall():
             targets[r["sponsorship_type"]] = float(r["target_value"])
 
-        alloc_query = """
-            SELECT a.donor_email, a.donor_phone, a.donor_id, a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type
-            FROM sponsorship_allocations a
-            JOIN sponsorship_beneficiaries b ON a.beneficiary_id = b.id
-            WHERE 1=1
-        """
-        alloc_params = []
-        if comp != "all":
-            alloc_query += " AND a.company_id = ?"
-            alloc_params.append(comp)
-        cur.execute(alloc_query, alloc_params)
-        all_allocs = [dict(r) for r in cur.fetchall()]
+        all_allocs = _donor_slot_allocations(cur, comp, s_type, targets)
 
         # Query manual sponsorship donors
         man_query = """
@@ -905,6 +1171,16 @@ def get_qualifying_donors(
                 
                 # 1. Dates: Min & Max per donor for this sponsorship
                 s_dt_agg = s_rel_rows.groupby("Donor ID")["_unified_dt"].agg(["min", "max"])
+
+                # Running total per donor (date order) so we know WHEN each slot threshold was reached:
+                # the waiting clock starts at the payment that completed the slot, not the first donation.
+                timeline_df = pd.DataFrame({
+                    "did": s_rel_rows["Donor ID"].astype(str),
+                    "dt": s_rel_rows["_unified_dt"],
+                    "amt": amt_series.reindex(s_rel_rows.index).fillna(0.0),
+                }).dropna(subset=["dt"]).sort_values(["did", "dt"])
+                timeline_df["cum"] = timeline_df.groupby("did")["amt"].cumsum()
+                timelines = {k: (g["dt"].to_numpy(), g["cum"].to_numpy()) for k, g in timeline_df.groupby("did")}
                 
                 # 2. Campaigns involved per donor for this sponsorship
                 camp_col_name = "Campaign Name" if "Campaign Name" in s_rel_rows.columns else ("Campaign" if "Campaign" in s_rel_rows.columns else None)
@@ -953,6 +1229,8 @@ def get_qualifying_donors(
                     if d_email.lower() in ["n/a", "nan", "none", ""] and "@" in str_id:
                         d_email = str_id
                     d_phone = str(phones_by_did.get(str_id) or "")
+                    if d_phone.strip().lower() in ("nan", "none", "null", "n/a"):
+                        d_phone = ""
                     d_ltv = float(ltv_by_did.get(str_id, s_total_val))
 
                     # Dates and campaigns strictly for this sponsorship
@@ -975,7 +1253,6 @@ def get_qualifying_donors(
 
                     oldest_str = oldest_dt.strftime("%Y-%m-%d") if oldest_dt and pd.notna(oldest_dt) else "N/A"
                     latest_str = latest_dt.strftime("%Y-%m-%d") if latest_dt and pd.notna(latest_dt) else "N/A"
-                    waiting_days = max(0, (now_dt - oldest_dt).days) if oldest_dt and pd.notna(oldest_dt) else 0
 
                     # Target & slot calculation based strictly on amount toward THIS sponsorship
                     slot_threshold = 0.8 * target_amount if target_amount > 0 else 0.0
@@ -1006,8 +1283,20 @@ def get_qualifying_donors(
                         matched_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
 
                     allocated_items = list(matched_allocs_dict.values())
-                    allocated_count = len(allocated_items)
-                    remaining_slots = max(0, max_slots - allocated_count)
+                    allocated_count = _slots_used(allocated_items)
+                    remaining_slots = max(0, round(max_slots - allocated_count, 2))
+
+                    # Waiting age = days since the donation that earned the slot they are still waiting for
+                    # (cumulative giving for this type crossed (slots already used + 1) x 80% of target).
+                    eligible_since = None
+                    if slot_threshold > 0 and remaining_slots > 0 and str_id in timelines:
+                        dts, cums = timelines[str_id]
+                        needed = (int(allocated_count) + 1) * slot_threshold
+                        idx = int(np.searchsorted(cums, needed - 1e-6))
+                        if idx < len(dts):
+                            eligible_since = pd.Timestamp(dts[idx]).to_pydatetime().replace(tzinfo=None)
+                    waiting_days = max(0, (now_dt - eligible_since).days) if eligible_since else 0
+                    eligible_since_str = eligible_since.strftime("%Y-%m-%d") if eligible_since else None
 
                     if allocated_count > max_slots:
                         elig_status = "over_capacity" if max_slots > 0 else "exceptional"
@@ -1047,6 +1336,7 @@ def get_qualifying_donors(
                         "is_manual": False,
                         "oldest_donation_date": oldest_str,
                         "latest_donation_date": latest_str,
+                        "eligible_since": eligible_since_str,
                         "waiting_days": waiting_days,
                         "campaigns_involved": campaigns_involved,
                         "allocated_beneficiaries": allocated_items
@@ -1082,8 +1372,8 @@ def get_qualifying_donors(
             m_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
 
         m_allocated_items = list(m_allocs_dict.values())
-        m_allocated_count = len(m_allocated_items)
-        m_remaining_slots = max(0, m_max_slots - m_allocated_count)
+        m_allocated_count = _slots_used(m_allocated_items)
+        m_remaining_slots = max(0, round(m_max_slots - m_allocated_count, 2))
 
         if m_allocated_count > m_max_slots:
             m_status = "over_capacity"
@@ -1133,7 +1423,8 @@ def get_qualifying_donors(
             "created_at": mr.get("created_at"),
             "oldest_donation_date": m_oldest_str,
             "latest_donation_date": m_oldest_str,
-            "waiting_days": m_waiting_days,
+            "eligible_since": m_oldest_str if (m_total >= 0.8 * target_amount and m_oldest_str != "N/A") else None,
+            "waiting_days": m_waiting_days if m_total >= 0.8 * target_amount else 0,
             "campaigns_involved": ["Manual Entry"],
             "allocated_beneficiaries": m_allocated_items
         })
@@ -1175,18 +1466,7 @@ def search_any_donor(
         for r in cur.fetchall():
             targets[r["sponsorship_type"]] = float(r["target_value"])
 
-        alloc_query = """
-            SELECT a.donor_email, a.donor_phone, a.donor_id, a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type
-            FROM sponsorship_allocations a
-            JOIN sponsorship_beneficiaries b ON a.beneficiary_id = b.id
-            WHERE 1=1
-        """
-        alloc_params = []
-        if comp != "all":
-            alloc_query += " AND a.company_id = ?"
-            alloc_params.append(comp)
-        cur.execute(alloc_query, alloc_params)
-        all_allocs = [dict(r) for r in cur.fetchall()]
+        all_allocs = _donor_slot_allocations(cur, comp, s_type, targets)
 
         # Search matching manual donors
         man_query = """
@@ -1247,8 +1527,8 @@ def search_any_donor(
             m_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
 
         m_allocated_items = list(m_allocs_dict.values())
-        m_allocated_count = len(m_allocated_items)
-        m_remaining_slots = max(0, m_max_slots - m_allocated_count)
+        m_allocated_count = _slots_used(m_allocated_items)
+        m_remaining_slots = max(0, round(m_max_slots - m_allocated_count, 2))
 
         results.append({
             "donor_id": mid,
@@ -1391,8 +1671,8 @@ def search_any_donor(
                     matched_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
 
                 allocated_items = list(matched_allocs_dict.values())
-                allocated_count = len(allocated_items)
-                remaining_slots = max(0, max_slots - allocated_count)
+                allocated_count = _slots_used(allocated_items)
+                remaining_slots = max(0, round(max_slots - allocated_count, 2))
 
                 if allocated_count > max_slots:
                     elig_status = "over_capacity" if max_slots > 0 else "exceptional"
@@ -1648,6 +1928,27 @@ def get_qualifying_campaigns(
             map_params.append(comp)
         cur.execute(map_query, map_params)
         mappings = [dict(r) for r in cur.fetchall()]
+
+        # Organizer contacts come only from the Fundraisers registry. The donor_name/donor_email
+        # columns of platform_campaign_mappings hold the campaign's last DONOR, not its organizer.
+        reg_query = """
+            SELECT LOWER(TRIM(fc.campaign_name)) AS ckey, f.id AS fundraiser_id, f.name, f.email, f.phone
+            FROM fundraiser_campaigns fc
+            JOIN fundraisers f ON f.id = fc.fundraiser_id AND f.company_id = fc.company_id
+            WHERE COALESCE(TRIM(f.email), '') != '' OR COALESCE(TRIM(f.phone), '') != ''
+        """
+        reg_params = []
+        if comp != "all":
+            reg_query += " AND fc.company_id = ?"
+            reg_params.append(comp)
+        cur.execute(reg_query, reg_params)
+        organizers_by_campaign: Dict[str, List[Dict[str, Any]]] = {}
+        for r in cur.fetchall():
+            org = {"fundraiser_id": r["fundraiser_id"], "name": (r["name"] or "").strip(),
+                   "email": (r["email"] or "").strip(), "phone": (r["phone"] or "").strip()}
+            bucket = organizers_by_campaign.setdefault(r["ckey"], [])
+            if org not in bucket:
+                bucket.append(org)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1722,6 +2023,7 @@ def get_qualifying_campaigns(
 
     # Pre-aggregate min and max donation dates per campaign in a single vectorized pass (O(1) lookup)
     campaign_dates = {}
+    campaign_timelines = {}
     if not df.empty and camp_col and "_unified_dt" in df.columns and mask.any():
         try:
             valid_dt_df = df[mask & df["_unified_dt"].notna()]
@@ -1730,6 +2032,11 @@ def get_qualifying_campaigns(
                 dt_grp = valid_dt_df.groupby(clean_camps)["_unified_dt"].agg(["min", "max"])
                 for c_k_idx, row_dt in dt_grp.iterrows():
                     campaign_dates[c_k_idx] = (row_dt["min"], row_dt["max"])
+                # Running total per campaign, to date when each slot threshold was reached.
+                tl = pd.DataFrame({"c": clean_camps, "dt": valid_dt_df["_unified_dt"],
+                                   "amt": amt_series.reindex(valid_dt_df.index).fillna(0.0)}).sort_values(["c", "dt"])
+                tl["cum"] = tl.groupby("c")["amt"].cumsum()
+                campaign_timelines = {k: (g["dt"].to_numpy(), g["cum"].to_numpy()) for k, g in tl.groupby("c")}
         except Exception as e:
             logger.warning(f"Error vectorizing campaign dates: {e}")
 
@@ -1750,8 +2057,10 @@ def get_qualifying_campaigns(
 
         c_display = campaign_sums_display.get(c_key) or mapping_info.get("campaign_name") or c_key
         comm_name = mapping_info.get("community_name") or ""
-        org_name = mapping_info.get("donor_name") or ""
-        org_email = mapping_info.get("donor_email") or ""
+        organizers = organizers_by_campaign.get(c_key) or organizers_by_campaign.get(
+            (mapping_info.get("campaign_name") or "").strip().lower(), [])
+        org_name = ", ".join(o["name"] for o in organizers if o["name"])
+        org_email = ", ".join(o["email"] for o in organizers if o["email"])
 
         # Determine verified Campaign URL
         raw_url = str(mapping_info.get("campaign_url") or "").strip()
@@ -1767,10 +2076,10 @@ def get_qualifying_campaigns(
         has_direct_url = bool(clean_url)
 
         allocated_items = alloc_by_campaign.get(c_key, [])
-        allocated_count = len(allocated_items)
+        allocated_count = _slots_used(allocated_items)
         slot_threshold = 0.8 * target_amount if target_amount > 0 else 0.0
         max_slots = int(tot_val // slot_threshold) if slot_threshold > 0 else 0
-        remaining_slots = max(0, max_slots - allocated_count)
+        remaining_slots = max(0, round(max_slots - allocated_count, 2))
 
         if tot_val >= slot_threshold and remaining_slots > 0:
             elig_status = "eligible"
@@ -1799,7 +2108,14 @@ def get_qualifying_campaigns(
 
         c_oldest_str = c_oldest_dt.strftime("%Y-%m-%d") if c_oldest_dt and pd.notna(c_oldest_dt) else "N/A"
         c_latest_str = c_latest_dt.strftime("%Y-%m-%d") if c_latest_dt and pd.notna(c_latest_dt) else "N/A"
-        c_waiting_days = max(0, (now_dt - c_oldest_dt).days) if c_oldest_dt and pd.notna(c_oldest_dt) else 0
+        # Waiting age starts when the campaign's running total earned the slot it is still waiting for.
+        c_eligible_since = None
+        if slot_threshold > 0 and remaining_slots > 0 and c_key in campaign_timelines:
+            dts, cums = campaign_timelines[c_key]
+            idx = int(np.searchsorted(cums, (int(allocated_count) + 1) * slot_threshold - 1e-6))
+            if idx < len(dts):
+                c_eligible_since = pd.Timestamp(dts[idx]).to_pydatetime().replace(tzinfo=None)
+        c_waiting_days = max(0, (now_dt - c_eligible_since).days) if c_eligible_since else 0
 
         pct_raised = round((tot_val / target_amount) * 100, 1) if target_amount > 0 else 0.0
         is_target_reached = bool(tot_val >= target_amount)
@@ -1816,6 +2132,8 @@ def get_qualifying_campaigns(
             "community_name": comm_name if comm_name != "Unassigned" else "",
             "organizer_name": org_name,
             "organizer_email": org_email,
+            "organizers": organizers,
+            "organizer_source": "fundraiser_registry" if organizers else "none",
             "campaign_url": campaign_url,
             "has_direct_url": has_direct_url,
             "total_raised": round(tot_val, 2),
@@ -1830,6 +2148,7 @@ def get_qualifying_campaigns(
             "status": elig_status,
             "oldest_donation_date": c_oldest_str,
             "latest_donation_date": c_latest_str,
+            "eligible_since": c_eligible_since.strftime("%Y-%m-%d") if c_eligible_since else None,
             "waiting_days": c_waiting_days,
             "allocated_beneficiaries": allocated_items
         })
@@ -1853,7 +2172,19 @@ def get_allocations(
     allocation_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     renewal_filter: Optional[str] = Query(None),
-    search: Optional[str] = Query(None)
+    search: Optional[str] = Query(None),
+    donor: Optional[str] = Query(None),
+    beneficiary: Optional[str] = Query(None),
+    campaign: Optional[str] = Query(None),
+    start_from: Optional[str] = Query(None),
+    start_to: Optional[str] = Query(None),
+    end_from: Optional[str] = Query(None),
+    end_to: Optional[str] = Query(None),
+    last_emailed_from: Optional[str] = Query(None),
+    last_emailed_to: Optional[str] = Query(None),
+    never_emailed: Optional[bool] = Query(None),
+    funded_status: Optional[str] = Query(None),
+    needs_review: Optional[bool] = Query(None),
 ):
     """Returns all allocations joined with beneficiary, campaign metadata, communication metrics, and renewal lifecycle stats."""
     comp = (company_id or "rethink").strip().lower()
@@ -1917,9 +2248,34 @@ def get_allocations(
             query += " AND a.communication_status = ?"
             params.append(status)
         if search:
-            query += " AND (a.donor_name LIKE ? OR a.donor_email LIKE ? OR a.donor_phone LIKE ? OR a.campaign_name LIKE ? OR b.name LIKE ? OR b.project_code LIKE ?)"
+            query += (" AND (a.donor_name LIKE ? OR a.donor_email LIKE ? OR a.donor_phone LIKE ? OR a.campaign_name LIKE ? OR b.name LIKE ? OR b.project_code LIKE ?"
+                      " OR EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
+                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?)))")
             s_param = f"%{search.strip()}%"
-            params.extend([s_param, s_param, s_param, s_param, s_param, s_param])
+            params.extend([s_param] * 9)
+        if donor:
+            query += (" AND EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
+                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?))")
+            params.extend([f"%{donor.strip()}%"] * 3)
+        if beneficiary:
+            query += " AND (b.name LIKE ? OR b.project_code LIKE ?)"
+            params.extend([f"%{beneficiary.strip()}%"] * 2)
+        if campaign:
+            query += " AND (a.campaign_name LIKE ? OR a.community_name LIKE ?)"
+            params.extend([f"%{campaign.strip()}%"] * 2)
+        for col, op, val in (("a.start_date", ">=", start_from), ("a.start_date", "<=", start_to),
+                             ("a.end_date", ">=", end_from), ("a.end_date", "<=", end_to)):
+            if val:
+                query += f" AND substr({col}, 1, 10) {op} ?"
+                params.append(val[:10])
+        if last_emailed_from:
+            query += " AND substr(a.last_contacted_at, 1, 10) >= ?"
+            params.append(last_emailed_from[:10])
+        if last_emailed_to:
+            query += " AND substr(a.last_contacted_at, 1, 10) <= ?"
+            params.append(last_emailed_to[:10])
+        if never_emailed:
+            query += " AND NOT EXISTS (SELECT 1 FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound')"
 
         query += " ORDER BY a.created_at DESC"
         cur.execute(query, params)
@@ -1968,11 +2324,216 @@ def get_allocations(
 
             computed_allocations.append(row)
 
+        _attach_donors_and_funding(cur, computed_allocations, alloc_key="id")
+        if funded_status and funded_status != "all":
+            computed_allocations = [r for r in computed_allocations if r["funding_status"] == funded_status]
+        if needs_review is not None:
+            computed_allocations = [r for r in computed_allocations if r["needs_review"] == needs_review]
         return {"count": len(computed_allocations), "allocations": computed_allocations}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+# ==========================================
+# 6b. DONORS PER ALLOCATION (collective sponsorships)
+# ==========================================
+
+_ALLOC_DONOR_COLUMNS = (
+    "id, allocation_id, company_id, role, donor_id, donor_name, donor_email, donor_phone, "
+    "contribution_amount, is_primary, is_manual, source, needs_review, review_note"
+)
+
+
+def _load_allocation_donors(cur, allocation_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """Donor rows per allocation, primary first."""
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    ids = [int(i) for i in allocation_ids if i is not None]
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        cur.execute(
+            f"SELECT {_ALLOC_DONOR_COLUMNS} FROM sponsorship_allocation_donors "
+            f"WHERE allocation_id IN ({placeholders}) ORDER BY is_primary DESC, id ASC",
+            chunk,
+        )
+        cols = [c[0] for c in cur.description]
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            row["is_primary"] = bool(row["is_primary"])
+            row["is_manual"] = bool(row["is_manual"])
+            row["needs_review"] = bool(row["needs_review"])
+            out.setdefault(row["allocation_id"], []).append(row)
+    return out
+
+
+def _sync_allocation_from_donors(cur, allocation_id: int) -> None:
+    """Mirrors the primary donor into sponsorship_allocations (legacy readers, search, overdue
+    alerts) and keeps allocated_amount equal to the sum of contributions."""
+    donors = _load_allocation_donors(cur, [allocation_id]).get(allocation_id, [])
+    if not donors:
+        return
+    if not any(d["is_primary"] for d in donors):
+        cur.execute("UPDATE sponsorship_allocation_donors SET is_primary = 1 WHERE id = ?", (donors[0]["id"],))
+        donors[0]["is_primary"] = True
+    primary = next(d for d in donors if d["is_primary"])
+    total = round(sum(float(d["contribution_amount"] or 0.0) for d in donors), 2)
+    names = [d["donor_name"] for d in donors if d["donor_name"]]
+    cur.execute("""
+        UPDATE sponsorship_allocations SET
+            donor_name = ?, donor_email = ?, donor_phone = ?, donor_id = ?,
+            allocated_amount = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (
+        " & ".join(names) if len(names) > 1 else (primary["donor_name"] or ""),
+        primary["donor_email"] or "", primary["donor_phone"] or "", primary["donor_id"] or "",
+        total, allocation_id,
+    ))
+
+
+def _insert_allocation_donor(cur, allocation_id: int, company_id: str, allocation_type: str,
+                             d: AllocationDonorInput, source: str = "manual") -> int:
+    email = (d.donor_email or "").strip()
+    phone = (d.donor_phone or "").strip()
+    if not email and not phone:
+        raise HTTPException(status_code=400, detail=f"Donor '{d.donor_name or 'unnamed'}' needs an email or phone number.")
+    if email and "@" not in email:
+        raise HTTPException(status_code=400, detail=f"'{email}' is not a valid email address.")
+    if d.contribution_amount is not None and float(d.contribution_amount) < 0:
+        raise HTTPException(status_code=400, detail="Contribution amount cannot be negative.")
+    role = (d.role or ("organizer" if allocation_type == "campaign" else "donor")).strip().lower()
+    if role not in ("donor", "organizer"):
+        raise HTTPException(status_code=400, detail="Donor role must be 'donor' or 'organizer'.")
+    donor_id = (d.donor_id or "").strip()
+    if email:
+        dup = cur.execute(
+            "SELECT 1 FROM sponsorship_allocation_donors WHERE allocation_id = ? AND LOWER(donor_email) = LOWER(?)",
+            (allocation_id, email)).fetchone()
+        if dup:
+            raise HTTPException(status_code=400, detail=f"{email} is already on this sponsorship.")
+    if d.is_primary:
+        cur.execute("UPDATE sponsorship_allocation_donors SET is_primary = 0 WHERE allocation_id = ?", (allocation_id,))
+    cur.execute("""
+        INSERT INTO sponsorship_allocation_donors (
+            allocation_id, company_id, role, donor_id, donor_name, donor_email, donor_phone,
+            contribution_amount, is_primary, is_manual, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        allocation_id, company_id, role, donor_id, (d.donor_name or "").strip(), email, phone,
+        float(d.contribution_amount or 0.0), 1 if d.is_primary else 0,
+        1 if (d.is_manual or donor_id.startswith("manual_")) else 0, source,
+    ))
+    return cur.lastrowid
+
+
+@router.get("/allocations/{allocation_id}/donors")
+def list_allocation_donors(allocation_id: int):
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        return {"donors": _load_allocation_donors(cur, [allocation_id]).get(allocation_id, [])}
+    finally:
+        conn.close()
+
+
+@router.post("/allocations/{allocation_id}/donors")
+def add_allocation_donor(allocation_id: int, payload: AllocationDonorInput):
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        row = cur.execute("SELECT company_id, allocation_type FROM sponsorship_allocations WHERE id = ?",
+                          (allocation_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Allocation not found.")
+        new_id = _insert_allocation_donor(cur, allocation_id, row[0], row[1] or "individual", payload)
+        _sync_allocation_from_donors(cur, allocation_id)
+        conn.commit()
+        log_event("allocation.donor_added", category="allocation", company_id=row[0], allocation_id=allocation_id,
+                  allocation_donor_id=new_id, donor=payload.donor_name, donor_email=payload.donor_email,
+                  amount=payload.contribution_amount, message=f"Added {payload.donor_name or payload.donor_email} to allocation {allocation_id}")
+        invalidate_overdue_cache(row[0])
+        return {"status": "success", "allocation_donor_id": new_id,
+                "donors": _load_allocation_donors(cur, [allocation_id]).get(allocation_id, [])}
+    finally:
+        conn.close()
+
+
+@router.put("/allocation-donors/{allocation_donor_id}")
+def update_allocation_donor(allocation_donor_id: int, payload: AllocationDonorUpdate):
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        row = cur.execute("SELECT allocation_id, company_id FROM sponsorship_allocation_donors WHERE id = ?",
+                          (allocation_donor_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Donor not found on this sponsorship.")
+        allocation_id, comp = row
+        fields, values = [], []
+        if payload.donor_name is not None:
+            fields.append("donor_name = ?"); values.append(payload.donor_name.strip())
+        if payload.donor_email is not None:
+            email = payload.donor_email.strip()
+            if email and "@" not in email:
+                raise HTTPException(status_code=400, detail=f"'{email}' is not a valid email address.")
+            fields.append("donor_email = ?"); values.append(email)
+        if payload.donor_phone is not None:
+            fields.append("donor_phone = ?"); values.append(payload.donor_phone.strip())
+        if payload.contribution_amount is not None:
+            if float(payload.contribution_amount) < 0:
+                raise HTTPException(status_code=400, detail="Contribution amount cannot be negative.")
+            fields.append("contribution_amount = ?"); values.append(float(payload.contribution_amount))
+        if payload.needs_review is not None:
+            fields.append("needs_review = ?"); values.append(1 if payload.needs_review else 0)
+        if payload.is_primary:
+            cur.execute("UPDATE sponsorship_allocation_donors SET is_primary = 0 WHERE allocation_id = ?", (allocation_id,))
+            fields.append("is_primary = 1")
+        if fields:
+            values.append(allocation_donor_id)
+            cur.execute(f"UPDATE sponsorship_allocation_donors SET {', '.join(fields)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", values)
+            check = cur.execute("SELECT donor_email, donor_phone FROM sponsorship_allocation_donors WHERE id = ?",
+                                (allocation_donor_id,)).fetchone()
+            if not (check[0] or "").strip() and not (check[1] or "").strip():
+                raise HTTPException(status_code=400, detail="A donor needs an email or phone number.")
+            _sync_allocation_from_donors(cur, allocation_id)
+            conn.commit()
+            invalidate_overdue_cache(comp)
+            log_event("allocation.donor_updated", category="allocation", company_id=comp, allocation_id=allocation_id,
+                      allocation_donor_id=allocation_donor_id, changes=payload.dict(exclude_none=True, exclude={"company_id"}),
+                      message=f"Updated donor {allocation_donor_id} on allocation {allocation_id}")
+        return {"status": "success",
+                "donors": _load_allocation_donors(cur, [allocation_id]).get(allocation_id, [])}
+    finally:
+        conn.close()
+
+
+@router.delete("/allocation-donors/{allocation_donor_id}")
+def remove_allocation_donor(allocation_donor_id: int):
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        row = cur.execute("SELECT allocation_id, company_id FROM sponsorship_allocation_donors WHERE id = ?",
+                          (allocation_donor_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Donor not found on this sponsorship.")
+        allocation_id, comp = row
+        remaining = cur.execute("SELECT COUNT(*) FROM sponsorship_allocation_donors WHERE allocation_id = ?",
+                                (allocation_id,)).fetchone()[0]
+        if remaining <= 1:
+            raise HTTPException(status_code=400, detail="A sponsorship needs at least one donor. Remove the allocation instead.")
+        cur.execute("DELETE FROM sponsorship_allocation_donors WHERE id = ?", (allocation_donor_id,))
+        log_event("allocation.donor_removed", category="allocation", level="warning", company_id=comp,
+                  allocation_id=allocation_id, allocation_donor_id=allocation_donor_id,
+                  message=f"Removed donor {allocation_donor_id} from allocation {allocation_id}")
+        cur.execute("UPDATE sponsorship_email_queue SET status = 'skipped', error_message = 'Donor removed from sponsorship', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE allocation_donor_id = ? AND status = 'pending'", (allocation_donor_id,))
+        _sync_allocation_from_donors(cur, allocation_id)
+        conn.commit()
+        invalidate_overdue_cache(comp)
+        return {"status": "success",
+                "donors": _load_allocation_donors(cur, [allocation_id]).get(allocation_id, [])}
+    finally:
+        conn.close()
+
 
 @router.post("/allocations")
 def create_allocation(payload: AllocationCreateRequest):
@@ -2001,14 +2562,29 @@ def create_allocation(payload: AllocationCreateRequest):
             )
 
         alloc_type = (payload.allocation_type or "individual").strip().lower()
-        d_email = (payload.donor_email or "").strip()
-        d_phone = (payload.donor_phone or "").strip()
+        b_company = cur.execute("SELECT company_id FROM sponsorship_beneficiaries WHERE id = ?",
+                                (payload.beneficiary_id,)).fetchone()[0]
+        if comp != (b_company or "").strip().lower():
+            raise HTTPException(status_code=404, detail="Beneficiary not found for this charity.")
 
-        if not d_email and not d_phone:
-            raise HTTPException(
-                status_code=400,
-                detail="At least one contact method (Email or Phone number) is mandatory for allocation."
-            )
+        # Several donors may share one sponsorship; the legacy single-donor fields still work.
+        donors_in = list(payload.donors or [])
+        if not donors_in:
+            donors_in = [AllocationDonorInput(
+                donor_id=payload.donor_id, donor_name=payload.donor_name, donor_email=payload.donor_email,
+                donor_phone=payload.donor_phone, contribution_amount=payload.allocated_amount, is_primary=True,
+            )]
+        for d in donors_in:
+            if not (d.donor_email or "").strip() and not (d.donor_phone or "").strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"At least one contact method (Email or Phone number) is mandatory for '{d.donor_name or 'each donor'}'."
+                )
+        if not any(d.is_primary for d in donors_in):
+            donors_in[0].is_primary = True
+        primary = next(d for d in donors_in if d.is_primary)
+        d_email = (primary.donor_email or "").strip()
+        d_phone = (primary.donor_phone or "").strip()
 
         today = datetime.date.today()
         start_d = payload.start_date.strip() if payload.start_date else today.isoformat()
@@ -2031,8 +2607,8 @@ def create_allocation(payload: AllocationCreateRequest):
             payload.beneficiary_id,
             d_email,
             d_phone,
-            payload.donor_name.strip() if payload.donor_name else ("Campaign Allocation" if alloc_type == 'campaign' else "Anonymous Donor"),
-            payload.donor_id.strip() if payload.donor_id else "",
+            (primary.donor_name or "").strip() or ("Campaign Allocation" if alloc_type == 'campaign' else "Anonymous Donor"),
+            (primary.donor_id or "").strip(),
             alloc_type,
             payload.campaign_name.strip() if payload.campaign_name else None,
             payload.community_name.strip() if payload.community_name else None,
@@ -2043,11 +2619,22 @@ def create_allocation(payload: AllocationCreateRequest):
         ))
         alloc_id = cur.lastrowid
 
+        for d in donors_in:
+            if d.contribution_amount in (None, 0) and len(donors_in) == 1:
+                d.contribution_amount = float(payload.allocated_amount or 0.0)
+            _insert_allocation_donor(cur, alloc_id, comp, alloc_type, d)
+        _sync_allocation_from_donors(cur, alloc_id)
+
         cur.execute("UPDATE sponsorship_beneficiaries SET status = 'Allocated', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (payload.beneficiary_id,))
 
         conn.commit()
         invalidate_overdue_cache(comp)
-        assigned_to_label = payload.campaign_name if alloc_type == 'campaign' and payload.campaign_name else (payload.donor_name or d_email or d_phone)
+        log_event("allocation.created", category="allocation", company_id=comp, allocation_id=alloc_id,
+                  beneficiary_id=payload.beneficiary_id, allocation_type=alloc_type,
+                  donors=[{"name": d.donor_name, "email": d.donor_email, "amount": d.contribution_amount} for d in donors_in],
+                  message=f"Allocated beneficiary {b_row[1]}")
+        donor_labels = [d.donor_name or d.donor_email or d.donor_phone for d in donors_in]
+        assigned_to_label = payload.campaign_name if alloc_type == 'campaign' and payload.campaign_name else " & ".join(donor_labels)
         return {
             "status": "success",
             "message": f"Successfully allocated {b_row[1]} to {assigned_to_label}!",
@@ -2098,6 +2685,16 @@ def update_allocation(allocation_id: int, payload: AllocationUpdateRequest):
         if fields:
             values.append(allocation_id)
             cur.execute(f"UPDATE sponsorship_allocations SET {', '.join(fields)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", values)
+            # Legacy single-contact edits apply to the primary donor row.
+            d_fields, d_values = [], []
+            for col in ("donor_email", "donor_phone", "donor_name"):
+                val = getattr(payload, col)
+                if val is not None:
+                    d_fields.append(f"{col} = ?"); d_values.append(val.strip())
+            if d_fields:
+                d_values.append(allocation_id)
+                cur.execute(f"UPDATE sponsorship_allocation_donors SET {', '.join(d_fields)}, updated_at = CURRENT_TIMESTAMP "
+                            "WHERE allocation_id = ? AND is_primary = 1", d_values)
             conn.commit()
         return {"status": "success", "message": "Allocation updated successfully."}
     except Exception as e:
@@ -2189,10 +2786,15 @@ def delete_allocation(allocation_id: int):
             raise HTTPException(status_code=404, detail="Allocation not found.")
         
         b_id, c_id = row[0], row[1]
+        cur.execute("DELETE FROM sponsorship_allocation_donors WHERE allocation_id = ?", (allocation_id,))
+        cur.execute("UPDATE sponsorship_email_queue SET status = 'skipped', error_message = 'Allocation removed', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE allocation_id = ? AND status = 'pending'", (allocation_id,))
         cur.execute("DELETE FROM sponsorship_allocations WHERE id = ?", (allocation_id,))
         cur.execute("UPDATE sponsorship_beneficiaries SET status = 'Unallocated', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (b_id,))
         conn.commit()
         invalidate_overdue_cache(c_id)
+        log_event("allocation.deleted", category="allocation", level="warning", company_id=c_id,
+                  allocation_id=allocation_id, beneficiary_id=b_id, message=f"Allocation {allocation_id} released")
         return {"status": "success", "message": "Allocation removed and beneficiary freed successfully."}
     except HTTPException:
         raise
@@ -2407,6 +3009,8 @@ def save_outlook_credentials(payload: OutlookCredentialsRequest, current_user = 
                 updated_at = CURRENT_TIMESTAMP
         """, (comp, payload.client_id.strip(), encrypted_secret, tenant))
         conn.commit()
+        log_event("outlook.credentials_saved", category="outlook", company_id=comp, actor=current_user.get("email"),
+                  message=f"Azure app credentials updated for {comp}")
         return {"status": "success", "message": "Microsoft 365 credentials saved successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2458,6 +3062,8 @@ def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = 
     }, timeout=15)
 
     if res.status_code != 200:
+        log_event("outlook.connect_failed", category="outlook", level="error", company_id=comp,
+                  detail=res.text[:300], message=f"Microsoft 365 token exchange failed for {comp}")
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {res.text}")
 
     token_data = res.json()
@@ -2491,6 +3097,8 @@ def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = 
             WHERE company_id = ?
         """, (access_token, refresh_token, token_expiry, email, comp))
         conn.commit()
+        log_event("outlook.connected", category="outlook", company_id=comp, actor=current_user.get("email"),
+                  mailbox=email, message=f"Microsoft 365 mailbox {email} connected for {comp}")
         return {"status": "success", "connected_email": email}
     finally:
         conn.close()
@@ -2513,14 +3121,300 @@ def disconnect_outlook(company_id: Optional[str] = Query("rethink"), current_use
             WHERE company_id = ?
         """, (comp,))
         conn.commit()
+        log_event("outlook.disconnected", category="outlook", level="warning", company_id=comp,
+                  actor=current_user.get("email"), message=f"Microsoft 365 disconnected for {comp}")
         return {"status": "success", "message": "Microsoft 365 account disconnected."}
     finally:
         conn.close()
 
+# ==========================================
+# 8b. SERVER-SIDE EMAIL RENDERING (one personalised email per donor)
+# ==========================================
+
+_DEFAULT_THEME_FOR_COMPANY = {"rethink": "rethink", "iqra": "iqra"}
+_STATUS_FOR_TEMPLATE = {"video_update": "Video Sent", "end_year_feedback": "Feedback Sent"}
+
+
+def _resolve_theme(allocation_company: str, requested_theme: Optional[str]) -> str:
+    theme = (requested_theme or "").strip().lower() or _DEFAULT_THEME_FOR_COMPANY.get(allocation_company, allocation_company)
+    if _owner_company(theme) != allocation_company:
+        raise HTTPException(status_code=400, detail=f"Theme '{theme}' cannot be used for a {allocation_company} sponsorship.")
+    return theme
+
+
+def _get_template(cur, theme: str, template_type: str) -> Dict[str, str]:
+    """Template for this theme only; never falls back to another charity's templates."""
+    row = cur.execute(
+        "SELECT subject, body_html FROM sponsorship_email_templates WHERE company_id = ? AND template_type = ?",
+        (theme, template_type)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No '{template_type}' template saved for the '{theme}' theme.")
+    return {"subject": row[0] or "", "body_html": row[1] or ""}
+
+
+def _allocation_cycle(row: Dict[str, Any]) -> Dict[str, Any]:
+    today = datetime.date.today()
+    start = row.get("start_date") or (str(row.get("created_at") or "")[:10] or today.isoformat())
+    end = row.get("end_date")
+    if not end:
+        try:
+            end = (datetime.datetime.strptime(start[:10], "%Y-%m-%d").date() + datetime.timedelta(days=365)).isoformat()
+        except Exception:
+            end = (today + datetime.timedelta(days=365)).isoformat()
+    try:
+        days_remaining = (datetime.datetime.strptime(end[:10], "%Y-%m-%d").date() - today).days
+    except Exception:
+        days_remaining = None
+    return {"start_date": start, "end_date": end, "days_remaining": days_remaining,
+            "sponsorship_year": f"Year {(row.get('renewal_count') or 0) + 1}"}
+
+
+def _load_render_context(cur, allocation_id: int, allocation_donor_id: Optional[int]) -> Dict[str, Any]:
+    cur.execute("""
+        SELECT a.*, b.name AS beneficiary_name, b.sponsorship_type, b.location, b.project_code,
+               b.profile_link, b.video_link, b.donor_folder_link
+        FROM sponsorship_allocations a JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+        WHERE a.id = ?
+    """, (allocation_id,))
+    cols = [c[0] for c in cur.description]
+    r = cur.fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="Allocation not found.")
+    alloc = dict(zip(cols, r))
+    donors = _load_allocation_donors(cur, [allocation_id]).get(allocation_id, [])
+    if not donors:
+        raise HTTPException(status_code=400, detail="This sponsorship has no donors to email.")
+    if allocation_donor_id is None:
+        donor = next((d for d in donors if d["is_primary"]), donors[0])
+    else:
+        donor = next((d for d in donors if d["id"] == int(allocation_donor_id)), None)
+        if donor is None:
+            raise HTTPException(status_code=404, detail="That donor is not on this sponsorship.")
+    return {"allocation": alloc, "donor": donor, "donors": donors, "cycle": _allocation_cycle(alloc)}
+
+
+def _template_variables(ctx: Dict[str, Any], subject_template: str) -> Dict[str, str]:
+    alloc, donor, cycle = ctx["allocation"], ctx["donor"], ctx["cycle"]
+    is_organizer = donor.get("role") == "organizer"
+    full_name = (donor.get("donor_name") or "").strip() or (
+        alloc.get("campaign_name") if is_organizer else "") or ("Campaign Lead" if is_organizer else "Generous Donor")
+    first_name = full_name.split(" ")[0] if full_name else full_name
+    co_sponsors = [(d.get("donor_name") or "").split(" ")[0] for d in ctx["donors"]
+                   if d["id"] != donor["id"] and (d.get("donor_name") or "").strip()]
+    folder = alloc.get("donor_folder_link") or alloc.get("profile_link") or "#"
+    amount = float(donor.get("contribution_amount") or 0.0)
+    return {
+        "first_name": first_name,
+        "donor_name": full_name,
+        "email": donor.get("donor_email") or "",
+        "recipient_email": donor.get("donor_email") or "",
+        "contribution_amount": f"{amount:,.2f}".rstrip("0").rstrip(".") if amount else "",
+        "co_sponsors": ", ".join(co_sponsors),
+        "beneficiary_name": alloc.get("beneficiary_name") or "Beneficiary",
+        "sponsorship_type": alloc.get("sponsorship_type") or "Sponsorship",
+        "sponsorship_year": cycle["sponsorship_year"],
+        "renewal_deadline": cycle["end_date"] or "N/A",
+        "days_remaining": f"{cycle['days_remaining']} days" if cycle["days_remaining"] is not None else "",
+        "location": alloc.get("location") or "",
+        "project_code": alloc.get("project_code") or "",
+        "donor_folder_link": folder,
+        "folder_link": folder,
+        "profile_link": alloc.get("profile_link") or "#",
+        "video_link": alloc.get("video_link") or "#",
+        "report_link": alloc.get("profile_link") or "#",
+        "campaign_name": alloc.get("campaign_name") or "Campaign",
+        "community_name": alloc.get("community_name") or "Community",
+        "subject": subject_template or "Sponsorship Update",
+        "message_body": "Thank you for your generous sponsorship and support.",
+    }
+
+
+_PLACEHOLDER_RE = re.compile(r"\{\{?\s*([A-Za-z_]+)\s*\}?\}")
+
+
+def _render_text(text: str, variables: Dict[str, str]) -> str:
+    """Replaces {name} / {{name}} (case-insensitive). Unknown placeholders are left untouched."""
+    def repl(m):
+        key = m.group(1).lower()
+        return variables[key] if key in variables else m.group(0)
+    return _PLACEHOLDER_RE.sub(repl, text or "")
+
+
+def render_email_for_donor(cur, allocation_id: int, allocation_donor_id: Optional[int], template_type: str,
+                           theme: Optional[str], subject_template: Optional[str] = None,
+                           body_template: Optional[str] = None) -> Dict[str, Any]:
+    ctx = _load_render_context(cur, allocation_id, allocation_donor_id)
+    comp = _owner_company(ctx["allocation"]["company_id"])
+    theme = _resolve_theme(comp, theme)
+    if subject_template is None or body_template is None:
+        tpl = _get_template(cur, theme, template_type)
+        subject_template = tpl["subject"] if subject_template is None else subject_template
+        body_template = tpl["body_html"] if body_template is None else body_template
+    variables = _template_variables(ctx, subject_template)
+    subject = _render_text(subject_template, variables)
+    variables["subject"] = subject
+    return {
+        "company_id": comp,
+        "theme": theme,
+        "template_type": template_type,
+        "allocation_donor_id": ctx["donor"]["id"],
+        "recipient_email": ctx["donor"].get("donor_email") or "",
+        "recipient_name": variables["donor_name"],
+        "subject": subject,
+        "body_html": _render_text(body_template, variables),
+        "unresolved_placeholders": sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(subject + body_template)
+                                           if m.group(1).lower() not in variables}),
+        "donors": [{"id": d["id"], "donor_name": d["donor_name"], "donor_email": d["donor_email"],
+                    "role": d["role"], "is_primary": d["is_primary"],
+                    "contribution_amount": d["contribution_amount"]} for d in ctx["donors"]],
+    }
+
+
+@router.post("/email/preview")
+def preview_email(payload: EmailPreviewRequest):
+    """Renders exactly what one donor would receive (same code path as sending)."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        return render_email_for_donor(conn.cursor(), payload.allocation_id, payload.allocation_donor_id,
+                                      payload.template_type or "profile_intro", payload.company_id,
+                                      payload.subject_template, payload.body_template)
+    finally:
+        conn.close()
+
+
+def _public_base_url(request: Request) -> str:
+    base_url = str(request.base_url).rstrip('/')
+    forwarded_proto = request.headers.get("x-forwarded-proto", "http")
+    forwarded_host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
+    if forwarded_host:
+        base_url = f"{forwarded_proto}://{forwarded_host}".rstrip('/')
+    return base_url
+
+
+def _prepare_outgoing_html(raw_body: str, tracking_pixel_url: str) -> str:
+    pixel = (f'<div style="display:none;max-height:0px;overflow:hidden;"><img src="{tracking_pixel_url}" width="1" height="1" '
+             f'style="display:none;width:1px;height:1px;border:0;outline:none;" alt="" /></div>')
+    body = re.sub(r'src=["\']data:image/[^;]+;base64,[^"\']+["\']', f'src="{_RETHINK_EMAIL_LOGO_URI}"', (raw_body or "").strip())
+    if "alt=\"Sisters' Project\"" in body:
+        body = re.sub(r'(<img[^>]*alt="Sisters\' Project"[^>]*src=")[^"]*(")', r'\1' + _SP_LOGO_URI + r'\2', body)
+    if "alt=\"IQRA\"" in body:
+        body = re.sub(r'(<img[^>]*alt="IQRA"[^>]*src=")[^"]*(")', r'\1' + _IQRA_EMAIL_LOGO_URI + r'\2', body)
+    return body.replace("</body>", f"{pixel}</body>") if "</body>" in body else f"{body}{pixel}"
+
+
+def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_url: str) -> Dict[str, Any]:
+    """Sends one rendered email from the allocation's own charity mailbox and logs it against that donor."""
+    comp = rendered["company_id"]
+    to_email = (rendered["recipient_email"] or "").strip()
+    log_ctx = dict(category="email", company_id=comp, allocation_id=allocation_id,
+                   allocation_donor_id=rendered["allocation_donor_id"], template=rendered["template_type"],
+                   theme=rendered["theme"], recipient=to_email, recipient_name=rendered["recipient_name"],
+                   subject=rendered["subject"])
+    if not to_email or "@" not in to_email:
+        log_event("email.skipped", level="warning", message=f"No email for {rendered['recipient_name']}", **log_ctx)
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "skipped",
+                "detail": "Donor has no email address"}
+    if rendered["unresolved_placeholders"]:
+        log_event("email.failed", level="error", message="Unknown placeholders in template",
+                  placeholders=rendered["unresolved_placeholders"], **log_ctx)
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed",
+                "detail": "Unknown placeholders: " + ", ".join(rendered["unresolved_placeholders"])}
+    access_token = _get_valid_graph_token(comp)
+    auth = _get_outlook_auth_row(comp)
+    sender_email = auth["connected_email"] if auth and auth["connected_email"] else "me"
+    tracking_id = str(uuid.uuid4())
+    html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}")
+    res = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers={
+        "Authorization": f"Bearer {access_token}", "Content-Type": "application/json"
+    }, json={
+        "message": {
+            "subject": rendered["subject"].strip(),
+            "body": {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": to_email, "name": rendered["recipient_name"]}}],
+        },
+        "saveToSentItems": "true",
+    }, timeout=15)
+    if res.status_code not in (200, 202):
+        log_event("email.failed", level="error", message=f"Graph sendMail HTTP {res.status_code} to {to_email}",
+                  http_status=res.status_code, detail=res.text[:300], mailbox=sender_email, **log_ctx)
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed",
+                "detail": f"Microsoft Graph sendMail error: {res.text[:300]}"}
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO sponsorship_communications (
+                allocation_id, allocation_donor_id, template_type, company_id, direction, message_id, thread_id,
+                subject, body, sender_email, recipient_email, tracking_id, delivery_status, open_count, sent_at
+            ) VALUES (?, ?, ?, ?, 'outbound', ?, '', ?, ?, ?, ?, ?, 'delivered', 0, CURRENT_TIMESTAMP)
+        """, (allocation_id, rendered["allocation_donor_id"], rendered["template_type"], comp,
+              f"graph_{int(time.time()*1000)}_{rendered['allocation_donor_id']}", rendered["subject"].strip(),
+              rendered["body_html"], sender_email, to_email, tracking_id))
+        comm_id = cur.lastrowid
+        cur.execute("""
+            UPDATE sponsorship_allocations SET communication_status = ?, last_contacted_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (_STATUS_FOR_TEMPLATE.get(rendered["template_type"], "Profile Sent"), allocation_id))
+        cur.execute("""
+            UPDATE sponsorship_email_queue SET status = 'sent', sent_comm_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE allocation_donor_id = ? AND template_type = ? AND status = 'pending'
+        """, (comm_id, rendered["allocation_donor_id"], rendered["template_type"]))
+        conn.commit()
+    finally:
+        conn.close()
+    log_event("email.sent", message=f"Sent '{rendered['subject']}' to {to_email} from {sender_email}",
+              mailbox=sender_email, tracking_id=tracking_id, communication_id=comm_id, **log_ctx)
+    return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "sent",
+            "recipient_email": to_email, "tracking_id": tracking_id, "communication_id": comm_id}
+
+
+def _send_per_donor(payload: OutlookSendRequest, request: Request) -> Dict[str, Any]:
+    base_url = _public_base_url(request)
+    template_type = payload.template_type or "profile_intro"
+    results = []
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        rendered_list = [render_email_for_donor(cur, payload.allocation_id, donor_id, template_type, payload.company_id,
+                                                payload.subject_template, payload.body_template)
+                         for donor_id in dict.fromkeys(payload.allocation_donor_ids or [])]
+    finally:
+        conn.close()
+    for rendered in rendered_list:
+        try:
+            results.append(deliver_rendered_email(rendered, payload.allocation_id, base_url))
+        except HTTPException as e:
+            log_event("email.failed", category="email", level="error", company_id=rendered["company_id"],
+                      allocation_id=payload.allocation_id, allocation_donor_id=rendered["allocation_donor_id"],
+                      recipient=rendered["recipient_email"], detail=str(e.detail), message=f"Send failed: {e.detail}")
+            results.append({"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed", "detail": e.detail})
+        except Exception as e:
+            log_event("email.failed", category="email", level="error", company_id=rendered["company_id"],
+                      allocation_id=payload.allocation_id, allocation_donor_id=rendered["allocation_donor_id"],
+                      recipient=rendered["recipient_email"], detail=str(e), message=f"Send failed: {e}")
+            results.append({"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed", "detail": str(e)})
+    sent = sum(1 for r in results if r["status"] == "sent")
+    return {
+        "status": "success" if sent == len(results) and results else ("partial" if sent else "failed"),
+        "message": f"Sent {sent} of {len(results)} personalised email(s).",
+        "results": results,
+    }
+
+
 @router.post("/outlook/send")
 def send_outlook_message(payload: OutlookSendRequest, request: Request, current_user = Depends(get_current_user)):
     """Dispatches an email via Microsoft Graph API, embeds real-time open tracking pixel, and logs delivery metadata."""
-    comp = (payload.company_id or "rethink").strip().lower()
+    if payload.allocation_donor_ids:
+        return _send_per_donor(payload, request)
+    if not (payload.recipient_email or "").strip() or not (payload.body_html or "").strip():
+        raise HTTPException(status_code=400, detail="Choose at least one donor to email.")
+    # The sending mailbox always belongs to the charity that owns the allocation.
+    # payload.company_id carries the email theme (e.g. 'sp'), which only selects branding.
+    comp = _allocation_company(payload.allocation_id)
+    theme_owner = _owner_company(payload.company_id) if payload.company_id else comp
+    if theme_owner != comp:
+        raise HTTPException(status_code=400, detail=f"Theme '{payload.company_id}' cannot be used for a {comp} sponsorship.")
     access_token = _get_valid_graph_token(comp)
     auth = _get_outlook_auth_row(comp)
     sender_email = auth["connected_email"] if auth and auth["connected_email"] else "me"
@@ -2593,7 +3487,13 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
     }, json=send_payload, timeout=15)
 
     if res.status_code not in (200, 202):
+        log_event("email.failed", category="email", level="error", company_id=comp, allocation_id=payload.allocation_id,
+                  recipient=payload.recipient_email, http_status=res.status_code, detail=res.text[:300],
+                  message=f"Graph sendMail HTTP {res.status_code} (legacy single send)")
         raise HTTPException(status_code=400, detail=f"Microsoft Graph sendMail Error: {res.text}")
+    log_event("email.sent", category="email", company_id=comp, allocation_id=payload.allocation_id,
+              recipient=payload.recipient_email, template=payload.template_type, subject=payload.subject,
+              mailbox=sender_email, tracking_id=tracking_id, message=f"Sent (legacy single send) to {payload.recipient_email}")
 
     # Log in communications database with tracking fields
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -2849,7 +3749,12 @@ async def outlook_graph_webhook(request: Request):
             continue
 
         client_state = item.get("clientState", "")
-        company_id = client_state.replace("sponsorship_", "") if client_state else "rethink"
+        company_id = client_state.replace("sponsorship_", "") if client_state else ""
+        # Only accept notifications for the subscription we created for that charity.
+        sub_auth = _get_outlook_auth_row(company_id) if company_id else None
+        if not sub_auth or not sub_auth["subscription_id"] or sub_auth["subscription_id"] != item.get("subscriptionId"):
+            logger.warning("Ignoring Graph notification with unknown subscription/clientState")
+            continue
 
         try:
             access_token = _get_valid_graph_token(company_id)
@@ -2867,47 +3772,10 @@ async def outlook_graph_webhook(request: Request):
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
                 try:
                     cur = conn.cursor()
-                    cur.execute("""
-                        SELECT id, donor_email FROM sponsorship_allocations 
-                        WHERE company_id = ? 
-                        ORDER BY created_at DESC
-                    """, (company_id,))
-                    alloc_rows = cur.fetchall()
-                    matched_alloc_id = None
-                    clean_from = from_email.strip().lower()
-                    for r_id, r_emails in alloc_rows:
-                        if r_emails:
-                            for single_em in r_emails.replace(";", ",").split(","):
-                                if single_em.strip().lower() == clean_from:
-                                    matched_alloc_id = r_id
-                                    break
-                        if matched_alloc_id:
-                            break
-
-                    if matched_alloc_id:
-                        alloc_id = matched_alloc_id
-                        cur.execute("""
-                            INSERT INTO sponsorship_communications (
-                                allocation_id, company_id, direction, message_id,
-                                thread_id, subject, body, sender_email, recipient_email
-                            ) VALUES (?, ?, 'inbound', ?, ?, ?, ?, ?, ?)
-                        """, (
-                            alloc_id,
-                            company_id,
-                            msg_id,
-                            conv_id,
-                            subject,
-                            body_preview,
-                            from_email,
-                            company_id
-                        ))
-
-                        cur.execute("""
-                            UPDATE sponsorship_allocations SET
-                                communication_status = 'Donor Replied',
-                                last_replied_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                        """, (alloc_id,))
+                    auth_row = _get_outlook_auth_row(company_id)
+                    mailbox = (auth_row["connected_email"] if auth_row and auth_row["connected_email"] else company_id)
+                    if _record_inbound_reply(cur, company_id, msg_id, conv_id, subject, body_preview,
+                                             from_email, mailbox, msg_data.get("receivedDateTime")):
                         conn.commit()
                 finally:
                     conn.close()
@@ -2915,6 +3783,66 @@ async def outlook_graph_webhook(request: Request):
             pass
 
     return Response(status_code=202)
+
+
+def _match_reply_sender(cur, company_id: str, sender_email: str):
+    """(allocation_id, allocation_donor_id) of the most recent sponsorship this sender is a donor on."""
+    sender = (sender_email or "").strip().lower()
+    if not sender:
+        return None, None
+    row = cur.execute("""
+        SELECT d.allocation_id, d.id FROM sponsorship_allocation_donors d
+        WHERE d.company_id = ? AND LOWER(TRIM(d.donor_email)) = ?
+        ORDER BY d.allocation_id DESC LIMIT 1
+    """, (company_id, sender)).fetchone()
+    if row:
+        return row[0], row[1]
+    # Allocations created before donor rows existed may still hold comma-separated emails.
+    for r_id, r_emails in cur.execute(
+            "SELECT id, donor_email FROM sponsorship_allocations WHERE company_id = ? ORDER BY created_at DESC",
+            (company_id,)).fetchall():
+        if r_emails and sender in [e.strip().lower() for e in r_emails.replace(";", ",").split(",")]:
+            return r_id, None
+    return None, None
+
+
+def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subject: str, body_preview: str,
+                          sender_email: str, recipient_email: str, received_at: Optional[str]) -> bool:
+    """Logs one inbound reply (once per message id) and marks only the outbound email that donor
+    was answering as replied - not every email on the sponsorship."""
+    if cur.execute("SELECT 1 FROM sponsorship_communications WHERE message_id = ? AND company_id = ?",
+                   (msg_id, company_id)).fetchone():
+        return False
+    alloc_id, alloc_donor_id = _match_reply_sender(cur, company_id, sender_email)
+    if not alloc_id:
+        return False
+    cur.execute("""
+        INSERT INTO sponsorship_communications (
+            allocation_id, allocation_donor_id, company_id, direction, message_id,
+            thread_id, subject, body, sender_email, recipient_email, sent_at
+        ) VALUES (?, ?, ?, 'inbound', ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+    """, (alloc_id, alloc_donor_id, company_id, msg_id, conv_id, subject, body_preview,
+          sender_email, recipient_email, received_at))
+    cur.execute("""
+        UPDATE sponsorship_allocations SET communication_status = 'Donor Replied',
+            last_replied_at = COALESCE(?, CURRENT_TIMESTAMP) WHERE id = ?
+    """, (received_at, alloc_id))
+    log_event("email.reply_received", category="email", company_id=company_id, allocation_id=alloc_id,
+              allocation_donor_id=alloc_donor_id, sender=sender_email, subject=subject,
+              message=f"Reply from {sender_email}")
+    target = cur.execute("""
+        SELECT id FROM sponsorship_communications
+        WHERE allocation_id = ? AND direction = 'outbound'
+          AND (allocation_donor_id = ? OR LOWER(recipient_email) LIKE ?)
+          AND sent_at <= COALESCE(?, CURRENT_TIMESTAMP)
+        ORDER BY sent_at DESC LIMIT 1
+    """, (alloc_id, alloc_donor_id, f"%{(sender_email or '').strip().lower()}%", received_at)).fetchone()
+    if target:
+        cur.execute("""
+            UPDATE sponsorship_communications SET delivery_status = 'replied',
+                replied_at = COALESCE(?, CURRENT_TIMESTAMP) WHERE id = ?
+        """, (received_at, target[0]))
+    return True
 
 
 def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
@@ -2943,57 +3871,15 @@ def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         try:
             cur = conn.cursor()
-            cur.execute("SELECT id, LOWER(donor_email) FROM sponsorship_allocations WHERE company_id = ?", (comp,))
-            alloc_map = {}
-            for r_id, r_emails in cur.fetchall():
-                if r_emails:
-                    for single_em in r_emails.replace(";", ",").split(","):
-                        clean_em = single_em.strip().lower()
-                        if clean_em and clean_em not in alloc_map:
-                            alloc_map[clean_em] = r_id
-
             for m in messages:
-                msg_id = m.get("id")
                 from_info = m.get("from", {}).get("emailAddress", {})
                 sender_email = (from_info.get("address") or "").strip().lower()
-
                 if not sender_email or sender_email == connected_email:
                     continue
-
-                if sender_email in alloc_map:
-                    alloc_id = alloc_map[sender_email]
-                    subject = m.get("subject", "")
-                    body_preview = m.get("bodyPreview", "")
-                    conv_id = m.get("conversationId", "")
-                    rec_dt = m.get("receivedDateTime")
-
-                    cur.execute("SELECT id FROM sponsorship_communications WHERE message_id = ? AND company_id = ?", (msg_id, comp))
-                    if not cur.fetchone():
-                        cur.execute("""
-                            INSERT INTO sponsorship_communications (
-                                allocation_id, company_id, direction, message_id,
-                                thread_id, subject, body, sender_email, recipient_email, sent_at
-                            ) VALUES (?, ?, 'inbound', ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
-                        """, (
-                            alloc_id, comp, msg_id, conv_id, subject, body_preview,
-                            sender_email, connected_email, rec_dt
-                        ))
-
-                        cur.execute("""
-                            UPDATE sponsorship_allocations SET
-                                communication_status = 'Donor Replied',
-                                last_replied_at = COALESCE(?, CURRENT_TIMESTAMP)
-                            WHERE id = ?
-                        """, (rec_dt, alloc_id))
-
-                        cur.execute("""
-                            UPDATE sponsorship_communications SET
-                                delivery_status = 'replied',
-                                replied_at = COALESCE(?, CURRENT_TIMESTAMP)
-                            WHERE allocation_id = ? AND direction = 'outbound'
-                        """, (rec_dt, alloc_id))
-
-                        new_synced += 1
+                if _record_inbound_reply(cur, comp, m.get("id"), m.get("conversationId", ""), m.get("subject", ""),
+                                         m.get("bodyPreview", ""), sender_email, connected_email,
+                                         m.get("receivedDateTime")):
+                    new_synced += 1
 
             conn.commit()
         finally:
@@ -3818,6 +4704,9 @@ def update_email_template(payload: TemplateUpdateRequest):
                 body_html = excluded.body_html
         """, (comp, payload.template_type.strip(), payload.subject.strip(), payload.body_html.strip()))
         conn.commit()
+        log_event("template.saved", category="template", company_id=_owner_company(comp), theme=comp,
+                  template=payload.template_type, subject=payload.subject,
+                  message=f"Template '{payload.template_type}' saved for {comp}")
         return {"status": "success", "message": f"Email template '{payload.template_type}' saved successfully for charity '{comp}'."}
     finally:
         conn.close()
@@ -3830,6 +4719,8 @@ def delete_email_template(template_id: int):
         cur = conn.cursor()
         cur.execute("DELETE FROM sponsorship_email_templates WHERE id = ?", (template_id,))
         conn.commit()
+        log_event("template.deleted", category="template", level="warning", template_id=template_id,
+                  message=f"Template {template_id} deleted")
         return {"status": "success", "message": "Email template deleted."}
     finally:
         conn.close()
@@ -3929,6 +4820,12 @@ def email_tracking_pixel(tracking_id: str, request: Request):
         row = cur.fetchone()
         if row:
             alloc_id = row[0]
+            first_open = cur.execute("SELECT open_count, company_id, recipient_email FROM sponsorship_communications WHERE tracking_id = ?",
+                                     (tracking_id,)).fetchone()
+            if first_open and first_open[0] == 1:  # log the first open only; repeats are counted in the table
+                log_event("email.opened", category="email", company_id=first_open[1], allocation_id=alloc_id,
+                          recipient=first_open[2], subject=row[1], tracking_id=tracking_id,
+                          message=f"Email opened by {first_open[2]}")
             cur.execute("""
                 UPDATE sponsorship_allocations
                 SET communication_status = 'Email Opened'
@@ -4072,8 +4969,10 @@ def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = Fals
                 did = str(d.get("donor_id", "")).strip().lower()
                 if ("donor", did, st.lower()) in dismissed_set:
                     continue
-                # Include donors with unallocated slots OR partial/below-threshold donors who have not yet allocated
-                is_unallocated = (rem > 0) or (d.get("allocated_count", 0) == 0 and tot > 0)
+                # Overdue = earned a slot (cumulative >= 80% of target) that is still not allocated.
+                # Donors below the threshold are not owed a beneficiary yet, so they are not overdue.
+                is_unallocated = rem > 0 and bool(d.get("is_threshold_reached")) and (
+                    d.get("is_manual") or d.get("eligible_since"))
                 if is_unallocated:
                     d_copy = dict(d)
                     d_copy["sponsorship_type"] = st
@@ -4096,7 +4995,7 @@ def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = Fals
                 cid = str(c.get("campaign_name", "")).strip().lower()
                 if ("campaign", cid, st.lower()) in dismissed_set:
                     continue
-                is_unallocated = (rem > 0) or (c.get("allocated_count", 0) == 0 and tot > 0)
+                is_unallocated = rem > 0 and bool(c.get("eligible_since"))
                 if is_unallocated:
                     c_copy = dict(c)
                     c_copy["sponsorship_type"] = st
@@ -4695,7 +5594,7 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
 
                 <!-- Action Button -->
                 <div style="margin: 32px 0 16px 0; text-align: center;">
-                    <a href="http://127.0.0.1:8000/tracker" style="background: {brand_color}; color: #ffffff; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: 700; font-size: 14px; display: inline-block;">
+                    <a href="{_PUBLIC_APP_BASE}/" style="background: {brand_color}; color: #ffffff; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: 700; font-size: 14px; display: inline-block;">
                         Open Sponsorship Tracker to Allocate Now &rarr;
                     </a>
                 </div>
@@ -4725,11 +5624,15 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
         }
 
     # Attempt Live Email Sending via Outlook Graph API if available
-    token_data = _get_valid_graph_token(comp)
     email_sent = False
     error_msg = None
+    try:
+        graph_access_token = _get_valid_graph_token(comp)
+    except HTTPException as e:
+        graph_access_token = None
+        error_msg = e.detail
 
-    if token_data and token_data.get("access_token"):
+    if graph_access_token:
         try:
             to_recipients_list = [{"emailAddress": {"address": r}} for r in recipients]
             send_payload = {
@@ -4746,7 +5649,7 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
             send_res = requests.post(
                 "https://graph.microsoft.com/v1.0/me/sendMail",
                 headers={
-                    "Authorization": f"Bearer {token_data['access_token']}",
+                    "Authorization": f"Bearer {graph_access_token}",
                     "Content-Type": "application/json"
                 },
                 json=send_payload,
@@ -4773,7 +5676,7 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
         conn.close()
 
     return {
-        "status": "success" if email_sent else ("warning" if not token_data else "error"),
+        "status": "success" if email_sent else ("warning" if not graph_access_token else "error"),
         "email_sent": email_sent,
         "message": f"Digest generated for {len(recipients)} staff recipient(s)." + (" Sent successfully via Outlook Graph API!" if email_sent else (f" (Notice: Outlook not connected or failed: {error_msg}). Preview generated." if not email_sent else "")),
         "recipients": recipients,
@@ -4784,3 +5687,573 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
         },
         "html_preview": body_html if not email_sent else None
     }
+
+
+# ==========================================
+# 12. SHARED DONATION HELPERS (donor details + triggers)
+# ==========================================
+
+def _settled_amount_column(df: pd.DataFrame) -> Optional[str]:
+    for col in ("Total Online Donations Net Amount in Settled Currency",
+                "Donation Amount in Project Currency (May be approx.)",
+                "Donation Amount (in Donation Currency)"):
+        if col in df.columns:
+            return col
+    return None
+
+
+def _native_amounts(df: pd.DataFrame) -> pd.Series:
+    """Amount in the donor's own currency; GiveBrite CSV imports leave that column blank and keep the
+    native value in the project/net columns, so fall back to those."""
+    out = pd.Series(float("nan"), index=df.index)
+    for col in ("Donation Amount (in Donation Currency)", "Donation Amount in Project Currency (May be approx.)",
+                "Total Online Donations Net Amount in Settled Currency"):
+        if col in df.columns:
+            out = out.fillna(pd.to_numeric(df[col], errors="coerce"))
+    return out
+
+
+def _sponsorship_type_masks(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """Same rules qualifying-donors uses (code, campaign name, giving level) so totals agree."""
+    def col(name):
+        return df[name].astype(str).str.strip().str.upper() if name in df.columns else pd.Series("", index=df.index)
+    code_s, camp_s = col("Code"), col("Campaign Name")
+    gl_s = col("Giving Level Title") if "Giving Level Title" in df.columns else col("Giving Level")
+    return {
+        "Hafiz": code_s.str.contains(r"HUF|HAF", regex=True, na=False) | camp_s.str.contains(r"HAFIZ|HIFZ", regex=True, na=False) | gl_s.str.contains(r"HAFIZ|HIFZ", regex=True, na=False),
+        "Orphan": gl_s.str.contains("ORPHAN", na=False) | camp_s.str.contains("ORPHAN", na=False) | code_s.str.contains("ORP", na=False),
+        "Widow": code_s.str.contains("WID", na=False) | camp_s.str.contains("WIDOW", na=False) | gl_s.str.contains("WIDOW", na=False),
+        "Ex-Prisoner": code_s.str.contains(r"SUR|EX-PRISONER", regex=True, na=False) | camp_s.str.contains(r"PRISONER|SURVIVOR", regex=True, na=False) | gl_s.str.contains(r"PRISONER|SURVIVOR", regex=True, na=False),
+    }
+
+
+def _donation_dates(df: pd.DataFrame) -> pd.Series:
+    for c in ("_parsed_date", "Created Date (UTC)", "Date", "Settled Date (UTC)", "created_at", "Date of collection"):
+        if c in df.columns:
+            return pd.to_datetime(df[c], errors="coerce", format="mixed")
+    return pd.Series(pd.NaT, index=df.index)
+
+
+def _num(v) -> Optional[float]:
+    """Float or None (NaN/blank/garbage become None so JSON stays valid)."""
+    try:
+        f = float(pd.to_numeric(v, errors="coerce"))
+    except (TypeError, ValueError):
+        return None
+    return None if f != f or f in (float("inf"), float("-inf")) else round(f, 2)
+
+
+_PLACEHOLDER_IDENTITIES = {"", "missing email", "no email", "noemail", "unknown", "n/a", "na", "none", "nan", "null",
+                           "anonymous", "anonymous donor", "-"}
+
+
+def _is_placeholder_identity(v: Any) -> bool:
+    return str(v or "").strip().lower() in _PLACEHOLDER_IDENTITIES
+
+
+def _clean(v) -> str:
+    s = "" if v is None else str(v).strip()
+    return "" if s.lower() in ("nan", "none", "null", "nat", "<na>", "n/a") else s
+
+
+def _consent_for_row(row: pd.Series) -> Optional[str]:
+    """Marketing consent per platform rules: GiveBrite 'optin' (CSV/webhook), Madinah hidden donor = No /
+    shown = Yes (inferred), otherwise the 'Marketing Consent' column. None when unknown."""
+    platform = _clean(row.get("Platform")).lower()
+    optin = _clean(row.get("optin")).lower()
+    if platform in ("givebright", "givebrite") and optin in ("true", "false"):
+        return "Yes" if optin == "true" else "No"
+    if platform == "madinah":
+        hidden = _clean(row.get("Anonymous or Public")).lower() == "anonymous" or not _clean(row.get("Email"))
+        return "No" if hidden else "Yes (inferred)"
+    mc = _clean(row.get("Marketing Consent")).lower()
+    if mc in ("yes", "true", "1"):
+        return "Yes"
+    if mc in ("no", "false", "0") and platform not in ("givebright", "givebrite"):
+        return "No"  # GiveBrite sync rows hard-code "No", so it is not evidence there
+    return None
+
+
+# ==========================================
+# 13. DONOR DETAILS PANEL
+# ==========================================
+
+@router.get("/donors/{donor_key}/details")
+def get_sponsorship_donor_details(donor_key: str, company_id: Optional[str] = Query("rethink"),
+                                  sponsorship_type: Optional[str] = Query(None)):
+    """Everything about one donor for the active charity: contact, consent, giving towards each
+    sponsorship type (currency, gift aid, frequency, platforms, slots), their sponsorships,
+    email history and the individual donations that count towards sponsorships."""
+    comp = (company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(status_code=400, detail="Choose a charity to view donor details.")
+    key = urllib.parse.unquote(donor_key).strip()
+    key_l = key.lower()
+    pinned_row_id = None  # "ad_<id>": one specific donor row on a sponsorship (donors without a usable email)
+    if key_l.startswith("ad_") and key_l[3:].isdigit():
+        conn0 = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+        try:
+            r0 = conn0.execute("SELECT id, donor_email, donor_id, donor_name FROM sponsorship_allocation_donors "
+                               "WHERE id = ? AND company_id = ?", (int(key_l[3:]), comp)).fetchone()
+        finally:
+            conn0.close()
+        if not r0:
+            raise HTTPException(status_code=404, detail="Donor not found for this charity.")
+        email0, id0 = (r0[1] or "").strip().lower(), (r0[2] or "").strip().lower()
+        if "@" in email0:
+            key = key_l = email0
+        elif id0 and not _is_placeholder_identity(id0):
+            key = key_l = id0
+        else:
+            pinned_row_id = r0[0]
+            key, key_l = r0[3] or key, f"__row_{r0[0]}__"
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        targets = {k: float(v) for k, v in get_targets(company_id=comp).items()}
+
+        manual = None
+        if key_l.startswith("manual_") or key_l.startswith("md_"):
+            manual = cur.execute("SELECT * FROM sponsorship_manual_donors WHERE company_id = ? AND id = ?",
+                                 (comp, key.replace("manual_", ""))).fetchone()
+            if not manual:
+                raise HTTPException(status_code=404, detail="Donor not found for this charity.")
+            manual = dict(manual)
+
+        df = load_data(company_id=comp)
+        rows = pd.DataFrame()
+        if manual is None and not df.empty and pinned_row_id is None and not _is_placeholder_identity(key_l):
+            email_s = df["Email"].astype(str).str.strip().str.lower() if "Email" in df.columns else pd.Series("", index=df.index)
+            did_s = df["Donor ID"].astype(str).str.strip().str.lower() if "Donor ID" in df.columns else pd.Series("", index=df.index)
+            rows = df[(email_s == key_l) | (did_s == key_l)]
+
+        emails = set()
+        if manual and _clean(manual.get("donor_email")):
+            emails.add(manual["donor_email"].strip().lower())
+        if not rows.empty and "Email" in rows.columns:
+            emails.update(e.strip().lower() for e in rows["Email"].dropna().astype(str) if "@" in e)
+        if "@" in key_l:
+            emails.add(key_l)
+        donor_ids = {key_l}
+        if not rows.empty and "Donor ID" in rows.columns:
+            donor_ids.update(str(d).strip().lower() for d in rows["Donor ID"].dropna())
+        if manual:
+            donor_ids.update({f"manual_{manual['id']}".lower(), str(manual["id"]).lower()})
+        donor_ids = {d for d in donor_ids if not _is_placeholder_identity(d)}
+        emails = {e for e in emails if e and "@" in e}
+
+        # Their sponsorships (as a donor or organizer on any allocation of this charity)
+        placeholders_e = ",".join("?" * len(emails)) or "NULL"
+        placeholders_d = ",".join("?" * len(donor_ids)) or "NULL"
+        cur.execute(f"""
+            SELECT d.*, a.beneficiary_id, a.allocation_type, a.campaign_name, a.start_date, a.end_date,
+                   a.renewal_count, a.created_at AS allocation_created_at, a.communication_status,
+                   b.name AS beneficiary_name, b.sponsorship_type, b.project_code, b.location
+            FROM sponsorship_allocation_donors d
+            JOIN sponsorship_allocations a ON a.id = d.allocation_id
+            JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+            WHERE d.company_id = ? AND (LOWER(d.donor_email) IN ({placeholders_e}) OR LOWER(d.donor_id) IN ({placeholders_d})
+                   OR (? NOT LIKE '%@%' AND LOWER(TRIM(d.donor_name)) = ?))
+            ORDER BY a.end_date
+        """, [comp, *emails, *donor_ids, key_l, key_l])
+        my_rows = [dict(r) for r in cur.fetchall()]
+        if pinned_row_id is not None:
+            cur.execute("""
+                SELECT d.*, a.beneficiary_id, a.allocation_type, a.campaign_name, a.start_date, a.end_date,
+                       a.renewal_count, a.created_at AS allocation_created_at, a.communication_status,
+                       b.name AS beneficiary_name, b.sponsorship_type, b.project_code, b.location
+                FROM sponsorship_allocation_donors d
+                JOIN sponsorship_allocations a ON a.id = d.allocation_id
+                JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                WHERE d.id = ?
+            """, (pinned_row_id,))
+            my_rows = [dict(r) for r in cur.fetchall()]
+        if manual is None and rows.empty and not my_rows and "@" not in key_l:
+            raise HTTPException(status_code=404, detail="Donor not found for this charity.")
+        # Imported donors may only be known by name/id on the sponsorship: use their stored contact.
+        for r in my_rows:
+            if (r.get("donor_email") or "").strip() and "@" in r["donor_email"]:
+                emails.add(r["donor_email"].strip().lower())
+        co_map = _load_allocation_donors(cur, [r["allocation_id"] for r in my_rows])
+        sponsorships = []
+        for r in my_rows:
+            cycle = _allocation_cycle({"start_date": r["start_date"], "end_date": r["end_date"],
+                                       "created_at": r["allocation_created_at"], "renewal_count": r["renewal_count"]})
+            target = targets.get(r["sponsorship_type"], 0.0)
+            amount = float(r["contribution_amount"] or 0.0)
+            sponsorships.append({
+                "allocation_id": r["allocation_id"], "allocation_donor_id": r["id"], "role": r["role"],
+                "beneficiary_id": r["beneficiary_id"], "beneficiary_name": r["beneficiary_name"],
+                "sponsorship_type": r["sponsorship_type"], "project_code": r["project_code"], "location": r["location"],
+                "contribution_amount": amount, "target_amount": target,
+                "share_percent": round(100.0 * amount / target, 1) if target else None,
+                "is_primary": bool(r["is_primary"]), "needs_review": bool(r["needs_review"]),
+                "co_sponsors": [{"id": c["id"], "donor_name": c["donor_name"], "donor_email": c["donor_email"],
+                                 "contribution_amount": c["contribution_amount"]}
+                                for c in co_map.get(r["allocation_id"], []) if c["id"] != r["id"]],
+                "communication_status": r["communication_status"], **cycle,
+            })
+
+        # Email history + pending triggers for this donor
+        alloc_donor_ids = [s["allocation_donor_id"] for s in sponsorships]
+        history = []
+        if alloc_donor_ids or emails:
+            ph_ad = ",".join("?" * len(alloc_donor_ids)) or "NULL"
+            like_clauses = " OR ".join(["LOWER(c.recipient_email) LIKE ? OR LOWER(c.sender_email) = ?"] * len(emails)) or "0"
+            like_params = [p for e in emails for p in (f"%{e}%", e)]
+            cur.execute(f"""
+                SELECT c.id, c.allocation_id, c.allocation_donor_id, c.direction, c.subject, c.template_type,
+                       c.sent_at, c.delivery_status, c.open_count, c.opened_at, c.replied_at, c.recipient_email, c.sender_email
+                FROM sponsorship_communications c
+                WHERE c.company_id = ? AND (c.allocation_donor_id IN ({ph_ad}) OR {like_clauses})
+                ORDER BY c.sent_at DESC LIMIT 200
+            """, [comp, *alloc_donor_ids, *like_params])
+            history = [dict(r) for r in cur.fetchall()]
+        pending = []
+        if alloc_donor_ids:
+            ph_ad = ",".join("?" * len(alloc_donor_ids))
+            cur.execute(f"""SELECT id, allocation_id, allocation_donor_id, template_type, reason, due_date, status
+                            FROM sponsorship_email_queue WHERE company_id = ? AND status = 'pending'
+                            AND allocation_donor_id IN ({ph_ad}) ORDER BY due_date""", [comp, *alloc_donor_ids])
+            pending = [dict(r) for r in cur.fetchall()]
+        slot_rows = _donor_slot_allocations(cur, comp, "all", targets)
+        manual_q = "SELECT * FROM sponsorship_manual_donors WHERE company_id = ? AND ("
+        manual_p: List[Any] = [comp]
+        conds = []
+        if emails:
+            conds.append(f"LOWER(TRIM(donor_email)) IN ({','.join('?' * len(emails))})"); manual_p += list(emails)
+        if manual:
+            conds.append("id = ?"); manual_p.append(manual["id"])
+        manual_entries = []
+        if conds:
+            cur.execute(manual_q + " OR ".join(conds) + ")", manual_p)
+            manual_entries = [{"id": r["id"], "donor_key": f"manual_{r['id']}", "donor_name": r["donor_name"],
+                               "sponsorship_type": r["sponsorship_type"], "total_donated": float(r["total_donated"] or 0),
+                               "custom_slots": r["custom_slots"], "notes": r["notes"] or ""} for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    # Giving towards sponsorships
+    giving, donations, consent = [], [], None
+    if not rows.empty:
+        rows = rows.assign(_dt=_donation_dates(rows))
+        amt_col = _settled_amount_column(rows)
+        masks = _sponsorship_type_masks(rows)
+        any_mask = pd.Series(False, index=rows.index)
+        for s_type, mask in masks.items():
+            if sponsorship_type and sponsorship_type.lower() != "all" and s_type != sponsorship_type:
+                continue
+            any_mask |= mask
+            sub = rows[mask]
+            if sub.empty:
+                continue
+            settled = pd.to_numeric(sub[amt_col], errors="coerce").fillna(0.0) if amt_col else pd.Series(0.0, index=sub.index)
+            native = _native_amounts(sub).fillna(0.0)
+            cur_s = sub.get("Donation Currency (DC)", pd.Series("", index=sub.index)).astype(str).str.upper()
+            ga_s = sub.get("Gift Aid (yes or no)", pd.Series("", index=sub.index)).astype(str).str.lower()
+            target = targets.get(s_type, 0.0)
+            total = round(float(settled.sum()), 2)
+            threshold = 0.8 * target if target else 0.0
+            max_slots = int(total // threshold) if threshold > 0 else 0
+            used = _slots_used([r for r in slot_rows if r.get("sponsorship_type") == s_type and (
+                (r.get("donor_email") or "").strip().lower() in emails or (r.get("donor_id") or "").strip().lower() in donor_ids)])
+            giving.append({
+                "sponsorship_type": s_type,
+                "total_settled": total,
+                "settlement_currencies": sorted({_clean(c) for c in sub.get("Settlement Currency", pd.Series(dtype=str)).dropna() if _clean(c)}),
+                "by_currency": {c: round(float(v), 2) for c, v in native.groupby(cur_s).sum().items() if _clean(c)},
+                "donation_count": int(len(sub)),
+                "gift_aid_count": int((ga_s == "yes").sum()),
+                "gift_aid_total": round(float(settled[ga_s == "yes"].sum()), 2),
+                "frequencies": sorted({_clean(f) for f in sub.get("Payment Frequency", pd.Series(dtype=str)).dropna() if _clean(f)}),
+                "platforms": sorted({_clean(p) for p in sub.get("Platform", pd.Series(dtype=str)).dropna() if _clean(p)}),
+                "by_platform": {(_clean(k) or "Unknown"): round(float(v), 2) for k, v in settled.groupby(
+                    sub.get("Platform", pd.Series("Unknown", index=sub.index)).astype(str)).sum().items()},
+                "manual_total": round(sum(m["total_donated"] for m in manual_entries
+                                          if m["sponsorship_type"] in (s_type, "All")), 2),
+                "first_donation": str(sub["_dt"].min().date()) if pd.notna(sub["_dt"].min()) else None,
+                "last_donation": str(sub["_dt"].max().date()) if pd.notna(sub["_dt"].max()) else None,
+                "target_amount": target, "max_slots": max_slots, "slots_used": used,
+                "slots_remaining": max(0, round(max_slots - used, 2)),
+            })
+        rel = rows[any_mask].sort_values("_dt", ascending=False).head(300)
+        rel_native = _native_amounts(rel)
+        type_of = pd.Series("", index=rows.index)
+        for s_type, mask in masks.items():
+            type_of[mask & (type_of == "")] = s_type
+        for idx, r in rel.iterrows():
+            donations.append({
+                "donation_id": _clean(r.get("Donation ID")),
+                "date": str(r["_dt"].date()) if pd.notna(r["_dt"]) else _clean(r.get("Created Date (UTC)")),
+                "amount": _num(rel_native.get(idx)),
+                "currency": _clean(r.get("Donation Currency (DC)")),
+                "settled_amount": _num(r.get(amt_col)) if amt_col else None,
+                "settlement_currency": _clean(r.get("Settlement Currency")),
+                "campaign": _clean(r.get("Campaign Name")),
+                "sponsorship_type": type_of.get(idx, ""),
+                "gift_aid": _clean(r.get("Gift Aid (yes or no)")),
+                "frequency": _clean(r.get("Payment Frequency")),
+                "payment_method": _clean(r.get("Payment Type")),
+                "platform": _clean(r.get("Platform")),
+                "status": _clean(r.get("Status")),
+            })
+        dated = rows.sort_values("_dt", ascending=False)
+        for _, r in dated.iterrows():
+            consent = _consent_for_row(r)
+            if consent:
+                break
+
+    def first_val(cols):
+        if rows.empty:
+            return ""
+        for c in cols:
+            if c in rows.columns:
+                for v in rows.sort_values("_dt", ascending=False)[c] if "_dt" in rows.columns else rows[c]:
+                    if _clean(v):
+                        return _clean(v)
+        return ""
+
+    if manual:
+        name, phone, country = manual.get("donor_name") or "", manual.get("donor_phone") or "", ""
+    elif rows.empty:
+        name = next((r["donor_name"] for r in my_rows if (r["donor_name"] or "").strip()), key)
+        phone = next((r["donor_phone"] for r in my_rows if (r["donor_phone"] or "").strip()), "")
+        country = ""
+    else:
+        fn, ln = first_val(["First Name"]), first_val(["Last Name"])
+        name = f"{fn} {ln}".strip() or first_val(["Display Name", "Billing Name"]) or key
+        phone = first_val(["Phone Number", "Phone", "phone_number"])
+        country = first_val(["Billing Country", "Donor Address Country Code", "Country"])
+    if (not name or name == key) and my_rows:
+        name = next((r["donor_name"] for r in my_rows if (r["donor_name"] or "").strip()), name)
+
+    return {
+        "donor_key": key,
+        "company_id": comp,
+        "donor_type": "manual" if manual else ("crm" if not rows.empty else "contact_only"),
+        "is_organizer": any(s["role"] == "organizer" for s in sponsorships),
+        "contact": {"name": name, "emails": sorted(emails), "phone": phone, "country": country,
+                    "marketing_consent": consent or "Unknown",
+                    "manual_total_donated": float(manual["total_donated"]) if manual else None,
+                    "notes": manual.get("notes") if manual else ""},
+        "giving": giving,
+        "manual_entries": manual_entries,
+        "sponsorships": sponsorships,
+        "email_history": history,
+        "pending_emails": pending,
+        "donations": donations,
+    }
+
+
+# ==========================================
+# 14. TRIGGERED EMAIL QUEUE (review, then send)
+# ==========================================
+
+class QueueActionRequest(BaseModel):
+    company_id: str
+    ids: List[int]
+    charity_theme: Optional[str] = None
+
+
+def generate_email_queue(company_id: str) -> Dict[str, int]:
+    """Creates pending queue items (never sends). Idempotent via UNIQUE(allocation_donor_id, template_type, trigger_key).
+      - profile_intro: donor added to a sponsorship after the queue launched (migrated rows are skipped)
+      - renewal_notice: sponsorship ends within the charity's renewal_lead_days
+      - end_year_feedback: sponsorship year has ended (0-30 days ago)
+      - general_custom (thank-you): a donor on a sponsorship made a new donation of that sponsorship type
+    """
+    comp = company_id.strip().lower()
+    counts = {"profile_intro": 0, "renewal_notice": 0, "end_year_feedback": 0, "donation_thank_you": 0}
+    today = datetime.date.today()
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        lead = cur.execute("SELECT COALESCE(renewal_lead_days, 30) FROM sponsorship_alert_settings WHERE company_id = ?",
+                           (comp,)).fetchone()
+        lead_days = int(lead[0]) if lead else 30
+        rows = [dict(r) for r in cur.execute("""
+            SELECT d.id AS adid, d.allocation_id, d.donor_email, d.donor_id, d.source, d.created_at AS donor_added,
+                   a.start_date, a.end_date, a.created_at, a.renewal_count, b.sponsorship_type
+            FROM sponsorship_allocation_donors d
+            JOIN sponsorship_allocations a ON a.id = d.allocation_id
+            JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+            WHERE d.company_id = ? AND COALESCE(TRIM(d.donor_email), '') LIKE '%@%'
+        """, (comp,)).fetchall()]
+
+        def enqueue(r, template_type, reason, trigger_key, due):
+            cur.execute("""
+                INSERT OR IGNORE INTO sponsorship_email_queue
+                    (company_id, allocation_id, allocation_donor_id, template_type, reason, trigger_key, due_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (comp, r["allocation_id"], r["adid"], template_type, reason, trigger_key, due))
+            return cur.rowcount
+
+        intro_sent = {row[0] for row in cur.execute(
+            "SELECT DISTINCT allocation_donor_id FROM sponsorship_communications WHERE company_id = ? "
+            "AND direction = 'outbound' AND template_type = 'profile_intro' AND allocation_donor_id IS NOT NULL", (comp,))}
+        for r in rows:
+            cycle = _allocation_cycle(r)
+            if r["source"] != "migrated" and r["adid"] not in intro_sent:
+                counts["profile_intro"] += enqueue(r, "profile_intro", "Added to sponsorship", "intro",
+                                                   str(r["donor_added"] or today)[:10])
+            days = cycle["days_remaining"]
+            if days is not None and 0 <= days <= lead_days:
+                counts["renewal_notice"] += enqueue(r, "renewal_notice", f"Sponsorship ends in {days} days",
+                                                    f"renewal:{cycle['end_date']}", cycle["end_date"])
+            if days is not None and -30 <= days < 0:
+                counts["end_year_feedback"] += enqueue(r, "end_year_feedback", "Sponsorship year ended",
+                                                       f"feedback:{cycle['end_date']}", cycle["end_date"])
+
+        # New donations (last 30 days) of the same sponsorship type from donors already on a sponsorship
+        df = load_data(company_id=comp)
+        if not df.empty and "Email" in df.columns and rows:
+            df = df.assign(_dt=_donation_dates(df))
+            recent = df[df["_dt"] >= pd.Timestamp(today - datetime.timedelta(days=30))]
+            if not recent.empty:
+                masks = _sponsorship_type_masks(recent)
+                email_s = recent["Email"].astype(str).str.strip().str.lower()
+                by_email: Dict[str, List[Dict[str, Any]]] = {}
+                for r in rows:
+                    by_email.setdefault(r["donor_email"].strip().lower(), []).append(r)
+                for idx in recent.index[email_s.isin(by_email.keys())]:
+                    don = recent.loc[idx]
+                    status_v = _clean(don.get("Status")).lower()
+                    if status_v and status_v not in ("succeeded", "paid", "success", "completed"):
+                        continue
+                    for r in by_email[email_s[idx]]:
+                        mask = masks.get(r["sponsorship_type"])
+                        start = pd.to_datetime(r["start_date"] or r["created_at"], errors="coerce")
+                        if mask is None or not bool(mask.get(idx, False)) or (pd.notna(start) and don["_dt"] < start):
+                            continue
+                        don_id = _clean(don.get("Donation ID")) or f"row{idx}"
+                        counts["donation_thank_you"] += enqueue(
+                            r, "general_custom", f"New {r['sponsorship_type']} donation on {str(don['_dt'].date())}",
+                            f"donation:{don_id}", str(don["_dt"].date()))
+        conn.commit()
+    finally:
+        conn.close()
+    if sum(counts.values()):
+        log_event("queue.generated", category="queue", company_id=comp, created=counts,
+                  message=f"Email queue: {sum(counts.values())} new item(s) to review")
+    return counts
+
+
+@router.post("/email-queue/generate")
+def trigger_queue_generation(company_id: str = Query(...)):
+    comp = company_id.strip().lower()
+    if comp == "all":
+        raise HTTPException(status_code=400, detail="Choose a charity.")
+    return {"status": "success", "created": generate_email_queue(comp)}
+
+
+@router.get("/email-queue")
+def list_email_queue(company_id: str = Query(...), status: Optional[str] = Query("pending"),
+                     template_type: Optional[str] = Query(None), donor: Optional[str] = Query(None),
+                     beneficiary: Optional[str] = Query(None), sponsorship_type: Optional[str] = Query(None),
+                     due_from: Optional[str] = Query(None), due_to: Optional[str] = Query(None),
+                     page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=500)):
+    comp = company_id.strip().lower()
+    where, params = ["q.company_id = ?"], [comp]
+    if status and status != "all":
+        where.append("q.status = ?"); params.append(status)
+    if template_type:
+        where.append("q.template_type = ?"); params.append(template_type)
+    if donor:
+        where.append("(d.donor_name LIKE ? OR d.donor_email LIKE ?)"); params += [f"%{donor}%"] * 2
+    if beneficiary:
+        where.append("(b.name LIKE ? OR b.project_code LIKE ?)"); params += [f"%{beneficiary}%"] * 2
+    if sponsorship_type and sponsorship_type != "all":
+        where.append("b.sponsorship_type = ?"); params.append(sponsorship_type)
+    if due_from:
+        where.append("q.due_date >= ?"); params.append(due_from)
+    if due_to:
+        where.append("q.due_date <= ?"); params.append(due_to)
+    base = f"""
+        FROM sponsorship_email_queue q
+        JOIN sponsorship_allocation_donors d ON d.id = q.allocation_donor_id
+        JOIN sponsorship_allocations a ON a.id = q.allocation_id
+        JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+        WHERE {' AND '.join(where)}
+    """
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        total = cur.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+        cur.execute(f"""
+            SELECT q.*, d.donor_name, d.donor_email, d.role, d.contribution_amount,
+                   b.name AS beneficiary_name, b.sponsorship_type, b.project_code
+            {base} ORDER BY q.due_date ASC, q.id ASC LIMIT ? OFFSET ?
+        """, params + [page_size, (page - 1) * page_size])
+        items = [dict(r) for r in cur.fetchall()]
+        summary = {r[0]: r[1] for r in cur.execute(
+            "SELECT status, COUNT(*) FROM sponsorship_email_queue WHERE company_id = ? GROUP BY status", (comp,))}
+        return {"total": total, "page": page, "page_size": page_size, "items": items, "summary": summary}
+    finally:
+        conn.close()
+
+
+@router.post("/email-queue/skip")
+def skip_email_queue_items(payload: QueueActionRequest):
+    comp = payload.company_id.strip().lower()
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        ph = ",".join("?" * len(payload.ids)) or "NULL"
+        cur = conn.cursor()
+        cur.execute(f"UPDATE sponsorship_email_queue SET status = 'skipped', updated_at = CURRENT_TIMESTAMP "
+                    f"WHERE company_id = ? AND status = 'pending' AND id IN ({ph})", [comp, *payload.ids])
+        conn.commit()
+        log_event("queue.skipped", category="queue", company_id=comp, ids=payload.ids, skipped=cur.rowcount,
+                  message=f"Skipped {cur.rowcount} queued email(s)")
+        return {"status": "success", "skipped": cur.rowcount}
+    finally:
+        conn.close()
+
+
+@router.post("/email-queue/send")
+def send_email_queue_items(payload: QueueActionRequest, request: Request):
+    """Sends the selected pending items, each rendered for its own donor from the charity's own mailbox."""
+    comp = payload.company_id.strip().lower()
+    base_url = _public_base_url(request)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        ph = ",".join("?" * len(payload.ids)) or "NULL"
+        items = [dict(r) for r in conn.execute(
+            f"SELECT * FROM sponsorship_email_queue WHERE company_id = ? AND status = 'pending' AND id IN ({ph})",
+            [comp, *payload.ids]).fetchall()]
+    finally:
+        conn.close()
+    results = []
+    for item in items:
+        try:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+            try:
+                rendered = render_email_for_donor(conn.cursor(), item["allocation_id"], item["allocation_donor_id"],
+                                                  item["template_type"], payload.charity_theme)
+            finally:
+                conn.close()
+            res = deliver_rendered_email(rendered, item["allocation_id"], base_url)
+        except HTTPException as e:
+            res = {"status": "failed", "detail": e.detail}
+        except Exception as e:
+            res = {"status": "failed", "detail": str(e)}
+        if res["status"] != "sent":
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+            try:
+                conn.execute("UPDATE sponsorship_email_queue SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP "
+                             "WHERE id = ?", ("skipped" if res["status"] == "skipped" else "failed",
+                                             str(res.get("detail", ""))[:500], item["id"]))
+                conn.commit()
+            finally:
+                conn.close()
+        results.append({"queue_id": item["id"], **res})
+    sent = sum(1 for r in results if r["status"] == "sent")
+    log_event("queue.sent", category="queue", company_id=comp, level="info" if sent == len(results) else "warning",
+              requested=len(payload.ids), sent=sent, failed=len(results) - sent,
+              message=f"Queue send: {sent} of {len(results)} sent")
+    return {"status": "success" if results and sent == len(results) else ("partial" if sent else "failed"),
+            "message": f"Sent {sent} of {len(results)} queued email(s).", "results": results}

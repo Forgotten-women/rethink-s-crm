@@ -51,6 +51,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
   // Form State
   const [selectedCode, setSelectedCode] = useState('');
+  const [specialCase, setSpecialCase] = useState('');
   const [heading, setHeading] = useState('');
   const [subHeading, setSubHeading] = useState('');
   const [country, setCountry] = useState('');
@@ -240,10 +241,20 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
     };
   }, [statusFilter, activeCompany]);
 
-  // Handle Code Selection & Auto-Fill Heading, Sub-Heading, Country
+  // Handle Code Selection & Auto-Fill Heading, Sub-Heading, Country, Special Case
   const handleCodeSelect = (e) => {
-    const codeVal = e.target.value;
+    const rawVal = e.target.value;
+    let codeVal = rawVal;
+    let autoSpecialCase = '';
+    const bracketMatch = rawVal.match(/^(.+?)\s*\[(.*?)\]$/);
+    if (bracketMatch) {
+      codeVal = bracketMatch[1].trim();
+      autoSpecialCase = bracketMatch[2].trim();
+    }
     setSelectedCode(codeVal);
+    if (autoSpecialCase) {
+      setSpecialCase(autoSpecialCase);
+    }
     const matched = codes.find(c => c.code === codeVal);
     if (matched) {
       setHeading(matched.heading || 'Unassigned');
@@ -277,12 +288,23 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
     setSubmitting(true);
     setFormMsg('');
 
+    let cleanCode = selectedCode.trim();
+    let finalSpecialCase = (specialCase || '').trim();
+    const bracketMatch = cleanCode.match(/^(.+?)\s*\[(.*?)\]$/);
+    if (bracketMatch) {
+      cleanCode = bracketMatch[1].trim();
+      if (!finalSpecialCase) {
+        finalSpecialCase = bracketMatch[2].trim();
+      }
+    }
+
     fetch(`${API_BASE_URL}/api/expenses/submit`, {
       method: 'POST',
       headers: getAuthHeaders({ 'Content-Type': 'application/json' }, user),
       body: JSON.stringify({
         company_id: activeCompany,
-        code: selectedCode,
+        code: cleanCode,
+        special_case: finalSpecialCase,
         title: title,
         vendor: vendor || 'Unassigned Vendor',
         amount: parseFloat(amount),
@@ -316,6 +338,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
             setShowSubmitModal(false);
             setFormMsg('');
             setSelectedCode('');
+            setSpecialCase('');
             setIsZakat(false);
             setHeading('');
             setSubHeading('');
@@ -937,7 +960,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
             <table className="crm-table">
               <thead>
                 <tr>
-                  <th>Expense ID</th><th>Date</th><th>Project Code</th><th>GL Ledger Code</th>
+                  <th>Expense ID</th><th>Date</th><th>Project Code</th><th>Special Case</th><th>GL Ledger Code</th>
                   <th>Zakat</th><th>Department</th><th>Office</th><th>Amount</th><th>Status</th>
                 </tr>
               </thead>
@@ -968,6 +991,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                   <th>Expense ID</th>
                   <th>Date</th>
                   <th>Project Code</th>
+                  <th>Special Case</th>
                   <th>GL Ledger Code</th>
                   <th>Zakat</th>
                   <th>Department</th>
@@ -982,7 +1006,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
               <tbody>
                 {expensesData.expenses?.length === 0 ? (
                   <tr>
-                    <td colSpan={isSuperAdmin ? 12 : 11} className="text-center py-12 text-xs font-semibold" style={{ color: 'var(--text-muted)' }}>
+                    <td colSpan={isSuperAdmin ? 13 : 12} className="text-center py-12 text-xs font-semibold" style={{ color: 'var(--text-muted)' }}>
                       No expense claims found matching filter '{statusFilter}'.
                     </td>
                   </tr>
@@ -992,6 +1016,15 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                       <td className="font-mono text-xs font-bold text-cyan-400">{exp.id}</td>
                       <td className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>{exp.payment_date}</td>
                       <td className="font-mono text-xs font-bold text-purple-400">{exp.code}</td>
+                      <td>
+                        {exp.special_case ? (
+                          <span className="badge badge-amber text-[10px] font-bold">
+                            {exp.special_case}
+                          </span>
+                        ) : (
+                          <span className="text-slate-500 text-xs italic">—</span>
+                        )}
+                      </td>
                       <td>
                         {exp.gl_code ? (
                           <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-slate-900/90 text-cyan-300 border border-cyan-500/30 shadow-xs">
@@ -1142,12 +1175,62 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                 >
                   <option value="">-- Choose Campaign Code --</option>
                   {codes.map(c => (
-                    <option key={c.code} value={c.code}>
-                      {c.code} — {c.heading} ({c.country})
-                    </option>
+                    <React.Fragment key={c.code}>
+                      <option value={c.code}>
+                        {c.code} — {c.heading} ({c.country})
+                      </option>
+                      {c.special_cases?.map(sc => (
+                        <option key={`${c.code}-${sc}`} value={`${c.code} [${sc}]`}>
+                          &nbsp;&nbsp;↳ {c.code} [{sc}]
+                        </option>
+                      ))}
+                    </React.Fragment>
                   ))}
                 </select>
               </div>
+
+              {/* Dedicated Special Case Field (Approach 2) */}
+              {selectedCode && (
+                <div>
+                  <label className="block text-xs font-bold mb-1" style={{ color: 'var(--text-main)' }}>
+                    Special Case / Sub-Category <span className="text-cyan-400 font-normal">{(matchedSelected?.special_treatment ? `(${matchedSelected.special_treatment})` : '(Optional sub-case)')}</span>
+                  </label>
+                  {matchedSelected?.special_cases?.length > 0 ? (
+                    <select
+                      value={specialCase}
+                      onChange={e => setSpecialCase(e.target.value)}
+                      className="w-full rounded-lg px-3 py-2 text-xs font-semibold focus:outline-none"
+                      style={{
+                        backgroundColor: 'var(--input-bg)',
+                        color: 'var(--input-text)',
+                        borderColor: 'var(--input-border)',
+                        borderWidth: '1px',
+                        borderStyle: 'solid'
+                      }}
+                    >
+                      <option value="">-- General / No Special Case --</option>
+                      {matchedSelected.special_cases.map(sc => (
+                        <option key={sc} value={sc}>{sc}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      placeholder="e.g. Specific Case or note (optional)"
+                      value={specialCase}
+                      onChange={e => setSpecialCase(e.target.value)}
+                      className="w-full rounded-lg px-3 py-2 text-xs focus:outline-none"
+                      style={{
+                        backgroundColor: 'var(--input-bg)',
+                        color: 'var(--input-text)',
+                        borderColor: 'var(--input-border)',
+                        borderWidth: '1px',
+                        borderStyle: 'solid'
+                      }}
+                    />
+                  )}
+                </div>
+              )}
 
               {/* Auto-Filled Details Readonly Group */}
               {selectedCode && (
@@ -1417,6 +1500,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                       <tr>
                         <th>Claim ID</th>
                         <th>Title & Vendor</th>
+                        <th>Special Case</th>
                         <th>Date</th>
                         <th>Amount</th>
                         <th>Status</th>
@@ -1433,6 +1517,15 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                             <td>
                               <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>{exp.title}</div>
                               {exp.vendor && <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Vendor: {exp.vendor}</div>}
+                            </td>
+                            <td>
+                              {exp.special_case ? (
+                                <span className="badge badge-amber text-[10px] font-bold">
+                                  {exp.special_case}
+                                </span>
+                              ) : (
+                                <span className="text-slate-500 text-xs italic">—</span>
+                              )}
                             </td>
                             <td className="text-xs" style={{ color: 'var(--text-muted)' }}>{formatDate(exp.created_at)}</td>
                             <td className="text-xs font-black text-white">£{exp.amount?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>

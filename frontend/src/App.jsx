@@ -14,6 +14,7 @@ import PayoutsView from './components/PayoutsView';
 import FundraiserView from './components/FundraiserView';
 import DonorDrawer from './components/DonorDrawer';
 import LoginView from './components/LoginView';
+import OpsConsole from './components/ops/OpsConsole';
 
 import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Gift, Layers, DollarSign, Filter, ChevronUp, ChevronDown } from 'lucide-react';
 
@@ -255,6 +256,36 @@ export default function App() {
     setFilters(INITIAL_FILTERS);
   };
 
+  // ---- Hidden ops console (super admins): Konami code ↑ ↑ ↓ ↓ ← → ← → B A ----
+  const [opsOpen, setOpsOpen] = useState(false);
+  const [opsHealth, setOpsHealth] = useState(null);
+  const isSuperAdmin = user?.role === 'super_admin';
+  useEffect(() => {
+    if (!isSuperAdmin) return undefined;
+    const SEQUENCE = ['arrowup', 'arrowup', 'arrowdown', 'arrowdown', 'arrowleft', 'arrowright', 'arrowleft', 'arrowright', 'b', 'a'];
+    let pos = 0;
+    let last = 0;
+    const onKey = (e) => {
+      const tag = (e.target?.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) return;
+      const now = Date.now();
+      if (now - last > 1500) pos = 0;
+      last = now;
+      const key = (e.key || '').toLowerCase();
+      pos = key === SEQUENCE[pos] ? pos + 1 : (key === SEQUENCE[0] ? 1 : 0);
+      if (pos === SEQUENCE.length) { pos = 0; setOpsOpen(true); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isSuperAdmin]);
+  useEffect(() => {
+    if (!isSuperAdmin) return undefined;
+    const check = () => fetch(`${API_BASE_URL}/api/ops/status`).then(r => (r.ok ? r.json() : null)).then(d => setOpsHealth(d?.overall || null)).catch(() => {});
+    check();
+    const t = setInterval(check, 5 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [isSuperAdmin]);
+
   const handleLoginSuccess = (userData, accessToken) => {
     const sessionData = {
       ...userData,
@@ -425,6 +456,12 @@ export default function App() {
 
       {/* Donor 360° Profile Drawer Modal */}
       <DonorDrawer donorId={selectedDonor} onClose={() => setSelectedDonor(null)} activeCompany={activeCompany} />
+
+      {isSuperAdmin && opsHealth === 'down' && !opsOpen && (
+        <button type="button" onClick={() => setOpsOpen(true)} title="A platform integration is not working - open the ops console"
+          className="fixed bottom-3 right-3 z-[70] w-3 h-3 rounded-full bg-rose-500 animate-pulse shadow" aria-label="Integration problem" />
+      )}
+      {isSuperAdmin && opsOpen && <OpsConsole onClose={() => setOpsOpen(false)} />}
     </div>
   );
 }

@@ -56,7 +56,7 @@ def init_expense_db():
         """)
 
         # Migration safe-guards for existing databases
-        for col_def in ["gl_code TEXT", "is_zakat INTEGER DEFAULT 0", "company_id TEXT DEFAULT 'rethink'"]:
+        for col_def in ["gl_code TEXT", "is_zakat INTEGER DEFAULT 0", "company_id TEXT DEFAULT 'rethink'", "special_case TEXT DEFAULT ''"]:
             try:
                 cursor.execute(f"ALTER TABLE expense_requests ADD COLUMN {col_def};")
             except Exception:
@@ -127,6 +127,7 @@ class SubmitExpenseRequest(BaseModel):
     is_zakat: Optional[bool] = False
     gl_code: Optional[str] = None
     company_id: Optional[str] = "rethink"
+    special_case: Optional[str] = ""
 
 
 class ReviewExpenseRequest(BaseModel):
@@ -243,8 +244,14 @@ def _send_smtp_email(smtp_cfg: dict, to_email: str, subject: str, html_body: str
             server.ehlo()
             server.login(smtp_user, smtp_password)
             server.sendmail(smtp_from_email, [to_email], msg.as_string())
+        from core.event_log import log_event
+        log_event("email.sent", category="email", recipient=to_email, subject=subject, channel="smtp",
+                  message=f"Expense email sent to {to_email}")
         return True, ""
     except Exception as e:
+        from core.event_log import log_event
+        log_event("email.failed", category="email", level="error", recipient=to_email, subject=subject,
+                  channel="smtp", detail=str(e)[:300], message=f"Expense email to {to_email} failed: {e}")
         return False, str(e)
 
 
@@ -384,7 +391,8 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
                     old_codes,
                     description,
                     is_active,
-                    company_id
+                    company_id,
+                    COALESCE(special_treatment, '') as special_treatment
                 FROM master_project_codes
                 WHERE code IS NOT NULL AND TRIM(code) != '' AND company_id = ?
                 ORDER BY code
@@ -405,7 +413,8 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
                     old_codes,
                     description,
                     is_active,
-                    company_id
+                    company_id,
+                    COALESCE(special_treatment, '') as special_treatment
                 FROM master_project_codes
                 WHERE code IS NOT NULL AND TRIM(code) != ''
                 ORDER BY code
@@ -470,7 +479,7 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
     # Build code list STRICTLY from master_project_codes
     for (code_val, department, office, portfolio, country, zakat_elig,
          programme_fund, fund_code, legacy_nz, legacy_z, old_codes,
-         description, is_active, comp_tag) in master_rows:
+         description, is_active, comp_tag, special_treatment) in master_rows:
         if not code_val:
             continue
         code_str = str(code_val).strip().upper()
@@ -479,6 +488,7 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
         t_in = transfers_in_map.get(code_str, 0.0)
         t_out = transfers_out_map.get(code_str, 0.0)
         net_t = round(t_in - t_out, 2)
+        cases = [s.strip() for s in str(special_treatment or "").split(";") if s.strip()]
         code_map[code_str] = {
             "code": code_str,
             "company_id": str(comp_tag or comp),
@@ -493,6 +503,8 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
             "legacy_zakat_code": str(legacy_z or ""),
             "old_codes": str(old_codes or ""),
             "description": str(description or ""),
+            "special_treatment": str(special_treatment or ""),
+            "special_cases": cases,
             "is_active": bool(is_active),
             "campaign_name": "N/A",
             "gross_raised": round(gross_val, 2),
@@ -647,6 +659,7 @@ def export_expense_requests(
         "created_at": "Submission Date",
         "payment_date": "Payment Date",
         "code": "Project Code",
+        "special_case": "Special Case",
         "gl_code": "GL Ledger Code",
         "is_zakat": "Zakat Eligible",
         "title": "Expense Title",
@@ -663,7 +676,7 @@ def export_expense_requests(
     }
 
     target_cols = [
-        "id", "company_id", "created_at", "payment_date", "code", "gl_code", "is_zakat",
+        "id", "company_id", "created_at", "payment_date", "code", "special_case", "gl_code", "is_zakat",
         "title", "vendor", "amount", "heading", "sub_heading", "country",
         "status", "requested_by", "reviewed_by", "notes", "review_notes"
     ]
@@ -759,6 +772,17 @@ def submit_expense(payload: SubmitExpenseRequest):
         else:
             gl_code = str(c_info.get("Legacy Non-Zakat Code") or c_info.get("Legacy Zakat Code") or "")
 
+    raw_code = payload.code.strip()
+    spec_case = (payload.special_case or "").strip()
+    clean_code = raw_code
+    if "[" in raw_code and raw_code.endswith("]"):
+        parts = raw_code.split("[")
+        clean_code = parts[0].strip().upper()
+        if not spec_case:
+            spec_case = parts[1].rstrip("]").strip()
+    else:
+        clean_code = raw_code.upper()
+
     expense_id = f"EXP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
     token = uuid.uuid4().hex
 
@@ -766,12 +790,12 @@ def submit_expense(payload: SubmitExpenseRequest):
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO expense_requests 
-        (id, code, gl_code, is_zakat, heading, sub_heading, country, title, vendor, amount, payment_date, notes, status, requested_by, approval_token, company_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?)
+        (id, code, gl_code, is_zakat, heading, sub_heading, country, title, vendor, amount, payment_date, notes, status, requested_by, approval_token, company_id, special_case)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?)
     """, (
-        expense_id, payload.code.strip(), gl_code, 1 if is_zkt_bool else 0, heading, sub_heading, country,
+        expense_id, clean_code, gl_code, 1 if is_zkt_bool else 0, heading, sub_heading, country,
         payload.title.strip(), payload.vendor.strip(), payload.amount, payload.payment_date,
-        payload.notes, payload.requested_by, token, comp
+        payload.notes, payload.requested_by, token, comp, spec_case
     ))
     conn.commit()
     conn.close()

@@ -10,12 +10,30 @@ import {
   FileCode, Tag, HelpCircle, LayoutTemplate, Zap, AlertTriangle, Bell, Download, Sliders, SendHorizontal, EyeOff, Ban
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import AllocationDonorsEditor from './tracker/AllocationDonorsEditor';
+import SponsorshipDonorPanel from './tracker/SponsorshipDonorPanel';
+import EmailDispatcherModal from './tracker/EmailDispatcherModal';
+import EmailQueueView from './tracker/EmailQueueView';
+import TrackerFilterBar from './tracker/TrackerFilterBar';
+import { toDraftDonor, donorKeyFor, readFiltersFromUrl, writeFiltersToUrl, filtersToParams } from './tracker/trackerUtils';
 
 export default function TrackerView({ user, filters, onSelectDonor, activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
   
   // Navigation Tabs: 'beneficiaries' | 'allocations' | 'alerts' | 'analytics' | 'outlook' | 'templates'
   const [activeTab, setActiveTab] = useState('beneficiaries');
+
+  // Donor details panel, per-allocation donor management, per-donor email dispatcher
+  const [donorPanelKey, setDonorPanelKey] = useState(null);
+  const [manageDonorsAlloc, setManageDonorsAlloc] = useState(null);
+  const [dispatcher, setDispatcher] = useState(null); // { allocation, templateType, theme }
+  const [allocDonorsDraft, setAllocDonorsDraft] = useState([]);
+  const [benFilters, setBenFilters] = useState(() => readFiltersFromUrl('ben'));
+  const [allocFilters, setAllocFilters] = useState(() => readFiltersFromUrl('alloc'));
+  const openDonor = (key) => {
+    const k = (key || '').toString().trim();
+    if (k && k.toLowerCase() !== 'n/a') setDonorPanelKey(k);
+  };
 
   // --- OVERDUE ALERTS TRACKER STATE ---
   const [overdueSummary, setOverdueSummary] = useState(null);
@@ -134,8 +152,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const [isCustomCampaign, setIsCustomCampaign] = useState(false);
   const [customCampaignName, setCustomCampaignName] = useState('');
   const [campaignCommunityName, setCampaignCommunityName] = useState('');
-  const [campaignContactEmail, setCampaignContactEmail] = useState('');
-  const [campaignContactPhone, setCampaignContactPhone] = useState('');
+  const [, setCampaignContactEmail] = useState('');
+  const [, setCampaignContactPhone] = useState('');
   const [campaignContactName, setCampaignContactName] = useState('');
   const [allocationNotes, setAllocationNotes] = useState('');
   const [modalDonorSourceTab, setModalDonorSourceTab] = useState('sponsorship'); // 'sponsorship' | 'all_crm' | 'custom'
@@ -248,12 +266,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   });
   const [savingContact, setSavingContact] = useState(false);
 
-  // Interactive Email Modal (Microsoft 365 / Outlook)
-  const [emailModalAllocation, setEmailModalAllocation] = useState(null);
+  // Email templates (the per-donor dispatcher renders them on the server)
   const [emailTemplates, setEmailTemplates] = useState([]);
-  const [selectedTemplateType, setSelectedTemplateType] = useState('profile_intro');
-  const [emailDraft, setEmailDraft] = useState({ subject: '', body_html: '', recipient_email: '', recipient_name: '' });
-  const [sendingEmail, setSendingEmail] = useState(false);
 
   // Two-Way Conversation Drawer
   const [conversationAllocation, setConversationAllocation] = useState(null);
@@ -463,14 +477,31 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   // DATA FETCHING
   // -------------------------------------------------------------
+  const listParams = (values) => {
+    const p = filtersToParams(values);
+    p.set('company_id', activeCompany);
+    return p.toString();
+  };
+
+  // Reloads only the two filtered lists (cheap) when the filter bars change.
+  const loadFilteredLists = () => {
+    Promise.all([
+      fetch(`${API_BASE_URL}/api/tracker/beneficiaries?${listParams(benFilters)}`).then(r => r.json()),
+      fetch(`${API_BASE_URL}/api/tracker/allocations?${listParams(allocFilters)}`).then(r => r.json())
+    ])
+      .then(([bData, aData]) => {
+        setBeneficiaries(bData?.beneficiaries || []);
+        setAllocations(aData?.allocations || []);
+      })
+      .catch(err => console.error('Error fetching filtered tracker lists:', err));
+  };
+
   const loadBeneficiariesAndAllocations = () => {
     setLoadingData(true);
-    const params = new URLSearchParams();
-    params.append('company_id', activeCompany);
 
     Promise.all([
-      fetch(`${API_BASE_URL}/api/tracker/beneficiaries?${params.toString()}`).then(r => r.json()),
-      fetch(`${API_BASE_URL}/api/tracker/allocations?${params.toString()}`).then(r => r.json()),
+      fetch(`${API_BASE_URL}/api/tracker/beneficiaries?${listParams(benFilters)}`).then(r => r.json()),
+      fetch(`${API_BASE_URL}/api/tracker/allocations?${listParams(allocFilters)}`).then(r => r.json()),
       fetch(`${API_BASE_URL}/api/tracker/qualifying-donors?company_id=${activeCompany}&sponsorship_type=${selectedDonorType}`).then(r => r.json()),
       fetch(`${API_BASE_URL}/api/tracker/qualifying-campaigns?company_id=${activeCompany}&sponsorship_type=${selectedDonorType}`).then(r => r.json()),
       fetch(`${API_BASE_URL}/api/tracker/outlook/status?company_id=${activeCompany}`).then(r => r.json()),
@@ -615,9 +646,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     setSelectedDonorForAllocation(d);
     setSelectedCampaignForAllocation(null);
     setAllocationMode('donor');
-    setDonorContactName(d.donor_name || '');
-    setDonorContactEmail(d.donor_email || '');
-    setDonorContactPhone(d.donor_phone || '');
+    setAllocDonorsDraft([{ ...toDraftDonor(d, 'donor'), is_primary: true, contribution_amount: Number(d.target_amount || 480) }]);
     setSelectedDonorType(d.sponsorship_type);
     
     // Look for matching unallocated beneficiary
@@ -635,13 +664,19 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     }
   };
 
+  // Campaign contacts come only from the Fundraisers registry (c.organizers), never from donor data.
+  const organizerDraftFromCampaign = (c) => (c?.organizers || []).map((o, i) => ({
+    ...toDraftDonor({ donor_name: o.name, donor_email: o.email, donor_phone: o.phone, donor_id: o.email || o.phone }, 'organizer'),
+    is_primary: i === 0,
+    contribution_amount: i === 0 ? Number(c.target_amount || 480) : 0
+  }));
+
   const handleAllocateOverdueCampaign = (c) => {
     setSelectedCampaignForAllocation(c);
     setSelectedDonorForAllocation(null);
     setAllocationMode('campaign');
     setIsCustomCampaign(false);
-    setCampaignContactName(c.organizer_name || c.campaign_name);
-    setCampaignContactEmail(c.organizer_email || '');
+    setAllocDonorsDraft(organizerDraftFromCampaign(c));
     setSelectedDonorType(c.sponsorship_type);
 
     const matching = beneficiaries.find(b => (!b.allocation_id || b.status === 'Unallocated') && b.sponsorship_type === c.sponsorship_type);
@@ -831,8 +866,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       }
 
       const headers = isDonors
-        ? ['Donor ID', 'Donor Name', 'Email', 'Phone', 'Sponsorship Type', 'Total Donated', 'Target Amount', '% Raised', 'Target Status', 'Max Slots', 'Allocated Count', 'Remaining Slots', 'Oldest Donation Date', 'Waiting Days', 'Severity', 'Involved Campaigns']
-        : ['Campaign Name', 'Community', 'Organizer Name', 'Organizer Email', 'Sponsorship Type', 'Total Raised', 'Target Amount', '% Raised', 'Target Status', 'Max Slots', 'Allocated Count', 'Remaining Slots', 'Oldest Donation Date', 'Waiting Days', 'Severity'];
+        ? ['Donor ID', 'Donor Name', 'Email', 'Phone', 'Sponsorship Type', 'Total Donated', 'Target Amount', '% Raised', 'Target Status', 'Max Slots', 'Allocated Count', 'Remaining Slots', 'Slot Earned On', 'First Donation Date', 'Waiting Days', 'Severity', 'Involved Campaigns']
+        : ['Campaign Name', 'Community', 'Organizer Name', 'Organizer Email', 'Sponsorship Type', 'Total Raised', 'Target Amount', '% Raised', 'Target Status', 'Max Slots', 'Allocated Count', 'Remaining Slots', 'Slot Earned On', 'First Donation Date', 'Waiting Days', 'Severity'];
 
       const rows = dataList.map(item => isDonors ? [
         `"${(item.donor_id || '').replace(/"/g, '""')}"`,
@@ -847,6 +882,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         item.max_slots || 0,
         item.allocated_count || 0,
         item.remaining_slots || 0,
+        `"${item.eligible_since || ''}"`,
         `"${item.oldest_donation_date || ''}"`,
         item.waiting_days || 0,
         `"${item.severity || ''}"`,
@@ -864,6 +900,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         item.max_slots || 0,
         item.allocated_count || 0,
         item.remaining_slots || 0,
+        `"${item.eligible_since || ''}"`,
         `"${item.oldest_donation_date || ''}"`,
         item.waiting_days || 0,
         `"${item.severity || ''}"`
@@ -887,10 +924,22 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
   useEffect(() => {
     loadBeneficiariesAndAllocations();
-    loadTrackerStats();
     loadOverdueSummary();
     loadOverdueSettings();
-  }, [activeCompany, selectedDonorType, filters]);
+  }, [activeCompany, selectedDonorType]);
+
+  // The global filter bar only affects the stats; it no longer reloads every tracker list.
+  useEffect(() => {
+    loadTrackerStats();
+  }, [activeCompany, filters]);
+
+  const filtersMounted = useRef(false);
+  useEffect(() => {
+    writeFiltersToUrl('ben', benFilters);
+    writeFiltersToUrl('alloc', allocFilters);
+    if (!filtersMounted.current) { filtersMounted.current = true; return; }
+    loadFilteredLists();
+  }, [benFilters, allocFilters]);
 
   useEffect(() => {
     if (activeTab === 'alerts') {
@@ -1104,39 +1153,58 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   // ALLOCATION ACTIONS
   // -------------------------------------------------------------
+  const allocationTarget = () => Number(allocateModalBeneficiary?.target_amount || selectedDonorForAllocation?.target_amount || 480);
+
+  // Picking a donor ADDS them to the sponsorship (collective sponsorships); null clears the list.
   const handleSelectDonorForAllocation = (d) => {
-    setSelectedDonorForAllocation(d);
-    if (d) {
-      setDonorContactEmail((d.donor_email && d.donor_email.toLowerCase() !== 'n/a') ? d.donor_email : '');
-      setDonorContactPhone((d.donor_phone && d.donor_phone.toLowerCase() !== 'n/a') ? d.donor_phone : '');
-      setDonorContactName(d.donor_name || '');
-    } else {
-      setDonorContactEmail('');
-      setDonorContactPhone('');
-      setDonorContactName('');
+    setDonorContactEmail('');
+    setDonorContactPhone('');
+    setDonorContactName('');
+    if (!d) {
+      setSelectedDonorForAllocation(null);
+      setAllocDonorsDraft([]);
+      return;
     }
+    setSelectedDonorForAllocation(d);
+    setAllocDonorsDraft(prev => {
+      const row = toDraftDonor(d, 'donor');
+      const exists = prev.some(p => (row.donor_email && p.donor_email && p.donor_email.toLowerCase() === row.donor_email.toLowerCase()) ||
+        (row.donor_id && p.donor_id && p.donor_id.toLowerCase() === row.donor_id.toLowerCase()));
+      if (exists) return prev;
+      const funded = prev.reduce((sum, p) => sum + Number(p.contribution_amount || 0), 0);
+      const target = Number(allocateModalBeneficiary?.target_amount || d.target_amount || 480);
+      row.contribution_amount = prev.length === 0 ? target : Math.max(0, Math.round((target - funded) * 100) / 100);
+      row.is_primary = prev.length === 0;
+      row.exceptional = Boolean(d.remaining_slots <= 0 || d.is_exceptional || ['ineligible', 'over_capacity', 'at_capacity'].includes(d.status));
+      return [...prev, row];
+    });
   };
 
   const handleConfirmAllocation = () => {
     if (!allocateModalBeneficiary) return;
 
-    if (allocationMode === 'donor') {
-      if (!selectedDonorForAllocation) {
-        alert('Please select a donor or enter custom donor details.');
-        return;
-      }
-      if (!donorContactEmail.trim() && !donorContactPhone.trim()) {
-        alert('Please provide at least one contact method (Email or Phone number) for the donor.');
-        return;
-      }
+    const draftPayload = allocDonorsDraft.map(d => ({
+      donor_id: d.donor_id || d.donor_email || d.donor_phone,
+      donor_name: d.donor_name,
+      donor_email: d.donor_email,
+      donor_phone: d.donor_phone,
+      contribution_amount: Number(d.contribution_amount || 0),
+      is_primary: Boolean(d.is_primary),
+      is_manual: Boolean(d.is_manual),
+      role: d.role
+    }));
+    const missingContact = allocDonorsDraft.find(d => !(d.donor_email || '').trim() && !(d.donor_phone || '').trim());
 
-      const isExceptional = Boolean(
-        selectedDonorForAllocation.remaining_slots <= 0 ||
-        selectedDonorForAllocation.status === 'ineligible' ||
-        selectedDonorForAllocation.status === 'over_capacity' ||
-        selectedDonorForAllocation.status === 'at_capacity' ||
-        selectedDonorForAllocation.is_exceptional
-      );
+    if (allocationMode === 'donor') {
+      if (!allocDonorsDraft.length) {
+        alert('Please add at least one donor.');
+        return;
+      }
+      if (missingContact) {
+        alert(`Please provide an email or phone number for ${missingContact.donor_name || 'every donor'}.`);
+        return;
+      }
+      const isExceptional = allocDonorsDraft.some(d => d.exceptional);
 
       fetch(`${API_BASE_URL}/api/tracker/allocations`, {
         method: 'POST',
@@ -1144,11 +1212,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         body: JSON.stringify({
           beneficiary_id: allocateModalBeneficiary.id,
           allocation_type: 'individual',
-          donor_email: donorContactEmail.trim(),
-          donor_phone: donorContactPhone.trim(),
-          donor_name: donorContactName.trim() || selectedDonorForAllocation.donor_name,
-          donor_id: selectedDonorForAllocation.donor_id || donorContactEmail.trim(),
-          allocated_amount: selectedDonorForAllocation.target_amount || allocateModalBeneficiary.target_amount || 480,
+          donors: draftPayload,
+          allocated_amount: allocationTarget(),
           admin_notes: allocationNotes,
           company_id: activeCompany,
           is_exceptional: isExceptional
@@ -1177,8 +1242,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         alert('Please enter a campaign name.');
         return;
       }
-      if (!campaignContactEmail.trim() && !campaignContactPhone.trim()) {
-        alert('Please enter at least one contact method (Email or Phone Number) for the recipient.');
+      if (!allocDonorsDraft.length || missingContact) {
+        alert('Please add at least one campaign contact with an email or phone number.');
         return;
       }
 
@@ -1195,9 +1260,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           allocation_type: 'campaign',
           campaign_name: campName,
           community_name: commName,
-          donor_email: campaignContactEmail.trim(),
-          donor_phone: campaignContactPhone.trim(),
-          donor_name: contactName,
+          donors: draftPayload.map((d, i) => ({ ...d, role: 'organizer', donor_name: d.donor_name || (i === 0 ? contactName : '') })),
           allocated_amount: targetAmt,
           admin_notes: allocationNotes,
           company_id: activeCompany
@@ -1215,6 +1278,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             setCampaignContactEmail('');
             setCampaignContactPhone('');
             setCampaignContactName('');
+            setAllocDonorsDraft([]);
             setAllocationNotes('');
             loadBeneficiariesAndAllocations();
           } else {
@@ -1401,149 +1465,24 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   // OUTLOOK EMAIL DISPATCH & CONVERSATIONS
   // -------------------------------------------------------------
-  const [emailModalTab, setEmailModalTab] = useState('edit'); // 'edit' | 'preview'
+  // Opens the per-donor dispatcher. Accepts an allocation row or a partial object with the allocation id.
   const openEmailDispatcher = (alloc, defaultType = 'profile_intro', defaultTheme = null) => {
-    setEmailModalAllocation(alloc);
-    const themeToUse = defaultTheme || selectedModalTheme || (activeCompany === 'iqra' ? 'iqra' : 'rethink');
-    setSelectedModalTheme(themeToUse);
-    setSelectedTemplateType(defaultType);
-    setEmailModalTab('edit');
-
-    const themeTemplates = emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === themeToUse);
-    const tpl = themeTemplates.find(t => t.template_type === defaultType) || emailTemplates.find(t => t.template_type === defaultType) || {
-      subject: `Sponsorship Update: {beneficiary_name}`,
-      body_html: `<p>Dear {donor_name},</p><p>Here is your sponsorship update for {beneficiary_name}.</p>`
-    };
-
-    const recipientEmail = alloc.is_campaign_allocation
-      ? (alloc.campaign_contact_email || alloc.donor_email || '')
-      : (alloc.donor_email || '');
-
-    const recipientName = alloc.is_campaign_allocation
-      ? (alloc.campaign_contact_name || alloc.campaign_name || alloc.donor_name || 'Campaign Lead')
-      : (alloc.donor_name || 'Generous Donor');
-
-    const firstName = recipientName.split(' ')[0] || recipientName;
-
-    const replacePlaceholders = (text) => {
-      if (!text) return '';
-      const folderLink = alloc.donor_folder_link || alloc.profile_link || '#';
-      const yearStr = alloc.sponsorship_year ? `Year ${alloc.sponsorship_year}` : 'Year 1';
-      const daysLeftStr = alloc.days_remaining != null ? `${alloc.days_remaining} days` : '30 days';
-      const deadlineStr = alloc.end_date || 'N/A';
-
-      return text
-        .replace(/{{First_Name}}|{First_Name}/gi, firstName)
-        .replace(/{{donor_name}}|{donor_name}/gi, recipientName)
-        .replace(/{{Email}}|{Email}|{{recipient_email}}|{recipient_email}/gi, recipientEmail)
-        .replace(/{{beneficiary_name}}|{beneficiary_name}/gi, alloc.beneficiary_name || 'Beneficiary')
-        .replace(/{{sponsorship_type}}|{sponsorship_type}/gi, alloc.sponsorship_type || 'Sponsorship')
-        .replace(/{{sponsorship_year}}|{sponsorship_year}/gi, yearStr)
-        .replace(/{{renewal_deadline}}|{renewal_deadline}/gi, deadlineStr)
-        .replace(/{{days_remaining}}|{days_remaining}/gi, daysLeftStr)
-        .replace(/{{location}}|{location}/gi, alloc.location || '')
-        .replace(/{{project_code}}|{project_code}/gi, alloc.project_code || '')
-        .replace(/{{donor_folder_link}}|{donor_folder_link}/gi, folderLink)
-        .replace(/{{folder_link}}|{folder_link}/gi, folderLink)
-        .replace(/{{profile_link}}|{profile_link}/gi, alloc.profile_link || '#')
-        .replace(/{{video_link}}|{video_link}/gi, alloc.video_link || '#')
-        .replace(/{{report_link}}|{report_link}/gi, alloc.report_link || alloc.profile_link || '#')
-        .replace(/{{campaign_name}}|{campaign_name}/gi, alloc.campaign_name || 'Campaign')
-        .replace(/{{community_name}}|{community_name}/gi, alloc.community_name || 'Community')
-        .replace(/{{Subject}}|{Subject}/gi, tpl.subject || 'Sponsorship Update')
-        .replace(/{{Message_Body}}|{Message_Body}/gi, 'Thank you for your generous sponsorship and support.');
-    };
-
-    setEmailDraft({
-      subject: replacePlaceholders(tpl.subject),
-      body_html: replacePlaceholders(tpl.body_html),
-      recipient_email: recipientEmail,
-      recipient_name: recipientName
+    const allocId = alloc?.id || alloc?.allocation_id;
+    const full = allocations.find(x => x.id === allocId);
+    const open = (allocation) => setDispatcher({
+      allocation,
+      templateType: defaultType,
+      theme: defaultTheme || selectedModalTheme || (activeCompany === 'iqra' ? 'iqra' : 'rethink')
     });
-  };
-
-  const handleSwitchModalTheme = (newTheme) => {
-    setSelectedModalTheme(newTheme);
-    if (!emailModalAllocation) return;
-    const themeTemplates = emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === newTheme);
-    const tpl = themeTemplates.find(t => t.template_type === selectedTemplateType) || themeTemplates[0];
-    if (tpl) {
-      setSelectedTemplateType(tpl.template_type);
-
-      const recipientEmail = emailModalAllocation.is_campaign_allocation
-        ? (emailModalAllocation.campaign_contact_email || emailModalAllocation.donor_email || '')
-        : (emailModalAllocation.donor_email || '');
-      const recipientName = emailModalAllocation.is_campaign_allocation
-        ? (emailModalAllocation.campaign_contact_name || emailModalAllocation.campaign_name || emailModalAllocation.donor_name || 'Campaign Lead')
-        : (emailModalAllocation.donor_name || 'Generous Donor');
-      const firstName = recipientName.split(' ')[0] || recipientName;
-
-      const folderLink = emailModalAllocation.donor_folder_link || emailModalAllocation.profile_link || '#';
-      const yearStr = emailModalAllocation.sponsorship_year ? `Year ${emailModalAllocation.sponsorship_year}` : 'Year 1';
-      const daysLeftStr = emailModalAllocation.days_remaining != null ? `${emailModalAllocation.days_remaining} days` : '30 days';
-      const deadlineStr = emailModalAllocation.end_date || 'N/A';
-
-      const rep = (text) => (text || '')
-        .replace(/{{First_Name}}|{First_Name}/gi, firstName)
-        .replace(/{{donor_name}}|{donor_name}/gi, recipientName)
-        .replace(/{{Email}}|{Email}|{{recipient_email}}|{recipient_email}/gi, recipientEmail)
-        .replace(/{{beneficiary_name}}|{beneficiary_name}/gi, emailModalAllocation.beneficiary_name || 'Beneficiary')
-        .replace(/{{sponsorship_type}}|{sponsorship_type}/gi, emailModalAllocation.sponsorship_type || 'Sponsorship')
-        .replace(/{{sponsorship_year}}|{sponsorship_year}/gi, yearStr)
-        .replace(/{{renewal_deadline}}|{renewal_deadline}/gi, deadlineStr)
-        .replace(/{{days_remaining}}|{days_remaining}/gi, daysLeftStr)
-        .replace(/{{location}}|{location}/gi, emailModalAllocation.location || '')
-        .replace(/{{project_code}}|{project_code}/gi, emailModalAllocation.project_code || '')
-        .replace(/{{donor_folder_link}}|{donor_folder_link}/gi, folderLink)
-        .replace(/{{folder_link}}|{folder_link}/gi, folderLink)
-        .replace(/{{profile_link}}|{profile_link}/gi, emailModalAllocation.profile_link || '#')
-        .replace(/{{video_link}}|{video_link}/gi, emailModalAllocation.video_link || '#')
-        .replace(/{{report_link}}|{report_link}/gi, emailModalAllocation.report_link || emailModalAllocation.profile_link || '#')
-        .replace(/{{campaign_name}}|{campaign_name}/gi, emailModalAllocation.campaign_name || 'Campaign')
-        .replace(/{{community_name}}|{community_name}/gi, emailModalAllocation.community_name || 'Community')
-        .replace(/{{Subject}}|{Subject}/gi, tpl.subject || 'Sponsorship Update')
-        .replace(/{{Message_Body}}|{Message_Body}/gi, 'Thank you for your generous sponsorship and support.');
-
-      setEmailDraft(prev => ({
-        ...prev,
-        subject: rep(tpl.subject),
-        body_html: rep(tpl.body_html)
-      }));
-    }
-  };
-
-  const handleSendOutlookEmail = () => {
-    if (!emailModalAllocation) return;
-    setSendingEmail(true);
-
-    fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/outlook/send`), {
-      method: 'POST',
-      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        allocation_id: emailModalAllocation.id,
-        template_type: selectedTemplateType,
-        recipient_email: emailDraft.recipient_email,
-        recipient_name: emailDraft.recipient_name,
-        subject: emailDraft.subject,
-        body_html: emailDraft.body_html,
-        company_id: selectedModalTheme || activeCompany
-      })
-    })
+    if (full && full.donors) { open(full); return; }
+    // The row is not in the current (filtered) list: fetch it, so we still have every donor.
+    fetch(`${API_BASE_URL}/api/tracker/allocations?company_id=${alloc.company_id || activeCompany}&search=${encodeURIComponent(alloc.project_code || alloc.beneficiary_name || '')}`)
       .then(r => r.json())
       .then(res => {
-        setSendingEmail(false);
-        if (res.status === 'success') {
-          setEmailModalAllocation(null);
-          alert('✅ Email successfully dispatched via Microsoft 365 / Outlook!');
-          loadBeneficiariesAndAllocations();
-        } else {
-          alert(`Failed to send email: ${res.detail || 'Unknown error'}`);
-        }
+        const match = (res.allocations || []).find(x => x.id === allocId);
+        if (match) open(match); else alert('Could not load this sponsorship\'s donors.');
       })
-      .catch(err => {
-        setSendingEmail(false);
-        alert(`Error: ${err.message}`);
-      });
+      .catch(err => alert(err.message));
   };
 
   const openConversationDrawer = (alloc) => {
@@ -1662,34 +1601,6 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           loadBeneficiariesAndAllocations();
         } else {
           alert(res.detail || 'Failed to create template');
-        }
-      })
-      .catch(err => alert(err.message));
-  };
-
-  const handleSaveModalDraftAsDefault = () => {
-    if (!selectedTemplateType) return;
-    const themeName = CHARITY_THEMES_PRESETS[selectedModalTheme]?.name || selectedModalTheme;
-    if (!window.confirm(`Save your current edits as the global default for template "${selectedTemplateType}" under ${themeName}? Future emails will use this updated text.`)) return;
-
-    const effectiveModalCompanyId = (selectedModalTheme === 'sp' && activeCompany === 'rethink') ? 'sp_rethink' : selectedModalTheme;
-    fetch(`${API_BASE_URL}/api/tracker/email-templates`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        company_id: effectiveModalCompanyId,
-        template_type: selectedTemplateType,
-        subject: emailDraft.subject,
-        body_html: emailDraft.body_html
-      })
-    })
-      .then(r => r.json())
-      .then(res => {
-        if (res.status === 'success') {
-          alert(`✅ Template saved as global default for ${themeName}!`);
-          loadBeneficiariesAndAllocations();
-        } else {
-          alert(res.detail || 'Failed to save template default');
         }
       })
       .catch(err => alert(err.message));
@@ -2099,6 +2010,18 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           </button>
 
           <button
+            onClick={() => setActiveTab('queue')}
+            className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
+              activeTab === 'queue'
+                ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            <Inbox className="w-4 h-4" />
+            Email Queue
+          </button>
+
+          <button
             onClick={() => setActiveTab('templates')}
             className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
               activeTab === 'templates'
@@ -2115,8 +2038,28 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {/* ========================================================= */}
       {/* TAB 1: BENEFICIARIES DIRECTORY */}
       {/* ========================================================= */}
+      {activeTab === 'queue' && (
+        isConsolidated ? (
+          <div className="p-6 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm text-slate-500">
+            Choose Rethink or Iqra to review that charity's email queue.
+          </div>
+        ) : (
+          <EmailQueueView companyId={activeCompany} sponsorshipTypes={['Orphan', 'Widow', 'Ex-Prisoner', 'Hafiz']} onOpenDonor={openDonor} />
+        )
+      )}
+
       {activeTab === 'beneficiaries' && (
         <div className="flex flex-col gap-5">
+          <TrackerFilterBar values={benFilters} onChange={setBenFilters} resultCount={beneficiaries.length}
+            fields={[
+              { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone' },
+              { key: 'campaign', label: 'Campaign', placeholder: 'Campaign name' },
+              { key: 'location', label: 'Location', placeholder: 'e.g. Gaza' },
+              { key: 'funded_status', label: 'Funding', type: 'select', options: [
+                { value: 'all', label: 'Any funding' }, { value: 'unfunded', label: 'Unfunded' },
+                { value: 'partial', label: 'Partly funded' }, { value: 'full', label: 'Fully funded' }] },
+              { key: 'needs_review', label: 'Needs review only', type: 'toggle' }
+            ]} />
           {/* Toolbar & Filter Bar */}
           <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm">
             {/* Search Input */}
@@ -2391,15 +2334,25 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           <td className="py-3.5 px-4">
                             {b.allocation_id ? (
                               <div className="flex flex-col gap-1">
-                                <div className="flex items-center gap-1.5">
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
-                                    <Check className="w-3 h-3" />
-                                    {b.donor_name || 'Allocated'}
-                                  </span>
+                                <div className="flex items-center gap-1 flex-wrap max-w-[220px]">
+                                  {(b.donors && b.donors.length ? b.donors : [{ id: 'legacy', donor_name: b.donor_name, donor_email: b.donor_email, donor_id: b.donor_id }]).map(d => (
+                                    <button key={d.id} type="button" onClick={() => openDonor(donorKeyFor(d))}
+                                      title={d.donor_email || ''}
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 hover:border-blue-400 hover:text-blue-600">
+                                      <Check className="w-3 h-3" />
+                                      {d.donor_name || d.donor_email || 'Allocated'}
+                                    </button>
+                                  ))}
                                 </div>
-                                <span className="text-[10px] text-slate-400 font-mono truncate max-w-[140px]">
-                                  {b.donor_email}
-                                </span>
+                                {b.donor_count > 1 ? (
+                                  <span className={`text-[10px] font-semibold ${b.funding_status === 'full' ? 'text-emerald-600' : 'text-amber-600'}`}>
+                                    {b.donor_count} donors · £{Number(b.funded_amount || 0).toLocaleString()} / £{Number(b.target_amount || 0).toLocaleString()}
+                                  </span>
+                                ) : (
+                                  <span className="text-[10px] text-slate-400 font-mono truncate max-w-[140px]">
+                                    {b.donor_email}
+                                  </span>
+                                )}
                                 {b.communication_status && (
                                   <span className={`text-[10px] font-bold ${
                                     b.communication_status === 'Donor Replied' 
@@ -2574,6 +2527,20 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {/* ========================================================= */}
       {activeTab === 'allocations' && (
         <div className="flex flex-col gap-6">
+          <TrackerFilterBar values={allocFilters} onChange={setAllocFilters} resultCount={allocations.length}
+            fields={[
+              { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone' },
+              { key: 'beneficiary', label: 'Beneficiary', placeholder: 'Name or project code' },
+              { key: 'campaign', label: 'Campaign', placeholder: 'Campaign / community' },
+              { key: 'sponsorship_type', label: 'Sponsorship', type: 'select', options: [
+                { value: 'all', label: 'All types' }, ...['Orphan', 'Widow', 'Ex-Prisoner', 'Hafiz'].map(t => ({ value: t, label: t }))] },
+              { key: 'funded_status', label: 'Funding', type: 'select', options: [
+                { value: 'all', label: 'Any funding' }, { value: 'partial', label: 'Partly funded' }, { value: 'full', label: 'Fully funded' }] },
+              { key: 'end', label: 'Sponsorship ends', type: 'daterange' },
+              { key: 'last_emailed', label: 'Last emailed', type: 'daterange' },
+              { key: 'never_emailed', label: 'Never emailed', type: 'toggle' },
+              { key: 'needs_review', label: 'Needs review', type: 'toggle' }
+            ]} />
           {/* Sponsorship Sub-Tabs Selector */}
           <div className="flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm">
             <div className="flex items-center gap-2">
@@ -2774,7 +2741,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             <div className="flex items-start justify-between">
                               <div>
                                 <div className="font-bold text-slate-800 dark:text-slate-100 text-xs md:text-sm flex items-center gap-1.5 flex-wrap">
-                                  <span>{d.donor_name}</span>
+                                  <button type="button" onClick={() => openDonor(donorKeyFor(d))}
+                                    className="hover:text-blue-600 hover:underline text-left">{d.donor_name}</button>
                                   {d.is_manual && (
                                     <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 flex items-center gap-0.5">
                                       <Tag className="w-2.5 h-2.5" /> Manual Entry
@@ -3133,8 +3101,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                   setSelectedCampaignForAllocation(c);
                                   setAllocationMode('campaign');
                                   setIsCustomCampaign(false);
-                                  setCampaignContactEmail(c.organizer_email || '');
-                                  setCampaignContactName(c.organizer_name || '');
+                                  setAllocDonorsDraft(organizerDraftFromCampaign(c));
                                   const available = beneficiaries.filter(b => !b.allocation_id || b.status === 'Unallocated');
                                   if (available.length === 0) {
                                     alert(`No unallocated beneficiaries available. Please add a beneficiary in the Beneficiaries tab first.`);
@@ -3306,7 +3273,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                               <div className="flex items-start justify-between gap-2">
                                 <div>
                                   <div className="font-bold text-slate-800 dark:text-slate-100 text-xs flex items-center gap-1.5 flex-wrap">
-                                    {d.donor_name}
+                                    <button type="button" onClick={() => openDonor(donorKeyFor(d))}
+                                      className="hover:text-blue-600 hover:underline text-left">{d.donor_name}</button>
                                     {isOverride && (
                                       <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 border border-amber-300 dark:border-amber-800 flex items-center gap-1">
                                         <Zap className="w-2.5 h-2.5 fill-amber-500 text-amber-500" /> Override
@@ -3587,60 +3555,48 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             </div>
 
                             <div className="text-xs text-slate-600 dark:text-slate-300 mt-1.5 flex flex-col gap-0.5">
-                              {(() => {
-                                const hasEmail = Boolean(a.donor_email && a.donor_email.trim() && a.donor_email.toLowerCase() !== 'n/a');
-                                const hasPhone = Boolean(a.donor_phone && a.donor_phone.trim() && a.donor_phone.toLowerCase() !== 'n/a');
-
-                                return a.allocation_type === 'campaign' ? (
-                                  <>
-                                    <div className="font-bold text-purple-700 dark:text-purple-300">
-                                      🏷️ Campaign: {a.campaign_name || a.donor_name}
-                                    </div>
-                                    {a.community_name && (
-                                      <div className="text-slate-500 dark:text-slate-400">
-                                        🏛️ Community: <strong>{a.community_name}</strong>
-                                      </div>
-                                    )}
-                                    <div className="text-slate-500 dark:text-slate-400 flex items-center gap-1.5 flex-wrap">
-                                      <span>✉️ Contacts:</span>
-                                      {hasEmail ? (
-                                        <span className="font-mono text-slate-700 dark:text-slate-200 font-semibold">{a.donor_email}</span>
-                                      ) : (
-                                        <span className="text-amber-600 dark:text-amber-400 italic text-[11px]">No email provided</span>
-                                      )}
-                                      {hasPhone && (
-                                        <span className="font-mono text-slate-600 dark:text-slate-300 ml-1">📞 {a.donor_phone}</span>
-                                      )}
-                                      <button
-                                        onClick={() => openEditContactModal(a)}
-                                        className="text-blue-600 hover:text-blue-700 dark:text-blue-400 font-bold text-[11px] underline ml-1 cursor-pointer"
-                                      >
-                                        {hasEmail ? 'Edit' : '+ Add Email'}
-                                      </button>
-                                    </div>
-                                  </>
-                                ) : (
-                                  <div className="flex items-center gap-1.5 flex-wrap">
-                                    <span>
-                                      Assigned Donor: <strong className="text-slate-800 dark:text-slate-200">{a.donor_name}</strong>
-                                      {hasEmail ? (
-                                        <span className="font-mono ml-1">({a.donor_email})</span>
-                                      ) : (
-                                        <span className="text-amber-600 dark:text-amber-400 italic text-[11px] ml-1">(No email)</span>
-                                      )}
-                                      {hasPhone && (
-                                        <span className="font-mono text-slate-600 dark:text-slate-300 ml-1">📞 {a.donor_phone}</span>
-                                      )}
-                                    </span>
-                                    <button
-                                      onClick={() => openEditContactModal(a)}
-                                      className="text-blue-600 hover:text-blue-700 dark:text-blue-400 font-bold text-[11px] underline ml-1 cursor-pointer"
-                                    >
-                                      {hasEmail ? 'Edit' : '+ Add Email'}
-                                    </button>
+                              {a.allocation_type === 'campaign' && (
+                                <>
+                                  <div className="font-bold text-purple-700 dark:text-purple-300">
+                                    🏷️ Campaign: {a.campaign_name || a.donor_name}
                                   </div>
-                                );
-                              })()}
+                                  {a.community_name && (
+                                    <div className="text-slate-500 dark:text-slate-400">
+                                      🏛️ Community: <strong>{a.community_name}</strong>
+                                    </div>
+                                  )}
+                                </>
+                              )}
+                              <div className="flex items-start gap-1.5 flex-wrap mt-0.5">
+                                <span className="text-slate-500 dark:text-slate-400 pt-0.5">
+                                  {a.allocation_type === 'campaign' ? 'Contacts:' : (a.donor_count > 1 ? 'Donors:' : 'Donor:')}
+                                </span>
+                                {(a.donors && a.donors.length ? a.donors : [{ id: 'legacy', donor_name: a.donor_name, donor_email: a.donor_email, donor_phone: a.donor_phone, donor_id: a.donor_id }]).map(d => {
+                                  const dEmail = d.donor_email && d.donor_email.toLowerCase() !== 'n/a' ? d.donor_email : '';
+                                  return (
+                                    <button key={d.id} type="button" onClick={() => openDonor(donorKeyFor(d))}
+                                      title={`${dEmail || d.donor_phone || 'No contact'}${d.contribution_amount ? ` · £${Number(d.contribution_amount).toLocaleString()}` : ''}`}
+                                      className={`px-2 py-0.5 rounded-full border text-[11px] font-semibold hover:border-blue-400 hover:text-blue-600 ${d.is_primary ? 'border-blue-300 bg-blue-50 dark:bg-blue-950/40 text-slate-800 dark:text-slate-100' : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'}`}>
+                                      {d.donor_name || dEmail || 'Unnamed'}
+                                      {a.donor_count > 1 && d.contribution_amount ? <span className="font-normal text-slate-500"> · £{Number(d.contribution_amount).toLocaleString()}</span> : null}
+                                      {!dEmail && <span className="ml-1 text-amber-600 italic">(no email)</span>}
+                                    </button>
+                                  );
+                                })}
+                                <button type="button" onClick={() => setManageDonorsAlloc(a)}
+                                  className="text-blue-600 hover:text-blue-700 dark:text-blue-400 font-bold text-[11px] underline cursor-pointer pt-0.5">
+                                  {a.allocation_type === 'campaign' ? 'Manage contacts' : 'Manage donors'}
+                                </button>
+                                {a.needs_review && (
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                                    title={(a.donors || []).map(d => d.review_note).filter(Boolean).join(' | ')}>Needs review</span>
+                                )}
+                              </div>
+                              {a.target_amount > 0 && a.donor_count > 1 && (
+                                <div className={`text-[11px] ${a.funding_status === 'full' ? 'text-emerald-600' : 'text-amber-600'}`}>
+                                  Funded £{Number(a.funded_amount || 0).toLocaleString()} of £{Number(a.target_amount).toLocaleString()}
+                                </div>
+                              )}
 
                               {/* Sponsorship Cycle Dates & Renewal Indicator */}
                               <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-500 dark:text-slate-400 flex-wrap">
@@ -4314,7 +4270,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       <th className="py-3 px-4">Program</th>
                       <th className="py-3 px-4 text-center">Unallocated Slots</th>
                       <th className="py-3 px-4 text-right min-w-[170px]">Total Donated / Target</th>
-                      <th className="py-3 px-4">Oldest Donation</th>
+                      <th className="py-3 px-4" title="Date the donor's running total for this sponsorship reached 80% of the target for the slot they are waiting on">Slot Earned On</th>
                       <th className="py-3 px-4 text-center">Waiting Age</th>
                       <th className="py-3 px-4">Involved Campaigns</th>
                       <th className="py-3 px-4 text-right">Action</th>
@@ -4347,7 +4303,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           <tr key={`${d.donor_id}_${d.sponsorship_type}_${idx}`} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/40 transition-colors">
                             <td className="py-3 px-4">
                               <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
-                                {d.donor_name}
+                                <button type="button" onClick={() => openDonor(donorKeyFor(d))}
+                                  className="hover:text-blue-600 hover:underline text-left">{d.donor_name}</button>
                                 {d.is_manual && (
                                   <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300">Manual</span>
                                 )}
@@ -4425,7 +4382,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             </td>
 
                             <td className="py-3 px-4 font-mono text-slate-600 dark:text-slate-300">
-                              {d.oldest_donation_date || 'N/A'}
+                              {d.eligible_since || 'N/A'}
+                              <div className="text-[10px] text-slate-400">first gift {d.oldest_donation_date || 'N/A'}</div>
                             </td>
 
                             <td className="py-3 px-4 text-center">
@@ -4538,7 +4496,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       <th className="py-3 px-4">Program</th>
                       <th className="py-3 px-4 text-center">Unallocated Slots</th>
                       <th className="py-3 px-4 text-right min-w-[170px]">Total Raised / Target</th>
-                      <th className="py-3 px-4">Oldest Donation</th>
+                      <th className="py-3 px-4" title="Date the donor's running total for this sponsorship reached 80% of the target for the slot they are waiting on">Slot Earned On</th>
                       <th className="py-3 px-4 text-center">Waiting Age</th>
                       <th className="py-3 px-4 text-right">Action</th>
                     </tr>
@@ -4662,7 +4620,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             </td>
 
                             <td className="py-3 px-4 font-mono text-slate-600 dark:text-slate-300">
-                              {c.oldest_donation_date || 'N/A'}
+                              {c.eligible_since || 'N/A'}
+                              <div className="text-[10px] text-slate-400">first gift {c.oldest_donation_date || 'N/A'}</div>
                             </td>
 
                             <td className="py-3 px-4 text-center">
@@ -6439,7 +6398,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             <div className="flex items-center gap-2 p-1 bg-slate-100 dark:bg-slate-800 rounded-xl">
               <button
                 type="button"
-                onClick={() => setAllocationMode('donor')}
+                onClick={() => { if (allocationMode !== 'donor') setAllocDonorsDraft([]); setAllocationMode('donor'); }}
                 className={`flex-1 py-2 rounded-lg font-bold text-xs transition-all flex items-center justify-center gap-1.5 ${
                   allocationMode === 'donor'
                     ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-xs'
@@ -6451,7 +6410,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               </button>
               <button
                 type="button"
-                onClick={() => setAllocationMode('campaign')}
+                onClick={() => { if (allocationMode !== 'campaign') setAllocDonorsDraft([]); setAllocationMode('campaign'); }}
                 className={`flex-1 py-2 rounded-lg font-bold text-xs transition-all flex items-center justify-center gap-1.5 ${
                   allocationMode === 'campaign'
                     ? 'bg-white dark:bg-slate-900 text-purple-600 dark:text-purple-400 shadow-xs'
@@ -6466,147 +6425,31 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             {/* MODE 1: INDIVIDUAL DONOR */}
             {allocationMode === 'donor' && (
               <div className="flex flex-col gap-2.5 text-xs">
-                {/* Active Selected Donor Banner & Editable Contact Information */}
-                {selectedDonorForAllocation && (() => {
-                  const isSelectedExceptional = Boolean(
-                    selectedDonorForAllocation.remaining_slots <= 0 ||
-                    selectedDonorForAllocation.is_exceptional ||
-                    selectedDonorForAllocation.status === 'ineligible' ||
-                    selectedDonorForAllocation.status === 'over_capacity' ||
-                    selectedDonorForAllocation.status === 'at_capacity'
-                  );
-
-                  return (
-                    <div className="flex flex-col gap-2.5">
-                      <div className={`p-3 rounded-xl border-2 flex items-start justify-between gap-3 shadow-xs animate-in fade-in duration-150 ${
-                        isSelectedExceptional
-                          ? 'bg-amber-50/80 dark:bg-amber-950/40 border-amber-500/70 dark:border-amber-600/70'
-                          : 'bg-blue-50 dark:bg-blue-950/40 border-blue-500/60 dark:border-blue-600/60'
-                      }`}>
-                        <div className="flex items-start gap-2.5 min-w-0">
-                          <div className={`p-2 rounded-lg text-white shrink-0 mt-0.5 ${
-                            isSelectedExceptional ? 'bg-amber-600' : 'bg-blue-600'
-                          }`}>
-                            {isSelectedExceptional ? <Zap className="w-4 h-4 fill-white" /> : <UserCheck className="w-4 h-4" />}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-bold text-slate-800 dark:text-slate-100 text-sm">
-                                {selectedDonorForAllocation.donor_name}
-                              </span>
-                              {isSelectedExceptional ? (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-600 text-white flex items-center gap-1">
-                                  <Zap className="w-2.5 h-2.5 fill-white" /> Exceptional Override
-                                </span>
-                              ) : (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-600 text-white flex items-center gap-1">
-                                  <Check className="w-3 h-3" /> Selected Donor
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-3 text-[11px] text-slate-500 mt-1 flex-wrap">
-                              <span className="font-mono">✉️ {selectedDonorForAllocation.donor_email || 'No email in data'}</span>
-                              {selectedDonorForAllocation.donor_phone && (
-                                <span>📞 {selectedDonorForAllocation.donor_phone}</span>
-                              )}
-                              <span>💰 For {selectedDonorType}: <strong>£{Number(selectedDonorForAllocation.total_donated || 0).toLocaleString()}</strong></span>
-                              {selectedDonorForAllocation.total_lifetime_donated !== undefined && (
-                                <span className="text-purple-600 dark:text-purple-400 font-semibold">
-                                  🌐 LTV: <strong>£{Number(selectedDonorForAllocation.total_lifetime_donated || 0).toLocaleString()}</strong>
-                                </span>
-                              )}
-                              {selectedDonorForAllocation.remaining_slots > 0 ? (
-                                <span className="text-emerald-600 dark:text-emerald-400 font-bold">
-                                  {selectedDonorForAllocation.remaining_slots} Slots Available
-                                </span>
-                              ) : (
-                                <span className="text-amber-600 dark:text-amber-400 font-bold">
-                                  ⚡ Capacity Reached ({selectedDonorForAllocation.allocated_count || 0}/{selectedDonorForAllocation.max_slots || 0}) • Override Slot
-                                </span>
-                              )}
-                            </div>
-
-                            {isSelectedExceptional && (
-                              <div className="mt-2 p-1.5 rounded-md bg-amber-100/70 dark:bg-amber-950/60 border border-amber-300 dark:border-amber-800 text-[11px] text-amber-800 dark:text-amber-300 flex items-start gap-1.5">
-                                <AlertCircle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
-                                <span>
-                                  <strong>Admin Override Notice:</strong> This donor has insufficient/at-capacity slots for {selectedDonorType}. Proceeding will assign this beneficiary as an <em>exceptional allocation</em> and record an audit tag.
-                                </span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => handleSelectDonorForAllocation(null)}
-                          className="text-[11px] font-bold text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-200 shrink-0 underline cursor-pointer"
-                        >
-                          Change
-                        </button>
-                      </div>
-
-                      {/* Editable Contact Information for this Allocation */}
-                      <div className="p-3 bg-white dark:bg-slate-900 rounded-xl border border-blue-200 dark:border-blue-900/60 flex flex-col gap-2 shadow-xs">
-                        <div className="flex items-center justify-between">
-                          <label className="font-bold text-slate-800 dark:text-slate-200 text-xs flex items-center gap-1.5">
-                            <Mail className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                            Donor Contact Details for Allocation
-                          </label>
-                          <span className="text-[10px] text-slate-400">
-                            Default loaded from data • Edit anytime
-                          </span>
-                        </div>
-
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          <div className="flex flex-col gap-1">
-                            <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
-                              Contact Email <span className="text-blue-500 font-normal">(Enables Outlook Email)</span>
-                            </label>
-                            <input
-                              type="email"
-                              placeholder="e.g. donor@example.com"
-                              value={donorContactEmail}
-                              onChange={(e) => setDonorContactEmail(e.target.value)}
-                              className="px-2.5 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs font-mono text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                            />
-                          </div>
-
-                          <div className="flex flex-col gap-1">
-                            <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
-                              Contact Phone
-                            </label>
-                            <input
-                              type="tel"
-                              placeholder="e.g. +44 7123 456789"
-                              value={donorContactPhone}
-                              onChange={(e) => setDonorContactPhone(e.target.value)}
-                              className="px-2.5 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs font-mono text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="flex flex-col gap-1">
-                          <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
-                            Donor Display Name
-                          </label>
-                          <input
-                            type="text"
-                            placeholder="Donor name"
-                            value={donorContactName}
-                            onChange={(e) => setDonorContactName(e.target.value)}
-                            className="px-2.5 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs font-medium text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })()}
+                {/* Donors sharing this sponsorship (pick one or more below) */}
+                {allocDonorsDraft.length > 0 && (
+                  <AllocationDonorsEditor
+                    mode="draft"
+                    value={allocDonorsDraft}
+                    onChange={setAllocDonorsDraft}
+                    companyId={activeCompany}
+                    targetAmount={allocationTarget()}
+                    sponsorshipType={selectedDonorType}
+                    role="donor"
+                    onOpenDonor={openDonor}
+                  />
+                )}
+                {allocDonorsDraft.some(d => d.exceptional) && (
+                  <div className="p-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 text-[11px] text-amber-800 dark:text-amber-300 flex items-start gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    <span><strong>Admin Override:</strong> at least one donor has no free {selectedDonorType} slots. This will be recorded as an exceptional allocation.</span>
+                  </div>
+                )}
 
                 {/* Donor Selection Controls */}
                 <div className="flex flex-col gap-2 mt-1">
                   <div className="flex items-center justify-between">
                     <label className="font-bold text-slate-700 dark:text-slate-300 text-xs">
-                      {selectedDonorForAllocation ? 'Or Choose Another Donor to Assign:' : 'Select Donor to Assign:'}
+                      {allocDonorsDraft.length ? 'Add another donor to share this sponsorship:' : 'Select Donor to Assign:'}
                     </label>
                   </div>
 
@@ -6977,6 +6820,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     onClick={() => {
                       setIsCustomCampaign(!isCustomCampaign);
                       setSelectedCampaignForAllocation(null);
+                      setAllocDonorsDraft([]);
                     }}
                     className="text-purple-600 dark:text-purple-400 font-bold hover:underline text-[11px]"
                   >
@@ -7014,8 +6858,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 key={idx}
                                 onClick={() => {
                                   setSelectedCampaignForAllocation(c);
-                                  if (c.organizer_email) setCampaignContactEmail(c.organizer_email);
-                                  if (c.organizer_name) setCampaignContactName(c.organizer_name);
+                                  setAllocDonorsDraft(organizerDraftFromCampaign(c));
                                 }}
                                 className={`p-3 rounded-xl border cursor-pointer transition-all flex items-center justify-between ${
                                   isSelected
@@ -7087,88 +6930,28 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   </div>
                 )}
 
-                {/* Contact Emails, Phone & Organizer Name */}
-                <div className="p-3.5 bg-purple-50/60 dark:bg-purple-950/30 rounded-xl border border-purple-200/80 dark:border-purple-900/60 flex flex-col gap-3 mt-1">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-purple-950 dark:text-purple-200 text-xs flex items-center gap-1.5">
-                      <Users className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
-                      Recipient Contact Information
-                    </span>
-                    {(campaignContactEmail || campaignContactPhone || campaignContactName) && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setCampaignContactEmail('');
-                          setCampaignContactPhone('');
-                          setCampaignContactName('');
-                        }}
-                        className="text-[10px] text-purple-600 dark:text-purple-400 hover:underline font-semibold"
-                      >
-                        Clear Contacts
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Validation status badge */}
-                  <div className="flex items-center gap-1.5 text-[11px]">
-                    {campaignContactEmail.trim() || campaignContactPhone.trim() ? (
-                      <span className="text-emerald-600 dark:text-emerald-400 font-bold flex items-center gap-1">
-                        <Check className="w-3 h-3" /> Contact method provided (Email / Phone)
-                      </span>
-                    ) : (
-                      <span className="text-amber-600 dark:text-amber-400 font-bold flex items-center gap-1">
-                        <AlertCircle className="w-3.5 h-3.5" /> At least one required (Email or Phone Number) *
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Email Input */}
-                  <div>
-                    <label className="font-semibold text-purple-900 dark:text-purple-300 flex items-center justify-between text-xs">
-                      <span>Recipient Contact Email(s) {!campaignContactPhone.trim() && <strong className="text-rose-500">*</strong>}</span>
-                      <span className="text-[10px] font-normal text-purple-600 dark:text-purple-400">Comma-separated for multiple</span>
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. jamila@org.com, team@org.com"
-                      value={campaignContactEmail}
-                      onChange={(e) => setCampaignContactEmail(e.target.value)}
-                      className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-purple-200 dark:border-purple-800 rounded-lg text-xs font-mono mt-1 focus:ring-1 focus:ring-purple-500 focus:outline-none"
-                    />
-                  </div>
-
-                  {/* Phone Input */}
-                  <div>
-                    <label className="font-semibold text-purple-900 dark:text-purple-300 flex items-center justify-between text-xs">
-                      <span>Recipient Contact Phone Number(s) {!campaignContactEmail.trim() && <strong className="text-rose-500">*</strong>}</span>
-                      <span className="text-[10px] font-normal text-purple-600 dark:text-purple-400">Comma-separated for multiple</span>
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. +44 7123 456789, +44 7987 654321"
-                      value={campaignContactPhone}
-                      onChange={(e) => setCampaignContactPhone(e.target.value)}
-                      className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-purple-200 dark:border-purple-800 rounded-lg text-xs font-mono mt-1 focus:ring-1 focus:ring-purple-500 focus:outline-none"
-                    />
-                  </div>
-
-                  {/* Organizer Name */}
-                  <div>
-                    <label className="font-semibold text-purple-900 dark:text-purple-300 text-xs">
-                      Contact / Organizer Name (Optional)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Jamila (Campaign Lead)"
-                      value={campaignContactName}
-                      onChange={(e) => setCampaignContactName(e.target.value)}
-                      className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-purple-200 dark:border-purple-800 rounded-lg text-xs mt-1 focus:ring-1 focus:ring-purple-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <span className="text-[10px] text-slate-500 dark:text-slate-400 block pt-0.5">
-                    Introduction profiles and feedback reports will be delivered to the specified email / phone contacts.
+                {/* Campaign contacts: registered fundraisers/organizers (several allowed) */}
+                <div className="p-3.5 bg-purple-50/60 dark:bg-purple-950/30 rounded-xl border border-purple-200/80 dark:border-purple-900/60 flex flex-col gap-2 mt-1">
+                  <span className="font-bold text-purple-950 dark:text-purple-200 text-xs flex items-center gap-1.5">
+                    <Users className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
+                    Campaign contacts (receive profiles &amp; feedback)
                   </span>
+                  {selectedCampaignForAllocation && !isCustomCampaign && !(selectedCampaignForAllocation.organizers || []).length && (
+                    <span className="text-[11px] text-amber-700 dark:text-amber-400 flex items-start gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      No organizer is linked to this campaign in the Fundraisers registry. Add the organizer's contact below — donor emails are never used automatically.
+                    </span>
+                  )}
+                  <AllocationDonorsEditor
+                    mode="draft"
+                    value={allocDonorsDraft}
+                    onChange={setAllocDonorsDraft}
+                    companyId={activeCompany}
+                    targetAmount={Number(selectedCampaignForAllocation?.target_amount || allocationTarget())}
+                    sponsorshipType={selectedDonorType}
+                    role="organizer"
+                    onOpenDonor={openDonor}
+                  />
                 </div>
               </div>
             )}
@@ -7201,8 +6984,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 disabled={
                   !allocateModalBeneficiary ||
                   (allocationMode === 'donor'
-                    ? !selectedDonorForAllocation
-                    : (!campaignContactEmail.trim() && !campaignContactPhone.trim()) || (!isCustomCampaign && !selectedCampaignForAllocation) || (isCustomCampaign && !customCampaignName.trim()))
+                    ? !allocDonorsDraft.length
+                    : !allocDonorsDraft.length || (!isCustomCampaign && !selectedCampaignForAllocation) || (isCustomCampaign && !customCampaignName.trim()))
                 }
                 onClick={handleConfirmAllocation}
                 className="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-xs flex items-center gap-2 shadow-sm"
@@ -7218,225 +7001,53 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {/* ========================================================= */}
       {/* MODAL 5: MICROSOFT 365 / OUTLOOK EMAIL DISPATCHER */}
       {/* ========================================================= */}
-      {emailModalAllocation && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
-          <div className="bg-white dark:bg-slate-900 w-full max-w-2xl max-h-[90vh] rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl p-6 flex flex-col gap-4 overflow-hidden animate-in fade-in zoom-in duration-150">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-lg bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400">
-                  <Mail className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-slate-800 dark:text-slate-100 text-base">
-                    Compose & Dispatch via Microsoft 365 / Outlook
-                  </h3>
-                  <span className="text-xs text-slate-400">
-                    Recipient: <strong>{emailDraft.recipient_name}</strong> ({emailDraft.recipient_email})
-                  </span>
-                </div>
-              </div>
+      {dispatcher && (
+        <EmailDispatcherModal
+          allocation={dispatcher.allocation}
+          companyId={activeCompany}
+          themes={Object.values(CHARITY_THEMES_PRESETS)}
+          templates={emailTemplates}
+          initialTemplateType={dispatcher.templateType}
+          initialTheme={dispatcher.theme}
+          variables={AVAILABLE_VARIABLES}
+          onClose={() => setDispatcher(null)}
+          onSent={() => loadBeneficiariesAndAllocations()}
+        />
+      )}
 
-              <div className="flex items-center gap-2">
-                <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
-                  <button
-                    type="button"
-                    onClick={() => setEmailModalTab('edit')}
-                    className={`px-2.5 py-1 rounded-md text-[11px] font-bold flex items-center gap-1 transition-all ${
-                      emailModalTab === 'edit'
-                        ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-2xs'
-                        : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    <Code className="w-3.5 h-3.5" />
-                    HTML Editor
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setEmailModalTab('preview')}
-                    className={`px-2.5 py-1 rounded-md text-[11px] font-bold flex items-center gap-1 transition-all ${
-                      emailModalTab === 'preview'
-                        ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-2xs'
-                        : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    <Eye className="w-3.5 h-3.5" />
-                    Live Branded Preview
-                  </button>
-                </div>
-
-                <button
-                  onClick={() => setEmailModalAllocation(null)}
-                  className="p-1 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+      {manageDonorsAlloc && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs" onClick={() => setManageDonorsAlloc(null)}>
+          <div className="bg-white dark:bg-slate-900 w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl p-6 flex flex-col gap-4" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-slate-800 dark:text-slate-100 text-base">
+                  {manageDonorsAlloc.allocation_type === 'campaign' ? 'Campaign contacts' : 'Donors'} · {manageDonorsAlloc.beneficiary_name}
+                </h3>
+                <span className="text-xs text-slate-500">{manageDonorsAlloc.sponsorship_type} · changes save immediately</span>
               </div>
+              <button type="button" onClick={() => setManageDonorsAlloc(null)} className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500"><X className="w-4 h-4" /></button>
             </div>
-
-            <div className="flex flex-col gap-3.5 text-xs overflow-y-auto pr-1">
-              {/* Charity Theme Switcher in Modal */}
-              <div className="flex items-center gap-2 p-2 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200/80 dark:border-slate-700">
-                <span className="font-bold text-slate-500 uppercase text-[10px] shrink-0">Charity Theme:</span>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {availableCharityThemes.map((theme) => {
-                    const isSelected = selectedModalTheme === theme.id;
-                    return (
-                      <button
-                        key={theme.id}
-                        type="button"
-                        onClick={() => handleSwitchModalTheme(theme.id)}
-                        className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
-                          isSelected
-                            ? 'bg-blue-600 text-white shadow-xs'
-                            : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:border-slate-300'
-                        }`}
-                      >
-                        <img
-                          src={theme.logo}
-                          alt={theme.name}
-                          className="w-3.5 h-3.5 rounded object-contain bg-white shrink-0"
-                          onError={(e) => { e.target.style.display = 'none'; }}
-                        />
-                        <span>{theme.name}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-bold text-slate-500 uppercase text-[10px]">Template:</span>
-                {emailTemplates
-                  .filter((tpl) => (tpl.charity_theme || tpl.company_id || 'rethink') === selectedModalTheme)
-                  .map((tpl) => (
-                    <button
-                      key={tpl.id || tpl.template_type}
-                      type="button"
-                      onClick={() => openEmailDispatcher(emailModalAllocation, tpl.template_type)}
-                      className={`px-3 py-1 rounded-md font-bold text-xs transition-all ${
-                        selectedTemplateType === tpl.template_type
-                          ? 'bg-blue-600 text-white shadow-xs'
-                          : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200'
-                      }`}
-                    >
-                      {tpl.template_type}
-                    </button>
-                  ))}
-              </div>
-
-              <div className="flex flex-col gap-1">
-                <label className="font-semibold text-slate-600 dark:text-slate-400">Subject</label>
-                <input
-                  type="text"
-                  value={emailDraft.subject}
-                  onChange={(e) => setEmailDraft({ ...emailDraft, subject: e.target.value })}
-                  className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-bold text-sm"
-                />
-              </div>
-
-              {emailModalTab === 'preview' ? (
-                <div className="flex flex-col gap-1.5">
-                  <label className="font-semibold text-slate-600 dark:text-slate-400 flex items-center justify-between">
-                    <span>Live Branded Email Preview (Recipient View):</span>
-                    <span className="text-[10px] text-emerald-600 font-bold">
-                      {CHARITY_THEMES_PRESETS[selectedModalTheme]?.name || 'Charity'} Responsive Layout
-                    </span>
-                  </label>
-                  <div className="border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden bg-white shadow-sm">
-                    <iframe
-                      title="Recipient Email Preview"
-                      className="w-full h-[420px] border-0 bg-white"
-                      srcDoc={
-                        (emailDraft.body_html || '<p style="padding:20px;text-align:center;color:#666;">No content</p>')
-                          .replace(/https:\/\/rethink-s-crm\.vercel\.app\/logos\/rethink_logo\.jpg/gi, '/logos/rethink_email_logo.png')
-                          .replace(/\/logos\/rethink_logo\.jpg/gi, '/logos/rethink_email_logo.png')
-                          .replace(/https:\/\/rethink-s-crm\.vercel\.app\/logos\/iqra_logo\.png/gi, '/logos/iqra_logo.png')
-                          .replace(/data:image\/[^;]+;base64,[^"'\s>]+/gi, '/logos/rethink_email_logo.png')
-                      }
-                    />
-                  </div>
-                </div>
-              ) : (
-                <>
-                  {/* Variable Chips in Modal */}
-                  <div className="flex flex-col gap-1 p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/40 border border-slate-200/80 dark:border-slate-700">
-                    <span className="text-[10px] font-bold text-slate-400">Quick Insert Variable Tag:</span>
-                    <div className="flex flex-wrap gap-1">
-                      {AVAILABLE_VARIABLES.map((v) => (
-                        <button
-                          key={v.tag}
-                          type="button"
-                          onClick={() => {
-                            setEmailDraft(prev => ({
-                              ...prev,
-                              body_html: (prev.body_html || '') + ` ${v.tag} `
-                            }));
-                          }}
-                          className="px-2 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[10px] font-mono text-slate-600 dark:text-slate-300 hover:border-blue-500 hover:text-blue-600"
-                          title={`Example value: ${v.example}`}
-                        >
-                          {v.tag}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <label className="font-semibold text-slate-600 dark:text-slate-400">Email Body (HTML / Formatted)</label>
-                    <textarea
-                      rows={9}
-                      value={emailDraft.body_html}
-                      onChange={(e) => setEmailDraft({ ...emailDraft, body_html: e.target.value })}
-                      className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-mono text-xs leading-relaxed"
-                    />
-                  </div>
-                </>
-              )}
-
-              {/* Exact Email Delivery & Open Tracking Notification */}
-              <div className="flex items-center gap-2 p-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 text-xs">
-                <Eye className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                <span>
-                  <strong>Exact Tracking Active:</strong> A secure 1x1 read receipt pixel will be embedded automatically. Delivery, open timestamps, and read counts will be tracked in real-time.
-                </span>
-              </div>
-
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-3 border-t border-slate-100 dark:border-slate-800">
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleSaveModalDraftAsDefault}
-                    className="text-[11px] text-indigo-600 dark:text-indigo-400 hover:underline font-semibold flex items-center gap-1"
-                    title="Save your current text as default for this template type"
-                  >
-                    <Save className="w-3.5 h-3.5" />
-                    Save Edits as Template Default
-                  </button>
-                </div>
-
-                <div className="flex items-center gap-2 justify-end">
-                  <button
-                    type="button"
-                    onClick={() => setEmailModalAllocation(null)}
-                    className="px-4 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 font-semibold"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    disabled={sendingEmail}
-                    onClick={handleSendOutlookEmail}
-                    className="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold flex items-center gap-2 shadow-sm"
-                  >
-                    <Send className="w-4 h-4" />
-                    {sendingEmail ? 'Sending via Outlook...' : 'Send Email Now'}
-                  </button>
-                </div>
-              </div>
-            </div>
+            <AllocationDonorsEditor
+              mode="live"
+              allocationId={manageDonorsAlloc.id}
+              companyId={manageDonorsAlloc.company_id || activeCompany}
+              targetAmount={manageDonorsAlloc.target_amount || 0}
+              sponsorshipType={manageDonorsAlloc.sponsorship_type}
+              role={manageDonorsAlloc.allocation_type === 'campaign' ? 'organizer' : 'donor'}
+              onOpenDonor={openDonor}
+              onSaved={() => loadFilteredLists()}
+            />
           </div>
         </div>
       )}
+
+      <SponsorshipDonorPanel
+        donorKey={donorPanelKey}
+        companyId={activeCompany}
+        sponsorshipType={selectedDonorType}
+        onClose={() => setDonorPanelKey(null)}
+        onOpenCrmProfile={(key) => { setDonorPanelKey(null); if (onSelectDonor) onSelectDonor(key); }}
+      />
 
       {/* ========================================================= */}
       {/* MODAL 7: CREATE NEW CUSTOM TEMPLATE */}
