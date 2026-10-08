@@ -1,5 +1,6 @@
 from typing import Optional
 from fastapi import APIRouter, Query
+from core.cache import cached
 import pandas as pd
 from core.data_processor import load_data
 from backend.api.donors import _apply_filters
@@ -8,6 +9,7 @@ router = APIRouter(prefix="/api/metrics", tags=["Metrics"])
 
 
 @router.get("/summary")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_metrics_summary(
     company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,

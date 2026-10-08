@@ -157,14 +157,16 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
   // Fetch Code Map for dynamic Code -> Heading, Sub-Heading, Country, Zakat auto-fill
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${encodeURIComponent(activeCompany)}`)
+    const codeMapController = new AbortController();
+    fetch(`${API_BASE_URL}/api/classifications/code-map?company_id=${encodeURIComponent(activeCompany)}`, { signal: codeMapController.signal })
       .then(res => res.json())
       .then(data => {
         if (data && typeof data === 'object') {
           setCodeMap(data);
         }
       })
-      .catch(err => console.error('Error fetching code map:', err));
+      .catch(err => { if (err.name !== 'AbortError') console.error('Error fetching code map:', err); });
+    return () => codeMapController.abort();
   }, [activeCompany]);
 
   // Master Code Modal State
@@ -348,14 +350,28 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     }
   };
 
-  // Race-Condition-Free Data Loading with Cancellation Cleanup
+  // Only the most recent request may update the view: older ones are aborted, and any late
+  // response for a different platform/company is ignored (it used to overwrite the current tab).
+  const matrixRequestRef = useRef({ id: 0, controller: null, key: null });
+  const EMPTY_MATRIX = { total_campaigns: 0, classified_campaigns: 0, unassigned_campaigns: 0, rules: [] };
+
   const loadMatrixData = () => {
+    const key = `${platform}|${activeCompany}`;
+    const prev = matrixRequestRef.current;
+    if (prev.controller) prev.controller.abort();
+    const controller = new AbortController();
+    const reqId = prev.id + 1;
+    // Switching tab/company: clear the old numbers so another platform's stats are never shown.
+    if (prev.key !== key) setMatrixData(EMPTY_MATRIX);
+    matrixRequestRef.current = { id: reqId, controller, key };
+    const isCurrent = () => matrixRequestRef.current.id === reqId;
     setLoading(true);
 
     if (platform === 'master') {
-      fetch(`${API_BASE_URL}/api/classifications/master-codes?company_id=${encodeURIComponent(activeCompany)}`)
+      fetch(`${API_BASE_URL}/api/classifications/master-codes?company_id=${encodeURIComponent(activeCompany)}`, { signal: controller.signal })
         .then(res => res.json())
         .then(data => {
+          if (!isCurrent()) return;
           let rules = (data.codes || []).map((r, i) => ({
             ...r,
             _row_id: `master__${r.code}__${i}`,
@@ -389,15 +405,17 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           setLoading(false);
         })
         .catch(err => {
+          if (err.name === 'AbortError' || !isCurrent()) return;
           console.error('Error loading master codes:', err);
           setLoading(false);
         });
       return;
     }
 
-    fetch(`${API_BASE_URL}/api/classifications/${platform}?company_id=${encodeURIComponent(activeCompany)}`)
+    fetch(`${API_BASE_URL}/api/classifications/${platform}?company_id=${encodeURIComponent(activeCompany)}`, { signal: controller.signal })
       .then(res => res.json())
       .then(data => {
+        if (!isCurrent()) return;
         let rules = (data.rules || []).map((r, i) => {
           const rawSpec = cleanText(r['Special Case'] || r['special_case'] || '');
           const cleanSpec = canonicalizeSpecialCase(rawSpec);
@@ -435,6 +453,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         setLoading(false);
       })
       .catch(err => {
+        if (err.name === 'AbortError' || !isCurrent()) return;
         console.error('Error loading classification matrix:', err);
         setLoading(false);
       });
@@ -443,6 +462,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   // Race-Condition-Free Data Loading
   useEffect(() => {
     loadMatrixData();
+    return () => { if (matrixRequestRef.current.controller) matrixRequestRef.current.controller.abort(); };
   }, [platform, activeCompany]);
 
   // Dynamic list of all known unique codes (from central code map + active rules + smart case variants)
@@ -1113,31 +1133,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           setShowImportModal(false);
           setImportFile(null);
           setImportMsg('');
-          // Re-fetch active matrix
-          setLoading(true);
-          fetch(`${API_BASE_URL}/api/classifications/${platform}?company_id=${encodeURIComponent(activeCompany)}`)
-            .then(r => r.json())
-            .then(d => {
-              let rules = (d.rules || []).map(r => ({
-                ...r,
-                'Campaign Name': cleanText(r['Campaign Name']),
-                'Community Name': cleanText(r['Community Name']),
-                'Heading': cleanText(r['Heading']),
-                'Sub-Heading': cleanText(r['Sub-Heading']),
-                'Country': cleanText(r['Country']),
-                'Code': cleanText(r['Code']),
-                'Zakat Eligibility': cleanText(r['Zakat Eligibility']),
-                'Campaign URL': r['Campaign URL'] || r['campaign_url'] || ''
-              }));
-              setMatrixData({
-                ...d,
-                total_campaigns: rules.length,
-                classified_campaigns: rules.filter(r => r['Heading'] && r['Heading'] !== 'Unassigned').length,
-                unassigned_campaigns: rules.filter(r => !r['Heading'] || r['Heading'] === 'Unassigned').length,
-                rules: rules
-              });
-              setLoading(false);
-            });
+          // Re-fetch active matrix through the guarded loader (same mapping as a normal load)
+          loadMatrixData();
         }, 1500);
       } else {
         setImportMsg(`❌ ${data?.detail || 'Bulk import failed.'}`);
@@ -1579,7 +1576,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           <span className={`text-xs font-mono font-extrabold px-3.5 py-1.5 rounded-xl border shadow-sm ${bStyles.countPill}`}>
             {platform === 'master' 
               ? `${matrixData.rules?.length?.toLocaleString() || 0} Project Codes`
-              : `${matrixData.total_campaigns?.toLocaleString()} Rules Active`}
+              : (loading && !matrixData.rules?.length ? 'Loading rules…' : `${matrixData.total_campaigns?.toLocaleString()} Rules Active`)}
           </span>
         </div>
       </div>
@@ -1618,19 +1615,19 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'paysuite' ? 'Total Tracked Direct Debits' : 'Unique Tracked Campaigns'}
             </div>
-            <div className="text-2xl font-black text-slate-900 dark:text-white mt-1">{uniqueCampaignsCount.toLocaleString()}</div>
+            <div className="text-2xl font-black text-slate-900 dark:text-white mt-1">{loading && !matrixData.rules?.length ? <span className="inline-block w-16 h-6 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" /> : uniqueCampaignsCount.toLocaleString()}</div>
           </div>
           <div className="glass-panel p-4 border-l-4 border-emerald-500 dark:border-emerald-400">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'paysuite' ? 'Fully Classified Debits' : 'Fully Classified Campaigns'}
             </div>
-            <div className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{classifiedCampaignsCount.toLocaleString()}</div>
+            <div className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{loading && !matrixData.rules?.length ? <span className="inline-block w-16 h-6 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" /> : classifiedCampaignsCount.toLocaleString()}</div>
           </div>
           <div className="glass-panel p-4 border-l-4 border-amber-500 dark:border-amber-400">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'paysuite' ? 'Unassigned Debits' : 'Unassigned Campaigns'}
             </div>
-            <div className="text-2xl font-black text-amber-600 dark:text-amber-400 mt-1">{unassignedCampaignsCount.toLocaleString()}</div>
+            <div className="text-2xl font-black text-amber-600 dark:text-amber-400 mt-1">{loading && !matrixData.rules?.length ? <span className="inline-block w-16 h-6 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" /> : unassignedCampaignsCount.toLocaleString()}</div>
           </div>
         </div>
       )}

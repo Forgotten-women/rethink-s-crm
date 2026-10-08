@@ -1,3 +1,4 @@
+from config.settings import PARQUET_COMPRESSION
 import sqlite3
 import threading
 import time
@@ -174,11 +175,11 @@ def _ensure_parquet_has_company_id():
                 df = pd.read_parquet(p_path)
                 if not df.empty and "company_id" not in df.columns:
                     df["company_id"] = "rethink"
-                    df.to_parquet(p_path, index=False)
+                    df.to_parquet(p_path, index=False, compression=PARQUET_COMPRESSION)
                     print(f"[Multi-Tenancy] Backfilled company_id='rethink' into {os.path.basename(p_path)}")
                 elif not df.empty and df["company_id"].isna().any():
                     df["company_id"] = df["company_id"].fillna("rethink").replace({"": "rethink"})
-                    df.to_parquet(p_path, index=False)
+                    df.to_parquet(p_path, index=False, compression=PARQUET_COMPRESSION)
             except Exception as e:
                 print(f"[Parquet Multi-Tenancy Notice] {p_path}: {e}")
 

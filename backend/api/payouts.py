@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException, Response
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+from core.cache import cached
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -114,10 +115,23 @@ LEGACY_PAYOUT_CODE_MAP = {
     'ALL-SEA-FIT': 'ALL-SOC-AID-ZKT'
 }
 
+_PAYOUT_CACHE_TOKENS: Dict[str, str] = {}
+
+
+def _ensure_payout_caches_fresh(cid: str) -> None:
+    """Drop this worker's payout caches when classification/payout/donation data changed in ANY process."""
+    from core.cache import version_token
+    token = version_token(["classification", "payouts", "donations"], cid)
+    if _PAYOUT_CACHE_TOKENS.get(cid) != token:
+        invalidate_payouts_cache(cid)
+        _PAYOUT_CACHE_TOKENS[cid] = token
+
+
 def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Optional[str] = "rethink") -> Dict[Any, Dict[str, str]]:
     global _CLASSIFICATION_MATRIX_CACHE, _PAYSUITE_MATRIX_CACHE
     p_clean = _clean_str(platform, "launchgood").lower()
     cid = _clean_str(company_id, "rethink").lower()
+    _ensure_payout_caches_fresh(cid)
     
     if p_clean == "paysuite":
         if cid in _PAYSUITE_MATRIX_CACHE:
@@ -319,6 +333,7 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
     global _CLASSIFIED_PAYOUTS_CACHE, _CLASSIFIED_PAYSUITE_CACHE
     p_clean = _clean_str(platform, "launchgood").lower()
     cid = _clean_str(company_id, "rethink").lower()
+    _ensure_payout_caches_fresh(cid)
 
     if p_clean == "paysuite":
         if not force_reload and cid in _CLASSIFIED_PAYSUITE_CACHE and not _CLASSIFIED_PAYSUITE_CACHE[cid].empty:
@@ -750,6 +765,7 @@ def _generate_ledger_breakdown(df: pd.DataFrame, platform: str = "launchgood") -
 
 
 @router.get("/summary")
+@cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payouts_summary(
     company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
@@ -907,6 +923,7 @@ def get_payouts_summary(
 
 
 @router.get("/batches")
+@cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payout_batches(
     company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
@@ -1015,6 +1032,7 @@ def get_payout_batches(
 
 
 @router.get("/ledger-breakdown")
+@cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payout_ledger_breakdown(
     company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
@@ -1031,6 +1049,7 @@ def get_payout_ledger_breakdown(
 
 
 @router.get("/campaign-breakdown")
+@cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_campaign_payout_breakdown(
     company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
@@ -1358,6 +1377,7 @@ def get_campaign_payout_breakdown(
 
 
 @router.get("/donors")
+@cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payout_donors(
     company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),
@@ -1592,6 +1612,7 @@ def get_payout_donors(
 
 
 @router.get("/ledger")
+@cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payout_ledger(
     company_id: Optional[str] = Query("rethink"),
     platform: Optional[str] = Query("launchgood", description="Platform: launchgood or paysuite"),

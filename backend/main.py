@@ -2,12 +2,13 @@ import os
 import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.api import admin, auth, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, tracker, webhooks
+from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, tracker, webhooks
 
 app = FastAPI(
     title="Crowdfunding Analytics & Enterprise CRM API",
@@ -33,6 +34,9 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+# Compress JSON responses (the classification matrices are several MB uncompressed).
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 # Audit trail: every change (POST/PUT/PATCH/DELETE), every server error and every denied request is
 # recorded via core.event_log (local table + Axiom). Read-only traffic is not logged.
 _AUDIT_SKIP_PREFIXES = ("/api/tracker/email-tracking/pixel/", "/api/tracker/outlook/webhook", "/api/ops/logs", "/ws/")
@@ -43,6 +47,8 @@ async def audit_log_middleware(request, call_next):
     import asyncio
     import time as _time
     from core.event_log import log_event
+    from core.cache import current_request
+    request_token = current_request.set(request)  # lets the response cache read ETag / nocache headers
     start = _time.perf_counter()
     status_code = 500
     try:
@@ -50,6 +56,7 @@ async def audit_log_middleware(request, call_next):
         status_code = response.status_code
         return response
     finally:
+        current_request.reset(request_token)
         path = request.url.path
         mutating = request.method in ("POST", "PUT", "PATCH", "DELETE")
         if path.startswith("/api/") and not path.startswith(_AUDIT_SKIP_PREFIXES) and (
@@ -75,6 +82,7 @@ async def audit_log_middleware(request, call_next):
 
 # Register API Routers
 app.include_router(ops.router)
+app.include_router(cache_versions.router)
 app.include_router(auth.router)
 app.include_router(metrics.router)
 app.include_router(overview.router)
@@ -148,7 +156,19 @@ async def startup_event():
 
 
 
-    # 3. Daily sponsorship email-queue refresh: only creates PENDING items for staff to review;
+    # 3. Response-cache invalidation: DB triggers bump data_versions on every write (any process).
+    try:
+        from core.cache import install_version_triggers
+        created = await asyncio.to_thread(install_version_triggers)
+        if created:
+            print(f"[Cache] Installed {created} data-version triggers")
+    except Exception as cache_err:
+        print(f"[Cache Trigger Notice]: {cache_err}")
+
+    # 4. Cache warm-up: rebuild the heaviest pages in the background after the data changes.
+    asyncio.get_running_loop().create_task(_cache_warmup_loop())
+
+    # 5. Daily sponsorship email-queue refresh: only creates PENDING items for staff to review;
     #    nothing is emailed until someone presses Send in the tracker's Email Queue.
     asyncio.get_running_loop().create_task(_sponsorship_queue_daily_loop())
 
@@ -165,3 +185,44 @@ async def _sponsorship_queue_daily_loop():
             except Exception as queue_err:
                 print(f"[Sponsorship Queue Notice] {company}: {queue_err}")
         await asyncio.sleep(24 * 60 * 60)
+
+
+async def _cache_warmup_loop():
+    """One worker (file lock) watches each company's donation/classification versions and, when they
+    change (e.g. platform-sync ingested a donation), pre-computes the slowest endpoints so the next
+    visitor gets a cached response. At most once per 5 minutes per company."""
+    import asyncio
+    import time as _time
+    from core.cache import route_defaults, try_exclusive, version_token
+    from core.event_log import log_event
+    await asyncio.sleep(30)
+    lock = try_exclusive("cache_warmup")
+    if lock is None:
+        return  # another worker is the warmer
+    from backend.api import classifications, metrics, overview, tracker
+    last_token, last_run = {}, {}
+    jobs = {
+        "rethink": [(classifications.get_launchgood_matrix, {}), (classifications.get_givebright_matrix, {}),
+                    (metrics.get_metrics_summary, {}), (overview.get_overview_top_campaigns, {})]
+                   + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")],
+        "iqra": [(classifications.get_madinah_matrix, {}), (classifications.get_givebright_matrix, {}),
+                 (metrics.get_metrics_summary, {}), (overview.get_overview_top_campaigns, {})]
+                + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")],
+    }
+    while True:
+        for company, fns in jobs.items():
+            try:
+                token = await asyncio.to_thread(version_token, ["donations", "classification", "tracker"], company)
+                if token == last_token.get(company) or _time.time() - last_run.get(company, 0) < 300:
+                    continue
+                started = _time.perf_counter()
+                for fn, extra in fns:
+                    kwargs = route_defaults(fn, company_id=company, **extra)
+                    await asyncio.to_thread(fn, **kwargs)
+                last_token[company], last_run[company] = token, _time.time()
+                log_event("cache.warmed", category="performance", company_id=company, endpoints=len(fns),
+                          duration_ms=round((_time.perf_counter() - started) * 1000),
+                          message=f"Pre-computed {len(fns)} heavy pages for {company}")
+            except Exception as warm_err:
+                print(f"[Cache Warm-up Notice] {company}: {warm_err}")
+        await asyncio.sleep(60)

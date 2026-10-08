@@ -11,6 +11,8 @@ LOCAL_DB_PATH = os.path.join(BASE_DIR, "launchgood_donations.db")
 PARQUET_PATH = os.path.join(BASE_DIR, "donations_cache.parquet")
 PAYOUTS_PARQUET_PATH = os.path.join(BASE_DIR, "payouts_cache.parquet")
 PAYSUITE_PAYOUTS_PARQUET_PATH = os.path.join(BASE_DIR, "paysuite_payouts_cache.parquet")
+# Codec for every parquet the app writes (readers auto-detect, so older snappy files still load).
+PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "zstd")
 CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 LOGOS_DIR = os.path.join(CACHE_DIR, "logos")
 os.makedirs(LOGOS_DIR, exist_ok=True)

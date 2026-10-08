@@ -1,3 +1,4 @@
+from core.cache import cached
 import io
 import math
 import os
@@ -607,6 +608,7 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
 
 
 @router.get("")
+@cached(scopes=["donations", "classification", "payouts"], ttl=1800)
 def get_donors_paginated(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=1000),
@@ -982,6 +984,7 @@ def export_donors(
 
 
 @router.get("/kanban")
+@cached(scopes=["donations", "classification"], ttl=1800)
 def get_donors_kanban(
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
@@ -1422,6 +1425,7 @@ def get_donor_history_paginated(
 
 
 @router.get("/campaigns")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_campaigns_list(company_id: Optional[str] = Query("rethink")):
     """Returns sorted unique list of campaign names for fast dropdown filtering in Data Explorer."""
     comp = str(company_id or "rethink").lower().strip()

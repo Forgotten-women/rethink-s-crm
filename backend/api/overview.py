@@ -1,4 +1,5 @@
 from typing import Optional
+from core.cache import cached
 import pandas as pd
 from fastapi import APIRouter, Query
 from core.data_processor import load_data
@@ -19,6 +20,7 @@ def _get_amount_column(df):
 
 
 @router.get("/timeline")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_overview_timeline(
     company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
@@ -60,6 +62,7 @@ def get_overview_timeline(
 
 
 @router.get("/headings")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_overview_headings(
     company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
@@ -93,6 +96,7 @@ def get_overview_headings(
 
 
 @router.get("/campaigns")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_overview_top_campaigns(
     company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,
@@ -126,6 +130,7 @@ def get_overview_top_campaigns(
 
 
 @router.get("/subheadings")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_overview_subheadings(
     company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,

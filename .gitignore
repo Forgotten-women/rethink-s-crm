@@ -46,3 +46,8 @@ scripts/*
 test_*
 # Locally generated JWT signing secret (core/auth.py)
 .jwt_secret
+
+# Response cache / runtime state (core/cache.py, platform-sync health)
+data_cache/cache.db*
+data_cache/cache_locks/
+data_cache/platform_health.json

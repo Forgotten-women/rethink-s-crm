@@ -308,6 +308,7 @@ def dispatch_approval_email(expense_id: str, title: str, amount: float, code: st
     return dest_email, approve_url, reject_url, email_sent, send_error
 
 _CODES_CACHE = {}
+_CODES_CACHE_TOKENS = {}  # company -> data-version token the cached codes were built from
 
 def clear_expenses_cache(company_id: Optional[str] = None):
     global _CODES_CACHE
@@ -321,7 +322,9 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
     """Returns unique list of project codes with gross raised, approved expenses, and net balance aggregated across donations, payouts, and classifications in real-time."""
     global _CODES_CACHE
     comp = (company_id or "rethink").strip().lower()
-    if not force_reload and comp in _CODES_CACHE:
+    from core.cache import version_token
+    token = version_token(["classification", "donations", "payouts", "expenses"], comp)
+    if not force_reload and comp in _CODES_CACHE and _CODES_CACHE_TOKENS.get(comp) == token:
         return _CODES_CACHE[comp]
 
     init_expense_db()
@@ -548,6 +551,7 @@ def get_project_codes(force_reload: bool = False, company_id: Optional[str] = Qu
 
     sorted_codes = sorted(list(code_map.values()), key=lambda x: x["code"])
     _CODES_CACHE[comp] = sorted_codes
+    _CODES_CACHE_TOKENS[comp] = token
     return sorted_codes
 
 

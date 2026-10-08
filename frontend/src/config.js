@@ -70,3 +70,14 @@ export const installAuthFetch = () => {
   };
 };
 
+// A tab opened before a deploy may ask for a page chunk that no longer exists. Reload once to pick up
+// the new build instead of showing a broken page (guarded so it can never loop).
+export const reloadForNewBuild = () => {
+  try {
+    const last = Number(sessionStorage.getItem('chunk_reload_at') || 0)
+    if (Date.now() - last < 30000) return false
+    sessionStorage.setItem('chunk_reload_at', String(Date.now()))
+  } catch { /* storage unavailable: still reload once */ }
+  window.location.reload()
+  return true
+}

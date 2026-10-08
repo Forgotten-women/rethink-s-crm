@@ -1,3 +1,4 @@
+from config.settings import PARQUET_COMPRESSION
 import os
 import sqlite3
 import threading
@@ -220,6 +221,7 @@ def deduplicate_dataframe_columns(df_input):
 
 # Global In-Memory Code Map Cache per Company
 _CACHED_CODE_MAP = {}
+_CACHED_CODE_MAP_TOKEN = {}  # company -> data-version token the cached map was built from
 
 
 def invalidate_code_map(company_id: Optional[str] = None):
@@ -244,7 +246,9 @@ def get_code_to_classification_map(force_reload: bool = False, company_id: Optio
         _CACHED_CODE_MAP = {}
 
     comp = str(company_id or "rethink").lower().strip()
-    if not force_reload and comp in _CACHED_CODE_MAP:
+    from core.cache import version_token
+    token = version_token(["classification"], comp)
+    if not force_reload and comp in _CACHED_CODE_MAP and _CACHED_CODE_MAP_TOKEN.get(comp) == token:
         return _CACHED_CODE_MAP[comp]
 
     code_map = {}
@@ -353,6 +357,7 @@ def get_code_to_classification_map(force_reload: bool = False, company_id: Optio
         conn.close()
 
     _CACHED_CODE_MAP[comp] = code_map
+    _CACHED_CODE_MAP_TOKEN[comp] = token
     return code_map
 
 
@@ -383,6 +388,19 @@ def _mode_or_last(series):
         return series.iloc[-1] if not series.empty else 'Unassigned'
     mode_vals = clean.mode()
     return mode_vals.iloc[0] if not mode_vals.empty else clean.iloc[-1]
+
+_CLASSIFICATION_DB_READY = False
+
+
+def ensure_classification_db():
+    """Read paths: run the full schema/cleanup routine once per process, then skip.
+    (init_classification_db rewrites views and purges rows under the write lock - far too heavy
+    for every GET.) Write paths keep calling init_classification_db() directly."""
+    global _CLASSIFICATION_DB_READY
+    if not _CLASSIFICATION_DB_READY:
+        init_classification_db()
+        _CLASSIFICATION_DB_READY = True
+
 
 def init_classification_db():
     """Ensures that database schema is up-to-date with two-tier architecture."""
@@ -847,9 +865,78 @@ def init_classification_db():
         finally:
             conn.close()
 
+_MATRIX_INVALID_CODES = ["UNASSIGNED", "N/A", "NONE", "NAN", ""]
+_MATRIX_INVALID_SPECIAL = ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]
+
+
+def _dedupe_matrix_rows(merged_raw: pd.DataFrame) -> pd.DataFrame:
+    """One row per (campaign, giving level, code), vectorised.
+
+    Rules (identical to the previous per-group loop, which took ~13 s for ~4k groups):
+      * a (campaign, giving level) group with any assigned code keeps only its assigned rows;
+        a group with none keeps just its first row;
+      * per code (case-insensitive) the first row in original order is kept, then:
+        - Campaign URL  <- first value in that code's rows starting with "http"
+        - Community Name <- first real community in that code's rows
+        - Special Case  <- first real value in that code's rows, else in the whole group, else ""
+        - donation_count / total_amount <- the whole group's sum when the kept row has none
+      * output ordered by (campaign, giving level, code) like the old groupby iteration.
+    """
+    if merged_raw is None or merged_raw.empty:
+        return merged_raw
+    m = merged_raw.copy()
+    m["_c"] = m["Campaign Name"].astype(str).str.strip().str.lower()
+    m["_g"] = m["Giving Level"].astype(str).str.strip().str.lower()
+    m["_code"] = m["Code"].astype(str).str.upper()
+    m["_ord"] = np.arange(len(m))
+    assigned = ~m["Code"].astype(str).str.strip().str.upper().isin(_MATRIX_INVALID_CODES)
+    grp_keys = ["_c", "_g"]
+    has_assigned = assigned.groupby([m["_c"], m["_g"]]).transform("any")
+    first_in_group = m.groupby(grp_keys, sort=False).cumcount() == 0
+    rtp = m[assigned | (~has_assigned & first_in_group)]
+    keys = ["_c", "_g", "_code"]
+    base = rtp.drop_duplicates(subset=keys, keep="first").copy()
+
+    def first_valid(frame, mask, col, by):
+        sub = frame[mask]
+        return sub.drop_duplicates(subset=by, keep="first").set_index(by)[col]
+
+    key_index = pd.MultiIndex.from_frame(base[keys])
+    if "Campaign URL" in rtp.columns:
+        url_ok = rtp["Campaign URL"].astype(str).str.strip().str.startswith("http") & (rtp["Campaign URL"].astype(str).str.strip() != "")
+        urls = first_valid(rtp, url_ok, "Campaign URL", keys).reindex(key_index)
+        base["Campaign URL"] = np.where(urls.notna().to_numpy(), urls.to_numpy(), base["Campaign URL"].to_numpy())
+    if "Community Name" in rtp.columns:
+        comm_ok = ~rtp["Community Name"].astype(str).str.strip().str.lower().isin(["n/a", "unassigned", "none", "nan", ""])
+        comms = first_valid(rtp, comm_ok, "Community Name", keys).reindex(key_index)
+        base["Community Name"] = np.where(comms.notna().to_numpy(), comms.to_numpy(), base["Community Name"].to_numpy())
+    if "Special Case" in rtp.columns:
+        def sc_ok(frame):
+            v = frame["Special Case"].astype(str)
+            return (v.str.strip() != "") & ~v.str.strip().str.lower().isin(_MATRIX_INVALID_SPECIAL)
+        sc_code = first_valid(rtp, sc_ok(rtp), "Special Case", keys).reindex(key_index)
+        sc_grp = first_valid(m, sc_ok(m), "Special Case", grp_keys).reindex(pd.MultiIndex.from_frame(base[grp_keys]))
+        base["Special Case"] = np.where(sc_code.notna().to_numpy(), sc_code.to_numpy(),
+                                        np.where(sc_grp.notna().to_numpy(), sc_grp.to_numpy(), ""))
+    grp_index = pd.MultiIndex.from_frame(base[grp_keys])
+    for col, as_int in (("donation_count", True), ("total_amount", False)):
+        if col not in m.columns:
+            continue
+        sums = pd.to_numeric(m[col], errors="coerce").groupby([m["_c"], m["_g"]]).sum(min_count=1).reindex(grp_index).to_numpy()
+        cur = pd.to_numeric(base[col], errors="coerce")
+        need = (cur.isna() | (cur == 0)).to_numpy() & ~np.isnan(sums.astype(float)) & (np.nan_to_num(sums.astype(float)) > 0)
+        sums_f = np.nan_to_num(sums.astype(float))
+        fill = sums_f.astype("int64") if as_int else np.round(sums_f, 2)
+        base[col] = base[col].astype(object)
+        base.loc[need, col] = fill[need]
+    base = base.sort_values(keys, kind="mergesort")
+    return base.drop(columns=["_c", "_g", "_code", "_ord"])
+
+
+
 def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
     """Returns the campaign_classifications matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for a company."""
-    init_classification_db()
+    ensure_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
     comp = str(company_id or "rethink").lower().strip()
 
@@ -998,47 +1085,8 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
     else:
         merged_raw = db_matrix
 
-    # 3. Canonical Deduplication & Ghost Row Purging
-    cleaned_rows = []
-    if not merged_raw.empty:
-        cname_gl_groups = merged_raw.groupby([
-            merged_raw["Campaign Name"].astype(str).str.strip().str.lower(),
-            merged_raw["Giving Level"].astype(str).str.strip().str.lower()
-        ])
-        for (c_low, gl_low), grp in cname_gl_groups:
-            assigned_rows = grp[~grp["Code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "N/A", "NONE", "NAN", ""])]
-            rows_to_process = assigned_rows if not assigned_rows.empty else grp.iloc[0:1]
-
-            code_groups = rows_to_process.groupby(rows_to_process["Code"].astype(str).str.upper())
-            for code_up, c_grp in code_groups:
-                row = c_grp.iloc[0].copy()
-                if "Campaign URL" in c_grp.columns:
-                    urls = [u for u in c_grp["Campaign URL"] if str(u).strip() and str(u).strip().startswith("http")]
-                    if urls:
-                        row["Campaign URL"] = urls[0]
-                if "Community Name" in c_grp.columns:
-                    comms = [c for c in c_grp["Community Name"] if str(c).strip().lower() not in ["n/a", "unassigned", "none", "nan", ""]]
-                    if comms:
-                        row["Community Name"] = comms[0]
-                if "Special Case" in c_grp.columns:
-                    scs = [s for s in c_grp["Special Case"] if str(s).strip() and str(s).strip().lower() not in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]]
-                    if scs:
-                        row["Special Case"] = scs[0]
-                    else:
-                        grp_scs = [s for s in grp["Special Case"] if str(s).strip() and str(s).strip().lower() not in ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]] if "Special Case" in grp.columns else []
-                        row["Special Case"] = grp_scs[0] if grp_scs else ""
-                # Inherit donation metrics from grp if row was filled from db_matrix without donation metrics
-                if (pd.isna(row.get("donation_count")) or row.get("donation_count") == 0) and "donation_count" in grp.columns:
-                    d_sum = grp["donation_count"].dropna().sum()
-                    if d_sum > 0:
-                        row["donation_count"] = int(d_sum)
-                if (pd.isna(row.get("total_amount")) or row.get("total_amount") == 0.0) and "total_amount" in grp.columns:
-                    t_sum = grp["total_amount"].dropna().sum()
-                    if t_sum > 0:
-                        row["total_amount"] = round(float(t_sum), 2)
-                cleaned_rows.append(row)
-
-    deduped_df = pd.DataFrame(cleaned_rows) if cleaned_rows else merged_raw
+    # 3. Canonical Deduplication & Ghost Row Purging (vectorised; same rules as the old per-group loop)
+    deduped_df = _dedupe_matrix_rows(merged_raw)
 
     # Dynamic auto-assignment based on Code mapping in < 5ms
     code_map = get_code_to_classification_map(company_id=comp)
@@ -1427,7 +1475,7 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 df_raw.loc[valid_idx, col] = mapped_series.loc[valid_idx]
 
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
-    df_raw.to_parquet(PARQUET_PATH, index=False)
+    df_raw.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
 
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     try:
@@ -3132,7 +3180,7 @@ def process_payout_settlement_upload(df_raw, source_name="LaunchGood Payout.xlsx
                         donations_df["Payout Settled"] = "No"
                     donations_df.loc[m, "Payout Settled"] = "Yes"
                     donations_df = sanitize_df_dtypes_for_parquet(donations_df)
-                    donations_df.to_parquet(PARQUET_PATH, index=False)
+                    donations_df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                     
                     try:
                         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -3392,7 +3440,7 @@ def update_source_tag(old_tag, new_tag):
             df = pd.read_parquet(PARQUET_PATH)
             if "Source" in df.columns:
                 df["Source"] = df["Source"].replace({old_tag: new_tag})
-                df.to_parquet(PARQUET_PATH, index=False)
+                df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                 sync_to_cloud_async(df, mode="replace")
         except Exception as e:
             print(f"Parquet source tag update notice: {e}")
@@ -3416,15 +3464,16 @@ def delete_single_dataset(source_tag):
             df = pd.read_parquet(PARQUET_PATH)
             if "Source" in df.columns:
                 df = df[df["Source"] != source_tag]
-                df.to_parquet(PARQUET_PATH, index=False)
+                df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                 sync_to_cloud_async(df, mode="replace")
         except Exception as e:
             print(f"Parquet dataset delete notice: {e}")
 
     return deleted_count
 
-def invalidate_data_cache():
-    """Forces the in-memory dataset cache to be invalidated."""
+def invalidate_data_cache(company_id=None):
+    """Forces the in-memory dataset cache to be invalidated.
+    company_id is accepted for callers that pass it; the parquet frame is shared by all companies."""
     global _CACHED_DF, _CACHE_MTIME
     with _CACHE_LOCK:
         _CACHED_DF = None
@@ -3497,7 +3546,7 @@ def purge_payout_data():
                 if "Payout Settled" in df_clean.columns:
                     df_clean["Payout Settled"] = "No"
                 df_clean = sanitize_df_dtypes_for_parquet(df_clean)
-                df_clean.to_parquet(PARQUET_PATH, index=False)
+                df_clean.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
         except Exception as e:
             print(f"Parquet payout purge notice: {e}")
 
@@ -3651,7 +3700,7 @@ def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> p
             if not df.empty:
                 df = _ensure_two_tier_columns(df)
                 try:
-                    df.to_parquet(PARQUET_PATH, index=False)
+                    df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                     if os.path.exists(PARQUET_PATH):
                         _CACHE_MTIME = os.path.getmtime(PARQUET_PATH)
                 except Exception:
@@ -3673,7 +3722,7 @@ def atomic_write_parquet(df: pd.DataFrame, target_path: str) -> None:
     """
     tmp_path = target_path + f".tmp_{os.getpid()}_{threading.get_ident()}"
     try:
-        df.to_parquet(tmp_path, index=False)
+        df.to_parquet(tmp_path, index=False, compression=PARQUET_COMPRESSION)
         os.replace(tmp_path, target_path)
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -3755,7 +3804,7 @@ def load_payouts_data(force_reload: bool = False, company_id: Optional[str] = No
                 conn.close()
                 if not df.empty:
                     try:
-                        df.to_parquet(PAYOUTS_PARQUET_PATH, index=False)
+                        df.to_parquet(PAYOUTS_PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                         if os.path.exists(PAYOUTS_PARQUET_PATH):
                             _CACHE_PAYOUTS_MTIME = os.path.getmtime(PAYOUTS_PARQUET_PATH)
                     except Exception:
@@ -3813,7 +3862,7 @@ def load_paysuite_payouts_data(force_reload: bool = False, company_id: Optional[
                     if "company_id" not in df.columns:
                         df["company_id"] = "rethink"
                     try:
-                        df.to_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH, index=False)
+                        df.to_parquet(PAYSUITE_PAYOUTS_PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                         if os.path.exists(PAYSUITE_PAYOUTS_PARQUET_PATH):
                             _CACHE_PAYSUITE_PAYOUTS_MTIME = os.path.getmtime(PAYSUITE_PAYOUTS_PARQUET_PATH)
                     except Exception:
@@ -3861,7 +3910,7 @@ def ensure_database_indexes():
 
 def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
     """Returns GiveBright classification matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for a company."""
-    init_classification_db()
+    ensure_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
     comp = str(company_id or "rethink").lower().strip()
 
@@ -4028,7 +4077,7 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
 
 def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "iqra"):
     """Returns Madinah classification matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for Iqra."""
-    init_classification_db()
+    ensure_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
     comp = str(company_id or "iqra").lower().strip()
 

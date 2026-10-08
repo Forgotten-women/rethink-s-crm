@@ -1,3 +1,4 @@
+from core.cache import cached
 import os
 import re
 import time
@@ -559,6 +560,7 @@ _FILTER_CACHE = {}
 _LAST_DATA_MTIME = 0.0
 
 @router.get("/stats")
+@cached(scopes=["donations", "classification", "tracker"], ttl=21600)
 def get_tracker_stats(
     payment_type: Optional[str] = Query(None),
     tier: Optional[str] = Query(None),
@@ -777,6 +779,7 @@ def _attach_donors_and_funding(cur, rows: List[Dict[str, Any]], alloc_key: str) 
 
 
 @router.get("/beneficiaries")
+@cached(scopes=["tracker", "tracker_comms"], ttl=3600)
 def get_beneficiaries(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query(None),
@@ -1031,6 +1034,7 @@ def _slots_used(items: List[Dict[str, Any]]) -> float:
 
 
 @router.get("/qualifying-donors")
+@cached(scopes=["donations", "classification", "tracker"], ttl=21600, daily=True)
 def get_qualifying_donors(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("Orphan"),
@@ -1439,6 +1443,7 @@ def get_qualifying_donors(
 
 
 @router.get("/search-any-donor")
+@cached(scopes=["donations", "classification", "tracker"], ttl=1800)
 def search_any_donor(
     query: str = Query(..., min_length=1),
     sponsorship_type: Optional[str] = Query("Orphan"),
@@ -1872,6 +1877,7 @@ def delete_manual_donor(
 
 
 @router.get("/qualifying-campaigns")
+@cached(scopes=["donations", "classification", "tracker", "fundraisers"], ttl=21600, daily=True)
 def get_qualifying_campaigns(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("Orphan"),
@@ -2166,6 +2172,7 @@ def get_qualifying_campaigns(
 # 6. ALLOCATIONS MANAGEMENT
 # ==========================================
 @router.get("/allocations")
+@cached(scopes=["tracker", "tracker_comms"], ttl=3600, daily=True)
 def get_allocations(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query(None),
@@ -4912,11 +4919,14 @@ def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = Fals
     """
     comp = (company_id or "rethink").strip().lower()
     now_ts = time.time()
-    
+    # Valid only for the exact data it was built from (any process's writes change the token) and today.
+    from core.cache import version_token
+    token = version_token(["donations", "classification", "tracker", "fundraisers"], comp) + time.strftime("%Y%m%d", time.gmtime())
+
     # 1. First-tier fast in-memory cache check (<1ms)
     with _OVERDUE_CACHE_LOCK:
         cached = _OVERDUE_CACHE.get(comp)
-        if not force_refresh and cached and (now_ts - cached["timestamp"] < _OVERDUE_CACHE_TTL):
+        if not force_refresh and cached and cached.get("token") == token and (now_ts - cached["timestamp"] < _OVERDUE_CACHE_TTL):
             return cached["donors"], cached["campaigns"]
 
     # 2. Second-tier cross-worker persistent SQLite cache (~2ms)
@@ -4931,12 +4941,13 @@ def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = Fals
             conn.close()
             if row and row["data_json"]:
                 up_ts = float(row["updated_ts"] or 0)
-                if now_ts - up_ts < _OVERDUE_CACHE_TTL:
-                    parsed = json.loads(row["data_json"])
+                parsed = json.loads(row["data_json"])
+                if now_ts - up_ts < _OVERDUE_CACHE_TTL and parsed.get("token") == token:
                     donors_db = parsed.get("donors", [])
                     campaigns_db = parsed.get("campaigns", [])
                     with _OVERDUE_CACHE_LOCK:
                         _OVERDUE_CACHE[comp] = {
+                            "token": token,
                             "timestamp": up_ts,
                             "donors": donors_db,
                             "campaigns": campaigns_db
@@ -5027,6 +5038,7 @@ def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = Fals
 
     with _OVERDUE_CACHE_LOCK:
         _OVERDUE_CACHE[comp] = {
+            "token": token,
             "timestamp": now_ts,
             "donors": final_donors,
             "campaigns": final_campaigns
@@ -5037,7 +5049,7 @@ def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = Fals
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         cur = conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS sponsorship_overdue_cache (company_id TEXT PRIMARY KEY, data_json TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        data_str = json.dumps({"donors": final_donors, "campaigns": final_campaigns})
+        data_str = json.dumps({"token": token, "donors": final_donors, "campaigns": final_campaigns}, default=str)
         cur.execute("""
             INSERT INTO sponsorship_overdue_cache (company_id, data_json, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)

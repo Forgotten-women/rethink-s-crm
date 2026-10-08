@@ -1,3 +1,5 @@
+from config.settings import PARQUET_COMPRESSION
+from core.cache import cached
 import io
 import os
 import sqlite3
@@ -194,6 +196,7 @@ def _enrich_rules_metadata(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @router.get("/master-codes")
+@cached(scopes=["donations", "classification"], ttl=86400)
 def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
     """Returns all master project codes with Department, Office, Portfolio, linked campaigns count, and total gross raised for a company."""
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -394,7 +397,7 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
 
                 from core.data_processor import sanitize_df_dtypes_for_parquet
                 df_raw = sanitize_df_dtypes_for_parquet(df_raw)
-                df_raw.to_parquet(PARQUET_PATH, index=False)
+                df_raw.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
                 conn.execute("DELETE FROM donations WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
                 df_raw[comp_mask].to_sql("donations", con=conn, if_exists="append", index=False, chunksize=5000)
@@ -603,6 +606,7 @@ def canonicalize_special_case(sc_str: str) -> str:
 
 
 @router.get("/code-map")
+@cached(scopes=["classification"], ttl=86400)
 def get_code_map(company_id: Optional[str] = Query("rethink")):
     """Returns the central mapping of Code -> {Department, Office, Portfolio, Heading, Sub-Heading, Country, Zakat Eligibility, Programme Fund, Fund Code}."""
     comp = (company_id or "rethink").strip().lower()
@@ -692,6 +696,7 @@ def _clean_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @router.get("/launchgood")
+@cached(scopes=["donations", "classification"], ttl=86400)
 def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns LaunchGood classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
@@ -701,6 +706,7 @@ def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
 
 @router.get("/givebright")
 @router.get("/givebrite")
+@cached(scopes=["donations", "classification"], ttl=86400)
 def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns GiveBright/GiveBrite classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
@@ -709,6 +715,7 @@ def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
 
 
 @router.get("/paysuite")
+@cached(scopes=["classification", "payouts"], ttl=86400)
 def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns Paysuite classification matrix rules with (Campaign Name, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
@@ -749,6 +756,7 @@ def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
 
 
 @router.get("/website")
+@cached(scopes=["donations", "classification"], ttl=86400)
 def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns Website classification matrix rules with (Campaign Name, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
@@ -785,6 +793,7 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
 
 
 @router.get("/madinah")
+@cached(scopes=["donations", "classification"], ttl=86400)
 def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
     """Returns Madinah classification matrix rules with (Campaign Name, Giving Level, Code) granularity for Iqra."""
     comp = (company_id or "iqra").strip().lower()
@@ -1108,7 +1117,7 @@ def delete_single_rule(payload: DeleteRuleRequest):
                     if f in df.columns:
                         df.loc[mask, f] = "Unassigned" if f != "Portfolio" else ""
                 
-                df.to_parquet(PARQUET_PATH, index=False)
+                df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
         except Exception as e:
             print(f"Error updating donors parquet on delete: {e}")
 
@@ -1177,7 +1186,7 @@ def clear_platform_rules(payload: ClearPlatformRequest):
                     if f in df.columns:
                         df.loc[p_mask, f] = "Unassigned" if f != "Portfolio" else ""
                 
-                df.to_parquet(PARQUET_PATH, index=False)
+                df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
         except Exception as e:
             print(f"Error resetting donors on clear: {e}")
 

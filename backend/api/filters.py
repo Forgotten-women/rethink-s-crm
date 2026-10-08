@@ -1,5 +1,6 @@
 from typing import Optional
 from fastapi import APIRouter, Query
+from core.cache import cached
 from core.data_processor import load_data, load_payouts_data
 from backend.api.donors import _apply_filters
 
@@ -7,6 +8,7 @@ router = APIRouter(prefix="/api/filters", tags=["Filter Controls"])
 
 
 @router.get("/options")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_filter_options(
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,

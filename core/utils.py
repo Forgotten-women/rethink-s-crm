@@ -1,3 +1,4 @@
+from config.settings import PARQUET_COMPRESSION
 import os
 import sqlite3
 import time
@@ -225,7 +226,7 @@ def load_data():
                             df[c] = pd.to_datetime(df[c], format='mixed', errors='coerce')
                     # Save as Parquet for next time (instant load)
                     df = normalize_classifications(df)
-                    df.to_parquet(PARQUET_PATH, index=False)
+                    df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                     return df
             conn.close()
         except Exception:
@@ -425,7 +426,7 @@ def save_classification_matrix(matrix_df):
                 df_donations.loc[lg_mask, f] = lg_merged[f].values
 
             df_donations = deduplicate_dataframe_columns(df_donations)
-            df_donations.to_parquet(PARQUET_PATH, index=False)
+            df_donations.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
             conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
             df_donations.to_sql("donations", con=conn, if_exists="replace", index=False)
             conn.close()
@@ -604,7 +605,7 @@ def save_givebright_classification_matrix(matrix_df):
                         df_donations.loc[gb_mask, f] = mapped_vals.values
 
                 df_donations = deduplicate_dataframe_columns(df_donations)
-                df_donations.to_parquet(PARQUET_PATH, index=False)
+                df_donations.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
                 df_donations.to_sql("donations", con=conn, if_exists="replace", index=False)
                 conn.close()
@@ -634,7 +635,7 @@ def delete_single_dataset(source_tag):
                 else:
                     df_filtered = _enrich_dataframe(df_filtered)
                     df_filtered = deduplicate_dataframe_columns(df_filtered)
-                    df_filtered.to_parquet(PARQUET_PATH, index=False)
+                    df_filtered.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
                     
                     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
                     df_filtered.to_sql("donations", con=conn, if_exists="replace", index=False)
@@ -717,7 +718,7 @@ def update_source_tag(old_tag, new_tag):
             mask = df["Source"] == old_tag
             updated_count = mask.sum()
             df.loc[mask, "Source"] = new_tag
-            df.to_parquet(PARQUET_PATH, index=False)
+            df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
             
             conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
             df.to_sql("donations", con=conn, if_exists="replace", index=False)
@@ -1148,7 +1149,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
     df = deduplicate_dataframe_columns(df)
 
     # 5. Save Parquet cache (instant 0.05s loads on every restart)
-    df.to_parquet(PARQUET_PATH, index=False)
+    df.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
 
     # 6. Push to Local SQLite Database
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)

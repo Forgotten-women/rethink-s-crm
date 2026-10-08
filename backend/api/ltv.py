@@ -1,6 +1,7 @@
 from typing import Optional
 from fastapi import APIRouter, Query
 from config.settings import DONOR_TIER_ORDER
+from core.cache import cached
 from core.data_processor import load_data
 
 router = APIRouter(prefix="/api/ltv", tags=["Lifetime LTV & Segmentation"])
@@ -21,6 +22,7 @@ def _get_amount_column(df):
 
 
 @router.get("/summary")
+@cached(scopes=["donations", "classification"], ttl=21600)
 def get_ltv_summary(
     company_id: Optional[str] = Query("rethink"),
     payment_type: Optional[str] = None,

@@ -1,3 +1,4 @@
+from core.cache import cached
 import os
 import math
 import sqlite3
@@ -334,6 +335,7 @@ def _check_super_admin(user_role: str, can_edit_donors: bool = False):
 
 
 @router.get("/campaigns-list")
+@cached(scopes=["fundraisers", "payouts", "donations", "classification"], ttl=21600)
 def get_available_campaigns_list(company_id: Optional[str] = Query("rethink")):
     """
     Returns unique list of all (Campaign Name, Code, Platform, Heading) combinations
@@ -541,6 +543,7 @@ def sync_discovered_fundraisers(company_id: Optional[str] = Query("rethink")):
 
 
 @router.get("")
+@cached(scopes=["fundraisers", "payouts", "donations", "classification"], ttl=21600)
 def get_fundraisers_list(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -823,6 +826,7 @@ def get_fundraisers_list(
     }
 
 @router.get("/{fundraiser_id}")
+@cached(scopes=["fundraisers", "payouts", "donations", "classification"], ttl=21600)
 def get_fundraiser_detail(
     fundraiser_id: str,
     start_date: Optional[str] = None,

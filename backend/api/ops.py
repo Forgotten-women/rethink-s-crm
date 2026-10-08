@@ -271,3 +271,22 @@ def upload_session(platform: str, payload: SessionUpload, user: dict = Depends(r
     log_event("session.uploaded", category="session", actor=user.get("email"), platform=platform,
               expires_at=exp.isoformat(), has_refresh=bool(refresh), source=payload.source)
     return {"status": "success", "platform": platform, "access_expires_at": exp.isoformat(), "verified": True}
+
+
+# ---------------------------------------------------------------------------
+# Response cache visibility / control
+# ---------------------------------------------------------------------------
+@router.get("/cache")
+def ops_cache_status():
+    from core.cache import stats, versions
+    scopes = ["donations", "classification", "tracker", "tracker_comms", "payouts", "fundraisers", "expenses"]
+    return {**stats(), "versions": {c: versions(scopes, c) for c in ("rethink", "iqra")}}
+
+
+@router.post("/cache/clear")
+def ops_cache_clear(user: dict = Depends(require_super_admin)):
+    from core.cache import clear_all
+    clear_all()
+    log_event("cache.cleared", category="performance", level="warning", actor=user.get("email"),
+              message="Response cache cleared from the ops console")
+    return {"status": "success"}

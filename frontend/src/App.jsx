@@ -1,24 +1,31 @@
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
+import { reloadForNewBuild } from './config';
 import Navbar from './components/Navbar';
 import HorizontalFilters from './components/HorizontalFilters';
 import NavigationSidebar from './components/NavigationSidebar';
-import OverviewView from './components/OverviewView';
-import LtvView from './components/LtvView';
-import KanbanBoard from './components/KanbanBoard';
-import ExplorerView from './components/ExplorerView';
-import ClassificationView from './components/ClassificationView';
-import ExpenseView from './components/ExpenseView';
-import AdminView from './components/AdminView';
-import TrackerView from './components/TrackerView';
-import PayoutsView from './components/PayoutsView';
-import FundraiserView from './components/FundraiserView';
+// Lazy page that survives deploys: if its chunk is gone (tab opened on an older build), reload once.
+const lazyPage = (loader) => lazy(() => loader().catch((err) => {
+  if (reloadForNewBuild()) return new Promise(() => {}); // page is reloading
+  throw err;
+}));
+const OverviewView = lazyPage(() => import('./components/OverviewView'));
+const LtvView = lazyPage(() => import('./components/LtvView'));
+const KanbanBoard = lazyPage(() => import('./components/KanbanBoard'));
+const ExplorerView = lazyPage(() => import('./components/ExplorerView'));
+const ClassificationView = lazyPage(() => import('./components/ClassificationView'));
+const ExpenseView = lazyPage(() => import('./components/ExpenseView'));
+const AdminView = lazyPage(() => import('./components/AdminView'));
+const TrackerView = lazyPage(() => import('./components/TrackerView'));
+const PayoutsView = lazyPage(() => import('./components/PayoutsView'));
+const FundraiserView = lazyPage(() => import('./components/FundraiserView'));
 import DonorDrawer from './components/DonorDrawer';
 import LoginView from './components/LoginView';
-import OpsConsole from './components/ops/OpsConsole';
+const OpsConsole = lazyPage(() => import('./components/ops/OpsConsole'));
 
 import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Gift, Layers, DollarSign, Filter, ChevronUp, ChevronDown } from 'lucide-react';
 
 import { API_BASE_URL } from './config';
+
 
 const INITIAL_FILTERS = {
   payment_type: 'All Payment Types',
@@ -257,7 +264,7 @@ export default function App() {
   };
 
   // ---- Hidden ops console (super admins): Konami code ↑ ↑ ↓ ↓ ← → ← → B A ----
-  const [opsOpen, setOpsOpen] = useState(false);
+  const [opsOpen, setOpsOpen] = useState(false); // false | 'status' | 'logs' | 'sessions' | 'cache'
   const [opsHealth, setOpsHealth] = useState(null);
   const isSuperAdmin = user?.role === 'super_admin';
   useEffect(() => {
@@ -268,15 +275,28 @@ export default function App() {
     const onKey = (e) => {
       const tag = (e.target?.tagName || '').toLowerCase();
       if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) return;
-      const now = Date.now();
-      if (now - last > 1500) pos = 0;
-      last = now;
       const key = (e.key || '').toLowerCase();
+      // Shortcut: Ctrl+Alt+O (Cmd+Option+O on Mac). e.code is used because Option changes e.key on Mac.
+      if ((e.ctrlKey || e.metaKey) && e.altKey && (e.code === 'KeyO' || key === 'o')) {
+        e.preventDefault();
+        setOpsOpen('status');
+        return;
+      }
+      const now = Date.now();
+      if (now - last > 3000) pos = 0;
+      last = now;
       pos = key === SEQUENCE[pos] ? pos + 1 : (key === SEQUENCE[0] ? 1 : 0);
-      if (pos === SEQUENCE.length) { pos = 0; setOpsOpen(true); }
+      if (pos === SEQUENCE.length) { pos = 0; setOpsOpen('status'); }
     };
+    // Direct links: /#ops-status, /#ops-logs, /#ops-sessions, /#ops-cache (or just /#ops)
+    const fromHash = () => {
+      const m = (window.location.hash || '').match(/^#ops(?:-(status|logs|sessions|cache))?$/);
+      if (m) setOpsOpen(m[1] || 'status');
+    };
+    fromHash();
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('hashchange', fromHash);
+    return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('hashchange', fromHash); };
   }, [isSuperAdmin]);
   useEffect(() => {
     if (!isSuperAdmin) return undefined;
@@ -285,6 +305,28 @@ export default function App() {
     const t = setInterval(check, 5 * 60 * 1000);
     return () => clearInterval(t);
   }, [isSuperAdmin]);
+
+  // ---- "New data available" notice: poll the cheap data-version token (works across all workers) ----
+  const [dataUpdated, setDataUpdated] = useState(false);
+  const versionTokenRef = useRef(null);
+  useEffect(() => {
+    if (!user) return undefined;
+    versionTokenRef.current = null;
+    setDataUpdated(false);
+    const check = () => fetch(`${API_BASE_URL}/api/cache/versions?company_id=${encodeURIComponent(activeCompany)}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (!d?.token) return;
+        if (versionTokenRef.current && versionTokenRef.current !== d.token) setDataUpdated(true);
+        versionTokenRef.current = d.token;
+      })
+      .catch(() => {});
+    check();
+    const t = setInterval(check, 60000);
+    const onFocus = () => check();
+    window.addEventListener('focus', onFocus);
+    return () => { clearInterval(t); window.removeEventListener('focus', onFocus); };
+  }, [user, activeCompany, dataVersion]);
 
   const handleLoginSuccess = (userData, accessToken) => {
     const sessionData = {
@@ -357,8 +399,9 @@ export default function App() {
               />
             )}
 
-            {/* Active Tab Main Content */}
+            {/* Active Tab Main Content (each view is a separate, lazily loaded chunk) */}
             <div className="w-full min-w-0">
+              <Suspense fallback={<div className="py-24 flex justify-center"><div className="w-6 h-6 border-2 border-slate-300 border-t-blue-500 rounded-full animate-spin" /></div>}>
               {activeTab === 'overview' && (
                 <OverviewView 
                   key={`${activeCompany}-${dataVersion}`} 
@@ -448,6 +491,7 @@ export default function App() {
                   onCompaniesChange={fetchCompanies}
                 />
               )}
+              </Suspense>
             </div>
 
           </div>
@@ -458,10 +502,25 @@ export default function App() {
       <DonorDrawer donorId={selectedDonor} onClose={() => setSelectedDonor(null)} activeCompany={activeCompany} />
 
       {isSuperAdmin && opsHealth === 'down' && !opsOpen && (
-        <button type="button" onClick={() => setOpsOpen(true)} title="A platform integration is not working - open the ops console"
+        <button type="button" onClick={() => setOpsOpen('status')} title="A platform integration is not working - open the ops console"
           className="fixed bottom-3 right-3 z-[70] w-3 h-3 rounded-full bg-rose-500 animate-pulse shadow" aria-label="Integration problem" />
       )}
-      {isSuperAdmin && opsOpen && <OpsConsole onClose={() => setOpsOpen(false)} />}
+      {isSuperAdmin && opsOpen && (
+        <Suspense fallback={null}>
+          <OpsConsole initialTab={opsOpen} onClose={() => {
+            setOpsOpen(false);
+            if ((window.location.hash || '').startsWith('#ops')) window.history.replaceState(null, '', window.location.pathname + window.location.search);
+          }} />
+        </Suspense>
+      )}
+
+      {dataUpdated && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[65] px-4 py-2.5 rounded-xl bg-slate-900 text-white text-xs shadow-xl flex items-center gap-3">
+          <span>New data is available (synced donations or changes by a colleague).</span>
+          <button type="button" onClick={() => { setDataUpdated(false); handleDataChange(); }} className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 font-bold">Refresh</button>
+          <button type="button" onClick={() => setDataUpdated(false)} className="text-slate-400 hover:text-white">Later</button>
+        </div>
+      )}
     </div>
   );
 }
