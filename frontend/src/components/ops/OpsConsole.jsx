@@ -20,8 +20,10 @@ const LEVEL_CLS = {
 };
 
 const fmtAge = (iso) => {
-  if (!iso) return 'never';
-  const mins = (Date.now() - new Date(iso).getTime()) / 60000;
+  if (!iso || iso === 'nan' || iso === 'never') return 'never';
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return 'never';
+  const mins = (Date.now() - t) / 60000;
   if (mins < 1) return 'just now';
   if (mins < 60) return `${Math.round(mins)} min ago`;
   if (mins < 48 * 60) return `${Math.round(mins / 60)} h ago`;
@@ -596,11 +598,11 @@ export default function OpsConsole({ onClose, initialTab = 'status' }) {
   return (
     <div className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150" onClick={onClose}>
       <div
-        className="w-full max-w-6xl max-h-[92vh] overflow-y-auto rounded-2xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-2xl text-xs text-slate-700 dark:text-slate-200"
+        className="w-full max-w-6xl max-h-[92vh] overflow-y-auto rounded-2xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-2xl text-xs text-slate-800 dark:text-slate-200"
         onClick={e => e.stopPropagation()}
       >
         {/* Solid opaque sticky header — completely blocks background bleed-through when scrolling */}
-        <div className="sticky top-0 z-30 px-5 py-3.5 bg-white dark:bg-slate-950 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shadow-xs">
+        <div className="sticky top-0 z-30 px-5 py-3.5 bg-slate-50 dark:bg-slate-950 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shadow-xs">
           <div className="flex items-center gap-3">
             <span className="font-bold text-sm text-slate-900 dark:text-slate-100">Ops console</span>
             <div className="flex bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700/60">

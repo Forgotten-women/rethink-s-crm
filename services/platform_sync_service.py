@@ -26,7 +26,7 @@ import base64
 import logging
 import threading
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 import requests
@@ -47,6 +47,7 @@ from core.givebrite_ingestion import (
 )
 from core.madinah_ingestion import (
     ingest_madinah_donations,
+    run_madinah_historical_backfill,
     MADINAH_APIM_BASE
 )
 from core.event_log import log_event, set_service_name
@@ -123,6 +124,7 @@ class PlatformSyncService:
         self.session.headers.update({"User-Agent": "Rethink-CRM-Sync/1.0"})
         self.last_deep_sync = 0.0
         self.backfill_completed = False
+        self.madinah_backfill_completed = False
         self.health: Dict[str, Dict[str, Any]] = {}
         try:
             with open(HEALTH_FILE, "r", encoding="utf-8") as f:
@@ -132,6 +134,25 @@ class PlatformSyncService:
         for p in ("givebrite", "madinah"):
             self.health.setdefault(p, {})
             self.health[p]["consecutive_failures"] = 0
+
+        # Seed last_ingested_at from local DB if missing so Ops Console reflects accurate donation history
+        try:
+            from core.database import get_db_connection
+            conn = get_db_connection()
+            cur = conn.cursor()
+            for plat in ("madinah", "givebrite"):
+                if plat in self.health and (not self.health[plat].get("last_ingested_at") or str(self.health[plat].get("last_ingested_at")).lower() in ("nan", "none", "")):
+                    cur.execute("""
+                        SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
+                        FROM donations
+                        WHERE company_id = 'iqra' AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
+                    """, (f"%{plat}%",))
+                    r = cur.fetchone()
+                    if r and r[0] and "nan" not in str(r[0]).lower():
+                        self.health[plat]["last_ingested_at"] = r[0]
+            conn.close()
+        except Exception as seed_err:
+            logger.debug(f"Notice seeding initial last_ingested_at: {seed_err}")
 
     # -------------------------------------------------------------------------
     # Health tracking (read by the hidden ops console via /api/ops/status)
@@ -330,39 +351,77 @@ class PlatformSyncService:
             "campaigns": []
         }
 
-        # 1. Latest Real-Time Donations
-        url_madinah_donations = f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest?page=1&limit=50"
-        try:
-            r = self.session.get(url_madinah_donations, headers=headers, timeout=12)
-            if r.status_code == 401:
-                logger.warning("[Madinah] Received HTTP 401. Performing immediate token renewal...")
-                auth_header = self.ensure_madinah_token(force_refresh=True)
-                headers["Authorization"] = auth_header
-                r = self.session.get(url_madinah_donations, headers=headers, timeout=12)
+        # 1. Startup Historical Backfill (Non-destructive, skips existing IDs)
+        if not self.madinah_backfill_completed:
+            try:
+                logger.info("Executing initial Madinah historical backfill (fetching all missing donations)...")
+                bf_res = run_madinah_historical_backfill(auth_header, start_date="2024-01-01", company_id="iqra")
+                self.madinah_backfill_completed = True
+                logger.info(f"Madinah backfill finished: {bf_res['inserted']} inserted, {bf_res['skipped']} already present.")
+            except Exception as bf_ex:
+                logger.error(f"Madinah initial backfill notice: {bf_ex}")
 
-            if r.status_code == 200:
-                data = r.json().get("data", {})
-                raw_donations = data.get("donations", [])
-                result["donations_latest"] = raw_donations
-                result["status_counts"] = data.get("statusCounts", {})
+        # 2. Latest Real-Time Donations Stream (Rolling 7-day window with pagination)
+        start_window = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        page = 1
+        all_donations = []
+        total_inserted = 0
+        total_skipped = 0
+        latest_http_status = 200
 
-                # Direct CRM Ingestion (SQLite + Parquet atomic sync)
-                ingest_res = ingest_madinah_donations(raw_donations, company_id="iqra")
-                result["donations_ingested"] = ingest_res.get("inserted", 0)
-                result["donations_skipped"] = ingest_res.get("skipped", 0)
-                if ingest_res.get("inserted", 0) > 0:
-                    logger.info(f"[Madinah Live Ingest] Ingested {ingest_res['inserted']} new donations into CRM database & Parquet.")
-                self._record_cycle("madinah", True, 200, None, result["donations_ingested"], len(raw_donations))
-            else:
-                logger.warning(f"Madinah donations HTTP {r.status_code}")
-                self._record_cycle("madinah", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
-        except Exception as ex:
-            logger.error(f"Madinah donations fetch error: {ex}")
-            self._record_cycle("madinah", False, None, f"Donations fetch error: {ex}")
+        while True:
+            url_madinah_donations = (
+                f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest"
+                f"?startDate={start_window}&endDate={today}&page={page}&limit=100"
+            )
+            try:
+                r = self.session.get(url_madinah_donations, headers=headers, timeout=15)
+                if r.status_code == 401:
+                    logger.warning("[Madinah] Received HTTP 401. Performing immediate token renewal...")
+                    auth_header = self.ensure_madinah_token(force_refresh=True)
+                    headers["Authorization"] = auth_header
+                    r = self.session.get(url_madinah_donations, headers=headers, timeout=15)
+
+                latest_http_status = r.status_code
+                if r.status_code == 200:
+                    data = r.json().get("data", {})
+                    raw_donations = data.get("donations", [])
+                    if not raw_donations:
+                        break
+                    all_donations.extend(raw_donations)
+                    result["status_counts"] = data.get("statusCounts", {})
+
+                    # Ingest to SQLite and Parquet
+                    ingest_res = ingest_madinah_donations(raw_donations, company_id="iqra")
+                    total_inserted += ingest_res.get("inserted", 0)
+                    total_skipped += ingest_res.get("skipped", 0)
+
+                    pagination = data.get("pagination", {})
+                    total_pages = pagination.get("pages", 1)
+                    if page >= total_pages:
+                        break
+                    page += 1
+                    time.sleep(0.1)
+                else:
+                    logger.warning(f"Madinah donations HTTP {r.status_code}")
+                    self._record_cycle("madinah", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
+                    break
+            except Exception as ex:
+                logger.error(f"Madinah donations fetch error: {ex}")
+                self._record_cycle("madinah", False, None, f"Donations fetch error: {ex}")
+                break
+
+        result["donations_latest"] = all_donations[:50]
+        result["donations_ingested"] = total_inserted
+        result["donations_skipped"] = total_skipped
+        if latest_http_status == 200:
+            if total_inserted > 0:
+                logger.info(f"[Madinah Live Ingest] Ingested {total_inserted} new donations into CRM database & Parquet.")
+            self._record_cycle("madinah", True, 200, None, total_inserted, len(all_donations))
 
         time.sleep(0.2)
 
-        # 2. Donation Stats / Recovery Summary
+        # 3. Donation Stats / Recovery Summary
         try:
             r = self.session.get(
                 f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest/stats",
@@ -384,10 +443,10 @@ class PlatformSyncService:
 
         time.sleep(0.2)
 
-        # 3. Overall Revenue & Donor Geography
+        # 4. Overall Revenue & Donor Geography (Using tested dashboard date parameters)
         try:
             r = self.session.get(
-                f"{MADINAH_APIM_BASE}/dashboard-server/api/v1/user/dashboard/overview?startDateFilter=2024-01-01&endDateFilter={today}",
+                f"{MADINAH_APIM_BASE}/dashboard-server/api/v1/user/dashboard/overview?startDate={today}&endDate={today}&dateValue=today&dateName=Today",
                 headers=headers,
                 timeout=12
             )

@@ -353,7 +353,8 @@ def build_madinah_record(
 
 def ingest_madinah_donations(
     donations: List[Dict[str, Any]],
-    company_id: str = "iqra"
+    company_id: str = "iqra",
+    sync_parquet: bool = True
 ) -> Dict[str, Any]:
     """
     Ingests live Madinah donations into SQLite 'donations' and updates Parquet.
@@ -362,7 +363,7 @@ def ingest_madinah_donations(
     assert company_id == "iqra", f"Tenant violation: Madinah sync only runs for 'iqra', got: {company_id}"
 
     if not donations:
-        return {"total_incoming": 0, "inserted": 0, "skipped": 0}
+        return {"total_incoming": 0, "inserted": 0, "skipped": 0, "inserted_records": []}
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -498,7 +499,7 @@ def ingest_madinah_donations(
         except Exception as u_fetch_err:
             logger.warning(f"Failed fetching updated rows for Parquet: {u_fetch_err}")
 
-    if all_parquet_sync:
+    if sync_parquet and all_parquet_sync:
         try:
             update_madinah_parquet_cache(all_parquet_sync)
         except Exception as p_err:
@@ -518,7 +519,8 @@ def ingest_madinah_donations(
     return {
         "total_incoming": len(donations),
         "inserted": len(records_to_insert),
-        "skipped": len(donations) - len(records_to_insert)
+        "skipped": len(donations) - len(records_to_insert),
+        "inserted_records": all_parquet_sync
     }
 
 
@@ -546,3 +548,102 @@ def update_madinah_parquet_cache(new_records: List[Dict[str, Any]]) -> None:
     atomic_write_parquet(df_combined, PARQUET_PATH)
     invalidate_data_cache()
     logger.info(f"Parquet cache updated successfully with Madinah records. Total rows now: {len(df_combined):,}")
+
+
+def run_madinah_historical_backfill(
+    token: str,
+    start_date: str = "2024-01-01",
+    end_date: Optional[str] = None,
+    company_id: str = "iqra"
+) -> Dict[str, Any]:
+    """
+    Performs complete non-destructive historical backfill for Madinah donations using date parameters.
+    Fetches all pages from start_date to end_date with limit=100, ingests into SQLite,
+    and updates Parquet in a single atomic operation at completion.
+    """
+    assert company_id == "iqra", "Tenant isolation violation: Madinah only runs for 'iqra'!"
+
+    if not end_date:
+        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    auth = token.strip()
+    if not auth.startswith("Bearer "):
+        auth = f"Bearer {auth}"
+
+    headers = {
+        "Authorization": auth,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    base_url = f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest"
+    page = 1
+    total_inserted = 0
+    total_skipped = 0
+    all_new_parquet_records = []
+    session = requests.Session()
+
+    logger.info(f"[Madinah Backfill] Starting historical backfill: {start_date} to {end_date}...")
+
+    while True:
+        url = f"{base_url}?startDate={start_date}&endDate={end_date}&page={page}&limit=100"
+        try:
+            r = session.get(url, headers=headers, timeout=20)
+            if r.status_code != 200:
+                logger.error(f"[Madinah Backfill] Page {page} failed HTTP {r.status_code}: {r.text[:200]}")
+                break
+
+            data = r.json().get("data", {})
+            donations = data.get("donations", [])
+            if not donations:
+                logger.info(f"[Madinah Backfill] End of donations reached at page {page}.")
+                break
+
+            # Ingest to SQLite without rebuilding Parquet on every page
+            res = ingest_madinah_donations(donations, company_id=company_id, sync_parquet=False)
+            total_inserted += res["inserted"]
+            total_skipped += res["skipped"]
+            if res.get("inserted_records"):
+                all_new_parquet_records.extend(res["inserted_records"])
+
+            pagination = data.get("pagination", {})
+            total_pages = pagination.get("pages", 1)
+            total_records = pagination.get("total", 0)
+
+            if page % 10 == 0 or page == 1 or page >= total_pages:
+                logger.info(
+                    f"[Madinah Backfill] Progress: Page {page}/{total_pages} "
+                    f"({total_inserted} inserted, {total_skipped} skipped, total API records: {total_records})"
+                )
+
+            if page >= total_pages:
+                break
+
+            page += 1
+            time.sleep(0.1)  # Polite pacing
+        except Exception as ex:
+            logger.error(f"[Madinah Backfill] Error on page {page}: {ex}")
+            break
+
+    # Bulk update Parquet cache once if any new records were inserted
+    if all_new_parquet_records:
+        try:
+            logger.info(f"[Madinah Backfill] Updating Parquet cache with {len(all_new_parquet_records)} newly backfilled records...")
+            update_madinah_parquet_cache(all_new_parquet_records)
+            invalidate_data_cache()
+            from backend.api.events import broadcast_event_sync
+            broadcast_event_sync("DONORS_UPDATED", {
+                "source": "madinah_historical_backfill",
+                "inserted_count": total_inserted,
+                "company_id": company_id
+            })
+        except Exception as p_err:
+            logger.error(f"[Madinah Backfill] Parquet update notice: {p_err}")
+
+    logger.info(f"[Madinah Backfill] Complete! Inserted: {total_inserted}, Skipped: {total_skipped}, Pages scanned: {page}.")
+    return {
+        "status": "complete",
+        "inserted": total_inserted,
+        "skipped": total_skipped,
+        "pages_scanned": page
+    }

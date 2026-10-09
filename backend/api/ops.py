@@ -145,7 +145,24 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
     if h.get("last_token_refresh_error"):
         issues.append(f"Last session renewal failed: {h['last_token_refresh_error']}")
         state = "warning" if state == "ok" else state
-    out = {"platform": platform, "state": state, "issues": issues, "token": token, "sync": h}
+    sync_data = dict(h)
+    if not sync_data.get("last_ingested_at") or str(sync_data.get("last_ingested_at")).lower() in ("nan", "none", ""):
+        try:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=2.0)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
+                FROM donations
+                WHERE company_id = 'iqra' AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
+            """, (f"%{platform}%",))
+            row = cursor.fetchone()
+            if row and row[0] and "nan" not in str(row[0]).lower():
+                sync_data["last_ingested_at"] = row[0]
+            conn.close()
+        except Exception:
+            pass
+
+    out = {"platform": platform, "state": state, "issues": issues, "token": token, "sync": sync_data}
     if live:
         out["live_check"] = _live_check(platform)
         if not out["live_check"]["ok"]:
