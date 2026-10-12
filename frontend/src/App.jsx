@@ -306,26 +306,56 @@ export default function App() {
     return () => clearInterval(t);
   }, [isSuperAdmin]);
 
-  // ---- "New data available" notice: poll the cheap data-version token (works across all workers) ----
+  // ---- "New data available" notice: the data-version token changes when ANY process writes data (works across
+  // all workers). Pushed live over Server-Sent Events; if the stream can't connect we fall back to polling.
   const [dataUpdated, setDataUpdated] = useState(false);
   const versionTokenRef = useRef(null);
   useEffect(() => {
     if (!user) return undefined;
     versionTokenRef.current = null;
     setDataUpdated(false);
+    const onToken = (token) => {
+      if (!token) return;
+      if (versionTokenRef.current && versionTokenRef.current !== token) {
+        setDataUpdated(true);
+        window.dispatchEvent(new CustomEvent('crm:data-changed', { detail: { company: activeCompany, token } }));
+      }
+      versionTokenRef.current = token;
+    };
     const check = () => fetch(`${API_BASE_URL}/api/cache/versions?company_id=${encodeURIComponent(activeCompany)}`)
       .then(r => (r.ok ? r.json() : null))
-      .then(d => {
-        if (!d?.token) return;
-        if (versionTokenRef.current && versionTokenRef.current !== d.token) setDataUpdated(true);
-        versionTokenRef.current = d.token;
-      })
+      .then(d => onToken(d?.token))
       .catch(() => {});
-    check();
-    const t = setInterval(check, 60000);
+
+    let pollTimer = null;
+    const startPolling = () => {
+      if (pollTimer) return;
+      check();
+      pollTimer = setInterval(check, 60000);
+    };
+    let source = null;
+    let failures = 0;
+    const sessionToken = localStorage.getItem('analytics_token');
+    if (typeof window.EventSource === 'function' && sessionToken) {
+      source = new EventSource(`${API_BASE_URL}/api/stream/versions?company_id=${encodeURIComponent(activeCompany)}&token=${encodeURIComponent(sessionToken)}`);
+      source.addEventListener('version', (e) => {
+        failures = 0;
+        try { onToken(JSON.parse(e.data).token); } catch { /* ignore malformed event */ }
+      });
+      source.onerror = () => {
+        failures += 1;
+        if (failures >= 3) { source.close(); source = null; startPolling(); }  // e.g. a proxy that blocks streaming
+      };
+    } else {
+      startPolling();
+    }
     const onFocus = () => check();
     window.addEventListener('focus', onFocus);
-    return () => { clearInterval(t); window.removeEventListener('focus', onFocus); };
+    return () => {
+      if (source) source.close();
+      if (pollTimer) clearInterval(pollTimer);
+      window.removeEventListener('focus', onFocus);
+    };
   }, [user, activeCompany, dataVersion]);
 
   const handleLoginSuccess = (userData, accessToken) => {

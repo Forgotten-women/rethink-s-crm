@@ -199,10 +199,212 @@ def resolve_classification(
     return meta
 
 
+_MASTER_IMPACTS_CACHE: Optional[Dict[str, Any]] = None
+
+
+def get_master_impact_map() -> Dict[str, Any]:
+    """
+    Returns the cached dictionary mapping GiveBrite impact IDs to their
+    associated campaign name, slug, giving level title, and amount.
+    """
+    global _MASTER_IMPACTS_CACHE
+    if _MASTER_IMPACTS_CACHE is not None:
+        return _MASTER_IMPACTS_CACHE
+
+    impacts_path = os.path.join(BASE_DIR, "data_cache", "givebrite_impacts.json")
+    if os.path.exists(impacts_path):
+        try:
+            with open(impacts_path, "r", encoding="utf-8") as f:
+                _MASTER_IMPACTS_CACHE = json.load(f)
+                return _MASTER_IMPACTS_CACHE
+        except Exception as ex:
+            logger.warning(f"Failed to load givebrite_impacts.json: {ex}")
+
+    _MASTER_IMPACTS_CACHE = {}
+    return _MASTER_IMPACTS_CACHE
+
+
+def invalidate_master_impacts_cache() -> None:
+    """Clears the in-memory master impact catalog cache."""
+    global _MASTER_IMPACTS_CACHE
+    _MASTER_IMPACTS_CACHE = None
+
+
+def extract_givebrite_campaign_and_giving_level(
+    doc: Dict[str, Any],
+    det: Optional[Dict[str, Any]] = None,
+    cursor: Optional[Any] = None,
+    master_impacts: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Robust extraction of GiveBrite campaign name, slug, URL, and giving level title/amount.
+    Resolves multi-tenant widgets (dhulhijjah-giving, ramadhan-giving), cart impact IDs,
+    comments/notes intent, and parent recurring subscription links.
+    """
+    if det is None:
+        det = doc
+
+    if master_impacts is None:
+        master_impacts = get_master_impact_map()
+
+    # 1. Direct campaign object
+    camp_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (doc.get("campaign") if isinstance(doc.get("campaign"), dict) else {})
+    campaign_name = str(camp_obj.get("name") or "").strip()
+    campaign_slug = str(camp_obj.get("slug") or "").strip()
+    campaign_url = f"https://donate.iqracharity.org/{campaign_slug}" if campaign_slug else ""
+
+    # 2. Extract cart items chosen by donor
+    giving_level_title = ""
+    giving_level_amount = 0.0
+    giving_level_qty = 1.0
+
+    cart_obj = det.get("cart") if isinstance(det.get("cart"), dict) else (doc.get("cart") if isinstance(doc.get("cart"), dict) else {})
+    cart_items = cart_obj.get("items", []) if isinstance(cart_obj, dict) else []
+    chosen_impact_id = None
+    if cart_items and isinstance(cart_items, list) and len(cart_items) > 0 and isinstance(cart_items[0], dict):
+        first_item = cart_items[0]
+        chosen_impact_id = str(first_item.get("impact") or "").strip()
+        try:
+            giving_level_amount = float(first_item.get("amount") or 0.0)
+        except (ValueError, TypeError):
+            giving_level_amount = 0.0
+        try:
+            giving_level_qty = float(first_item.get("qty") or 1.0)
+        except (ValueError, TypeError):
+            giving_level_qty = 1.0
+
+    # Match giving level from camp_obj impacts first
+    impacts = camp_obj.get("impacts", []) if isinstance(camp_obj, dict) else []
+    if chosen_impact_id and impacts and isinstance(impacts, list):
+        for imp in impacts:
+            if isinstance(imp, dict) and str(imp.get("_id") or "").strip() == chosen_impact_id:
+                giving_level_title = str(imp.get("name") or "").strip()
+                break
+
+    # If campaign name or giving level is missing, check master impact catalog
+    if chosen_impact_id and (not campaign_name or not giving_level_title) and master_impacts:
+        if chosen_impact_id in master_impacts:
+            imp_info = master_impacts[chosen_impact_id]
+            if not campaign_name and imp_info.get("campaign_name"):
+                campaign_name = imp_info["campaign_name"].strip()
+                campaign_slug = imp_info.get("campaign_slug", "").strip()
+                if campaign_slug:
+                    campaign_url = f"https://donate.iqracharity.org/{campaign_slug}"
+            if not giving_level_title and imp_info.get("giving_level"):
+                giving_level_title = imp_info["giving_level"].strip()
+            if giving_level_amount == 0.0 and imp_info.get("amount"):
+                try:
+                    giving_level_amount = float(imp_info["amount"])
+                except (ValueError, TypeError):
+                    pass
+
+    # 3. Check Multi-Tenant Widgets if campaign still missing
+    created_at_str = str(det.get("created_at") or doc.get("created_at") or "")
+    tenants = det.get("x_tenant_id") or doc.get("x_tenant_id") or []
+    if isinstance(tenants, str):
+        tenants = [tenants]
+    elif not isinstance(tenants, list):
+        tenants = []
+
+    if not campaign_name:
+        if any(t in ("dhulhijjah-giving", "dhgx") for t in tenants):
+            campaign_name = "🌙The Best 10 Days | HOPE WIDOWS VILLAGE & ABNAA AS SHAAM SCHOOL🏡"
+            campaign_slug = "the-best-10-days"
+            campaign_url = "https://donate.iqracharity.org/the-best-10-days"
+        elif any(t in ("ramadhan-giving", "rgx") for t in tenants):
+            if created_at_str.startswith("2026") or created_at_str.startswith("2025"):
+                campaign_name = "RAMADAN 2026: IFTAR500 IS BACK!"
+                campaign_slug = "ramadan2026"
+                campaign_url = "https://donate.iqracharity.org/ramadan2026"
+            elif created_at_str.startswith("2024"):
+                campaign_name = "RAMADAN 2024"
+                campaign_slug = "ramadan-2024"
+                campaign_url = "https://donate.iqracharity.org/ramadan-2024"
+            else:
+                campaign_name = "Iftaar Campaign"
+                campaign_slug = "iftaar-campaign"
+                campaign_url = "https://donate.iqracharity.org/iftaar-campaign"
+
+    # 4. Check comments/notes intent
+    if not campaign_name:
+        comments = det.get("comment") or doc.get("comment") or []
+        comm_text = ""
+        if isinstance(comments, list):
+            comm_text = " ".join([str(c.get("message", "")) for c in comments if isinstance(c, dict)]).upper()
+        elif isinstance(comments, str):
+            comm_text = comments.upper()
+
+        if "EDUCATION" in comm_text:
+            campaign_name = "STEM SCHOOL"
+            campaign_slug = "stem-school"
+            campaign_url = "https://donate.iqracharity.org/stem-school"
+            if not giving_level_title:
+                giving_level_title = "Education Category"
+        elif "UMM LUTFI" in comm_text:
+            campaign_name = "DAR Al-AFIYA, DAMASCUS: First-of-its kind Sanctuary for Survivors, Widows & Orphans"
+            campaign_slug = "dar-al-afiya-damascus"
+            campaign_url = "https://donate.iqracharity.org/dar-al-afiya-damascus"
+            if not giving_level_title:
+                giving_level_title = "Ref: Umm Lutfi"
+
+    # 5. Check subscription inheritance from database
+    gw_resp = det.get("gateway_response") if isinstance(det.get("gateway_response"), dict) else (doc.get("gateway_response") if isinstance(doc.get("gateway_response"), dict) else {})
+    sub_id = str(gw_resp.get("subscription_id") or det.get("subscription_id") or doc.get("subscription_id") or "").strip()
+    if not campaign_name and sub_id and cursor:
+        try:
+            cursor.execute("""
+                SELECT "Campaign Name", "Campaign URL", "Giving Level Title"
+                FROM donations
+                WHERE subscription_id = ? AND "Campaign Name" IS NOT NULL AND "Campaign Name" != '' AND "Campaign Name" != 'nan'
+                ORDER BY "Created Date (UTC)" ASC
+                LIMIT 1
+            """, (sub_id,))
+            parent_row = cursor.fetchone()
+            if parent_row and parent_row[0]:
+                campaign_name = parent_row[0].strip()
+                if parent_row[1] and not campaign_url:
+                    campaign_url = parent_row[1].strip()
+                if parent_row[2] and not giving_level_title:
+                    giving_level_title = parent_row[2].strip()
+        except Exception as sub_err:
+            logger.debug(f"Subscription inheritance query notice: {sub_err}")
+
+    # 6. Fallback if giving level was passed as string (e.g. from webhook or CSV import)
+    if not giving_level_title:
+        raw_gl = det.get("giving_level_title") or det.get("giving_level") or doc.get("giving_level_title") or doc.get("giving_level")
+        if raw_gl and str(raw_gl).strip() and str(raw_gl).strip().lower() not in ("none", "nan", ""):
+            giving_level_title = str(raw_gl).strip()
+            if giving_level_amount == 0.0:
+                try:
+                    giving_level_amount = float(det.get("amount", doc.get("amount", 0.0)) or 0.0)
+                except (ValueError, TypeError):
+                    pass
+
+    # 7. Fallback campaign mapping based on giving level keyword
+    if not campaign_name and giving_level_title:
+        if "Most Needy" in giving_level_title:
+            campaign_name = "Most Needy Appeal"
+        elif "Shelter" in giving_level_title:
+            campaign_name = "Shelter Gaza’s Displaced Families with Lauren"
+        elif "Food Pack" in giving_level_title:
+            campaign_name = "“Feed a Family in East Africa – Just £35 Provides a Full Food Pack for 5 People.”"
+
+    return {
+        "campaign_name": campaign_name,
+        "campaign_slug": campaign_slug,
+        "campaign_url": campaign_url,
+        "giving_level_title": giving_level_title,
+        "giving_level_amount": giving_level_amount,
+        "giving_level_qty": giving_level_qty,
+        "subscription_id": sub_id
+    }
+
+
 def build_donation_record(
     doc: Dict[str, Any],
     det: Optional[Dict[str, Any]] = None,
     classification_meta: Optional[Dict[str, Any]] = None,
+    extracted_campaign: Optional[Dict[str, Any]] = None,
     company_id: str = "iqra"
 ) -> Dict[str, Any]:
     """
@@ -257,44 +459,22 @@ def build_donation_record(
     if not charge_id and payment_intent_id:
         charge_id = payment_intent_id
 
-    # Campaign & Giving Level
-    camp_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (doc.get("campaign") if isinstance(doc.get("campaign"), dict) else {})
-    campaign_name = str(camp_obj.get("name", "")).strip()
-    campaign_slug = str(camp_obj.get("slug", "")).strip()
-    campaign_url = f"https://donate.iqracharity.org/{campaign_slug}" if campaign_slug else ""
-
-    # Giving Level extraction: check cart items explicitly chosen by donor!
-    giving_level_title = ""
-    giving_level_amount = 0.0
-    giving_level_qty = 1.0
-    cart_obj = det.get("cart") if isinstance(det.get("cart"), dict) else (doc.get("cart") if isinstance(doc.get("cart"), dict) else {})
-    cart_items = cart_obj.get("items", []) if isinstance(cart_obj, dict) else []
-    chosen_impact_id = None
-    if cart_items and isinstance(cart_items, list) and len(cart_items) > 0 and isinstance(cart_items[0], dict):
-        first_item = cart_items[0]
-        chosen_impact_id = str(first_item.get("impact") or "").strip()
-        try:
-            giving_level_amount = float(first_item.get("amount") or 0.0)
-        except (ValueError, TypeError):
-            giving_level_amount = 0.0
-        try:
-            giving_level_qty = float(first_item.get("qty") or 1.0)
-        except (ValueError, TypeError):
-            giving_level_qty = 1.0
-
-    impacts = camp_obj.get("impacts", []) if isinstance(camp_obj, dict) else []
-    if chosen_impact_id and impacts and isinstance(impacts, list):
-        for imp in impacts:
-            if isinstance(imp, dict) and str(imp.get("_id") or "").strip() == chosen_impact_id:
-                giving_level_title = str(imp.get("name") or "").strip()
-                break
-
-    # Fallback if giving level was passed as string (e.g. from webhook or CSV import)
-    if not giving_level_title:
-        raw_gl = det.get("giving_level_title") or det.get("giving_level") or doc.get("giving_level_title") or doc.get("giving_level")
-        if raw_gl and str(raw_gl).strip() and str(raw_gl).strip().lower() not in ("none", "nan", ""):
-            giving_level_title = str(raw_gl).strip()
-            giving_level_amount = amount_val
+    # Campaign & Giving Level (Robust resolution)
+    if extracted_campaign is not None:
+        campaign_name = str(extracted_campaign.get("campaign_name") or "").strip()
+        campaign_slug = str(extracted_campaign.get("campaign_slug") or "").strip()
+        campaign_url = str(extracted_campaign.get("campaign_url") or "").strip()
+        giving_level_title = str(extracted_campaign.get("giving_level_title") or "").strip()
+        giving_level_amount = float(extracted_campaign.get("giving_level_amount") or 0.0)
+        giving_level_qty = float(extracted_campaign.get("giving_level_qty") or 1.0)
+    else:
+        ext = extract_givebrite_campaign_and_giving_level(doc, det=det)
+        campaign_name = ext["campaign_name"]
+        campaign_slug = ext["campaign_slug"]
+        campaign_url = ext["campaign_url"]
+        giving_level_title = ext["giving_level_title"]
+        giving_level_amount = ext["giving_level_amount"]
+        giving_level_qty = ext["giving_level_qty"]
 
     # Billing Details
     billing = det.get("billing") if isinstance(det.get("billing"), dict) else {}
@@ -452,7 +632,7 @@ def build_donation_record(
         "Lifetime Donor Classification": lifetime_class,
         "Transaction Donor Classification": txn_class,
         "Payment Frequency": det.get("frequency", "one-off"),
-        "subscription_id": gw_resp.get("subscription_id"),
+        "subscription_id": gw_resp.get("subscription_id") or det.get("subscription_id") or doc.get("subscription_id") or "",
         "_id": mysql_id if mysql_id else doc_id,
         "charge_id": charge_id,
         "Customer Ref": payment_intent_id or "",
@@ -609,17 +789,16 @@ def ingest_givebrite_donations(
             except Exception as det_ex:
                 logger.warning(f"Could not fetch detail for {doc_id}: {det_ex}")
 
-        # Extract campaign and giving level
-        camp_obj = (det or doc).get("campaign") if isinstance((det or doc).get("campaign"), dict) else {}
-        c_name = camp_obj.get("name", "")
-        impacts = camp_obj.get("impacts", []) if isinstance(camp_obj, dict) else []
-        g_level = impacts[0].get("name", "") if (impacts and isinstance(impacts, list) and isinstance(impacts[0], dict)) else ""
+        # Extract campaign and giving level robustly
+        extracted = extract_givebrite_campaign_and_giving_level(doc, det=det, cursor=cursor)
+        c_name = extracted["campaign_name"]
+        g_level = extracted["giving_level_title"]
 
         # Classification resolution
         cls_meta = resolve_classification(cursor, c_name, g_level, company_id=company_id)
 
         # Build normalized record
-        rec = build_donation_record(doc, det=det, classification_meta=cls_meta, company_id=company_id)
+        rec = build_donation_record(doc, det=det, classification_meta=cls_meta, extracted_campaign=extracted, company_id=company_id)
         records_to_insert.append(rec)
 
     # Step 3: Insert new records into SQLite

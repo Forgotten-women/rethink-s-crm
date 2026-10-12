@@ -197,7 +197,19 @@ function StatusTab() {
                   <span>Session renewed</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_token_refresh_at || p.token.retrieved_at)}</span>
                   <span>Last new donation</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ingested_at)}</span>
                 </div>
-                {p.sync?.last_error && <div className="text-[11px] text-slate-500">Last error ({fmtAge(p.sync.last_error_at)}): {p.sync.last_error}</div>}
+                {p.sync?.last_error && (
+                  <div className="text-[11px]">
+                    {p.sync?.consecutive_failures === 0 ? (
+                      <span className="text-slate-400 dark:text-slate-500">
+                        Resolved · Last transient issue ({fmtAge(p.sync.last_error_at)}): {p.sync.last_error}
+                      </span>
+                    ) : (
+                      <span className="text-rose-600 dark:text-rose-400 font-medium">
+                        Last error ({fmtAge(p.sync.last_error_at)}): {p.sync.last_error}
+                      </span>
+                    )}
+                  </div>
+                )}
                 {p.live_check && (
                   <div className={`text-[11px] font-semibold ${p.live_check.ok ? 'text-emerald-600' : 'text-rose-600'}`}>
                     Live check: {p.live_check.ok ? 'API answered normally' : `failed (${p.live_check.http_status || 'error'}) ${p.live_check.detail || ''}`}

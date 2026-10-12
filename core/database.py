@@ -1,4 +1,5 @@
 from config.settings import PARQUET_COMPRESSION
+import os
 import sqlite3
 import threading
 import time
@@ -337,6 +338,11 @@ def sync_to_cloud_async(data_df, mode="append", max_retries=3):
     via high-speed native COPY stream with automatic retries and backoff.
     """
     if not DATABASE_URL or "postgres" not in DATABASE_URL:
+        return
+    # Off by default: re-sending the whole donations table (~150k rows x 193 columns) to the Supabase database on
+    # every admin tag rename/delete exhausted its Disk IO budget. Off-site safety now comes from the nightly
+    # backup to Supabase Storage (core/nightly_backup.py). Set CLOUD_TABLE_SYNC_ENABLED=1 to bring it back.
+    if os.environ.get("CLOUD_TABLE_SYNC_ENABLED", "0").strip().lower() not in ("1", "true", "yes", "on"):
         return
 
     def _sync_worker(df, m):

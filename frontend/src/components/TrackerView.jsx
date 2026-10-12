@@ -3,7 +3,7 @@ import {
   Target, ShieldAlert, CheckCircle2, AlertCircle, Edit3, Save, 
   UserCheck, Flame, HeartHandshake, Plus, Search, Filter, 
   ExternalLink, FileText, Video, Folder, Mail, Phone, RefreshCw, 
-  Trash2, X, Send, Eye, MessageSquare, Layers, Settings,
+  Trash2, X, Send, Eye, MessageSquare, Layers, Settings, Upload,
   Check, ArrowRight, UserPlus, Users, Link2, Copy, Sparkles,
   Calendar, Award, Inbox, Clock, ChevronRight, ChevronLeft,
   ChevronsLeft, ChevronsRight, ChevronDown, ChevronUp, Code, RotateCcw,
@@ -14,6 +14,8 @@ import AllocationDonorsEditor from './tracker/AllocationDonorsEditor';
 import SponsorshipDonorPanel from './tracker/SponsorshipDonorPanel';
 import EmailDispatcherModal from './tracker/EmailDispatcherModal';
 import EmailQueueView from './tracker/EmailQueueView';
+import BeneficiaryImportModal from './tracker/BeneficiaryImportModal';
+import BulkEmailModal from './tracker/BulkEmailModal';
 import TrackerFilterBar from './tracker/TrackerFilterBar';
 import { toDraftDonor, donorKeyFor, readFiltersFromUrl, writeFiltersToUrl, filtersToParams } from './tracker/trackerUtils';
 
@@ -204,7 +206,13 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
   // --- TAB 1 & 2 STATE: BENEFICIARIES & ALLOCATIONS ---
   const [beneficiaries, setBeneficiaries] = useState([]);
-  const [allocations, setAllocations] = useState([]);
+  const [allocations, setAllocationsRaw] = useState([]);
+  // The API reports cycles as due_for_renewal / grace_period; the page's pills, badges and actions use due / grace.
+  const CYCLE_ALIASES = { due_for_renewal: 'due', grace_period: 'grace' };
+  const normalizeCycles = (list) => (Array.isArray(list)
+    ? list.map(a => (a && CYCLE_ALIASES[a.cycle_status] ? { ...a, cycle_status: CYCLE_ALIASES[a.cycle_status] } : a))
+    : list);
+  const setAllocations = (next) => setAllocationsRaw(prev => normalizeCycles(typeof next === 'function' ? next(prev) : next));
   const [qualifyingDonors, setQualifyingDonors] = useState([]);
   const [qualifyingCampaigns, setQualifyingCampaigns] = useState([]);
   const [allocationLeftTab, setAllocationLeftTab] = useState('donors'); // 'donors' | 'campaigns'
@@ -246,6 +254,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
   // Modals State
   const [showAddBeneficiaryModal, setShowAddBeneficiaryModal] = useState(false);
+  const [showBeneficiaryImport, setShowBeneficiaryImport] = useState(false);
+  const [showBulkEmail, setShowBulkEmail] = useState(false);
   const [editingBeneficiary, setEditingBeneficiary] = useState(null);
   const [beneficiaryForm, setBeneficiaryForm] = useState({
     sponsorship_type: 'Orphan',
@@ -634,6 +644,21 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const loadBeneficiariesAndAllocations = () => {
     setLoadingData(true);
 
+    // One round trip for the whole page (same data and caches as the six separate endpoints below);
+    // if it fails for any reason, fall back to the separate requests.
+    const pageParams = new URLSearchParams({
+      company_id: activeCompany,
+      sponsorship_type: selectedDonorType,
+      ben: listParams(benFilters),
+      alloc: listParams(allocFilters)
+    });
+    fetch(`${API_BASE_URL}/api/tracker/page-data?${pageParams.toString()}`)
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`page-data ${r.status}`))))
+      .then(d => applyPageData([d.beneficiaries, d.allocations, d.qualifying_donors, d.qualifying_campaigns, d.outlook_status, d.email_templates]))
+      .catch(() => loadBeneficiariesAndAllocationsSeparately());
+  };
+
+  const loadBeneficiariesAndAllocationsSeparately = () => {
     Promise.all([
       fetch(`${API_BASE_URL}/api/tracker/beneficiaries?${listParams(benFilters)}`).then(r => r.json()),
       fetch(`${API_BASE_URL}/api/tracker/allocations?${listParams(allocFilters)}`).then(r => r.json()),
@@ -642,26 +667,28 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       fetch(`${API_BASE_URL}/api/tracker/outlook/status?company_id=${activeCompany}`).then(r => r.json()),
       fetch(`${API_BASE_URL}/api/tracker/email-templates?company_id=${activeCompany}`).then(r => r.json())
     ])
-      .then(([bData, aData, qData, cData, oData, tData]) => {
-        setBeneficiaries(bData?.beneficiaries || []);
-        setAllocations(aData?.allocations || []);
-        setQualifyingDonors(qData?.donors || []);
-        setQualifyingCampaigns(cData?.campaigns || []);
-        setOutlookStatus(oData || null);
-        if (oData?.tenant_id) {
-          setOutlookCreds(prev => ({
-            ...prev,
-            tenant_id: oData.tenant_id || '76312bf2-382f-4ef6-8466-97c26aa8c92f',
-            client_id: prev.client_id || (oData.client_id_set ? 'a068a95b-b576-42b1-8f8c-530d76fc40b7' : '')
-          }));
-        }
-        setEmailTemplates(tData?.templates || []);
-        setLoadingData(false);
-      })
+      .then(applyPageData)
       .catch(err => {
         console.error('Error fetching tracker data:', err);
         setLoadingData(false);
       });
+  };
+
+  const applyPageData = ([bData, aData, qData, cData, oData, tData]) => {
+    setBeneficiaries(bData?.beneficiaries || []);
+    setAllocations(aData?.allocations || []);
+    setQualifyingDonors(qData?.donors || []);
+    setQualifyingCampaigns(cData?.campaigns || []);
+    setOutlookStatus(oData || null);
+    if (oData?.tenant_id) {
+      setOutlookCreds(prev => ({
+        ...prev,
+        tenant_id: oData.tenant_id || '76312bf2-382f-4ef6-8466-97c26aa8c92f',
+        client_id: prev.client_id || (oData.client_id_set ? 'a068a95b-b576-42b1-8f8c-530d76fc40b7' : '')
+      }));
+    }
+    setEmailTemplates(tData?.templates || []);
+    setLoadingData(false);
   };
 
   const loadTrackerStats = () => {
@@ -2054,6 +2081,16 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     setAllocationPage(1);
   }, [allocationTypeFilter, allocationRenewalFilter, allocations.length]);
 
+  const [allocSearchDraft, setAllocSearchDraft] = useState(allocFilters?.search || '');
+  useEffect(() => { setAllocSearchDraft(allocFilters?.search || ''); }, [allocFilters?.search]);
+  useEffect(() => {
+    if ((allocSearchDraft || '') === (allocFilters?.search || '')) return undefined;
+    const t = setTimeout(() => setAllocFilters(prev => ({ ...prev, search: allocSearchDraft })), 350);
+    return () => clearTimeout(t);
+  }, [allocSearchDraft]);
+  const allocActiveFilterCount = Object.entries(allocFilters || {})
+    .filter(([, v]) => v !== '' && v !== undefined && v !== null && v !== 'all' && v !== false).length;
+
   const filteredAllocations = useMemo(() => {
     return allocations.filter(a => {
       if (allocationTypeFilter === 'individual' && a.allocation_type === 'campaign') return false;
@@ -2396,6 +2433,14 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 <Plus className="w-4 h-4" />
                 Add Beneficiary
               </button>
+              <button
+                type="button"
+                onClick={() => setShowBeneficiaryImport(true)}
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-all"
+              >
+                <Upload className="w-4 h-4" />
+                Bulk upload
+              </button>
             </div>
           </div>
 
@@ -2730,6 +2775,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {/* ========================================================= */}
       {activeTab === 'allocations' && (
         <div className="flex flex-col gap-6">
+          <div id="alloc-filter-bar" className="scroll-mt-4" />
           <TrackerFilterBar values={allocFilters} onChange={setAllocFilters} resultCount={allocations.length}
             fields={[
               // General primary filters
@@ -3780,6 +3826,47 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       Lapsed {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${allocations.filter(a => a.cycle_status === 'lapsed').length})`}
                     </button>
                   </div>
+
+                  {/* Search inside the card (server-side: donor name / email / phone, beneficiary, project code, campaign) */}
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={allocSearchDraft}
+                        onChange={e => setAllocSearchDraft(e.target.value)}
+                        placeholder="Search donor, email, phone, beneficiary, project code or campaign"
+                        aria-label="Search allocations"
+                        className="w-full pl-8 pr-8 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-800 dark:text-slate-200 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                      {allocSearchDraft && (
+                        <button type="button" onClick={() => setAllocSearchDraft('')} aria-label="Clear search"
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    <button type="button"
+                      onClick={() => document.getElementById('alloc-filter-bar')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                      className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">
+                      <Filter className="w-3.5 h-3.5" />
+                      More filters{allocActiveFilterCount > 0 ? ` (${allocActiveFilterCount})` : ''}
+                    </button>
+                    <button type="button" onClick={() => setShowBulkEmail(true)}
+                      className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold">
+                      <Send className="w-3.5 h-3.5" />
+                      Bulk email
+                    </button>
+                  </div>
+                  {(allocActiveFilterCount > 0 || allocationTypeFilter !== 'all' || allocationRenewalFilter !== 'all') && !loadingData && (
+                    <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                      <span>Showing {filteredAllocations.length} matching allocation{filteredAllocations.length === 1 ? '' : 's'}</span>
+                      <button type="button" className="font-semibold text-blue-600 hover:underline"
+                        onClick={() => { setAllocSearchDraft(''); setAllocFilters({}); setAllocationTypeFilter('all'); setAllocationRenewalFilter('all'); }}>
+                        Clear all
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex flex-col gap-3 mt-3 max-h-[620px] overflow-y-auto pr-1">
@@ -5755,6 +5842,26 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {/* ========================================================= */}
       {/* MODAL 1: ADD / EDIT BENEFICIARY */}
       {/* ========================================================= */}
+      {showBulkEmail && (
+        <BulkEmailModal
+          companyId={activeCompany}
+          themes={Object.values(CHARITY_THEMES_PRESETS)}
+          templates={emailTemplates}
+          variables={AVAILABLE_VARIABLES}
+          outlookStatus={outlookStatus}
+          onClose={() => setShowBulkEmail(false)}
+          onSent={() => loadBeneficiariesAndAllocations()}
+        />
+      )}
+
+      {showBeneficiaryImport && (
+        <BeneficiaryImportModal
+          companyId={activeCompany}
+          onClose={() => setShowBeneficiaryImport(false)}
+          onImported={() => loadBeneficiariesAndAllocations()}
+        />
+      )}
+
       {showAddBeneficiaryModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
           <div className="bg-white dark:bg-slate-900 w-full max-w-lg rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl p-6 flex flex-col gap-4 animate-in fade-in zoom-in duration-150">

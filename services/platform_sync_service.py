@@ -367,7 +367,8 @@ class PlatformSyncService:
         all_donations = []
         total_inserted = 0
         total_skipped = 0
-        latest_http_status = 200
+        latest_http_status = None
+        fetch_success = False
 
         while True:
             url_madinah_donations = (
@@ -375,18 +376,33 @@ class PlatformSyncService:
                 f"?startDate={start_window}&endDate={today}&page={page}&limit=100"
             )
             try:
-                r = self.session.get(url_madinah_donations, headers=headers, timeout=15)
-                if r.status_code == 401:
-                    logger.warning("[Madinah] Received HTTP 401. Performing immediate token renewal...")
-                    auth_header = self.ensure_madinah_token(force_refresh=True)
-                    headers["Authorization"] = auth_header
-                    r = self.session.get(url_madinah_donations, headers=headers, timeout=15)
+                r = None
+                for attempt in range(2):
+                    try:
+                        r = self.session.get(url_madinah_donations, headers=headers, timeout=(5, 35))
+                        if r.status_code == 401:
+                            logger.warning("[Madinah] Received HTTP 401. Performing immediate token renewal...")
+                            auth_header = self.ensure_madinah_token(force_refresh=True)
+                            headers["Authorization"] = auth_header
+                            r = self.session.get(url_madinah_donations, headers=headers, timeout=(5, 35))
+                        break
+                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+                        if attempt == 0:
+                            logger.warning(f"Madinah donations fetch transient network issue on page {page} ({net_err}), retrying in 2s...")
+                            time.sleep(2)
+                            continue
+                        else:
+                            raise net_err
+
+                if r is None:
+                    break
 
                 latest_http_status = r.status_code
                 if r.status_code == 200:
                     data = r.json().get("data", {})
                     raw_donations = data.get("donations", [])
                     if not raw_donations:
+                        fetch_success = True
                         break
                     all_donations.extend(raw_donations)
                     result["status_counts"] = data.get("statusCounts", {})
@@ -399,22 +415,26 @@ class PlatformSyncService:
                     pagination = data.get("pagination", {})
                     total_pages = pagination.get("pages", 1)
                     if page >= total_pages:
+                        fetch_success = True
                         break
                     page += 1
                     time.sleep(0.1)
                 else:
                     logger.warning(f"Madinah donations HTTP {r.status_code}")
                     self._record_cycle("madinah", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
+                    fetch_success = False
                     break
             except Exception as ex:
                 logger.error(f"Madinah donations fetch error: {ex}")
+                latest_http_status = None
+                fetch_success = False
                 self._record_cycle("madinah", False, None, f"Donations fetch error: {ex}")
                 break
 
         result["donations_latest"] = all_donations[:50]
         result["donations_ingested"] = total_inserted
         result["donations_skipped"] = total_skipped
-        if latest_http_status == 200:
+        if fetch_success and latest_http_status == 200:
             if total_inserted > 0:
                 logger.info(f"[Madinah Live Ingest] Ingested {total_inserted} new donations into CRM database & Parquet.")
             self._record_cycle("madinah", True, 200, None, total_inserted, len(all_donations))
@@ -426,7 +446,7 @@ class PlatformSyncService:
             r = self.session.get(
                 f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest/stats",
                 headers=headers,
-                timeout=12
+                timeout=(5, 25)
             )
             if r.status_code == 200:
                 data = r.json().get("data", {})
@@ -448,7 +468,7 @@ class PlatformSyncService:
             r = self.session.get(
                 f"{MADINAH_APIM_BASE}/dashboard-server/api/v1/user/dashboard/overview?startDate={today}&endDate={today}&dateValue=today&dateName=Today",
                 headers=headers,
-                timeout=12
+                timeout=(5, 25)
             )
             if r.status_code == 200:
                 data = r.json().get("data", {})
@@ -462,7 +482,7 @@ class PlatformSyncService:
                 r = self.session.get(
                     f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/dashboard?page=1&limit=50&sortBy=createdAt&sortOrder=desc",
                     headers=headers,
-                    timeout=15
+                    timeout=(5, 25)
                 )
                 if r.status_code == 200:
                     result["campaigns"] = r.json().get("data", {}).get("campaigns", [])
@@ -548,18 +568,44 @@ class PlatformSyncService:
         except Exception as ex:
             logger.error(f"Givebrite collection stats error: {ex}")
 
-        # 4. Campaign List (In deep sync)
+        # 4. Campaign List & Impact Catalog Refresh (In deep sync)
         if is_deep:
             try:
-                r = self.session.get(
-                    f"https://api.givebrite.com/v1/campaign?filter_by=charity&value={GIVEBRITE_CHARITY_ID}&limit=50&page=1",
-                    headers={"Origin": "https://donate.iqracharity.org", "Referer": "https://donate.iqracharity.org/"},
-                    timeout=15
-                )
+                camp_url = f"{GIVEBRITE_API_BASE}/campaign?charity_id={GIVEBRITE_CHARITY_ID}&page=1&limit=100"
+                camp_headers = dict(headers)
+                camp_headers["x-tenant-id"] = "gbx"
+                r = self.session.get(camp_url, headers=camp_headers, timeout=(5, 25))
                 if r.status_code == 200:
-                    result["campaigns"] = r.json().get("docs", [])
+                    camp_data = r.json()
+                    docs = camp_data.get("docs", [])
+                    result["campaigns"] = docs
+
+                    # Refresh master impacts catalog
+                    impact_catalog = {}
+                    for c in docs:
+                        c_name = str(c.get("name") or "").strip()
+                        c_slug = str(c.get("slug") or "").strip()
+                        for imp in c.get("impacts", []):
+                            if isinstance(imp, dict):
+                                imp_id = str(imp.get("_id") or "").strip()
+                                if imp_id:
+                                    impact_catalog[imp_id] = {
+                                        "campaign_name": c_name,
+                                        "campaign_slug": c_slug,
+                                        "giving_level": str(imp.get("name") or "").strip(),
+                                        "amount": imp.get("amount")
+                                    }
+                    if impact_catalog:
+                        impacts_file = os.path.join(DATA_CACHE_DIR, "givebrite_impacts.json")
+                        atomic_write_json(impacts_file, impact_catalog)
+                        try:
+                            from core.givebrite_ingestion import invalidate_master_impacts_cache
+                            invalidate_master_impacts_cache()
+                        except Exception:
+                            pass
+                        logger.info(f"[GiveBrite Deep Sync] Refreshed master impact catalog with {len(impact_catalog)} impacts across {len(docs)} campaigns.")
             except Exception as ex:
-                logger.error(f"Givebrite campaigns error: {ex}")
+                logger.error(f"Givebrite campaigns/impacts sync error: {ex}")
 
         return result
 

@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, tracker, webhooks
+from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, stream, tracker, webhooks
 
 app = FastAPI(
     title="Crowdfunding Analytics & Enterprise CRM API",
@@ -39,7 +39,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # Audit trail: every change (POST/PUT/PATCH/DELETE), every server error and every denied request is
 # recorded via core.event_log (local table + Axiom). Read-only traffic is not logged.
-_AUDIT_SKIP_PREFIXES = ("/api/tracker/email-tracking/pixel/", "/api/tracker/outlook/webhook", "/api/ops/logs", "/ws/")
+_AUDIT_SKIP_PREFIXES = ("/api/tracker/email-tracking/pixel/", "/api/tracker/outlook/webhook", "/api/ops/logs", "/ws/", "/api/stream/")
 
 
 @app.middleware("http")
@@ -98,6 +98,7 @@ app.include_router(admin.router, dependencies=_GUARDED)
 app.include_router(expenses.router, dependencies=_GUARDED)
 app.include_router(filters.router, dependencies=_GUARDED)
 app.include_router(events.router)
+app.include_router(stream.router)  # authenticates its own ?token= (EventSource can't send headers)
 app.include_router(tracker.router)
 app.include_router(payouts.router, dependencies=_GUARDED)
 app.include_router(fundraisers.router, dependencies=_GUARDED)
@@ -173,6 +174,15 @@ async def startup_event():
     # 4. Cache warm-up: rebuild the heaviest pages in the background after the data changes.
     asyncio.get_running_loop().create_task(_cache_warmup_loop())
 
+    # 4b. Donations copy kept identical to SQLite (the source of truth); see core/donations_reconcile.py
+    asyncio.get_running_loop().create_task(_donations_reconcile_loop())
+
+    # 4c. Outlook: renew reply webhooks, learn sent-email threads, pull replies (every 5 minutes)
+    asyncio.get_running_loop().create_task(_mailbox_maintenance_loop())
+
+    # 4d. Nightly database backup (02:30 UTC): verified snapshot, local copies + Supabase Storage when configured
+    asyncio.get_running_loop().create_task(_nightly_backup_loop())
+
     # 5. Daily sponsorship email-queue refresh: only creates PENDING items for staff to review;
     #    nothing is emailed until someone presses Send in the tracker's Email Queue.
     asyncio.get_running_loop().create_task(_sponsorship_queue_daily_loop())
@@ -190,6 +200,77 @@ async def _sponsorship_queue_daily_loop():
             except Exception as queue_err:
                 print(f"[Sponsorship Queue Notice] {company}: {queue_err}")
         await asyncio.sleep(24 * 60 * 60)
+
+
+async def _donations_reconcile_loop():
+    """One worker: every minute compare the parquet copy's donation keys with SQLite and repair confirmed drift;
+    once a day (03:30 UTC) also compare every value."""
+    import asyncio
+    import datetime as _dt
+    from core.cache import try_exclusive
+    from core.donations_reconcile import reconcile
+    await asyncio.sleep(45)
+    lock = try_exclusive("donations_reconcile")
+    if lock is None:
+        return
+    last_deep_day = None
+    while True:
+        try:
+            now = _dt.datetime.now(_dt.timezone.utc)
+            deep = (now.hour, now.minute) >= (3, 30) and last_deep_day != now.date()
+            result = await asyncio.to_thread(reconcile, deep)
+            if deep:
+                last_deep_day = now.date()
+            if result.get("status") not in ("in_sync", "drift_seen_waiting_for_confirmation"):
+                print(f"[Donations Reconcile] {result}")
+        except Exception as rec_err:
+            print(f"[Donations Reconcile Notice]: {rec_err}")
+        await asyncio.sleep(60)
+
+
+async def _mailbox_maintenance_loop():
+    import asyncio
+    from core.cache import try_exclusive
+    from backend.api.tracker import run_mailbox_maintenance
+    await asyncio.sleep(90)
+    lock = try_exclusive("mailbox_maintenance")
+    if lock is None:
+        return
+    while True:
+        try:
+            result = await asyncio.to_thread(run_mailbox_maintenance)
+            if any("error" in str(v) or "new_replies" in v for v in result.values()):
+                print(f"[Mailbox Maintenance] {result}")
+        except Exception as mb_err:
+            print(f"[Mailbox Maintenance Notice]: {mb_err}")
+        await asyncio.sleep(300)
+
+
+async def _nightly_backup_loop():
+    import asyncio
+    import datetime as _dt
+    import json as _json
+    from core.cache import try_exclusive
+    from core.nightly_backup import STATUS_FILE, run_backup
+    await asyncio.sleep(120)
+    lock = try_exclusive("nightly_backup")
+    if lock is None:
+        return
+    while True:
+        try:
+            now = _dt.datetime.now(_dt.timezone.utc)
+            last_day = None
+            try:
+                with open(STATUS_FILE) as f:
+                    last_day = (_json.load(f).get("last_run") or {}).get("started_at", "")[:8]
+            except (OSError, ValueError):
+                pass
+            if (now.hour, now.minute) >= (2, 30) and last_day != now.strftime("%Y%m%d"):
+                result = await asyncio.to_thread(run_backup)
+                print(f"[Nightly Backup] {result.get('status')} {result.get('file', '')} {result.get('error', '')}")
+        except Exception as bk_err:
+            print(f"[Nightly Backup Notice]: {bk_err}")
+        await asyncio.sleep(300)
 
 
 async def _cache_warmup_loop():

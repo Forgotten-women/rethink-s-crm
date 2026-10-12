@@ -2,6 +2,7 @@ from core.cache import cached
 import os
 import math
 import sqlite3
+import threading
 import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Any
@@ -24,6 +25,157 @@ def _extract_fundraiser_series(df: pd.DataFrame) -> pd.Series:
             s = df[col].fillna("").astype(str).str.strip().str.lower()
             res = res.where(res != "", s)
     return res
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Attribution: which fundraiser each donation counts towards (computed when read - donation rows are not edited)
+#
+# Explicit assignments win over the platform's own fundraiser name, and the most specific page wins:
+#     fundraiser page link > community/team page link > campaign link > campaign name (+code) > platform name
+# Same page assigned to two fundraisers (only possible for campaign names; links are unique per charity):
+# the older fundraiser keeps it. Results are cached per charity on the donations version, so a new donation
+# (any process) or a changed assignment shows up on the next request.
+# ---------------------------------------------------------------------------------------------------------
+LINK_MATCH_TYPES = {"fundraiser_url": "fundraiser", "community_url": "community", "campaign_url": "campaign"}
+MATCH_PRECEDENCE = ["campaign_name", "campaign_url", "community_url", "fundraiser_url"]  # applied in order; later wins
+MATCH_LABELS = {"campaign_name": "Campaign name", "campaign_url": "Campaign link",
+                "community_url": "Community / team page", "fundraiser_url": "Fundraiser page"}
+_UNASSIGNED_NAMES = ["", "unassigned", "none", "nan", "null", "no one claimed", "<na>"]
+_LINK_KEYS_CACHE: Dict[str, Any] = {}
+_LINK_KEYS_LOCK = threading.Lock()
+
+
+def _norm_campaign_name(series: pd.Series) -> pd.Series:
+    return (series.fillna("").astype(str).str.strip().str.lower()
+            .str.replace("–", "-", regex=False).str.replace("—", "-", regex=False))
+
+
+def _donation_keys(df: pd.DataFrame, comp: str) -> pd.DataFrame:
+    """Link keys + normalised campaign name/code per donation, cached on the charity's donations version."""
+    from core.cache import version_token
+    from core.page_links import donation_link_keys
+    token = version_token(["donations"], comp)
+    hit = _LINK_KEYS_CACHE.get(comp)
+    if hit and hit[0] == token and hit[1].index.equals(df.index):
+        return hit[1]
+    with _LINK_KEYS_LOCK:
+        keys = donation_link_keys(df)
+        keys["cname"] = _norm_campaign_name(df["Campaign Name"]) if "Campaign Name" in df.columns else ""
+        keys["code"] = df["Code"].fillna("").astype(str).str.strip().str.lower() if "Code" in df.columns else ""
+        _LINK_KEYS_CACHE[comp] = (token, keys)
+        return keys
+
+
+def _load_assignments(comp: str) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        q = """SELECT fc.id AS assignment_id, fc.fundraiser_id, f.name AS fundraiser_name, f.created_at AS f_created,
+                      fc.campaign_name, fc.code, fc.platform, COALESCE(NULLIF(fc.match_type, ''), 'campaign_name') AS match_type,
+                      COALESCE(fc.match_value, '') AS match_value, COALESCE(fc.match_key, '') AS match_key, fc.company_id
+               FROM fundraiser_campaigns fc JOIN fundraisers f ON f.id = fc.fundraiser_id"""
+        rows = conn.execute(q + (" WHERE fc.company_id = ?" if comp != "all" else ""), (comp,) if comp != "all" else ()).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def attribute_donations(df: pd.DataFrame, comp: str, assignments: Optional[List[Dict[str, Any]]] = None):
+    """Returns (fundraiser_lower, assignment_id, match_type) Series aligned to df."""
+    if assignments is None:
+        assignments = _load_assignments(comp)
+    fn = _extract_fundraiser_series(df)
+    aid = pd.Series(None, index=df.index, dtype=object)
+    mtype = pd.Series(None, index=df.index, dtype=object)
+    if df.empty or not assignments:
+        return fn, aid, mtype
+    keys = _donation_keys(df, comp)
+    # oldest fundraiser applied last so it wins a tie
+    ordered = sorted(assignments, key=lambda a: str(a.get("f_created") or ""), reverse=True)
+
+    def apply(mask_values: pd.Series, winners: Dict[str, Any], match_type: str):
+        hit = mask_values.map(winners)
+        ok = hit.notna()
+        if ok.any():
+            fn.loc[ok] = hit[ok].map(lambda w: w[0])
+            aid.loc[ok] = hit[ok].map(lambda w: w[1])
+            mtype.loc[ok] = match_type
+
+    for match_type in MATCH_PRECEDENCE:
+        group = [a for a in ordered if a["match_type"] == match_type]
+        if not group:
+            continue
+        if match_type == "campaign_name":
+            by_name, by_name_code = {}, {}
+            for a in group:
+                name = str(a.get("campaign_name") or "").strip().lower().replace("–", "-").replace("—", "-")
+                code = str(a.get("code") or "ALL").strip().lower()
+                winner = (str(a["fundraiser_name"] or "").strip().lower(), a["assignment_id"])
+                if not name or not winner[0]:
+                    continue
+                if code in ("all", "unassigned", ""):
+                    by_name[name] = winner
+                else:
+                    by_name_code[f"{name}::{code}"] = winner
+                    by_name[f"{name}::__code_any"] = winner
+            apply(keys["cname"], by_name, match_type)
+            if by_name_code:
+                generic_code = keys["code"].isin(["", "all"])
+                apply(keys["cname"] + "::" + keys["code"], by_name_code, match_type)
+                apply((keys["cname"] + "::__code_any").where(generic_code), by_name, match_type)
+            continue
+        kind = LINK_MATCH_TYPES[match_type]
+        exact, any_family = {}, {}
+        for a in group:
+            key = a.get("match_key") or ""
+            winner = (str(a["fundraiser_name"] or "").strip().lower(), a["assignment_id"])
+            if not key or not winner[0]:
+                continue
+            (any_family if key.split("|")[1] == "*" else exact)[key] = winner
+        if any_family:
+            apply(keys[f"{kind}_slug_key"], any_family, match_type)
+        if exact:
+            apply(keys[f"{kind}_key"], exact, match_type)
+    return fn, aid, mtype
+
+
+def _tracked_page_stats(df: pd.DataFrame, aid: pd.Series, assignments: List[Dict[str, Any]],
+                        start_date: Optional[str], end_date: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """Per fundraiser: every assignment (campaign name or link) with the donations it brought in."""
+    amount_col = "Total Online Donations Net Amount in Settled Currency"
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    work = pd.DataFrame({"aid": aid})
+    work["amt"] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0) if amount_col in df.columns else 0.0
+    date_col = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date"] if c in df.columns), None)
+    work["day"] = df[date_col].fillna("").astype(str).str[:10] if date_col else ""
+    work["email"] = df["Email"].fillna("").astype(str).str.strip().str.lower() if "Email" in df.columns else ""
+    work = work[work["aid"].notna()]
+    grouped = {k: g for k, g in work.groupby("aid")} if not work.empty else {}
+    for a in assignments:
+        g = grouped.get(a["assignment_id"])
+        period = g
+        if g is not None and (start_date or end_date):
+            m = pd.Series(True, index=g.index)
+            if start_date:
+                m &= g["day"] >= start_date
+            if end_date:
+                m &= g["day"] <= end_date
+            period = g[m]
+        valid_days = g["day"][g["day"].str.len() == 10] if g is not None else pd.Series(dtype=object)
+        out.setdefault(a["fundraiser_id"], []).append({
+            "assignment_id": a["assignment_id"],
+            "match_type": a["match_type"],
+            "match_label": MATCH_LABELS.get(a["match_type"], a["match_type"]),
+            "value": a["match_value"] or a["campaign_name"],
+            "code": a.get("code") or "ALL",
+            "raised_all_time": round(float(g["amt"].sum()), 2) if g is not None else 0.0,
+            "donations_all_time": int(len(g)) if g is not None else 0,
+            "raised_period": round(float(period["amt"].sum()), 2) if period is not None else 0.0,
+            "donations_period": int(len(period)) if period is not None else 0,
+            "donors": int(g["email"][g["email"] != ""].nunique()) if g is not None else 0,
+            "latest_donation_date": str(valid_days.max()) if len(valid_days) else None,
+        })
+    return out
 
 
 def sync_assigned_campaigns_to_donations(company_id: str = "rethink") -> int:
@@ -168,6 +320,14 @@ def init_fundraiser_db():
                 cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN company_id TEXT DEFAULT 'rethink';")
             except Exception:
                 pass
+        # Link-based assignments: match_type campaign_name (legacy) | campaign_url | community_url | fundraiser_url
+        for col, ddl in (("match_type", "TEXT DEFAULT 'campaign_name'"), ("match_value", "TEXT DEFAULT ''"),
+                         ("match_key", "TEXT DEFAULT ''")):
+            try:
+                cursor.execute(f"ALTER TABLE fundraiser_campaigns ADD COLUMN {col} {ddl};")
+            except Exception:
+                pass
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_company_key ON fundraiser_campaigns(company_id, match_key)")
         
         # Purge legacy auto-sync campaign locks (id starting with fc_) so campaigns are not falsely locked
         cursor.execute("DELETE FROM fundraiser_campaigns WHERE id LIKE 'fc_%'")
@@ -281,9 +441,12 @@ except Exception as _sync_err:
 
 
 class CampaignAssignment(BaseModel):
-    campaign_name: str
+    campaign_name: str = ""
     code: Optional[str] = "ALL"
     platform: Optional[str] = "ALL"
+    # "campaign_name" (default, as before) or a page link: "campaign_url" | "community_url" | "fundraiser_url"
+    match_type: Optional[str] = "campaign_name"
+    match_value: Optional[str] = None  # the link as pasted
 
 
 class CreateFundraiserRequest(BaseModel):

@@ -216,6 +216,31 @@ def ops_status(live: bool = Query(False)):
         "sync_heartbeat": (sync.get("meta") or {}).get("last_synced_at"),
         "outlook": _outlook_status(),
         "logging": {**shipping_status(), "errors_last_24h": errors_24h},
+        "backup": _backup_status(),
+    }
+
+
+def _backup_status() -> dict:
+    """Nightly backup health: last run, last good local copy, last off-site copy (core/nightly_backup.py)."""
+    from core.nightly_backup import STATUS_FILE, _supabase_config
+    st = _read_json(STATUS_FILE)
+    last_ok = st.get("last_success") or {}
+    last_off = st.get("last_offsite_success") or {}
+    age_h = None
+    if last_ok.get("finished_at"):
+        try:
+            age_h = round((_now() - datetime.datetime.fromisoformat(last_ok["finished_at"])).total_seconds() / 3600, 1)
+        except ValueError:
+            pass
+    return {
+        "offsite_configured": _supabase_config() is not None,
+        "last_run_status": (st.get("last_run") or {}).get("status"),
+        "last_run_error": (st.get("last_run") or {}).get("error"),
+        "last_success_at": last_ok.get("finished_at"),
+        "last_success_age_hours": age_h,
+        "last_success_mb": round(last_ok["bytes"] / 2**20, 1) if last_ok.get("bytes") else None,
+        "last_offsite_at": last_off.get("finished_at"),
+        "stale": age_h is None or age_h > 26,
     }
 
 

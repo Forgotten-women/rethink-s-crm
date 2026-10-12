@@ -392,13 +392,17 @@ def _check_record_ownership(request: Request, user: Dict[str, Any], query, body:
 
 # Opened from emails without a session; each verifies its own single-use token.
 _PUBLIC_API_PATHS = {"/api/expenses/action-email"}
+# Loaded by <img> tags (which can't send the session token); branding only.
+import re as _re
+_PUBLIC_GET_PATTERN = _re.compile(r"^/api/admin/companies/[A-Za-z0-9_-]+/logo$")
 
 
 async def api_access_guard(request: Request) -> Dict[str, Any]:
     """Router-level isolation for every data API: a valid signed session is required, and every company the
     request names (or the endpoint's default company when none is named) must be one the user may access.
     'all' (or an endpoint whose company defaults to None = every charity) needs access to every charity."""
-    if request.url.path in _PUBLIC_API_PATHS:
+    if request.url.path in _PUBLIC_API_PATHS or (
+            request.method == "GET" and _PUBLIC_GET_PATTERN.match(request.url.path)):
         return {}
     user = await get_current_user(request, None, None)
     query, body, form = await _request_inputs(request)

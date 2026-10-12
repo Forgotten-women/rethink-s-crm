@@ -51,3 +51,6 @@ test_*
 data_cache/cache.db*
 data_cache/cache_locks/
 data_cache/platform_health.json
+
+# database backups (contain donor data) - never commit
+data_cache/backups/

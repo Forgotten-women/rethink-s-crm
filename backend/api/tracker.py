@@ -465,6 +465,21 @@ class OutlookSendRequest(BaseModel):
     subject: Optional[str] = ""
     body_html: Optional[str] = ""
 
+class BulkEmailItem(BaseModel):
+    allocation_id: int
+    allocation_donor_id: int
+    subject_template: Optional[str] = None  # per-donor personalised text (placeholders allowed)
+    body_template: Optional[str] = None
+
+class BulkEmailRequest(BaseModel):
+    company_id: str
+    template_type: str
+    theme: Optional[str] = None             # branding; the mailbox always follows the allocation's charity
+    subject_template: Optional[str] = None  # edited text for everyone (per-donor text wins)
+    body_template: Optional[str] = None
+    items: List[BulkEmailItem]
+    dry_run: bool = False
+
 class EmailPreviewRequest(BaseModel):
     allocation_id: int
     allocation_donor_id: Optional[int] = None
@@ -921,6 +936,213 @@ def create_beneficiary(payload: BeneficiaryCreateRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+# ---------------------------------------------------------------------------------------------------------
+# Beneficiary bulk import (CSV / XLSX) with a downloadable template.
+# ---------------------------------------------------------------------------------------------------------
+BENEFICIARY_IMPORT_COLUMNS = [
+    # (field, header in template, required, help, example)
+    ("name", "Name", True, "Beneficiary full name", "Zayd Al-Mansoor"),
+    ("project_code", "Project Code", True, "Unique per charity - used to detect existing beneficiaries", "RT-ORP-ABS-07-26-001M"),
+    ("sponsorship_type", "Sponsorship Type", True, "Orphan, Widow, Hafiz or Ex-Prisoner", "Orphan"),
+    ("location", "Location", False, "Country / town", "Gaza, Palestine"),
+    ("status", "Status", False, "Unallocated (default) or Pending Assignment", "Unallocated"),
+    ("donor_folder_link", "Donor Folder Link", False, "Link to the donor-facing folder", "https://drive.google.com/..."),
+    ("profile_link", "Profile Link", False, "Link to the profile document", "https://drive.google.com/..."),
+    ("video_link", "Video Link", False, "Link to an update video", "https://youtube.com/..."),
+]
+BENEFICIARY_IMPORT_ALIASES = {
+    "name": ["name", "beneficiary name", "beneficiary", "full name"],
+    "project_code": ["project code", "project_code", "code", "beneficiary code"],
+    "sponsorship_type": ["sponsorship type", "sponsorship_type", "type", "sponsorship"],
+    "location": ["location", "country", "town", "city"],
+    "status": ["status"],
+    "donor_folder_link": ["donor folder link", "donor_folder_link", "folder link", "folder"],
+    "profile_link": ["profile link", "profile_link", "profile"],
+    "video_link": ["video link", "video_link", "video"],
+}
+BENEFICIARY_IMPORT_TYPES = ["Orphan", "Widow", "Hafiz", "Ex-Prisoner"]
+BENEFICIARY_IMPORT_STATUSES = ["Unallocated", "Pending Assignment"]
+BENEFICIARY_IMPORT_MAX_ROWS = 5000
+
+
+@router.get("/beneficiaries/import-template")
+def download_beneficiary_import_template(company_id: Optional[str] = Query("rethink"), format: str = Query("xlsx")):
+    """Empty upload template (headers only) plus, for XLSX, an Instructions sheet and dropdowns."""
+    import io
+    from fastapi.responses import StreamingResponse
+    headers = [h for _, h, _, _, _ in BENEFICIARY_IMPORT_COLUMNS]
+    if (format or "").lower() == "csv":
+        body = ",".join(headers) + "\r\n"
+        return StreamingResponse(io.BytesIO(body.encode("utf-8-sig")), media_type="text/csv",
+                                 headers={"Content-Disposition": 'attachment; filename="beneficiaries_import_template.csv"'})
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.worksheet.datavalidation import DataValidation
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Beneficiaries"
+    ws.append(headers)
+    for i, (_, header, required, _, _) in enumerate(BENEFICIARY_IMPORT_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=i)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1D4ED8" if required else "64748B")
+        ws.column_dimensions[cell.column_letter].width = max(18, len(header) + 6)
+    type_col = [h for _, h, _, _, _ in BENEFICIARY_IMPORT_COLUMNS].index("Sponsorship Type") + 1
+    status_col = [h for _, h, _, _, _ in BENEFICIARY_IMPORT_COLUMNS].index("Status") + 1
+    for col, values in ((type_col, BENEFICIARY_IMPORT_TYPES), (status_col, BENEFICIARY_IMPORT_STATUSES)):
+        letter = ws.cell(row=1, column=col).column_letter
+        dv = DataValidation(type="list", formula1='"' + ",".join(values) + '"', allow_blank=True)
+        ws.add_data_validation(dv)
+        dv.add(f"{letter}2:{letter}{BENEFICIARY_IMPORT_MAX_ROWS + 1}")
+    ws.freeze_panes = "A2"
+    info = wb.create_sheet("Instructions")
+    info.append(["Column", "Required", "What to enter", "Example"])
+    for _, header, required, help_text, example in BENEFICIARY_IMPORT_COLUMNS:
+        info.append([header, "Yes" if required else "No", help_text, example])
+    info.append([])
+    info.append(["Fill the 'Beneficiaries' sheet - one row per beneficiary. Blue headers are required."])
+    info.append(["Rows whose Project Code already exists for this charity are skipped, or updated if you choose 'Update existing'."])
+    for col, width in zip("ABCD", (20, 10, 60, 32)):
+        info.column_dimensions[col].width = width
+    for cell in info[1]:
+        cell.font = Font(bold=True)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": 'attachment; filename="beneficiaries_import_template.xlsx"'})
+
+
+def _read_beneficiary_upload(filename: str, content: bytes) -> pd.DataFrame:
+    import io
+    name = (filename or "").lower()
+    if name.endswith((".xlsx", ".xlsm")):
+        xls = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+        sheet = "Beneficiaries" if "Beneficiaries" in xls.sheet_names else xls.sheet_names[0]
+        return pd.read_excel(xls, sheet_name=sheet, dtype=str, keep_default_na=False)
+    if name.endswith((".csv", ".txt")):
+        for encoding in ("utf-8-sig", "cp1252"):
+            try:
+                return pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False, encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+    raise HTTPException(status_code=400, detail="Please upload a .csv or .xlsx file (use the template).")
+
+
+@router.post("/beneficiaries/import")
+async def import_beneficiaries(
+    request: Request,
+    company_id: str = Query(...),
+    dry_run: bool = Query(True),
+    on_duplicate: str = Query("skip"),
+):
+    """Validates (dry_run=true) or imports a CSV/XLSX of beneficiaries for ONE charity. company_id comes from the
+    access-checked query string only - never from the file. The import is all-or-nothing."""
+    comp = (company_id or "").strip().lower()
+    if comp in ("", "all"):
+        raise HTTPException(status_code=400, detail="Choose a specific charity before importing.")
+    if on_duplicate not in ("skip", "update"):
+        raise HTTPException(status_code=400, detail="on_duplicate must be 'skip' or 'update'.")
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+    content = await upload.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File is larger than 5 MB.")
+    df = _read_beneficiary_upload(upload.filename, content)
+
+    # Map headers (case/spacing-insensitive, common aliases)
+    normalized = {str(c).strip().lower().replace("_", " "): c for c in df.columns}
+    column_for = {}
+    for field, aliases in BENEFICIARY_IMPORT_ALIASES.items():
+        for alias in aliases:
+            if alias.replace("_", " ") in normalized:
+                column_for[field] = normalized[alias.replace("_", " ")]
+                break
+    missing_cols = [h for f, h, req, _, _ in BENEFICIARY_IMPORT_COLUMNS if req and f not in column_for]
+    if missing_cols:
+        raise HTTPException(status_code=400, detail=f"Missing required column(s): {', '.join(missing_cols)}. Download the template to see the expected headers.")
+    rows = [{f: str(r.get(col, "") or "").strip() for f, col in column_for.items()} for r in df.to_dict("records")]
+    rows = [(i + 2, r) for i, r in enumerate(rows) if any(r.values())]  # i+2 = spreadsheet row number
+    if len(rows) > BENEFICIARY_IMPORT_MAX_ROWS:
+        raise HTTPException(status_code=400, detail=f"Too many rows ({len(rows)}); the limit is {BENEFICIARY_IMPORT_MAX_ROWS} per file.")
+
+    type_lookup = {t.lower(): t for t in BENEFICIARY_IMPORT_TYPES}
+    type_lookup.update({"ex prisoner": "Ex-Prisoner", "exprisoner": "Ex-Prisoner", "hafidh": "Hafiz", "hifz": "Hafiz"})
+    status_lookup = {s.lower(): s for s in BENEFICIARY_IMPORT_STATUSES}
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        existing = {}
+        for r in conn.execute("SELECT id, project_code FROM sponsorship_beneficiaries WHERE company_id = ?", (comp,)):
+            existing.setdefault((r["project_code"] or "").strip().upper(), r["id"])
+        seen_codes = {}
+        results = []
+        for row_no, r in rows:
+            errors = []
+            if not r.get("name"):
+                errors.append("Name is required")
+            if not r.get("project_code"):
+                errors.append("Project Code is required")
+            s_type = type_lookup.get((r.get("sponsorship_type") or "").strip().lower())
+            if not r.get("sponsorship_type"):
+                errors.append("Sponsorship Type is required")
+            elif not s_type:
+                errors.append(f"Unknown Sponsorship Type '{r['sponsorship_type']}' (use {', '.join(BENEFICIARY_IMPORT_TYPES)})")
+            status_val = "Unallocated"
+            if r.get("status"):
+                status_val = status_lookup.get(r["status"].strip().lower())
+                if not status_val:
+                    errors.append(f"Status '{r['status']}' not allowed (use {' or '.join(BENEFICIARY_IMPORT_STATUSES)}; allocations set 'Allocated')")
+            for link in ("donor_folder_link", "profile_link", "video_link"):
+                v = r.get(link) or ""
+                if v and not (v.startswith("http://") or v.startswith("https://")):
+                    errors.append(f"{link.replace('_', ' ').title()} must start with http:// or https://")
+            code_key = (r.get("project_code") or "").upper()
+            if code_key and code_key in seen_codes:
+                errors.append(f"Project Code repeated in this file (row {seen_codes[code_key]})")
+            elif code_key:
+                seen_codes[code_key] = row_no
+            action = "error" if errors else ("update" if code_key in existing and on_duplicate == "update"
+                                            else "skip" if code_key in existing else "create")
+            results.append({"row": row_no, "action": action, "errors": errors, "existing_id": existing.get(code_key),
+                            "data": {**r, "sponsorship_type": s_type or r.get("sponsorship_type"), "status": status_val}})
+
+        summary = {a: sum(1 for x in results if x["action"] == a) for a in ("create", "update", "skip", "error")}
+        if dry_run or summary["error"]:
+            return {"dry_run": True, "can_import": summary["error"] == 0 and (summary["create"] + summary["update"]) > 0,
+                    "summary": summary, "rows": results}
+
+        created_ids = []
+        with conn:  # one transaction: all rows or none
+            for x in results:
+                d = x["data"]
+                if x["action"] == "create":
+                    cur = conn.execute("""
+                        INSERT INTO sponsorship_beneficiaries (company_id, sponsorship_type, name, location, project_code,
+                                                               donor_folder_link, profile_link, video_link, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (comp, d["sponsorship_type"], d["name"], d.get("location", ""), d["project_code"],
+                         d.get("donor_folder_link", ""), d.get("profile_link", ""), d.get("video_link", ""), d["status"]))
+                    created_ids.append(cur.lastrowid)
+                elif x["action"] == "update":
+                    # only the columns present in the file and non-empty; status is left to the allocation logic
+                    fields = {k: d[k] for k in ("name", "sponsorship_type", "location", "donor_folder_link", "profile_link", "video_link")
+                              if k in column_for and d.get(k)}
+                    if fields:
+                        conn.execute(f"UPDATE sponsorship_beneficiaries SET {', '.join(f'{k} = ?' for k in fields)}, "
+                                     f"updated_at = CURRENT_TIMESTAMP WHERE id = ? AND company_id = ?",
+                                     (*fields.values(), x["existing_id"], comp))
+        log_event("beneficiaries.imported", category="tracker", company_id=comp,
+                  message=f"Imported beneficiaries for {comp}: {summary['create']} created, {summary['update']} updated, "
+                          f"{summary['skip']} skipped", file=upload.filename, **summary)
+        return {"dry_run": False, "summary": summary, "created_ids": created_ids}
+    finally:
+        conn.close()
+
 
 @router.put("/beneficiaries/{beneficiary_id}")
 def update_beneficiary(beneficiary_id: int, payload: BeneficiaryUpdateRequest):
@@ -2215,6 +2437,54 @@ def classify_campaign(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+
+def _call_with_query(fn, query_string: str, comp: str, **fixed):
+    """Calls a GET handler the way FastAPI would for `?query_string`, so it shares the same cache entries.
+    company_id is always the outer request's (already access-checked) company, never the sub-query's."""
+    import inspect
+    import typing
+    from urllib.parse import parse_qsl
+    from core.cache import route_defaults
+    params = inspect.signature(inspect.unwrap(fn)).parameters
+    kwargs = route_defaults(fn, company_id=comp, **fixed)
+    for key, value in parse_qsl(query_string or "", keep_blank_values=False):
+        if key == "company_id" or key in fixed or key not in params:
+            continue
+        kinds = typing.get_args(params[key].annotation) or (params[key].annotation,)
+        if bool in kinds:
+            value = value.strip().lower() in ("1", "true", "yes", "on")
+        elif int in kinds:
+            value = int(value)
+        elif float in kinds:
+            value = float(value)
+        kwargs[key] = value
+    return fn(**kwargs)
+
+
+@router.get("/page-data")
+async def get_tracker_page_data(
+    company_id: Optional[str] = Query("rethink"),
+    sponsorship_type: Optional[str] = Query("Orphan"),
+    ben: Optional[str] = Query(""),
+    alloc: Optional[str] = Query(""),
+):
+    """Everything the tracker page loads at once, in one round trip. Each section is exactly what its own
+    endpoint returns (same handlers, same cache entries): beneficiaries, allocations, qualifying donors and
+    campaigns for the selected sponsorship type, Outlook status and email templates."""
+    import asyncio
+    comp = _unwrap_param(company_id, "rethink").strip().lower()
+    s_type = _unwrap_param(sponsorship_type, "Orphan").strip() or "Orphan"
+    jobs = {
+        "beneficiaries": lambda: _call_with_query(get_beneficiaries, ben, comp),
+        "allocations": lambda: _call_with_query(get_allocations, alloc, comp),
+        "qualifying_donors": lambda: _call_with_query(get_qualifying_donors, "", comp, sponsorship_type=s_type),
+        "qualifying_campaigns": lambda: _call_with_query(get_qualifying_campaigns, "", comp, sponsorship_type=s_type),
+        "outlook_status": lambda: get_outlook_status(company_id=comp),
+        "email_templates": lambda: get_email_templates(company_id=comp, charity_theme=None),
+    }
+    results = await asyncio.gather(*(asyncio.to_thread(job) for job in jobs.values()))
+    return dict(zip(jobs.keys(), results))
 
 
 @router.get("/qualifying-campaigns")
@@ -3972,6 +4242,163 @@ def _send_per_donor(payload: OutlookSendRequest, request: Request) -> Dict[str, 
     }
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Bulk email: pick donors across ALL allocations (filters as the allocation list), choose a template, personalise
+# per donor, preview, send in batches. Every email goes through render_email_for_donor + deliver_rendered_email,
+# so it is personalised per donor and logged in that donor's history exactly like a single send.
+# ---------------------------------------------------------------------------------------------------------
+BULK_SEND_BATCH_LIMIT = 25
+BULK_PREVIEW_LIMIT = 50
+_CYCLE_ALIASES = {"due_for_renewal": "due", "grace_period": "grace"}
+
+
+@router.get("/bulk-email/recipients")
+def get_bulk_email_recipients(request: Request, company_id: str = Query(...), lifecycle: Optional[str] = Query(None),
+                              allocation_kind: Optional[str] = Query(None)):
+    """One row per donor on every matching allocation (no paging). Accepts the same filters as /allocations."""
+    comp = (company_id or "").strip().lower()
+    passthrough = "&".join(f"{k}={urllib.parse.quote(v)}" for k, v in request.query_params.multi_items()
+                           if k not in ("company_id", "lifecycle", "allocation_kind"))
+    allocations = _call_with_query(get_allocations, passthrough, comp)["allocations"]
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        last_by_donor, last_by_email = {}, {}
+        for r in conn.execute("""
+                SELECT allocation_id, allocation_donor_id, LOWER(TRIM(recipient_email)) AS email, template_type,
+                       subject, sent_at, delivery_status
+                FROM sponsorship_communications
+                WHERE company_id = ? AND direction = 'outbound' ORDER BY sent_at""", (comp,)):
+            info = {"sent_at": r["sent_at"], "template_type": r["template_type"], "subject": r["subject"],
+                    "status": r["delivery_status"]}
+            if r["allocation_donor_id"]:
+                last_by_donor[r["allocation_donor_id"]] = info
+            last_by_email[(r["allocation_id"], r["email"])] = info
+    finally:
+        conn.close()
+    rows = []
+    for a in allocations:
+        cycle = _CYCLE_ALIASES.get(a.get("cycle_status"), a.get("cycle_status"))
+        if lifecycle and lifecycle != "all" and cycle != lifecycle:
+            continue
+        kind = "campaign" if a.get("allocation_type") == "campaign" else "individual"
+        if allocation_kind and allocation_kind != "all" and kind != allocation_kind:
+            continue
+        for d in a.get("donors") or []:
+            email = (d.get("donor_email") or "").strip()
+            last = last_by_donor.get(d["id"]) or last_by_email.get((a["id"], email.lower()))
+            rows.append({
+                "allocation_id": a["id"], "allocation_donor_id": d["id"],
+                "donor_name": d.get("donor_name") or "", "donor_email": email,
+                "has_email": "@" in email, "role": d.get("role"), "is_primary": d.get("is_primary"),
+                "beneficiary_name": a.get("beneficiary_name"), "project_code": a.get("project_code"),
+                "sponsorship_type": a.get("sponsorship_type"), "cycle_status": cycle, "end_date": a.get("end_date"),
+                "days_remaining": a.get("days_remaining"), "allocation_kind": kind,
+                "campaign_name": a.get("campaign_name"), "last_email": last,
+            })
+    return {"company_id": comp, "count": len(rows), "with_email": sum(1 for r in rows if r["has_email"]), "recipients": rows}
+
+
+def _bulk_items_for_company(payload: BulkEmailRequest, limit: int) -> List[BulkEmailItem]:
+    comp = (payload.company_id or "").strip().lower()
+    if comp in ("", "all"):
+        raise HTTPException(status_code=400, detail="Choose a specific charity.")
+    items = list({i.allocation_donor_id: i for i in payload.items}.values())  # each donor once
+    if not items:
+        raise HTTPException(status_code=400, detail="Select at least one donor.")
+    if len(items) > limit:
+        raise HTTPException(status_code=400, detail=f"At most {limit} donors per request.")
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        ids = sorted({i.allocation_id for i in items})
+        owned = {r[0] for r in conn.execute(
+            f"SELECT id FROM sponsorship_allocations WHERE company_id = ? AND id IN ({','.join('?' * len(ids))})", (comp, *ids))}
+    finally:
+        conn.close()
+    foreign = [i.allocation_id for i in items if i.allocation_id not in owned]
+    if foreign:
+        log_event("access.cross_company_blocked", category="security", level="warning", company_id=comp,
+                  message=f"Bulk email referenced allocations outside {comp}: {foreign[:10]}")
+        raise HTTPException(status_code=404, detail="Some selected sponsorships were not found for this charity.")
+    return items
+
+
+def _render_bulk_item(cur, payload: BulkEmailRequest, item: BulkEmailItem) -> Dict[str, Any]:
+    subject = item.subject_template if item.subject_template is not None else payload.subject_template
+    body = item.body_template if item.body_template is not None else payload.body_template
+    return render_email_for_donor(cur, item.allocation_id, item.allocation_donor_id, payload.template_type,
+                                  payload.theme or payload.company_id, subject, body)
+
+
+@router.post("/bulk-email/preview")
+def preview_bulk_email(payload: BulkEmailRequest):
+    """Exactly what each selected donor would receive (same rendering as sending). Nothing is sent."""
+    items = _bulk_items_for_company(payload, BULK_PREVIEW_LIMIT)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    out = []
+    try:
+        cur = conn.cursor()
+        for item in items:
+            try:
+                r = _render_bulk_item(cur, payload, item)
+                problem = ("Donor has no email address" if "@" not in (r["recipient_email"] or "") else
+                           ("Unknown placeholders: " + ", ".join(r["unresolved_placeholders"])) if r["unresolved_placeholders"] else None)
+                out.append({"allocation_id": item.allocation_id, "allocation_donor_id": item.allocation_donor_id,
+                            "recipient_email": r["recipient_email"], "recipient_name": r["recipient_name"],
+                            "subject": r["subject"], "body_html": r["body_html"], "theme": r["theme"],
+                            "personalised": item.subject_template is not None or item.body_template is not None,
+                            "ready": problem is None, "problem": problem})
+            except HTTPException as e:
+                out.append({"allocation_id": item.allocation_id, "allocation_donor_id": item.allocation_donor_id,
+                            "ready": False, "problem": str(e.detail)})
+    finally:
+        conn.close()
+    return {"count": len(out), "ready": sum(1 for o in out if o["ready"]), "previews": out}
+
+
+@router.post("/bulk-email/send")
+def send_bulk_email(payload: BulkEmailRequest, request: Request):
+    """Sends up to BULK_SEND_BATCH_LIMIT personalised emails (the page sends larger selections batch by batch).
+    dry_run=true validates everything without sending."""
+    items = _bulk_items_for_company(payload, BULK_SEND_BATCH_LIMIT)
+    base_url = _public_base_url(request)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    rendered = []
+    try:
+        cur = conn.cursor()
+        for item in items:
+            try:
+                rendered.append((item, _render_bulk_item(cur, payload, item), None))
+            except HTTPException as e:
+                rendered.append((item, None, str(e.detail)))
+    finally:
+        conn.close()
+    results = []
+    for item, r, err in rendered:
+        base = {"allocation_id": item.allocation_id, "allocation_donor_id": item.allocation_donor_id}
+        if err:
+            results.append({**base, "status": "failed", "detail": err})
+            continue
+        if payload.dry_run:
+            problem = ("Donor has no email address" if "@" not in (r["recipient_email"] or "") else
+                       ("Unknown placeholders: " + ", ".join(r["unresolved_placeholders"])) if r["unresolved_placeholders"] else None)
+            results.append({**base, "status": "ready" if not problem else "skipped", "detail": problem,
+                            "recipient_email": r["recipient_email"]})
+            continue
+        try:
+            results.append({**base, **deliver_rendered_email(r, item.allocation_id, base_url)})
+        except HTTPException as e:
+            results.append({**base, "status": "failed", "detail": str(e.detail)})
+        except Exception as e:
+            results.append({**base, "status": "failed", "detail": str(e)})
+    counts = {k: sum(1 for x in results if x["status"] == k) for k in ("sent", "ready", "skipped", "failed")}
+    if not payload.dry_run:
+        log_event("email.bulk_batch", category="email", company_id=payload.company_id.strip().lower(),
+                  template=payload.template_type, message=f"Bulk email batch: {counts['sent']} sent, "
+                  f"{counts['skipped']} skipped, {counts['failed']} failed", **counts)
+    return {"dry_run": payload.dry_run, "counts": counts, "results": results}
+
+
 @router.post("/outlook/send")
 def send_outlook_message(payload: OutlookSendRequest, request: Request, current_user = Depends(get_current_user)):
     """Dispatches an email via Microsoft Graph API, embeds real-time open tracking pixel, and logs delivery metadata."""
@@ -4355,11 +4782,28 @@ async def outlook_graph_webhook(request: Request):
     return Response(status_code=202)
 
 
-def _match_reply_sender(cur, company_id: str, sender_email: str):
-    """(allocation_id, allocation_donor_id) of the most recent sponsorship this sender is a donor on."""
+def _match_reply_sender(cur, company_id: str, sender_email: str, conv_id: str = "", received_at: Optional[str] = None):
+    """(allocation_id, allocation_donor_id) the reply belongs to, most precise evidence first:
+      1. the Outlook conversation of an email we sent (exact sponsorship + donor);
+      2. the most recent email we sent to this address before the reply arrived;
+      3. the most recent sponsorship this sender is a donor on (old behaviour)."""
     sender = (sender_email or "").strip().lower()
+    if conv_id:
+        row = cur.execute("""
+            SELECT allocation_id, allocation_donor_id FROM sponsorship_communications
+            WHERE company_id = ? AND direction = 'outbound' AND thread_id = ?
+            ORDER BY sent_at DESC LIMIT 1""", (company_id, conv_id)).fetchone()
+        if row:
+            return row[0], row[1] or _donor_row_for_email(cur, row[0], sender)
     if not sender:
         return None, None
+    row = cur.execute("""
+        SELECT allocation_id, allocation_donor_id FROM sponsorship_communications
+        WHERE company_id = ? AND direction = 'outbound' AND LOWER(TRIM(recipient_email)) = ?
+          AND sent_at <= COALESCE(REPLACE(REPLACE(?, 'T', ' '), 'Z', ''), CURRENT_TIMESTAMP)
+        ORDER BY sent_at DESC LIMIT 1""", (company_id, sender, received_at)).fetchone()
+    if row:
+        return row[0], row[1] or _donor_row_for_email(cur, row[0], sender)
     row = cur.execute("""
         SELECT d.allocation_id, d.id FROM sponsorship_allocation_donors d
         WHERE d.company_id = ? AND LOWER(TRIM(d.donor_email)) = ?
@@ -4376,6 +4820,64 @@ def _match_reply_sender(cur, company_id: str, sender_email: str):
     return None, None
 
 
+def _donor_row_for_email(cur, allocation_id: int, email: str) -> Optional[int]:
+    if not email:
+        return None
+    row = cur.execute("SELECT id FROM sponsorship_allocation_donors WHERE allocation_id = ? AND LOWER(TRIM(donor_email)) = ? LIMIT 1",
+                      (allocation_id, email)).fetchone()
+    return row[0] if row else None
+
+
+def _backfill_conversation_ids(company_id: str) -> Dict[str, Any]:
+    """Graph's sendMail returns no message id, so after sending we find each email in Sent Items (same recipient,
+    same subject, sent within 10 minutes) and store its conversationId. Replies are then matched exactly."""
+    comp = (company_id or "").strip().lower()
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        pending = [dict(r) for r in conn.execute("""
+            SELECT id, recipient_email, subject, sent_at FROM sponsorship_communications
+            WHERE company_id = ? AND direction = 'outbound' AND COALESCE(thread_id, '') = ''
+              AND sent_at >= datetime('now', '-3 days')""", (comp,))]
+    finally:
+        conn.close()
+    if not pending:
+        return {"status": "nothing_to_do"}
+    access_token = _get_valid_graph_token(comp)
+    oldest = min(p["sent_at"] for p in pending)
+    since = (datetime.datetime.strptime(oldest[:19], "%Y-%m-%d %H:%M:%S") - datetime.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    res = requests.get("https://graph.microsoft.com/v1.0/me/mailFolders('SentItems')/messages", params={
+        "$filter": f"sentDateTime ge {since}", "$orderby": "sentDateTime desc", "$top": "200",
+        "$select": "conversationId,internetMessageId,subject,toRecipients,sentDateTime"},
+        headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
+    if res.status_code != 200:
+        return {"status": "fetch_failed", "http_status": res.status_code}
+    sent_items = []
+    for m in res.json().get("value", []):
+        to = [((t.get("emailAddress") or {}).get("address") or "").strip().lower() for t in m.get("toRecipients") or []]
+        try:
+            when = datetime.datetime.strptime(m["sentDateTime"][:19], "%Y-%m-%dT%H:%M:%S")
+        except (KeyError, ValueError):
+            continue
+        sent_items.append((to, (m.get("subject") or "").strip(), when, m.get("conversationId") or ""))
+    matched = 0
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        for p in pending:
+            sent_at = datetime.datetime.strptime(p["sent_at"][:19], "%Y-%m-%d %H:%M:%S")
+            email = (p["recipient_email"] or "").strip().lower()
+            candidates = [(abs((when - sent_at).total_seconds()), conv) for to, subj, when, conv in sent_items
+                          if conv and email in to and subj == (p["subject"] or "").strip()
+                          and abs((when - sent_at).total_seconds()) <= 600]
+            if candidates:
+                conn.execute("UPDATE sponsorship_communications SET thread_id = ? WHERE id = ?", (min(candidates)[1], p["id"]))
+                matched += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok", "pending": len(pending), "matched": matched}
+
+
 def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subject: str, body_preview: str,
                           sender_email: str, recipient_email: str, received_at: Optional[str]) -> bool:
     """Logs one inbound reply (once per message id) and marks only the outbound email that donor
@@ -4383,7 +4885,7 @@ def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subje
     if cur.execute("SELECT 1 FROM sponsorship_communications WHERE message_id = ? AND company_id = ?",
                    (msg_id, company_id)).fetchone():
         return False
-    alloc_id, alloc_donor_id = _match_reply_sender(cur, company_id, sender_email)
+    alloc_id, alloc_donor_id = _match_reply_sender(cur, company_id, sender_email, conv_id, received_at)
     if not alloc_id:
         return False
     cur.execute("""
@@ -4402,11 +4904,15 @@ def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subje
               message=f"Reply from {sender_email}")
     target = cur.execute("""
         SELECT id FROM sponsorship_communications
-        WHERE allocation_id = ? AND direction = 'outbound'
-          AND (allocation_donor_id = ? OR LOWER(recipient_email) LIKE ?)
-          AND sent_at <= COALESCE(?, CURRENT_TIMESTAMP)
+        WHERE company_id = ? AND direction = 'outbound' AND thread_id = ? AND ? != ''
         ORDER BY sent_at DESC LIMIT 1
-    """, (alloc_id, alloc_donor_id, f"%{(sender_email or '').strip().lower()}%", received_at)).fetchone()
+    """, (company_id, conv_id or "", conv_id or "")).fetchone() or cur.execute("""
+        SELECT id FROM sponsorship_communications
+        WHERE allocation_id = ? AND direction = 'outbound'
+          AND (allocation_donor_id = ? OR LOWER(TRIM(recipient_email)) = ? OR LOWER(recipient_email) LIKE ?)
+          AND sent_at <= COALESCE(REPLACE(REPLACE(?, 'T', ' '), 'Z', ''), CURRENT_TIMESTAMP)
+        ORDER BY sent_at DESC LIMIT 1
+    """, (alloc_id, alloc_donor_id, (sender_email or '').strip().lower(), f"%{(sender_email or '').strip().lower()}%", received_at)).fetchone()
     if target:
         cur.execute("""
             UPDATE sponsorship_communications SET delivery_status = 'replied',
@@ -4458,6 +4964,35 @@ def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
         return {"status": "success", "synced_new_replies": new_synced}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+def run_mailbox_maintenance() -> Dict[str, Any]:
+    """Background (every few minutes, one worker): keep each connected charity mailbox's reply webhook alive,
+    learn conversation ids of recently sent emails, and pull new replies - so replies are recorded even when
+    nobody has the tracker open. Read-only towards Outlook apart from renewing the subscription."""
+    out = {}
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        companies = [r[0] for r in conn.execute(
+            "SELECT company_id FROM sponsorship_outlook_auth WHERE COALESCE(refresh_token, '') != ''")]
+    except sqlite3.OperationalError:
+        companies = []
+    finally:
+        conn.close()
+    for comp in companies:
+        result = {}
+        for name, fn in (("subscription", lambda: ensure_outlook_subscription(comp)),
+                         ("threads", lambda: _backfill_conversation_ids(comp)),
+                         ("replies", lambda: sync_inbound_outlook_replies(comp))):
+            try:
+                r = fn()
+                result[name] = r.get("status") if isinstance(r, dict) else r
+                if name == "replies" and isinstance(r, dict) and r.get("synced_new_replies"):
+                    result["new_replies"] = r["synced_new_replies"]
+            except Exception as e:
+                result[name] = f"error: {e}"
+        out[comp] = result
+    return out
+
 
 @router.post("/outlook/sync-replies")
 def trigger_sync_replies(company_id: Optional[str] = Query("rethink"), current_user = Depends(get_current_user)):
@@ -5344,13 +5879,15 @@ def get_allocation_communications(allocation_id: int):
             sync_inbound_outlook_replies(a_row["company_id"])
 
         cur.execute("""
-            SELECT id, allocation_id, company_id, direction, message_id,
-                   thread_id, subject, body, sender_email, recipient_email, sent_at,
-                   tracking_id, delivery_status, opened_at, open_count, replied_at,
-                   last_opened_ip, last_opened_user_agent
-            FROM sponsorship_communications
-            WHERE allocation_id = ?
-            ORDER BY sent_at ASC
+            SELECT c.id, c.allocation_id, c.company_id, c.direction, c.message_id,
+                   c.thread_id, c.subject, c.body, c.sender_email, c.recipient_email, c.sent_at,
+                   c.tracking_id, c.delivery_status, c.opened_at, c.open_count, c.replied_at,
+                   c.last_opened_ip, c.last_opened_user_agent,
+                   c.allocation_donor_id, c.template_type, d.donor_name
+            FROM sponsorship_communications c
+            LEFT JOIN sponsorship_allocation_donors d ON d.id = c.allocation_donor_id
+            WHERE c.allocation_id = ?
+            ORDER BY c.sent_at ASC
         """, (allocation_id,))
         rows = [dict(r) for r in cur.fetchall()]
         return {"allocation_id": allocation_id, "count": len(rows), "messages": rows}
@@ -6490,8 +7027,10 @@ def get_sponsorship_donor_details(donor_key: str, company_id: Optional[str] = Qu
         history = []
         if alloc_donor_ids or emails:
             ph_ad = ",".join("?" * len(alloc_donor_ids)) or "NULL"
-            like_clauses = " OR ".join(["LOWER(c.recipient_email) LIKE ? OR LOWER(c.sender_email) = ?"] * len(emails)) or "0"
-            like_params = [p for e in emails for p in (f"%{e}%", e)]
+            # whole-address match (also inside comma/semicolon lists) - never a substring of someone else's email
+            like_clauses = " OR ".join(["(',' || REPLACE(REPLACE(LOWER(c.recipient_email), ' ', ''), ';', ',') || ',') LIKE ?"
+                                        " OR LOWER(TRIM(c.sender_email)) = ?"] * len(emails)) or "0"
+            like_params = [p for e in emails for p in (f"%,{e.strip().lower()},%", e.strip().lower())]
             cur.execute(f"""
                 SELECT c.id, c.allocation_id, c.allocation_donor_id, c.direction, c.subject, c.template_type,
                        c.sent_at, c.delivery_status, c.open_count, c.opened_at, c.replied_at, c.recipient_email, c.sender_email
