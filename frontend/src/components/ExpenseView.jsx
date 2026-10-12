@@ -185,7 +185,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
     const wsHost = API_BASE_URL
       ? API_BASE_URL.replace(/^https?:\/\//, '')
       : window.location.host;
-    const wsUrl = `${wsProtocol}//${wsHost}/ws/events`;
+    const wsUrl = `${wsProtocol}//${wsHost}/ws/events?token=${encodeURIComponent(localStorage.getItem('analytics_token') || '')}`;
 
     let socket = null;
     let fallbackInterval = null;

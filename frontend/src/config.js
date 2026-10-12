@@ -81,3 +81,31 @@ export const reloadForNewBuild = () => {
   window.location.reload()
   return true
 }
+
+/**
+ * Downloads an export through fetch so the request carries the session token (a plain window.open
+ * would arrive at the API without it and be refused). Saves the file under the server's filename.
+ */
+export const downloadFile = async (url, fallbackName = 'export') => {
+  const response = await fetch(url);
+  if (!response.ok) {
+    let detail = `Download failed (${response.status})`;
+    try {
+      const body = await response.json();
+      if (body?.detail) detail = typeof body.detail === 'string' ? body.detail : detail;
+    } catch { /* not JSON */ }
+    window.alert(detail);
+    return;
+  }
+  const disposition = response.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  const filename = match ? decodeURIComponent(match[1]) : fallbackName;
+  const blobUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = blobUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+};

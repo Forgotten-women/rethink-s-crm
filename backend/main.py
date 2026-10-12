@@ -81,21 +81,26 @@ async def audit_log_middleware(request, call_next):
 
 
 # Register API Routers
+# Data routers: signed session + charity access check on every call (see auth.api_access_guard).
+# auth (login), webhooks (platform callbacks) and events (WebSocket) are public by design; ops and
+# tracker carry their own stricter router guards.
+from fastapi import Depends as _Depends
+_GUARDED = [_Depends(auth.api_access_guard)]
 app.include_router(ops.router)
-app.include_router(cache_versions.router)
+app.include_router(cache_versions.router, dependencies=_GUARDED)
 app.include_router(auth.router)
-app.include_router(metrics.router)
-app.include_router(overview.router)
-app.include_router(ltv.router)
-app.include_router(donors.router)
-app.include_router(classifications.router)
-app.include_router(admin.router)
-app.include_router(expenses.router)
-app.include_router(filters.router)
+app.include_router(metrics.router, dependencies=_GUARDED)
+app.include_router(overview.router, dependencies=_GUARDED)
+app.include_router(ltv.router, dependencies=_GUARDED)
+app.include_router(donors.router, dependencies=_GUARDED)
+app.include_router(classifications.router, dependencies=_GUARDED)
+app.include_router(admin.router, dependencies=_GUARDED)
+app.include_router(expenses.router, dependencies=_GUARDED)
+app.include_router(filters.router, dependencies=_GUARDED)
 app.include_router(events.router)
 app.include_router(tracker.router)
-app.include_router(payouts.router)
-app.include_router(fundraisers.router)
+app.include_router(payouts.router, dependencies=_GUARDED)
+app.include_router(fundraisers.router, dependencies=_GUARDED)
 app.include_router(webhooks.router)
 
 # Mount logos directory for branded email assets
@@ -188,9 +193,10 @@ async def _sponsorship_queue_daily_loop():
 
 
 async def _cache_warmup_loop():
-    """One worker (file lock) watches each company's donation/classification versions and, when they
-    change (e.g. platform-sync ingested a donation), pre-computes the slowest endpoints so the next
-    visitor gets a cached response. At most once per 5 minutes per company."""
+    """One worker (file lock) pre-computes the slowest pages so visitors get cached responses.
+    Each page is rebuilt only when the data IT depends on changed for THAT charity (its own cache scopes),
+    and only once the change has settled for 90 s, so a burst of syncs costs one rebuild, not one per sync.
+    A page is never served stale meanwhile: its cache key already changed, so a visitor computes it fresh."""
     import asyncio
     import time as _time
     from core.cache import route_defaults, try_exclusive, version_token
@@ -200,7 +206,7 @@ async def _cache_warmup_loop():
     if lock is None:
         return  # another worker is the warmer
     from backend.api import classifications, metrics, overview, tracker
-    last_token, last_run = {}, {}
+    settle_seconds = 90
     jobs = {
         "rethink": [(classifications.get_launchgood_matrix, {}), (classifications.get_givebright_matrix, {}),
                     (metrics.get_metrics_summary, {}), (overview.get_overview_top_campaigns, {})]
@@ -209,20 +215,26 @@ async def _cache_warmup_loop():
                  (metrics.get_metrics_summary, {}), (overview.get_overview_top_campaigns, {})]
                 + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")],
     }
+    warmed_token, seen_token, seen_at = {}, {}, {}
     while True:
         for company, fns in jobs.items():
             try:
-                token = await asyncio.to_thread(version_token, ["donations", "classification", "tracker"], company)
-                if token == last_token.get(company) or _time.time() - last_run.get(company, 0) < 300:
-                    continue
-                started = _time.perf_counter()
+                started, ran = _time.perf_counter(), 0
                 for fn, extra in fns:
+                    key = (company, fn.__name__, tuple(sorted(extra.items())))
+                    token = await asyncio.to_thread(version_token, getattr(fn, "cache_scopes", ["donations"]), company)
+                    if token != seen_token.get(key):
+                        seen_token[key], seen_at[key] = token, _time.time()
+                    if token == warmed_token.get(key) or _time.time() - seen_at[key] < settle_seconds:
+                        continue
                     kwargs = route_defaults(fn, company_id=company, **extra)
                     await asyncio.to_thread(fn, **kwargs)
-                last_token[company], last_run[company] = token, _time.time()
-                log_event("cache.warmed", category="performance", company_id=company, endpoints=len(fns),
-                          duration_ms=round((_time.perf_counter() - started) * 1000),
-                          message=f"Pre-computed {len(fns)} heavy pages for {company}")
+                    warmed_token[key] = token
+                    ran += 1
+                if ran:
+                    log_event("cache.warmed", category="performance", company_id=company, endpoints=ran,
+                              duration_ms=round((_time.perf_counter() - started) * 1000),
+                              message=f"Pre-computed {ran} heavy page(s) for {company}")
             except Exception as warm_err:
                 print(f"[Cache Warm-up Notice] {company}: {warm_err}")
         await asyncio.sleep(60)

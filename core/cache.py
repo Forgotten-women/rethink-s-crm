@@ -43,7 +43,7 @@ SCOPE_TABLES: Dict[str, List[str]] = {
     "fundraisers": ["fundraisers", "fundraiser_campaigns"],
     "tracker": ["sponsorship_beneficiaries", "sponsorship_allocations", "sponsorship_allocation_donors",
                 "sponsorship_manual_donors", "sponsorship_targets", "sponsorship_alert_dismissals",
-                "sponsorship_alert_settings"],
+                "sponsorship_alert_settings", "sponsorship_donor_classifications", "sponsorship_campaign_classifications"],
     "tracker_comms": ["sponsorship_communications", "sponsorship_email_queue", "sponsorship_email_templates",
                       "sponsorship_feedbacks"],
     "payouts": ["payout_settlements", "paysuite_payout_settlements"],
@@ -52,11 +52,18 @@ SCOPE_TABLES: Dict[str, List[str]] = {
 }
 # scopes whose version also includes a file mtime
 SCOPE_FILES: Dict[str, List[str]] = {
-    "donations": [PARQUET_PATH],
     "payouts": [PAYOUTS_PARQUET_PATH, PAYSUITE_PAYOUTS_PARQUET_PATH],
 }
-# huge tables: one global counter instead of per-company (cheaper per-row trigger)
-GLOBAL_ONLY_TABLES = {"donations", "payout_settlements", "paysuite_payout_settlements"}
+# scopes whose version includes a per-company CONTENT fingerprint of a file: a rewrite that leaves a charity's
+# rows unchanged (or only changes the other charity's rows) keeps that charity's caches valid.
+SCOPE_CONTENT_FILES: Dict[str, List[str]] = {
+    "donations": [PARQUET_PATH],
+}
+# one global counter instead of per-company
+GLOBAL_ONLY_TABLES = {"payout_settlements", "paysuite_payout_settlements"}
+# UPDATE triggers on these tables only bump when a column value really changes (no-op rewrites are ignored)
+CHANGE_ONLY_UPDATE_TABLES = {"donations"}
+FINGERPRINT_FILE = os.path.join(BASE_DIR, "data_cache", "parquet_fingerprints.json")
 
 current_request: contextvars.ContextVar = contextvars.ContextVar("current_request", default=None)
 
@@ -94,7 +101,8 @@ def _trigger_specs(conn) -> List[Tuple[str, str]]:
         for table in tables:
             if table not in existing:
                 continue
-            per_company = table not in GLOBAL_ONLY_TABLES and "company_id" in _table_columns(conn, table)
+            columns = _table_columns(conn, table)
+            per_company = table not in GLOBAL_ONLY_TABLES and "company_id" in columns
 
             def bump(row_ref: Optional[str]) -> str:
                 key = (f"'{scope}:' || LOWER(TRIM(COALESCE({row_ref}.company_id, 'rethink')))" if row_ref
@@ -103,8 +111,15 @@ def _trigger_specs(conn) -> List[Tuple[str, str]]:
                         f"ON CONFLICT(scope) DO UPDATE SET version = version + 1, updated_at = CURRENT_TIMESTAMP;")
             for op, refs in (("INSERT", ["NEW"]), ("UPDATE", ["NEW", "OLD"]), ("DELETE", ["OLD"])):
                 body = " ".join(bump(r if per_company else None) for r in (refs if per_company else refs[:1]))
-                name = f"cachever_{table}_{op.lower()}"
-                specs.append((name, f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {op} ON {table} BEGIN {body} END"))
+                when = ""
+                if op == "UPDATE" and table in CHANGE_ONLY_UPDATE_TABLES:
+                    changed = " OR ".join(f'OLD."{c}" IS NOT NEW."{c}"' for c in columns)
+                    when = f" WHEN {changed}"
+                # The name carries a hash of the definition, so a changed definition (new columns, new
+                # scoping) is detected and the old trigger replaced.
+                definition = f"AFTER {op} ON {table}{when} BEGIN {body} END"
+                name = f"cachever_{table}_{op.lower()}_{hashlib.sha1(definition.encode()).hexdigest()[:8]}"
+                specs.append((name, f"CREATE TRIGGER IF NOT EXISTS {name} {definition}"))
     return specs
 
 
@@ -115,8 +130,13 @@ def install_version_triggers(bump_epoch: bool = False) -> int:
         conn.execute("""CREATE TABLE IF NOT EXISTS data_versions (
                             scope TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMP)""")
         have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'cachever_%'")}
+        specs = _trigger_specs(conn)
         created = 0
-        for name, sql in _trigger_specs(conn):
+        conn.execute("BEGIN IMMEDIATE")  # swap old -> new definitions atomically: no write is ever unversioned
+        for name in have - {n for n, _ in specs}:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            created += 1
+        for name, sql in specs:
             if name not in have:
                 conn.execute(sql)
                 created += 1
@@ -137,7 +157,7 @@ def _ensure_triggers(conn) -> None:
         return
     expected = {name for name, _ in _trigger_specs(conn)}
     have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'cachever_%'")}
-    if not expected.issubset(have):
+    if expected != have:
         install_version_triggers(bump_epoch=True)
     _triggers_checked_at = now
 
@@ -179,8 +199,120 @@ def versions(scopes: Iterable[str], company_id: Optional[str]) -> Dict[str, Any]
                 files.append(os.stat(path).st_mtime_ns)
             except OSError:
                 files.append(0)
+        for path in SCOPE_CONTENT_FILES.get(s, []):
+            files.append(company_fingerprint(path, comp))
         out[s] = [v, files] if files else v
     return out
+
+
+# --------------------------------------------------------------------------------------------------
+# Per-company content fingerprints of the donations parquet
+# --------------------------------------------------------------------------------------------------
+_fp_memo: Dict[str, Tuple[Tuple[int, int], Dict[str, str]]] = {}
+_fp_lock = threading.Lock()
+
+
+def _file_stat(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _compute_fingerprints(path: str) -> Dict[str, str]:
+    """sha1 of each company's rows (Arrow IPC bytes, every column). Rows are matched to companies exactly as
+    load_data(company_id=...) does (lower/trimmed company_id); '*' covers every row (company 'all')."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    table = pq.read_table(path)
+    # string vs large_string (and binary vs large_binary) load into the same DataFrame; normalise so a writer
+    # that picks the other one isn't mistaken for a data change.
+    norm_fields = [pa.field(f.name, pa.string() if pa.types.is_large_string(f.type) else
+                            pa.binary() if pa.types.is_large_binary(f.type) else f.type, f.nullable)
+                   for f in table.schema]
+    table = table.cast(pa.schema(norm_fields, metadata=table.schema.metadata))
+    out: Dict[str, str] = {}
+    # What decides the DataFrame load_data builds: column names + (normalised) arrow types + the values. File
+    # details - row groups, compression, pandas' own type labels ('unicode' vs 'object' load identically) and
+    # the total row count in its index metadata - are left out, so the other charity's appends and harmless
+    # rewrites don't look like a change here.
+    layout = json.dumps([(f.name, str(f.type)) for f in table.schema]).encode()
+    plain_schema = table.schema.remove_metadata()
+
+    def digest(t) -> str:
+        h = hashlib.sha1(layout)
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, plain_schema) as writer:
+            writer.write_table(t.replace_schema_metadata(None).combine_chunks())
+        h.update(sink.getvalue())
+        return h.hexdigest()[:16]
+
+    out["*"] = digest(table)
+    if "company_id" in table.column_names:
+        comp = pc.utf8_lower(pc.utf8_trim_whitespace(pc.cast(table["company_id"], pa.string())))
+        for value in pc.unique(comp).to_pylist():
+            if value is None:
+                continue
+            out[value] = digest(table.filter(pc.equal(comp, value)))
+    return out
+
+
+def _fingerprints(path: str) -> Optional[Dict[str, str]]:
+    stat = _file_stat(path)
+    if stat is None:
+        return None
+    hit = _fp_memo.get(path)
+    if hit and hit[0] == stat:
+        return hit[1]
+    with _fp_lock:
+        hit = _fp_memo.get(path)
+        if hit and hit[0] == stat:
+            return hit[1]
+        os.makedirs(LOCK_DIR, exist_ok=True)
+        with open(os.path.join(LOCK_DIR, "parquet_fingerprint.lock"), "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)  # one process computes; the others read its result
+            try:
+                try:
+                    with open(FINGERPRINT_FILE) as f:
+                        saved = json.load(f).get(path) or {}
+                except (OSError, ValueError):
+                    saved = {}
+                if tuple(saved.get("stat") or ()) == stat:
+                    fps = saved["fp"]
+                else:
+                    fps = _compute_fingerprints(path)
+                    if _file_stat(path) != stat:
+                        return None  # file changed while reading: don't trust this result
+                    try:
+                        with open(FINGERPRINT_FILE) as f:
+                            all_saved = json.load(f)
+                    except (OSError, ValueError):
+                        all_saved = {}
+                    all_saved[path] = {"stat": list(stat), "fp": fps}
+                    tmp = FINGERPRINT_FILE + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(all_saved, f)
+                    os.replace(tmp, FINGERPRINT_FILE)
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+        _fp_memo[path] = (stat, fps)
+        return fps
+
+
+def company_fingerprint(path: str, company: str) -> str:
+    """Version component for one company's rows of a parquet file. Falls back to the file's mtime (i.e. the
+    old, every-company invalidation) if the fingerprint can't be computed - never to a stale value."""
+    try:
+        fps = _fingerprints(path)
+    except Exception:
+        fps = None
+    if fps is None:
+        stat = _file_stat(path)
+        return f"mtime:{stat[0] if stat else 0}"
+    key = "*" if company in ("all", "") else company
+    return fps.get(key, "none")
 
 
 # --------------------------------------------------------------------------------------------------

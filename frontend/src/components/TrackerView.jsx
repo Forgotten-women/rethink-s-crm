@@ -17,6 +17,130 @@ import EmailQueueView from './tracker/EmailQueueView';
 import TrackerFilterBar from './tracker/TrackerFilterBar';
 import { toDraftDonor, donorKeyFor, readFiltersFromUrl, writeFiltersToUrl, filtersToParams } from './tracker/trackerUtils';
 
+export const WORKSPACE_ALLOWED_CLASSIFICATIONS = {
+  rethink: ['Rethink Only', 'Rethink + SP'],
+  iqra: ['Iqra Only', 'Iqra + SP'],
+  all: ['Rethink Only', 'Rethink + SP', 'Iqra Only', 'Iqra + SP']
+};
+
+export const getAllowedClassifications = (companyId) => {
+  const comp = (companyId || 'rethink').toLowerCase();
+  if (comp === 'iqra') return WORKSPACE_ALLOWED_CLASSIFICATIONS.iqra;
+  if (comp === 'all') return WORKSPACE_ALLOWED_CLASSIFICATIONS.all;
+  return WORKSPACE_ALLOWED_CLASSIFICATIONS.rethink;
+};
+
+export const ClassificationBadge = ({ 
+  classification, 
+  isManual = false,
+  companyId = 'rethink', 
+  onClassify = null, 
+  editable = true,
+  size = 'sm' 
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const popoverRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target)) {
+        setIsOpen(false);
+      }
+    };
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [isOpen]);
+
+  const defaultCls = (companyId || '').toLowerCase() === 'iqra' ? 'Iqra Only' : 'Rethink Only';
+  const cls = classification || defaultCls;
+  const allowed = getAllowedClassifications(companyId);
+
+  const getStyle = (val) => {
+    switch (val) {
+      case 'Rethink Only':
+        return 'bg-blue-500/15 text-blue-700 dark:text-blue-300 border-blue-500/30 hover:border-blue-500/60';
+      case 'Rethink + SP':
+        return 'bg-purple-500/15 text-purple-700 dark:text-purple-300 border-purple-500/30 hover:border-purple-500/60';
+      case 'Iqra Only':
+        return 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30 hover:border-emerald-500/60';
+      case 'Iqra + SP':
+        return 'bg-teal-500/15 text-teal-700 dark:text-teal-300 border-teal-500/30 hover:border-teal-500/60';
+      default:
+        return 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border-slate-500/30';
+    }
+  };
+
+  const getDotColor = (val) => {
+    switch (val) {
+      case 'Rethink Only': return 'bg-blue-500';
+      case 'Rethink + SP': return 'bg-purple-500';
+      case 'Iqra Only': return 'bg-emerald-500';
+      case 'Iqra + SP': return 'bg-teal-500';
+      default: return 'bg-slate-400';
+    }
+  };
+
+  const padClass = size === 'xs' ? 'px-1.5 py-0.2 text-[9px]' : 'px-2 py-0.5 text-[10px]';
+
+  return (
+    <div className="relative inline-block" ref={popoverRef}>
+      <button
+        type="button"
+        disabled={!editable || !onClassify}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (editable && onClassify) setIsOpen(!isOpen);
+        }}
+        title={editable && onClassify ? "Click to change source classification" : cls}
+        className={`inline-flex items-center gap-1.5 rounded-full font-bold border transition-all ${padClass} ${getStyle(cls)} ${editable && onClassify ? 'cursor-pointer hover:shadow-xs' : 'cursor-default'}`}
+      >
+        <span className={`w-1.5 h-1.5 rounded-full ${getDotColor(cls)}`} />
+        <span>{cls}</span>
+        {editable && onClassify && (
+          <ChevronDown className="w-2.5 h-2.5 opacity-60 ml-0.5" />
+        )}
+      </button>
+
+      {isOpen && (
+        <div 
+          onClick={(e) => e.stopPropagation()}
+          className="absolute left-0 mt-1 z-50 min-w-[155px] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-xl p-1.5 animate-in fade-in zoom-in-95 duration-100"
+        >
+          <div className="text-[10px] font-semibold text-slate-400 dark:text-slate-400 px-2 py-1 uppercase tracking-wider">
+            Set Classification
+          </div>
+          <div className="flex flex-col gap-0.5">
+            {allowed.map((opt) => (
+              <button
+                key={opt}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClassify(opt);
+                  setIsOpen(false);
+                }}
+                className={`flex items-center justify-between w-full px-2 py-1.5 rounded text-left text-xs font-semibold transition-colors ${
+                  cls === opt 
+                    ? 'bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white font-bold' 
+                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className={`w-2 h-2 rounded-full ${getDotColor(opt)}`} />
+                  <span>{opt}</span>
+                </div>
+                {cls === opt && <Check className="w-3 h-3 text-blue-600 dark:text-blue-400" />}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export default function TrackerView({ user, filters, onSelectDonor, activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
   
@@ -46,6 +170,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const [overdueTypeFilter, setOverdueTypeFilter] = useState('All'); // 'All' | 'Orphan' | 'Hafiz' | 'Widow' | 'Ex-Prisoner'
   const [overdueSeverityFilter, setOverdueSeverityFilter] = useState('all'); // 'all' | 'critical' | 'urgent' | 'warning'
   const [overdueTargetStatusFilter, setOverdueTargetStatusFilter] = useState('all'); // 'all' | 'target_reached' | 'threshold_reached' | 'below_threshold'
+  const [overdueClassificationFilter, setOverdueClassificationFilter] = useState('all');
   const [overdueSearchQuery, setOverdueSearchQuery] = useState('');
   const [overdueDonorPage, setOverdueDonorPage] = useState(1);
   const [overdueDonorPageSize, setOverdueDonorPageSize] = useState(15);
@@ -93,14 +218,23 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // --- DONORS LEFT PANEL SEARCH & PAGINATION STATE ---
   const [donorSearchQuery, setDonorSearchQuery] = useState('');
   const [donorSlotFilter, setDonorSlotFilter] = useState('all'); // 'all' | 'available' | 'full'
+  const [donorClassificationFilter, setDonorClassificationFilter] = useState('all');
   const [donorPage, setDonorPage] = useState(1);
   const [donorPageSize, setDonorPageSize] = useState(10);
 
   // --- CAMPAIGNS LEFT PANEL SEARCH & PAGINATION STATE ---
   const [campaignListSearchQuery, setCampaignListSearchQuery] = useState('');
   const [campaignSlotFilter, setCampaignSlotFilter] = useState('all'); // 'all' | 'available' | 'full'
+  const [campaignClassificationFilter, setCampaignClassificationFilter] = useState('all');
   const [campaignPage, setCampaignPage] = useState(1);
   const [campaignPageSize, setCampaignPageSize] = useState(10);
+
+  useEffect(() => {
+    setDonorClassificationFilter('all');
+    setCampaignClassificationFilter('all');
+    setOverdueClassificationFilter('all');
+    setAllocFilters(prev => (prev.classification && prev.classification !== 'all' ? { ...prev, classification: 'all' } : prev));
+  }, [activeCompany]);
 
   // --- BENEFICIARIES DIRECTORY PAGINATION STATE ---
   const [beneficiaryPage, setBeneficiaryPage] = useState(1);
@@ -134,7 +268,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     sponsorship_type: 'Orphan',
     total_donated: 480,
     custom_slots: 1,
-    notes: ''
+    notes: '',
+    classification: getAllowedClassifications(activeCompany)[0]
   });
   const [savingManualDonor, setSavingManualDonor] = useState(false);
 
@@ -589,6 +724,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       page: overdueDonorPage,
       page_size: overdueDonorPageSize
     });
+    if (overdueClassificationFilter && overdueClassificationFilter !== 'all') {
+      params.append('classification', overdueClassificationFilter);
+    }
     if (overdueSearchQuery) params.append('search', overdueSearchQuery);
     if (forceRefresh) params.append('force_refresh', 'true');
 
@@ -616,6 +754,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       page: overdueCampaignPage,
       page_size: overdueCampaignPageSize
     });
+    if (overdueClassificationFilter && overdueClassificationFilter !== 'all') {
+      params.append('classification', overdueClassificationFilter);
+    }
     if (overdueSearchQuery) params.append('search', overdueSearchQuery);
     if (forceRefresh) params.append('force_refresh', 'true');
 
@@ -951,7 +1092,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         loadOverdueDismissals();
       }
     }
-  }, [activeTab, activeCompany, overdueActiveSubTab, overdueThreshold, overdueTypeFilter, overdueSeverityFilter, overdueTargetStatusFilter, overdueSearchQuery, overdueDonorPage, overdueDonorPageSize, overdueCampaignPage, overdueCampaignPageSize]);
+  }, [activeTab, activeCompany, overdueActiveSubTab, overdueThreshold, overdueTypeFilter, overdueSeverityFilter, overdueTargetStatusFilter, overdueClassificationFilter, overdueSearchQuery, overdueDonorPage, overdueDonorPageSize, overdueCampaignPage, overdueCampaignPageSize]);
 
   useEffect(() => {
     if (activeTab === 'alerts') {
@@ -1098,7 +1239,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         total_donated: parseFloat(manualDonorForm.total_donated) || 0.0,
         custom_slots: manualDonorForm.custom_slots ? parseInt(manualDonorForm.custom_slots) : null,
         notes: manualDonorForm.notes.trim(),
-        company_id: activeCompany
+        company_id: activeCompany,
+        classification: manualDonorForm.classification || getAllowedClassifications(activeCompany)[0]
       };
 
       const res = await fetch(url, {
@@ -1121,7 +1263,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         sponsorship_type: selectedDonorType || 'Orphan',
         total_donated: targetInputs[selectedDonorType] || 480,
         custom_slots: 1,
-        notes: ''
+        notes: '',
+        classification: getAllowedClassifications(activeCompany)[0]
       });
       loadBeneficiariesAndAllocations();
     } catch (err) {
@@ -1147,6 +1290,63 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       loadBeneficiariesAndAllocations();
     } catch (err) {
       alert(err.message || 'Error deleting manual donor');
+    }
+  };
+
+  const handleClassifyDonor = async (donor, newClassification) => {
+    try {
+      const comp = activeCompany === 'all' ? (newClassification.startsWith('Iqra') ? 'iqra' : 'rethink') : activeCompany;
+      const res = await fetch(`${API_BASE_URL}/api/tracker/donors/classify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          donor_id: String(donor.donor_id),
+          classification: newClassification,
+          company_id: comp,
+          donor_email: donor.donor_email && donor.donor_email !== 'N/A' ? donor.donor_email : null
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to update classification');
+      }
+      setQualifyingDonors(prev => prev.map(d => 
+        (d.donor_id === donor.donor_id ? { ...d, classification: newClassification, is_manually_classified: true } : d)
+      ));
+      setOverdueDonors(prev => prev.map(d => 
+        (d.donor_id === donor.donor_id ? { ...d, classification: newClassification, is_manually_classified: true } : d)
+      ));
+    } catch (err) {
+      console.error('Error classifying donor:', err);
+      alert(err.message || 'Failed to classify donor');
+    }
+  };
+
+  const handleClassifyCampaign = async (campaign, newClassification) => {
+    try {
+      const comp = activeCompany === 'all' ? (newClassification.startsWith('Iqra') ? 'iqra' : 'rethink') : activeCompany;
+      const res = await fetch(`${API_BASE_URL}/api/tracker/campaigns/classify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          campaign_name: campaign.campaign_name,
+          classification: newClassification,
+          company_id: comp
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to update campaign classification');
+      }
+      setQualifyingCampaigns(prev => prev.map(c => 
+        (c.campaign_name === campaign.campaign_name ? { ...c, classification: newClassification, is_manually_classified: true } : c)
+      ));
+      setOverdueCampaigns(prev => prev.map(c => 
+        (c.campaign_name === campaign.campaign_name ? { ...c, classification: newClassification, is_manually_classified: true } : c)
+      ));
+    } catch (err) {
+      console.error('Error classifying campaign:', err);
+      alert(err.message || 'Failed to classify campaign');
     }
   };
 
@@ -1789,12 +1989,13 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   useEffect(() => {
     setDonorPage(1);
-  }, [donorSearchQuery, donorSlotFilter, selectedDonorType, activeCompany]);
+  }, [donorSearchQuery, donorSlotFilter, donorClassificationFilter, selectedDonorType, activeCompany]);
 
   const filteredQualifyingDonors = useMemo(() => {
     return qualifyingDonors.filter(d => {
       if (donorSlotFilter === 'available' && d.remaining_slots <= 0) return false;
       if (donorSlotFilter === 'full' && d.remaining_slots > 0) return false;
+      if (donorClassificationFilter !== 'all' && d.classification !== donorClassificationFilter) return false;
       if (donorSearchQuery) {
         const q = donorSearchQuery.toLowerCase().trim();
         const cleanQ = q.replace(/[\s\-\(\)\+]/g, '');
@@ -1808,7 +2009,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       }
       return true;
     });
-  }, [qualifyingDonors, donorSearchQuery, donorSlotFilter]);
+  }, [qualifyingDonors, donorSearchQuery, donorSlotFilter, donorClassificationFilter]);
 
   const totalDonorPages = Math.max(1, Math.ceil(filteredQualifyingDonors.length / donorPageSize));
   const paginatedQualifyingDonors = useMemo(() => {
@@ -1821,12 +2022,13 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   useEffect(() => {
     setCampaignPage(1);
-  }, [campaignListSearchQuery, campaignSlotFilter, selectedDonorType, activeCompany]);
+  }, [campaignListSearchQuery, campaignSlotFilter, campaignClassificationFilter, selectedDonorType, activeCompany]);
 
   const filteredQualifyingCampaigns = useMemo(() => {
     return qualifyingCampaigns.filter(c => {
       if (campaignSlotFilter === 'available' && c.remaining_slots <= 0) return false;
       if (campaignSlotFilter === 'full' && c.remaining_slots > 0) return false;
+      if (campaignClassificationFilter !== 'all' && c.classification !== campaignClassificationFilter) return false;
       if (campaignListSearchQuery) {
         const q = campaignListSearchQuery.toLowerCase().trim();
         const matchesName = (c.campaign_name || '').toLowerCase().includes(q);
@@ -1837,7 +2039,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       }
       return true;
     });
-  }, [qualifyingCampaigns, campaignListSearchQuery, campaignSlotFilter]);
+  }, [qualifyingCampaigns, campaignListSearchQuery, campaignSlotFilter, campaignClassificationFilter]);
 
   const totalCampaignPages = Math.max(1, Math.ceil(filteredQualifyingCampaigns.length / campaignPageSize));
   const paginatedQualifyingCampaigns = useMemo(() => {
@@ -2162,7 +2364,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     sponsorship_type: activeType,
                     total_donated: targetInputs[activeType] || 480,
                     custom_slots: 1,
-                    notes: ''
+                    notes: '',
+                    classification: getAllowedClassifications(activeCompany)[0]
                   });
                   setShowManualDonorModal(true);
                 }}
@@ -2529,16 +2732,62 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         <div className="flex flex-col gap-6">
           <TrackerFilterBar values={allocFilters} onChange={setAllocFilters} resultCount={allocations.length}
             fields={[
-              { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone' },
-              { key: 'beneficiary', label: 'Beneficiary', placeholder: 'Name or project code' },
-              { key: 'campaign', label: 'Campaign', placeholder: 'Campaign / community' },
-              { key: 'sponsorship_type', label: 'Sponsorship', type: 'select', options: [
+              // General primary filters
+              { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone', section: 'general' },
+              { key: 'beneficiary', label: 'Beneficiary', placeholder: 'Name or project code', section: 'general' },
+              { key: 'campaign', label: 'Campaign', placeholder: 'Campaign / community', section: 'general' },
+              { key: 'sponsorship_type', label: 'Sponsorship', type: 'select', section: 'general', options: [
                 { value: 'all', label: 'All types' }, ...['Orphan', 'Widow', 'Ex-Prisoner', 'Hafiz'].map(t => ({ value: t, label: t }))] },
-              { key: 'funded_status', label: 'Funding', type: 'select', options: [
+              { key: 'classification', label: 'Source', type: 'select', section: 'general', options: [
+                { value: 'all', label: 'All sources' },
+                ...getAllowedClassifications(activeCompany).map(c => ({ value: c, label: c }))
+              ] },
+              { key: 'funded_status', label: 'Funding', type: 'select', section: 'general', options: [
                 { value: 'all', label: 'Any funding' }, { value: 'partial', label: 'Partly funded' }, { value: 'full', label: 'Fully funded' }] },
-              { key: 'end', label: 'Sponsorship ends', type: 'daterange' },
-              { key: 'last_emailed', label: 'Last emailed', type: 'daterange' },
+              { key: 'allocation_type', label: 'Type', type: 'select', section: 'general', options: [
+                { value: 'all', label: 'All types' },
+                { value: 'donor', label: '👤 Individual' },
+                { value: 'campaign', label: '🏷️ Campaign' }
+              ] },
+
+              // Communications & Outreach filters
+              { key: 'contact_status', label: 'Contact Status', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'All contact' },
+                { value: 'contacted', label: 'Contacted (≥1 email)' },
+                { value: 'not_contacted', label: 'Not contacted yet' }
+              ] },
+              { key: 'response_status', label: 'Response', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'All responses' },
+                { value: 'no_response', label: 'No response (Awaiting reply)' },
+                { value: 'replied', label: 'Donor replied' }
+              ] },
+              { key: 'email_sequence', label: 'Email Sequence', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'Any email count' },
+                { value: '0', label: 'Never emailed (0)' },
+                { value: '1', label: '1st email sent only' },
+                { value: '2', label: '2nd email sent (Second mail)' },
+                { value: '3_plus', label: '3+ emails sent' }
+              ] },
+              { key: 'first_emailed_preset', label: 'First Mail Sent Date', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'Any date' },
+                { value: '6_months_ago', label: 'Sent > 6 months ago' },
+                { value: '3_months_ago', label: 'Sent > 3 months ago' },
+                { value: '1_month_ago', label: 'Sent > 1 month ago' },
+                { value: 'last_30_days', label: 'Sent within last 30 days' }
+              ] },
+              { key: 'open_status', label: 'Email Open', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'Any open status' },
+                { value: 'opened', label: 'Opened by donor' },
+                { value: 'unopened', label: 'Unopened / Delivered' }
+              ] },
+              { key: 'first_emailed', label: 'First emailed range', type: 'daterange', section: 'comms' },
+              { key: 'last_emailed', label: 'Last emailed range', type: 'daterange', section: 'comms' },
+              { key: 'end', label: 'Sponsorship ends', type: 'daterange', section: 'comms' },
+
+              // Quick Toggle Chips
               { key: 'never_emailed', label: 'Never emailed', type: 'toggle' },
+              { key: 'no_response', label: 'No responses', type: 'toggle' },
+              { key: 'first_mail_6_months', label: 'First mail > 6 mos ago', type: 'toggle' },
               { key: 'needs_review', label: 'Needs review', type: 'toggle' }
             ]} />
           {/* Sponsorship Sub-Tabs Selector */}
@@ -2579,7 +2828,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     sponsorship_type: selectedDonorType,
                     total_donated: targetInputs[selectedDonorType] || 480,
                     custom_slots: 1,
-                    notes: ''
+                    notes: '',
+                    classification: getAllowedClassifications(activeCompany)[0]
                   });
                   setShowManualDonorModal(true);
                 }}
@@ -2666,7 +2916,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
                       {/* Filter Chips */}
                       <div className="flex items-center justify-between text-[11px] gap-1 flex-wrap">
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-1 flex-wrap">
                           <button
                             onClick={() => setDonorSlotFilter('all')}
                             className={`px-2 py-0.5 rounded-md font-semibold transition-all ${
@@ -2697,6 +2947,20 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           >
                             Full {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingDonors.filter(d => d.remaining_slots <= 0).length})`}
                           </button>
+
+                          <div className="flex items-center gap-1 ml-1 pl-1 border-l border-slate-200 dark:border-slate-700">
+                            <Tag className="w-3 h-3 text-slate-400" />
+                            <select
+                              value={donorClassificationFilter}
+                              onChange={(e) => setDonorClassificationFilter(e.target.value)}
+                              className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-300"
+                            >
+                              <option value="all">All Sources</option>
+                              {getAllowedClassifications(activeCompany).map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                              ))}
+                            </select>
+                          </div>
                         </div>
 
                         <span className="text-slate-400 text-[10px]">
@@ -2728,7 +2992,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         ))
                       ) : paginatedQualifyingDonors.length === 0 ? (
                         <div className="py-12 text-center text-slate-400 text-xs">
-                          {donorSearchQuery || donorSlotFilter !== 'all'
+                          {donorSearchQuery || donorSlotFilter !== 'all' || donorClassificationFilter !== 'all'
                             ? 'No donors match your search or filter criteria.'
                             : `No qualifying donors found for ${selectedDonorType}.`}
                         </div>
@@ -2743,6 +3007,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 <div className="font-bold text-slate-800 dark:text-slate-100 text-xs md:text-sm flex items-center gap-1.5 flex-wrap">
                                   <button type="button" onClick={() => openDonor(donorKeyFor(d))}
                                     className="hover:text-blue-600 hover:underline text-left">{d.donor_name}</button>
+                                  <ClassificationBadge 
+                                    classification={d.classification} 
+                                    isManual={d.is_manual}
+                                    companyId={activeCompany}
+                                    onClassify={(newCls) => handleClassifyDonor(d, newCls)}
+                                  />
                                   {d.is_manual && (
                                     <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 flex items-center gap-0.5">
                                       <Tag className="w-2.5 h-2.5" /> Manual Entry
@@ -2815,7 +3085,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                           sponsorship_type: d.sponsorship_type || selectedDonorType,
                                           total_donated: d.total_donated,
                                           custom_slots: d.max_slots,
-                                          notes: d.notes || ''
+                                          notes: d.notes || '',
+                                          classification: d.classification || getAllowedClassifications(activeCompany)[0]
                                         });
                                         setShowManualDonorModal(true);
                                       }}
@@ -2977,7 +3248,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
                       {/* Filter Chips */}
                       <div className="flex items-center justify-between text-[11px] gap-1 flex-wrap">
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-1 flex-wrap">
                           <button
                             onClick={() => setCampaignSlotFilter('all')}
                             className={`px-2 py-0.5 rounded-md font-semibold transition-all ${
@@ -3008,6 +3279,20 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           >
                             Full {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingCampaigns.filter(c => c.remaining_slots <= 0).length})`}
                           </button>
+
+                          <div className="flex items-center gap-1 ml-1 pl-1 border-l border-slate-200 dark:border-slate-700">
+                            <Tag className="w-3 h-3 text-slate-400" />
+                            <select
+                              value={campaignClassificationFilter}
+                              onChange={(e) => setCampaignClassificationFilter(e.target.value)}
+                              className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-300"
+                            >
+                              <option value="all">All Sources</option>
+                              {getAllowedClassifications(activeCompany).map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                              ))}
+                            </select>
+                          </div>
                         </div>
 
                         <span className="text-slate-400 text-[10px]">
@@ -3039,7 +3324,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         ))
                       ) : paginatedQualifyingCampaigns.length === 0 ? (
                         <div className="py-12 text-center text-slate-400 text-xs">
-                          {campaignListSearchQuery || campaignSlotFilter !== 'all'
+                          {campaignListSearchQuery || campaignSlotFilter !== 'all' || campaignClassificationFilter !== 'all'
                             ? 'No campaigns match your search or filter criteria.'
                             : `No qualifying campaigns found for ${selectedDonorType}.`}
                         </div>
@@ -3052,7 +3337,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             <div className="flex items-start justify-between gap-2">
                               <div>
                                 <div className="font-bold text-slate-800 dark:text-slate-100 text-xs md:text-sm flex items-center gap-1.5 flex-wrap">
-                                  🏷️ {c.campaign_name}
+                                  <span>🏷️ {c.campaign_name}</span>
+                                  <ClassificationBadge 
+                                    classification={c.classification} 
+                                    companyId={activeCompany}
+                                    onClassify={(newCls) => handleClassifyCampaign(c, newCls)}
+                                  />
                                 </div>
                                 {c.community_name && (
                                   <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-950/60 text-purple-600 dark:text-purple-400 text-[10px] font-semibold border border-purple-200/60 dark:border-purple-800/60">
@@ -3552,6 +3842,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                   👤 Individual Donor
                                 </span>
                               )}
+                              <ClassificationBadge
+                                classification={a.classification}
+                                companyId={a.company_id || activeCompany}
+                                editable={false}
+                                size="xs"
+                              />
                             </div>
 
                             <div className="text-xs text-slate-600 dark:text-slate-300 mt-1.5 flex flex-col gap-0.5">
@@ -4199,6 +4495,25 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 ))}
               </div>
 
+              {/* Source Classification Filter */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Source:</span>
+                <select
+                  value={overdueClassificationFilter}
+                  onChange={(e) => {
+                    setOverdueClassificationFilter(e.target.value);
+                    setOverdueDonorPage(1);
+                    setOverdueCampaignPage(1);
+                  }}
+                  className="px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                >
+                  <option value="all">All Sources</option>
+                  {getAllowedClassifications(activeCompany).map((cls) => (
+                    <option key={cls} value={cls}>{cls}</option>
+                  ))}
+                </select>
+              </div>
+
               {/* Search Bar */}
               <div className="relative w-full sm:w-72">
                 <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -4302,9 +4617,16 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         return (
                           <tr key={`${d.donor_id}_${d.sponsorship_type}_${idx}`} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/40 transition-colors">
                             <td className="py-3 px-4">
-                              <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+                              <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5 flex-wrap">
                                 <button type="button" onClick={() => openDonor(donorKeyFor(d))}
                                   className="hover:text-blue-600 hover:underline text-left">{d.donor_name}</button>
+                                <ClassificationBadge
+                                  classification={d.classification}
+                                  isManual={d.is_manual}
+                                  companyId={activeCompany}
+                                  onClassify={(newCls) => handleClassifyDonor(d, newCls)}
+                                  size="xs"
+                                />
                                 {d.is_manual && (
                                   <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300">Manual</span>
                                 )}
@@ -4529,6 +4851,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             <td className="py-3 px-4">
                               <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2 flex-wrap">
                                 <span>{c.campaign_name}</span>
+                                <ClassificationBadge
+                                  classification={c.classification}
+                                  companyId={activeCompany}
+                                  onClassify={(newCls) => handleClassifyCampaign(c, newCls)}
+                                  size="xs"
+                                />
                                 {c.campaign_url && (
                                   <a
                                     href={c.campaign_url}
@@ -5679,6 +6007,21 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               </div>
 
               <div className="flex flex-col gap-1">
+                <label className="font-semibold text-slate-600 dark:text-slate-400">
+                  Source Classification <span className="text-slate-400 font-normal text-[11px]">(Sponsorship Tracker Only)</span>
+                </label>
+                <select
+                  value={manualDonorForm.classification || getAllowedClassifications(activeCompany)[0]}
+                  onChange={(e) => setManualDonorForm({ ...manualDonorForm, classification: e.target.value })}
+                  className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-semibold text-xs text-slate-700 dark:text-slate-200"
+                >
+                  {getAllowedClassifications(activeCompany).map((opt) => (
+                    <option key={opt} value={opt}>{opt}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex flex-col gap-1">
                 <label className="font-semibold text-slate-600 dark:text-slate-400">Notes / Payment Reference</label>
                 <textarea
                   rows="2"
@@ -6537,8 +6880,15 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 }`}
                               >
                                 <div>
-                                  <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
-                                    {d.donor_name}
+                                  <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2 flex-wrap">
+                                    <span>{d.donor_name}</span>
+                                    <ClassificationBadge
+                                      classification={d.classification}
+                                      isManual={d.is_manual}
+                                      companyId={activeCompany}
+                                      size="xs"
+                                      editable={false}
+                                    />
                                     {isSelected && (
                                       <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-blue-600 text-white flex items-center gap-1">
                                         <Check className="w-3 h-3" /> Selected
@@ -6776,6 +7126,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           <span className="font-bold text-slate-800 dark:text-slate-100 text-sm">
                             {selectedCampaignForAllocation.campaign_name}
                           </span>
+                          <ClassificationBadge
+                            classification={selectedCampaignForAllocation.classification}
+                            companyId={activeCompany}
+                            size="xs"
+                            editable={false}
+                          />
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-600 text-white flex items-center gap-1">
                             <Check className="w-3 h-3" /> Pre-Selected Campaign
                           </span>
@@ -6868,7 +7224,13 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                               >
                                 <div>
                                   <div className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5 flex-wrap">
-                                    🏷️ {c.campaign_name}
+                                    <span>🏷️ {c.campaign_name}</span>
+                                    <ClassificationBadge
+                                      classification={c.classification}
+                                      companyId={activeCompany}
+                                      size="xs"
+                                      editable={false}
+                                    />
                                     {isSelected && (
                                       <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-purple-600 text-white flex items-center gap-1">
                                         <Check className="w-3 h-3" /> Selected

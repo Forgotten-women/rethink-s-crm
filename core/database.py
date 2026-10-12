@@ -271,7 +271,24 @@ def ensure_database_indexes():
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_created_date ON donations("Created Date (UTC)");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_donations_company_id ON donations("company_id");')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_pcm_comp_camp_level ON platform_campaign_mappings(company_id, campaign_name, giving_level);')
+            # Expression / covering indexes: they match the exact expressions the API queries use
+            # (LOWER(COALESCE(company_id, 'rethink')) etc.), so those queries stop reading the whole
+            # 193-column table. Keep the expressions identical to the queries or SQLite won't use them.
+            cursor.execute("""CREATE INDEX IF NOT EXISTS idx_don_xcomp_campaign
+                              ON donations(LOWER(COALESCE(company_id, 'rethink')), "Campaign Name");""")
+            cursor.execute("""CREATE INDEX IF NOT EXISTS idx_don_xcomp_code_amount
+                              ON donations(LOWER(COALESCE(company_id, 'rethink')), Code,
+                                           "Total Online Donations Net Amount in Settled Currency");""")
+            cursor.execute("""CREATE INDEX IF NOT EXISTS idx_don_comp_fundraiser_cover
+                              ON donations(company_id, fundraiser_name,
+                                           "Total Online Donations Net Amount in Settled Currency", "Created Date (UTC)");""")
+            cursor.execute("""CREATE INDEX IF NOT EXISTS idx_don_xcomptrim_fundraiser
+                              ON donations(LOWER(TRIM(company_id)), fundraiser_name);""")
+            cursor.execute("""CREATE INDEX IF NOT EXISTS idx_don_xdonor_xcomp
+                              ON donations(LOWER(TRIM(COALESCE("Donor ID", ''))), LOWER(TRIM(COALESCE(company_id, 'rethink'))));""")
             conn.commit()
+            # Keep the planner's statistics current (cheap; only re-analyses tables that changed a lot).
+            cursor.execute("PRAGMA optimize;")
         conn.close()
     except Exception as e:
         print(f"[DB Indexing Notice]: {e}")

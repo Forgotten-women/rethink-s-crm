@@ -27,7 +27,7 @@ import {
   Edit3,
   Sparkles
 } from 'lucide-react';
-import { API_BASE_URL } from '../config';
+import { API_BASE_URL, downloadFile } from '../config';
 import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
 
 // Robust frontend text cleaner to repair mojibake / corrupted UTF-8 and strip zero-width characters
@@ -1091,7 +1091,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
   const handleExport = (format = 'csv') => {
     const url = `${API_BASE_URL}/api/classifications/export?platform=${platform}&format=${format}&company_id=${encodeURIComponent(activeCompany)}`;
-    window.open(url, '_blank');
+    downloadFile(url, `classifications_${platform}.${format}`);
   };
 
   const handleImportSubmit = async (e) => {

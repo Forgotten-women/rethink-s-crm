@@ -209,7 +209,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
     try {
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsHost = API_BASE_URL.replace(/^http(s)?:\/\//, '') || window.location.host;
-      const wsUrl = `${wsProtocol}//${wsHost}/ws/events`;
+      const wsUrl = `${wsProtocol}//${wsHost}/ws/events?token=${encodeURIComponent(localStorage.getItem('analytics_token') || '')}`;
 
       socket = new WebSocket(wsUrl);
       socket.onmessage = (event) => {

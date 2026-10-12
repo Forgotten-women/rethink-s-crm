@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal, Globe } from 'lucide-react';
-import { API_BASE_URL } from '../config';
+import { API_BASE_URL, downloadFile } from '../config';
 import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
 
 const DEFAULT_EXPLORER_COLUMNS = [
@@ -732,7 +732,7 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
       params.append('columns', selectedColumns.join(','));
     }
 
-    window.open(`${API_BASE_URL}/api/donors/export?${params.toString()}`, '_blank');
+    downloadFile(`${API_BASE_URL}/api/donors/export?${params.toString()}`, 'donors_export.csv');
   };
 
   return (

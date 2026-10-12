@@ -575,7 +575,8 @@ def get_expense_requests(status_filter: Optional[str] = "ALL", company_id: Optio
     
     query += " ORDER BY created_at DESC"
     cursor.execute(query, params)
-    rows = [dict(r) for r in cursor.fetchall()]
+    # approval_token is the secret behind the emailed approve/reject links - never send it to the browser
+    rows = [{k: v for k, v in dict(r).items() if k != "approval_token"} for r in cursor.fetchall()]
 
     if comp != "all":
         cursor.execute("SELECT status, SUM(amount), COUNT(*) FROM expense_requests WHERE company_id = ? GROUP BY status", (comp,))
@@ -652,7 +653,7 @@ def export_expense_requests(
     if not rows:
         raise HTTPException(status_code=400, detail="No expense claims available to export for the given filter.")
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).drop(columns=["approval_token"], errors="ignore")  # secret behind the email links
     # Map Zakat boolean to human readable
     if "is_zakat" in df.columns:
         df["is_zakat"] = df["is_zakat"].apply(lambda v: "Yes" if v in [1, True, "1"] else "No")

@@ -236,7 +236,7 @@ class PlatformSyncService:
                         f"{MADINAH_APIM_BASE}/main-server/api/v1/user/token",
                         headers={"Content-Type": "application/json", "Accept": "application/json"},
                         json={"refreshToken": refresh_token},
-                        timeout=12
+                        timeout=(5, 25)
                     )
                     if r.status_code == 200:
                         resp_json = r.json()

@@ -312,6 +312,23 @@ _ensure_tracker_tables_migrated()
 # 1. MODELS & SCHEMAS
 # ==========================================
 
+WORKSPACE_ALLOWED_CLASSIFICATIONS = {
+    "rethink": ["Rethink Only", "Rethink + SP"],
+    "iqra": ["Iqra Only", "Iqra + SP"],
+    "all": ["Rethink Only", "Rethink + SP", "Iqra Only", "Iqra + SP"]
+}
+
+class DonorClassifyRequest(BaseModel):
+    donor_id: str
+    classification: str
+    company_id: Optional[str] = "rethink"
+    donor_email: Optional[str] = None
+
+class CampaignClassifyRequest(BaseModel):
+    campaign_name: str
+    classification: str
+    company_id: Optional[str] = "rethink"
+
 class ManualDonorCreateRequest(BaseModel):
     donor_name: str
     donor_email: Optional[str] = ""
@@ -321,6 +338,7 @@ class ManualDonorCreateRequest(BaseModel):
     custom_slots: Optional[int] = None
     notes: Optional[str] = ""
     company_id: Optional[str] = "rethink"
+    classification: Optional[str] = None
 
 class ManualDonorUpdateRequest(BaseModel):
     donor_name: Optional[str] = None
@@ -330,6 +348,7 @@ class ManualDonorUpdateRequest(BaseModel):
     total_donated: Optional[float] = None
     custom_slots: Optional[int] = None
     notes: Optional[str] = None
+    classification: Optional[str] = None
 
 class UpdateTargetsRequest(BaseModel):
     user_role: str
@@ -1033,12 +1052,224 @@ def _slots_used(items: List[Dict[str, Any]]) -> float:
     return int(used) if float(used).is_integer() else used
 
 
+def validate_classification_for_company(classification: str, company_id: str) -> None:
+    comp = (company_id or "rethink").strip().lower()
+    allowed = WORKSPACE_ALLOWED_CLASSIFICATIONS.get(comp, WORKSPACE_ALLOWED_CLASSIFICATIONS["rethink"])
+    if classification not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Classification '{classification}' is not permitted in workspace '{comp}'. Allowed options: {', '.join(allowed)}"
+        )
+
+
+def is_sp_campaign_name(name: str) -> bool:
+    c_lower = (name or "").lower().strip()
+    return (
+        any(k in c_lower for k in ["sisters project", "sister's project", "sisters' project", "sp:", "sp -", " sp "])
+        or c_lower.startswith("sp ")
+        or c_lower.startswith("sp-")
+        or c_lower.startswith("sp:")
+        or c_lower == "sp"
+    )
+
+
+def suggest_campaign_classification(campaign_name: str, company_id: str) -> str:
+    comp = (company_id or "rethink").strip().lower()
+    is_sp = is_sp_campaign_name(campaign_name)
+    if comp == "iqra":
+        return "Iqra + SP" if is_sp else "Iqra Only"
+    else:
+        return "Rethink + SP" if is_sp else "Rethink Only"
+
+
+def suggest_donor_classification(campaigns: List[str], company_id: str) -> str:
+    comp = (company_id or "rethink").strip().lower()
+    if not campaigns:
+        return "Iqra Only" if comp == "iqra" else "Rethink Only"
+    
+    has_sp = any(is_sp_campaign_name(c) for c in campaigns)
+    if comp == "iqra":
+        return "Iqra + SP" if has_sp else "Iqra Only"
+    else:
+        return "Rethink + SP" if has_sp else "Rethink Only"
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Per-donor sponsorship totals, precomputed once per charity + sponsorship type.
+# Built from the same rows and with the same pandas operations the qualifying-donors page always used, then
+# stored as plain dicts so the page no longer does ~100k slow pandas lookups per request. Depends only on the
+# charity's donations, so allocation edits, searches and classification filters reuse it; any change to the
+# donations (from any worker or the sync service) changes the version token and rebuilds it.
+# ---------------------------------------------------------------------------------------------------------
+_SPONSORSHIP_BASE: Dict[tuple, Any] = {}
+_SPONSORSHIP_BASE_LOCK = threading.Lock()
+
+
+def _sponsorship_masks(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    code_series = df["Code"].astype(str).str.strip().str.upper() if "Code" in df.columns else pd.Series("", index=df.index)
+    camp_series = df["Campaign Name"].astype(str).str.strip().str.upper() if "Campaign Name" in df.columns else pd.Series("", index=df.index)
+    gl_col = "Giving Level Title" if "Giving Level Title" in df.columns else ("Giving Level" if "Giving Level" in df.columns else None)
+    gl_series = df[gl_col].astype(str).str.strip().str.upper() if gl_col else pd.Series("", index=df.index)
+
+    is_orphan_gl = gl_series.str.contains("ORPHAN", na=False)
+    is_orphan_camp = camp_series.str.contains("ORPHAN", na=False)
+    is_orphan_code = code_series.str.contains("ORP", na=False)
+
+    return {
+        "Hafiz": code_series.str.contains(r"HUF|HAF", regex=True, na=False) | camp_series.str.contains(r"HAFIZ|HIFZ", regex=True, na=False) | gl_series.str.contains(r"HAFIZ|HIFZ", regex=True, na=False),
+        "Orphan": is_orphan_gl | is_orphan_camp | is_orphan_code,
+        "Widow": code_series.str.contains("WID", na=False) | camp_series.str.contains("WIDOW", na=False) | gl_series.str.contains("WIDOW", na=False),
+        "Ex-Prisoner": code_series.str.contains(r"SUR|EX-PRISONER", regex=True, na=False) | camp_series.str.contains(r"PRISONER|SURVIVOR", regex=True, na=False) | gl_series.str.contains(r"PRISONER|SURVIVOR", regex=True, na=False)
+    }
+
+
+def _split_by_key(keys: np.ndarray, *columns: np.ndarray) -> Dict[Any, tuple]:
+    """keys must already be grouped (sorted). Returns key -> tuple of per-column slices, in row order."""
+    if len(keys) == 0:
+        return {}
+    change = np.flatnonzero(keys[1:] != keys[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [len(keys)]))
+    return {keys[a]: tuple(col[a:b] for col in columns) for a, b in zip(starts, ends)}
+
+
+def _build_sponsorship_base(df: pd.DataFrame, s_type: str) -> Optional[Dict[str, Any]]:
+    if df.empty or "Donor ID" not in df.columns:
+        return None
+    col_amount = "Total Online Donations Net Amount in Settled Currency"
+    if col_amount not in df.columns:
+        col_amount = "Donation Amount in Project Currency (May be approx.)"
+    if col_amount not in df.columns:
+        col_amount = "Donation Amount (in Donation Currency)"
+    if col_amount not in df.columns:
+        return None
+
+    amt_series = pd.to_numeric(df[col_amount], errors="coerce").fillna(0.0)
+    d_id_series = df["Donor ID"].astype(str)
+    mask = _sponsorship_masks(df).get(s_type, pd.Series(False, index=df.index))
+    if not mask.any():
+        return None
+
+    date_col_cand = None
+    for c in ["_parsed_date", "Created Date (UTC)", "Date", "Settled Date (UTC)", "created_at", "Date of collection"]:
+        if c in df.columns:
+            date_col_cand = c
+            break
+    s_rows = df[mask]
+    unified_dt = (pd.to_datetime(s_rows[date_col_cand], errors="coerce", format="mixed") if date_col_cand
+                  else pd.Series(pd.NaT, index=s_rows.index))
+
+    # Group by donor for this sponsorship type ONLY
+    sums = amt_series[mask].groupby(d_id_series[mask]).sum()
+    valid_did_mask = ~sums.index.astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "undefined", "<na>"])
+    sums = sums[valid_did_mask]
+
+    raw_did = s_rows["Donor ID"]
+
+    # 1. Dates: Min & Max per donor for this sponsorship
+    s_dt_agg = unified_dt.groupby(raw_did).agg(["min", "max"])
+
+    # Running total per donor (date order) so we know WHEN each slot threshold was reached:
+    # the waiting clock starts at the payment that completed the slot, not the first donation.
+    timeline_df = pd.DataFrame({
+        "did": raw_did.astype(str),
+        "dt": unified_dt,
+        "amt": amt_series.reindex(s_rows.index).fillna(0.0),
+    }).dropna(subset=["dt"]).sort_values(["did", "dt"])
+    timeline_df["cum"] = timeline_df.groupby("did")["amt"].cumsum()
+    timelines = _split_by_key(timeline_df["did"].to_numpy(dtype=object), timeline_df["dt"].to_numpy(), timeline_df["cum"].to_numpy())
+
+    # 2. Campaigns involved per donor for this sponsorship (unique, in order of appearance)
+    camp_col_name = "Campaign Name" if "Campaign Name" in s_rows.columns else ("Campaign" if "Campaign" in s_rows.columns else None)
+    campaigns: Dict[Any, list] = {}
+    if camp_col_name:
+        camp_frame = pd.DataFrame({"did": raw_did, "camp": s_rows[camp_col_name]}).dropna(subset=["did"])
+        camp_frame = camp_frame.drop_duplicates(keep="first")
+        order = np.argsort(pd.factorize(camp_frame["did"])[0], kind="stable")
+        camp_frame = camp_frame.iloc[order]
+        campaigns = {k: list(v[0]) for k, v in _split_by_key(camp_frame["did"].to_numpy(dtype=object),
+                                                                camp_frame["camp"].to_numpy(dtype=object)).items()}
+
+    # 3. Donor display names
+    fn = s_rows["First Name"].fillna("").astype(str).str.strip() if "First Name" in s_rows.columns else pd.Series("", index=s_rows.index)
+    ln = s_rows["Last Name"].fillna("").astype(str).str.strip() if "Last Name" in s_rows.columns else pd.Series("", index=s_rows.index)
+    full_n = (fn + " " + ln).str.strip()
+    bill_n = s_rows["Billing Name"].fillna("").astype(str).str.strip() if "Billing Name" in s_rows.columns else pd.Series("", index=s_rows.index)
+    disp_n = s_rows["Display Name"].fillna("").astype(str).str.strip() if "Display Name" in s_rows.columns else pd.Series("", index=s_rows.index)
+    best_n_series = full_n.replace(["", "nan", "none", "nan nan", "none none"], np.nan).fillna(
+        bill_n.replace(["", "nan", "none"], np.nan)
+    ).fillna(
+        disp_n.replace(["", "nan", "none"], np.nan)
+    ).fillna("Anonymous Donor")
+    names_by_did = best_n_series.groupby(raw_did).first()
+
+    # 4. Donor email & phone
+    if "Email" in s_rows.columns:
+        emails_by_did = s_rows["Email"].dropna().astype(str).str.strip().groupby(raw_did).first()
+    else:
+        emails_by_did = pd.Series("N/A", index=names_by_did.index)
+    phone_col = None
+    for pc in ["Phone Number", "Phone", "phone_number", "Contact Phone"]:
+        if pc in s_rows.columns:
+            phone_col = pc
+            break
+    if phone_col:
+        phones_by_did = s_rows[phone_col].dropna().astype(str).str.strip().str.lstrip("'").groupby(raw_did).first()
+    else:
+        phones_by_did = pd.Series("", index=names_by_did.index)
+
+    # 5. Donor LTV across all causes
+    ltv_by_did = amt_series.groupby(d_id_series).sum()
+
+    # Allocation e-mail -> donor IDs (any cause), used to pull allocated donors into the list
+    email_to_dids: Dict[str, list] = {}
+    if "Email" in df.columns:
+        em = pd.DataFrame({"email": df["Email"].astype(str).str.strip().str.lower(), "did": df["Donor ID"]}).dropna(subset=["did"])
+        em = em.drop_duplicates()
+        for e, d in zip(em["email"].to_numpy(dtype=object), em["did"].to_numpy(dtype=object)):
+            email_to_dids.setdefault(e, []).append(str(d).strip())
+
+    return {
+        "sums": sums.to_dict(),
+        "positive_ids": set(sums[sums > 0].index),
+        "dt_min": s_dt_agg["min"].to_dict(),
+        "dt_max": s_dt_agg["max"].to_dict(),
+        "timelines": timelines,
+        "campaigns": campaigns,
+        "names": names_by_did.to_dict(),
+        "emails": emails_by_did.to_dict(),
+        "phones": phones_by_did.to_dict(),
+        "ltv": ltv_by_did.to_dict(),
+        "email_to_dids": email_to_dids,
+        "has_email_col": "Email" in df.columns,
+    }
+
+
+def _sponsorship_base(comp: str, s_type: str) -> Optional[Dict[str, Any]]:
+    from core.cache import version_token
+    token = version_token(["donations"], comp)
+    key = (comp, s_type)
+    hit = _SPONSORSHIP_BASE.get(key)
+    if hit and hit[0] == token:
+        return hit[1]
+    with _SPONSORSHIP_BASE_LOCK:
+        hit = _SPONSORSHIP_BASE.get(key)
+        if hit and hit[0] == token:
+            return hit[1]
+        base = _build_sponsorship_base(load_data(company_id=comp), s_type)
+        for stale in [k for k, v in _SPONSORSHIP_BASE.items() if k[0] == comp and v[0] != token]:
+            _SPONSORSHIP_BASE.pop(stale, None)
+        _SPONSORSHIP_BASE[key] = (token, base)
+        return base
+
+
 @router.get("/qualifying-donors")
 @cached(scopes=["donations", "classification", "tracker"], ttl=21600, daily=True)
 def get_qualifying_donors(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("Orphan"),
-    search: Optional[str] = Query(None)
+    search: Optional[str] = Query(None),
+    classification: Optional[str] = Query(None)
 ):
     """
     Returns qualifying donors for a given sponsorship type along with capacity calculations:
@@ -1047,10 +1278,12 @@ def get_qualifying_donors(
     - max_slots: floor(total_donated / target_amount)
     - allocated_count: Number of beneficiaries currently allocated to this donor
     - remaining_slots: max_slots - allocated_count
+    - classification: Donor source classification (Rethink Only, Rethink + SP, Iqra Only, Iqra + SP)
     """
     comp = _unwrap_param(company_id, "rethink").strip().lower()
     s_type = _unwrap_param(sponsorship_type, "Orphan").strip()
     search = _unwrap_param(search, "").strip() or None
+    target_class = _unwrap_param(classification, "").strip() or None
 
     targets = {"Hafiz": 240.0, "Orphan": 480.0, "Widow": 1080.0, "Ex-Prisoner": 1080.0}
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -1066,10 +1299,24 @@ def get_qualifying_donors(
 
         all_allocs = _donor_slot_allocations(cur, comp, s_type, targets)
 
+        # Query saved donor classifications
+        class_query = "SELECT donor_id, donor_email, classification FROM sponsorship_donor_classifications WHERE 1=1"
+        class_params = []
+        if comp != "all":
+            class_query += " AND company_id = ?"
+            class_params.append(comp)
+        cur.execute(class_query, class_params)
+        saved_donor_classes = {}
+        for cr in cur.fetchall():
+            if cr["donor_id"]:
+                saved_donor_classes[str(cr["donor_id"]).strip()] = cr["classification"]
+            if cr["donor_email"]:
+                saved_donor_classes[str(cr["donor_email"]).strip().lower()] = cr["classification"]
+
         # Query manual sponsorship donors
         man_query = """
             SELECT id, company_id, donor_name, donor_email, donor_phone,
-                   sponsorship_type, total_donated, custom_slots, notes, created_at
+                   sponsorship_type, total_donated, custom_slots, notes, created_at, classification
             FROM sponsorship_manual_donors
             WHERE 1=1
         """
@@ -1104,247 +1351,163 @@ def get_qualifying_donors(
 
     target_amount = float(targets.get(s_type, 480.0))
 
-    df = load_data(company_id=comp)
+    base = _sponsorship_base(comp, s_type)
     donors_list = []
 
-    if not df.empty and "Donor ID" in df.columns:
-        col_amount = "Total Online Donations Net Amount in Settled Currency"
-        if col_amount not in df.columns:
-            col_amount = "Donation Amount in Project Currency (May be approx.)"
-        if col_amount not in df.columns:
-            col_amount = "Donation Amount (in Donation Currency)"
+    if base is not None:
+        sums = base["sums"]
+        # Include all donors who donated towards this sponsorship type (even if below target threshold)
+        relevant_ids = set(base["positive_ids"])
 
-        if col_amount in df.columns:
-            amt_series = pd.to_numeric(df[col_amount], errors="coerce").fillna(0.0)
-            d_id_series = df["Donor ID"].astype(str)
-            code_series = df["Code"].astype(str).str.strip().str.upper() if "Code" in df.columns else pd.Series("", index=df.index)
+        # Ensure donors with existing allocations for this sponsorship type are retained
+        alloc_dids = {str(a.get("donor_id")).strip() for a in all_allocs if a.get("sponsorship_type") == s_type and a.get("donor_id")}
+        alloc_dids = {d for d in alloc_dids if d.lower() not in ["", "none", "null", "nan", "undefined"]}
+        relevant_ids.update(alloc_dids)
 
-            camp_series = df["Campaign Name"].astype(str).str.strip().str.upper() if "Campaign Name" in df.columns else pd.Series("", index=df.index)
-            gl_col = "Giving Level Title" if "Giving Level Title" in df.columns else ("Giving Level" if "Giving Level" in df.columns else None)
-            gl_series = df[gl_col].astype(str).str.strip().str.upper() if gl_col else pd.Series("", index=df.index)
+        if base["has_email_col"]:
+            alloc_emails = {str(a.get("donor_email")).strip().lower() for a in all_allocs if a.get("sponsorship_type") == s_type and a.get("donor_email")}
+            alloc_emails = {e for e in alloc_emails if "@" in e}
+            for e in alloc_emails:
+                relevant_ids.update(base["email_to_dids"].get(e, ()))
 
-            is_orphan_gl = gl_series.str.contains("ORPHAN", na=False)
-            is_orphan_camp = camp_series.str.contains("ORPHAN", na=False)
-            is_orphan_code = code_series.str.contains("ORP", na=False)
+        dt_min, dt_max, timelines = base["dt_min"], base["dt_max"], base["timelines"]
+        s_camps_agg, names_by_did, emails_by_did = base["campaigns"], base["names"], base["emails"]
+        phones_by_did, ltv_by_did = base["phones"], base["ltv"]
 
-            masks = {
-                "Hafiz": code_series.str.contains(r"HUF|HAF", regex=True, na=False) | camp_series.str.contains(r"HAFIZ|HIFZ", regex=True, na=False) | gl_series.str.contains(r"HAFIZ|HIFZ", regex=True, na=False),
-                "Orphan": is_orphan_gl | is_orphan_camp | is_orphan_code,
-                "Widow": code_series.str.contains("WID", na=False) | camp_series.str.contains("WIDOW", na=False) | gl_series.str.contains("WIDOW", na=False),
-                "Ex-Prisoner": code_series.str.contains(r"SUR|EX-PRISONER", regex=True, na=False) | camp_series.str.contains(r"PRISONER|SURVIVOR", regex=True, na=False) | gl_series.str.contains(r"PRISONER|SURVIVOR", regex=True, na=False)
-            }
+        now_dt = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
-            mask = masks.get(s_type, pd.Series(False, index=df.index))
-            date_col_cand = None
-            for c in ["_parsed_date", "Created Date (UTC)", "Date", "Settled Date (UTC)", "created_at", "Date of collection"]:
-                if c in df.columns:
-                    date_col_cand = c
-                    break
-            if date_col_cand:
-                df = df.assign(_unified_dt=pd.to_datetime(df[date_col_cand], errors="coerce", format="mixed"))
+        for str_id in relevant_ids:
+            s_total_val = float(sums.get(str_id, 0.0))
+            d_name = str(names_by_did.get(str_id) or "Anonymous Donor")
+            d_email = str(emails_by_did.get(str_id) or "N/A")
+            if d_email.lower() in ["n/a", "nan", "none", ""] and "@" in str_id:
+                d_email = str_id
+            d_phone = str(phones_by_did.get(str_id) or "")
+            if d_phone.strip().lower() in ("nan", "none", "null", "n/a"):
+                d_phone = ""
+            d_ltv = float(ltv_by_did.get(str_id, s_total_val))
+
+            # Dates and campaigns strictly for this sponsorship
+            oldest_dt, latest_dt = None, None
+            if str_id in dt_min:
+                oldest_dt = dt_min[str_id]
+                latest_dt = dt_max[str_id]
+
+            raw_camps = s_camps_agg.get(str_id, [])
+            campaigns_involved = [c for c in list(raw_camps) if c and str(c).lower() not in ["nan", "none", "n/a", "null"]]
+
+            if hasattr(oldest_dt, 'to_pydatetime'):
+                oldest_dt = oldest_dt.to_pydatetime()
+            if hasattr(oldest_dt, 'tzinfo') and oldest_dt and oldest_dt.tzinfo:
+                oldest_dt = oldest_dt.replace(tzinfo=None)
+            if hasattr(latest_dt, 'to_pydatetime'):
+                latest_dt = latest_dt.to_pydatetime()
+            if hasattr(latest_dt, 'tzinfo') and latest_dt and latest_dt.tzinfo:
+                latest_dt = latest_dt.replace(tzinfo=None)
+
+            oldest_str = oldest_dt.strftime("%Y-%m-%d") if oldest_dt and pd.notna(oldest_dt) else "N/A"
+            latest_str = latest_dt.strftime("%Y-%m-%d") if latest_dt and pd.notna(latest_dt) else "N/A"
+
+            # Target & slot calculation based strictly on amount toward THIS sponsorship
+            slot_threshold = 0.8 * target_amount if target_amount > 0 else 0.0
+            max_slots = int(s_total_val // slot_threshold) if slot_threshold > 0 else 0
+            pct_raised = round((s_total_val / target_amount) * 100, 1) if target_amount > 0 else 0.0
+
+            is_target_reached = bool(s_total_val >= target_amount)
+            is_threshold_reached = bool(s_total_val >= slot_threshold)
+            if is_target_reached:
+                target_status = "target_reached"
+            elif is_threshold_reached:
+                target_status = "threshold_reached"
             else:
-                df = df.assign(_unified_dt=pd.NaT)
+                target_status = "below_threshold"
 
-            if mask.any():
-                s_amt = amt_series[mask]
-                s_did = d_id_series[mask]
+            # Collect allocations for this donor
+            donor_emails = set()
+            if d_email and d_email.lower() != "n/a":
+                donor_emails.add(d_email.strip().lower())
+            if "@" in str_id:
+                donor_emails.add(str_id.strip().lower())
 
-                # Group by donor for this sponsorship type ONLY
-                sums = s_amt.groupby(s_did).sum()
-                valid_did_mask = ~sums.index.astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "undefined", "<na>"])
-                sums = sums[valid_did_mask]
+            matched_allocs_dict = {}
+            for ek in donor_emails:
+                for item in alloc_by_email.get(ek, []):
+                    matched_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
+            for item in alloc_by_did.get(str_id.strip().lower(), []):
+                matched_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
 
-                # Include all donors who donated towards this sponsorship type (even if below target threshold)
-                relevant_ids = set(sums[sums > 0].index)
+            allocated_items = list(matched_allocs_dict.values())
+            allocated_count = _slots_used(allocated_items)
+            remaining_slots = max(0, round(max_slots - allocated_count, 2))
 
-                # Ensure donors with existing allocations for this sponsorship type are retained
-                alloc_dids = {str(a.get("donor_id")).strip() for a in all_allocs if a.get("sponsorship_type") == s_type and a.get("donor_id")}
-                alloc_dids = {d for d in alloc_dids if d.lower() not in ["", "none", "null", "nan", "undefined"]}
-                relevant_ids.update(alloc_dids)
+            # Waiting age = days since the donation that earned the slot they are still waiting for
+            # (cumulative giving for this type crossed (slots already used + 1) x 80% of target).
+            eligible_since = None
+            if slot_threshold > 0 and remaining_slots > 0 and str_id in timelines:
+                dts, cums = timelines[str_id]
+                needed = (int(allocated_count) + 1) * slot_threshold
+                idx = int(np.searchsorted(cums, needed - 1e-6))
+                if idx < len(dts):
+                    eligible_since = pd.Timestamp(dts[idx]).to_pydatetime().replace(tzinfo=None)
+            waiting_days = max(0, (now_dt - eligible_since).days) if eligible_since else 0
+            eligible_since_str = eligible_since.strftime("%Y-%m-%d") if eligible_since else None
 
-                if "Email" in df.columns:
-                    alloc_emails = {str(a.get("donor_email")).strip().lower() for a in all_allocs if a.get("sponsorship_type") == s_type and a.get("donor_email")}
-                    alloc_emails = {e for e in alloc_emails if "@" in e}
-                    if alloc_emails:
-                        matched_alloc_rows = df[df["Email"].astype(str).str.strip().str.lower().isin(alloc_emails)]
-                        for d_val in matched_alloc_rows["Donor ID"].dropna().unique():
-                            relevant_ids.add(str(d_val).strip())
+            if allocated_count > max_slots:
+                elig_status = "over_capacity" if max_slots > 0 else "exceptional"
+            elif is_threshold_reached and remaining_slots > 0:
+                elig_status = "eligible"
+            elif is_threshold_reached and remaining_slots == 0:
+                elig_status = "at_capacity"
+            elif allocated_count > 0:
+                elig_status = "exceptional"
+            else:
+                elig_status = "near_target" if pct_raised >= 50 else "in_progress"
 
-                # High-performance vectorized metadata & date aggregation
-                s_rel_rows = df[mask & d_id_series.isin(relevant_ids)]
-                
-                # 1. Dates: Min & Max per donor for this sponsorship
-                s_dt_agg = s_rel_rows.groupby("Donor ID")["_unified_dt"].agg(["min", "max"])
+            saved_cls = saved_donor_classes.get(str_id) or (saved_donor_classes.get(d_email.lower()) if d_email else None)
+            if saved_cls:
+                donor_classification = saved_cls
+                is_manually_classified = True
+            else:
+                donor_classification = suggest_donor_classification(campaigns_involved, comp)
+                is_manually_classified = False
 
-                # Running total per donor (date order) so we know WHEN each slot threshold was reached:
-                # the waiting clock starts at the payment that completed the slot, not the first donation.
-                timeline_df = pd.DataFrame({
-                    "did": s_rel_rows["Donor ID"].astype(str),
-                    "dt": s_rel_rows["_unified_dt"],
-                    "amt": amt_series.reindex(s_rel_rows.index).fillna(0.0),
-                }).dropna(subset=["dt"]).sort_values(["did", "dt"])
-                timeline_df["cum"] = timeline_df.groupby("did")["amt"].cumsum()
-                timelines = {k: (g["dt"].to_numpy(), g["cum"].to_numpy()) for k, g in timeline_df.groupby("did")}
-                
-                # 2. Campaigns involved per donor for this sponsorship
-                camp_col_name = "Campaign Name" if "Campaign Name" in s_rel_rows.columns else ("Campaign" if "Campaign" in s_rel_rows.columns else None)
-                s_camps_agg = s_rel_rows.groupby("Donor ID")[camp_col_name].unique() if camp_col_name else {}
+            if target_class and target_class.lower() != "all" and donor_classification != target_class:
+                continue
 
-                # 3. Donor display names vectorized
-                fn = s_rel_rows["First Name"].fillna("").astype(str).str.strip() if "First Name" in s_rel_rows.columns else pd.Series("", index=s_rel_rows.index)
-                ln = s_rel_rows["Last Name"].fillna("").astype(str).str.strip() if "Last Name" in s_rel_rows.columns else pd.Series("", index=s_rel_rows.index)
-                full_n = (fn + " " + ln).str.strip()
-                bill_n = s_rel_rows["Billing Name"].fillna("").astype(str).str.strip() if "Billing Name" in s_rel_rows.columns else pd.Series("", index=s_rel_rows.index)
-                disp_n = s_rel_rows["Display Name"].fillna("").astype(str).str.strip() if "Display Name" in s_rel_rows.columns else pd.Series("", index=s_rel_rows.index)
-                
-                best_n_series = full_n.replace(["", "nan", "none", "nan nan", "none none"], np.nan).fillna(
-                    bill_n.replace(["", "nan", "none"], np.nan)
-                ).fillna(
-                    disp_n.replace(["", "nan", "none"], np.nan)
-                ).fillna("Anonymous Donor")
-                
-                names_by_did = best_n_series.groupby(s_rel_rows["Donor ID"]).first()
-                
-                # 4. Donor email & phone vectorized
-                if "Email" in s_rel_rows.columns:
-                    emails_by_did = s_rel_rows["Email"].dropna().astype(str).str.strip().groupby(s_rel_rows["Donor ID"]).first()
-                else:
-                    emails_by_did = pd.Series("N/A", index=names_by_did.index)
-                
-                phone_col = None
-                for pc in ["Phone Number", "Phone", "phone_number", "Contact Phone"]:
-                    if pc in s_rel_rows.columns:
-                        phone_col = pc
-                        break
-                if phone_col:
-                    phones_by_did = s_rel_rows[phone_col].dropna().astype(str).str.strip().str.lstrip("'").groupby(s_rel_rows["Donor ID"]).first()
-                else:
-                    phones_by_did = pd.Series("", index=names_by_did.index)
+            if search:
+                s_low = search.strip().lower()
+                clean_s = "".join([c for c in s_low if c.isdigit()])
+                clean_p = "".join([c for c in d_phone if c.isdigit()])
+                matches_phone = (s_low in d_phone.lower()) or (bool(clean_s) and clean_s in clean_p)
+                if s_low not in d_name.lower() and s_low not in d_email.lower() and s_low not in str_id.lower() and not matches_phone:
+                    continue
 
-                # 5. Donor LTV across all causes
-                ltv_by_did = amt_series[d_id_series.isin(relevant_ids)].groupby(d_id_series).sum()
-
-                now_dt = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-
-                for str_id in relevant_ids:
-                    s_total_val = float(sums.get(str_id, 0.0))
-                    d_name = str(names_by_did.get(str_id) or "Anonymous Donor")
-                    d_email = str(emails_by_did.get(str_id) or "N/A")
-                    if d_email.lower() in ["n/a", "nan", "none", ""] and "@" in str_id:
-                        d_email = str_id
-                    d_phone = str(phones_by_did.get(str_id) or "")
-                    if d_phone.strip().lower() in ("nan", "none", "null", "n/a"):
-                        d_phone = ""
-                    d_ltv = float(ltv_by_did.get(str_id, s_total_val))
-
-                    # Dates and campaigns strictly for this sponsorship
-                    oldest_dt, latest_dt = None, None
-                    if str_id in s_dt_agg.index:
-                        oldest_dt = s_dt_agg.loc[str_id, "min"]
-                        latest_dt = s_dt_agg.loc[str_id, "max"]
-                    
-                    raw_camps = s_camps_agg.get(str_id, [])
-                    campaigns_involved = [c for c in list(raw_camps) if c and str(c).lower() not in ["nan", "none", "n/a", "null"]]
-
-                    if hasattr(oldest_dt, 'to_pydatetime'):
-                        oldest_dt = oldest_dt.to_pydatetime()
-                    if hasattr(oldest_dt, 'tzinfo') and oldest_dt and oldest_dt.tzinfo:
-                        oldest_dt = oldest_dt.replace(tzinfo=None)
-                    if hasattr(latest_dt, 'to_pydatetime'):
-                        latest_dt = latest_dt.to_pydatetime()
-                    if hasattr(latest_dt, 'tzinfo') and latest_dt and latest_dt.tzinfo:
-                        latest_dt = latest_dt.replace(tzinfo=None)
-
-                    oldest_str = oldest_dt.strftime("%Y-%m-%d") if oldest_dt and pd.notna(oldest_dt) else "N/A"
-                    latest_str = latest_dt.strftime("%Y-%m-%d") if latest_dt and pd.notna(latest_dt) else "N/A"
-
-                    # Target & slot calculation based strictly on amount toward THIS sponsorship
-                    slot_threshold = 0.8 * target_amount if target_amount > 0 else 0.0
-                    max_slots = int(s_total_val // slot_threshold) if slot_threshold > 0 else 0
-                    pct_raised = round((s_total_val / target_amount) * 100, 1) if target_amount > 0 else 0.0
-
-                    is_target_reached = bool(s_total_val >= target_amount)
-                    is_threshold_reached = bool(s_total_val >= slot_threshold)
-                    if is_target_reached:
-                        target_status = "target_reached"
-                    elif is_threshold_reached:
-                        target_status = "threshold_reached"
-                    else:
-                        target_status = "below_threshold"
-
-                    # Collect allocations for this donor
-                    donor_emails = set()
-                    if d_email and d_email.lower() != "n/a":
-                        donor_emails.add(d_email.strip().lower())
-                    if "@" in str_id:
-                        donor_emails.add(str_id.strip().lower())
-
-                    matched_allocs_dict = {}
-                    for ek in donor_emails:
-                        for item in alloc_by_email.get(ek, []):
-                            matched_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
-                    for item in alloc_by_did.get(str_id.strip().lower(), []):
-                        matched_allocs_dict[item.get("id") or item.get("beneficiary_id")] = item
-
-                    allocated_items = list(matched_allocs_dict.values())
-                    allocated_count = _slots_used(allocated_items)
-                    remaining_slots = max(0, round(max_slots - allocated_count, 2))
-
-                    # Waiting age = days since the donation that earned the slot they are still waiting for
-                    # (cumulative giving for this type crossed (slots already used + 1) x 80% of target).
-                    eligible_since = None
-                    if slot_threshold > 0 and remaining_slots > 0 and str_id in timelines:
-                        dts, cums = timelines[str_id]
-                        needed = (int(allocated_count) + 1) * slot_threshold
-                        idx = int(np.searchsorted(cums, needed - 1e-6))
-                        if idx < len(dts):
-                            eligible_since = pd.Timestamp(dts[idx]).to_pydatetime().replace(tzinfo=None)
-                    waiting_days = max(0, (now_dt - eligible_since).days) if eligible_since else 0
-                    eligible_since_str = eligible_since.strftime("%Y-%m-%d") if eligible_since else None
-
-                    if allocated_count > max_slots:
-                        elig_status = "over_capacity" if max_slots > 0 else "exceptional"
-                    elif is_threshold_reached and remaining_slots > 0:
-                        elig_status = "eligible"
-                    elif is_threshold_reached and remaining_slots == 0:
-                        elig_status = "at_capacity"
-                    elif allocated_count > 0:
-                        elig_status = "exceptional"
-                    else:
-                        elig_status = "near_target" if pct_raised >= 50 else "in_progress"
-
-                    if search:
-                        s_low = search.strip().lower()
-                        clean_s = "".join([c for c in s_low if c.isdigit()])
-                        clean_p = "".join([c for c in d_phone if c.isdigit()])
-                        matches_phone = (s_low in d_phone.lower()) or (bool(clean_s) and clean_s in clean_p)
-                        if s_low not in d_name.lower() and s_low not in d_email.lower() and s_low not in str_id.lower() and not matches_phone:
-                            continue
-
-                    donors_list.append({
-                        "donor_id": str_id,
-                        "donor_name": d_name,
-                        "donor_email": d_email,
-                        "donor_phone": d_phone,
-                        "total_donated": round(s_total_val, 2),
-                        "donor_ltv": round(d_ltv, 2),
-                        "target_amount": target_amount,
-                        "pct_raised": pct_raised,
-                        "target_status": target_status,
-                        "is_target_reached": is_target_reached,
-                        "is_threshold_reached": is_threshold_reached,
-                        "max_slots": max_slots,
-                        "allocated_count": allocated_count,
-                        "remaining_slots": remaining_slots,
-                        "status": elig_status,
-                        "is_manual": False,
-                        "oldest_donation_date": oldest_str,
-                        "latest_donation_date": latest_str,
-                        "eligible_since": eligible_since_str,
-                        "waiting_days": waiting_days,
-                        "campaigns_involved": campaigns_involved,
-                        "allocated_beneficiaries": allocated_items
-                    })
+            donors_list.append({
+                "donor_id": str_id,
+                "donor_name": d_name,
+                "donor_email": d_email,
+                "donor_phone": d_phone,
+                "total_donated": round(s_total_val, 2),
+                "donor_ltv": round(d_ltv, 2),
+                "target_amount": target_amount,
+                "pct_raised": pct_raised,
+                "target_status": target_status,
+                "is_target_reached": is_target_reached,
+                "is_threshold_reached": is_threshold_reached,
+                "max_slots": max_slots,
+                "allocated_count": allocated_count,
+                "remaining_slots": remaining_slots,
+                "status": elig_status,
+                "is_manual": False,
+                "classification": donor_classification,
+                "is_manually_classified": is_manually_classified,
+                "oldest_donation_date": oldest_str,
+                "latest_donation_date": latest_str,
+                "eligible_since": eligible_since_str,
+                "waiting_days": waiting_days,
+                "campaigns_involved": campaigns_involved,
+                "allocated_beneficiaries": allocated_items
+            })
 
     # Append Manual / Offline Donors into qualifying donors
     now_dt = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
@@ -1386,6 +1549,17 @@ def get_qualifying_donors(
         else:
             m_status = "at_capacity"
 
+        m_saved_cls = mr.get("classification") or saved_donor_classes.get(mid) or saved_donor_classes.get(str(mr['id'])) or (saved_donor_classes.get(m_email.lower()) if m_email else None)
+        if m_saved_cls:
+            m_classification = m_saved_cls
+            m_manually_classified = True
+        else:
+            m_classification = "Iqra Only" if comp == "iqra" else "Rethink Only"
+            m_manually_classified = False
+
+        if target_class and target_class.lower() != "all" and m_classification != target_class:
+            continue
+
         if search:
             s_low = search.strip().lower()
             clean_s = "".join([c for c in s_low if c.isdigit()])
@@ -1423,6 +1597,8 @@ def get_qualifying_donors(
             "remaining_slots": m_remaining_slots,
             "status": m_status,
             "is_manual": True,
+            "classification": m_classification,
+            "is_manually_classified": m_manually_classified,
             "notes": mr.get("notes") or "",
             "created_at": mr.get("created_at"),
             "oldest_donation_date": m_oldest_str,
@@ -1774,14 +1950,21 @@ def create_manual_donor(
     donor_id = f"md_{uuid.uuid4().hex[:8]}"
     comp = (payload.company_id or "rethink").strip().lower()
 
+    # Determine and validate classification
+    classification = payload.classification
+    if classification:
+        validate_classification_for_company(classification, comp)
+    else:
+        classification = "Iqra Only" if comp == "iqra" else "Rethink Only"
+
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO sponsorship_manual_donors (
                 id, company_id, donor_name, donor_email, donor_phone,
-                sponsorship_type, total_donated, custom_slots, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sponsorship_type, total_donated, custom_slots, notes, classification
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             donor_id,
             comp,
@@ -1791,14 +1974,36 @@ def create_manual_donor(
             payload.sponsorship_type or "Orphan",
             float(payload.total_donated or 0.0),
             payload.custom_slots,
-            payload.notes or ""
+            payload.notes or "",
+            classification
         ))
+
+        # Also register in sponsorship_donor_classifications table
+        cur.execute("""
+            INSERT INTO sponsorship_donor_classifications (
+                donor_id, donor_email, company_id, classification, updated_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(donor_id, company_id) DO UPDATE SET
+                classification = excluded.classification,
+                company_id = excluded.company_id,
+                donor_email = COALESCE(excluded.donor_email, sponsorship_donor_classifications.donor_email),
+                updated_by = excluded.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            f"manual_{donor_id}",
+            email.lower() if email else None,
+            comp,
+            classification,
+            current_user.get("username", "admin")
+        ))
+
         conn.commit()
         invalidate_overdue_cache(comp)
         return {
             "status": "success",
             "message": f"Successfully created manual donor '{name}' for {payload.sponsorship_type} sponsorship tracking!",
-            "donor_id": donor_id
+            "donor_id": donor_id,
+            "classification": classification
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1815,8 +2020,16 @@ def update_manual_donor(
     """Updates an existing manual sponsorship donor's details."""
     raw_id = donor_id.replace("manual_", "")
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
+        cur.execute("SELECT id, company_id, donor_email FROM sponsorship_manual_donors WHERE id = ?", (raw_id,))
+        existing = cur.fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Manual donor not found")
+        comp = existing["company_id"] or "rethink"
+        existing_email = existing["donor_email"]
+
         fields = []
         params = []
         if payload.donor_name is not None:
@@ -1825,6 +2038,7 @@ def update_manual_donor(
         if payload.donor_email is not None:
             fields.append("donor_email = ?")
             params.append(payload.donor_email.strip())
+            existing_email = payload.donor_email.strip()
         if payload.donor_phone is not None:
             fields.append("donor_phone = ?")
             params.append(payload.donor_phone.strip())
@@ -1840,6 +2054,10 @@ def update_manual_donor(
         if payload.notes is not None:
             fields.append("notes = ?")
             params.append(payload.notes.strip())
+        if payload.classification is not None:
+            validate_classification_for_company(payload.classification, comp)
+            fields.append("classification = ?")
+            params.append(payload.classification.strip())
 
         if not fields:
             return {"status": "no_change"}
@@ -1847,9 +2065,31 @@ def update_manual_donor(
         fields.append("updated_at = CURRENT_TIMESTAMP")
         params.append(raw_id)
         cur.execute(f"UPDATE sponsorship_manual_donors SET {', '.join(fields)} WHERE id = ?", params)
+
+        if payload.classification is not None:
+            cur.execute("""
+                INSERT INTO sponsorship_donor_classifications (
+                    donor_id, donor_email, company_id, classification, updated_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(donor_id, company_id) DO UPDATE SET
+                    classification = excluded.classification,
+                    company_id = excluded.company_id,
+                    donor_email = COALESCE(excluded.donor_email, sponsorship_donor_classifications.donor_email),
+                    updated_by = excluded.updated_by,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                f"manual_{raw_id}",
+                existing_email.lower() if existing_email else None,
+                comp,
+                payload.classification.strip(),
+                current_user.get("username", "admin")
+            ))
+
         conn.commit()
         invalidate_overdue_cache(None)
         return {"status": "success", "message": "Manual donor updated successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1867,9 +2107,110 @@ def delete_manual_donor(
     try:
         cur = conn.cursor()
         cur.execute("DELETE FROM sponsorship_manual_donors WHERE id = ?", (raw_id,))
+        cur.execute("DELETE FROM sponsorship_donor_classifications WHERE donor_id = ? OR donor_id = ?", (f"manual_{raw_id}", raw_id))
         conn.commit()
         invalidate_overdue_cache(None)
         return {"status": "success", "message": "Manual donor deleted successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.get("/classifications/options")
+def get_classification_options(company_id: Optional[str] = Query("rethink")):
+    """Returns valid source classification options for the active workspace."""
+    comp = _unwrap_param(company_id, "rethink").strip().lower()
+    options = WORKSPACE_ALLOWED_CLASSIFICATIONS.get(comp, WORKSPACE_ALLOWED_CLASSIFICATIONS["rethink"])
+    return {
+        "company_id": comp,
+        "options": options
+    }
+
+
+@router.post("/donors/classify")
+def classify_donor(
+    payload: DonorClassifyRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Assigns or updates a donor's classification (Rethink Only, Rethink + SP, Iqra Only, Iqra + SP)."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    validate_classification_for_company(payload.classification, comp)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        did = payload.donor_id.strip()
+        demail = (payload.donor_email or "").strip().lower() or None
+
+        cur.execute("""
+            INSERT INTO sponsorship_donor_classifications (
+                donor_id, donor_email, company_id, classification, updated_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(donor_id, company_id) DO UPDATE SET
+                classification = excluded.classification,
+                company_id = excluded.company_id,
+                donor_email = COALESCE(excluded.donor_email, sponsorship_donor_classifications.donor_email),
+                updated_by = excluded.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+        """, (did, demail, comp, payload.classification, current_user.get("username", "admin")))
+
+        # If it's a manual donor, also update the sponsorship_manual_donors table
+        if did.startswith("manual_") or did.startswith("md_"):
+            raw_id = did.replace("manual_", "")
+            cur.execute("UPDATE sponsorship_manual_donors SET classification = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (payload.classification, raw_id))
+
+        conn.commit()
+        invalidate_overdue_cache(comp)
+        return {
+            "status": "success",
+            "donor_id": did,
+            "classification": payload.classification,
+            "message": f"Classification updated to '{payload.classification}'"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.post("/campaigns/classify")
+def classify_campaign(
+    payload: CampaignClassifyRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Assigns or updates a campaign's classification (Rethink Only, Rethink + SP, Iqra Only, Iqra + SP)."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    validate_classification_for_company(payload.classification, comp)
+    cname = (payload.campaign_name or "").strip()
+    if not cname:
+        raise HTTPException(status_code=400, detail="Campaign name is required.")
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO sponsorship_campaign_classifications (
+                campaign_name, company_id, classification, updated_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(campaign_name, company_id) DO UPDATE SET
+                classification = excluded.classification,
+                company_id = excluded.company_id,
+                updated_by = excluded.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+        """, (cname, comp, payload.classification, current_user.get("username", "admin")))
+
+        conn.commit()
+        invalidate_overdue_cache(comp)
+        return {
+            "status": "success",
+            "campaign_name": cname,
+            "classification": payload.classification,
+            "message": f"Campaign classification updated to '{payload.classification}'"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1881,7 +2222,8 @@ def delete_manual_donor(
 def get_qualifying_campaigns(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("Orphan"),
-    search: Optional[str] = Query(None)
+    search: Optional[str] = Query(None),
+    classification: Optional[str] = Query(None)
 ):
     """
     Returns qualifying campaigns/communities for a given sponsorship type with capacity calculations:
@@ -1895,10 +2237,12 @@ def get_qualifying_campaigns(
     - allocated_count: Number of beneficiaries currently allocated to this campaign
     - remaining_slots: max_slots - allocated_count
     - status: 'eligible' | 'at_capacity' | 'near_target'
+    - classification: Campaign source classification (Rethink Only, Rethink + SP, Iqra Only, Iqra + SP)
     """
     comp = _unwrap_param(company_id, "rethink").strip().lower()
     s_type = _unwrap_param(sponsorship_type, "Orphan").strip()
     search = _unwrap_param(search, "").strip() or None
+    target_class = _unwrap_param(classification, "").strip() or None
 
     targets = {"Hafiz": 240.0, "Orphan": 480.0, "Widow": 1080.0, "Ex-Prisoner": 1080.0}
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -1911,6 +2255,15 @@ def get_qualifying_campaigns(
             cur.execute("SELECT sponsorship_type, target_value FROM sponsorship_targets")
         for r in cur.fetchall():
             targets[r["sponsorship_type"]] = float(r["target_value"])
+
+        # Fetch saved campaign classifications
+        camp_cls_query = "SELECT campaign_name, classification FROM sponsorship_campaign_classifications WHERE 1=1"
+        camp_cls_params = []
+        if comp != "all":
+            camp_cls_query += " AND company_id = ?"
+            camp_cls_params.append(comp)
+        cur.execute(camp_cls_query, camp_cls_params)
+        saved_camp_classes = {str(cr["campaign_name"]).strip().lower(): cr["classification"] for cr in cur.fetchall()}
 
         # Fetch existing campaign allocations
         alloc_query = """
@@ -2094,6 +2447,17 @@ def get_qualifying_campaigns(
         else:
             elig_status = "near_target"
 
+        saved_cls = saved_camp_classes.get(c_key) or saved_camp_classes.get(c_display.strip().lower())
+        if saved_cls:
+            c_classification = saved_cls
+            is_manually_classified = True
+        else:
+            c_classification = suggest_campaign_classification(c_display, comp)
+            is_manually_classified = False
+
+        if target_class and target_class.lower() != "all" and c_classification != target_class:
+            continue
+
         if search_str:
             if (search_str not in c_display.lower() and 
                 search_str not in comm_name.lower() and 
@@ -2152,6 +2516,8 @@ def get_qualifying_campaigns(
             "allocated_count": allocated_count,
             "remaining_slots": remaining_slots,
             "status": elig_status,
+            "classification": c_classification,
+            "is_manually_classified": is_manually_classified,
             "oldest_donation_date": c_oldest_str,
             "latest_donation_date": c_latest_str,
             "eligible_since": c_eligible_since.strftime("%Y-%m-%d") if c_eligible_since else None,
@@ -2171,6 +2537,16 @@ def get_qualifying_campaigns(
 # ==========================================
 # 6. ALLOCATIONS MANAGEMENT
 # ==========================================
+def _parse_iso_date(val: Optional[str]) -> Optional[datetime.date]:
+    if not val:
+        return None
+    try:
+        s = str(val).strip()[:10]
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        return None
+
+
 @router.get("/allocations")
 @cached(scopes=["tracker", "tracker_comms"], ttl=3600, daily=True)
 def get_allocations(
@@ -2192,9 +2568,58 @@ def get_allocations(
     never_emailed: Optional[bool] = Query(None),
     funded_status: Optional[str] = Query(None),
     needs_review: Optional[bool] = Query(None),
+    classification: Optional[str] = Query(None),
+    first_emailed_from: Optional[str] = Query(None),
+    first_emailed_to: Optional[str] = Query(None),
+    first_emailed_preset: Optional[str] = Query(None),
+    first_mail_6_months: Optional[bool] = Query(None),
+    email_sequence: Optional[str] = Query(None),
+    response_status: Optional[str] = Query(None),
+    no_response: Optional[bool] = Query(None),
+    contact_status: Optional[str] = Query(None),
+    open_status: Optional[str] = Query(None),
 ):
     """Returns all allocations joined with beneficiary, campaign metadata, communication metrics, and renewal lifecycle stats."""
-    comp = (company_id or "rethink").strip().lower()
+    def _clean_str(v):
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    def _clean_bool(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes")
+        return None
+
+    company_id = _clean_str(company_id) or "rethink"
+    sponsorship_type = _clean_str(sponsorship_type)
+    allocation_type = _clean_str(allocation_type)
+    status = _clean_str(status)
+    renewal_filter = _clean_str(renewal_filter)
+    search = _clean_str(search)
+    donor = _clean_str(donor)
+    beneficiary = _clean_str(beneficiary)
+    campaign = _clean_str(campaign)
+    start_from = _clean_str(start_from)
+    start_to = _clean_str(start_to)
+    end_from = _clean_str(end_from)
+    end_to = _clean_str(end_to)
+    last_emailed_from = _clean_str(last_emailed_from)
+    last_emailed_to = _clean_str(last_emailed_to)
+    never_emailed = _clean_bool(never_emailed)
+    funded_status = _clean_str(funded_status)
+    needs_review = _clean_bool(needs_review)
+    classification = _clean_str(classification)
+    first_emailed_from = _clean_str(first_emailed_from)
+    first_emailed_to = _clean_str(first_emailed_to)
+    first_emailed_preset = _clean_str(first_emailed_preset)
+    first_mail_6_months = _clean_bool(first_mail_6_months)
+    email_sequence = _clean_str(email_sequence)
+    response_status = _clean_str(response_status)
+    no_response = _clean_bool(no_response)
+    contact_status = _clean_str(contact_status)
+    open_status = _clean_str(open_status)
+
+    comp = company_id.lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     try:
@@ -2231,12 +2656,16 @@ def get_allocations(
                 b.donor_folder_link,
                 (SELECT COUNT(*) FROM sponsorship_feedbacks f WHERE f.beneficiary_id = b.id) AS feedbacks_count,
                 (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id) AS messages_count,
+                (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS outbound_emails_count,
                 (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'inbound') AS inbound_replies_count,
+                (SELECT MIN(c.sent_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS first_email_sent_at,
+                (SELECT c.sent_at FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at ASC LIMIT 1 OFFSET 1) AS second_email_sent_at,
                 (SELECT c.delivery_status FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at DESC LIMIT 1) AS latest_email_status,
                 (SELECT c.opened_at FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at DESC LIMIT 1) AS latest_email_opened_at,
                 (SELECT c.open_count FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at DESC LIMIT 1) AS latest_email_open_count,
                 (SELECT c.sent_at FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at DESC LIMIT 1) AS latest_email_sent_at,
-                (SELECT c.subject FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at DESC LIMIT 1) AS latest_email_subject
+                (SELECT c.subject FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound' ORDER BY c.sent_at DESC LIMIT 1) AS latest_email_subject,
+                (SELECT GROUP_CONCAT(DISTINCT c.template_type) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS templates_sent
             FROM sponsorship_allocations a
             JOIN sponsorship_beneficiaries b ON a.beneficiary_id = b.id
             WHERE 1=1
@@ -2332,6 +2761,140 @@ def get_allocations(
             computed_allocations.append(row)
 
         _attach_donors_and_funding(cur, computed_allocations, alloc_key="id")
+
+        # Load classifications for allocations
+        cur.execute("SELECT donor_id, donor_email, classification FROM sponsorship_donor_classifications")
+        d_cls_map = {}
+        for cr in cur.fetchall():
+            if cr["donor_id"]:
+                d_cls_map[str(cr["donor_id"]).strip()] = cr["classification"]
+            if cr["donor_email"]:
+                d_cls_map[str(cr["donor_email"]).strip().lower()] = cr["classification"]
+        cur.execute("SELECT campaign_name, classification FROM sponsorship_campaign_classifications")
+        c_cls_map = {str(cr["campaign_name"]).strip().lower(): cr["classification"] for cr in cur.fetchall()}
+
+        for r in computed_allocations:
+            alloc_type = (r.get("allocation_type") or "").lower()
+            alloc_comp = (r.get("company_id") or comp or "rethink").lower()
+            if alloc_type == "campaign":
+                cname = (r.get("campaign_name") or "").strip()
+                r["classification"] = c_cls_map.get(cname.lower()) or suggest_campaign_classification(cname, alloc_comp)
+            else:
+                did = str(r.get("donor_id") or "").strip()
+                demail = str(r.get("donor_email") or "").strip().lower()
+                r["classification"] = d_cls_map.get(did) or d_cls_map.get(demail) or ("Iqra Only" if alloc_comp == "iqra" else "Rethink Only")
+
+            for d in r.get("donors", []):
+                sub_did = str(d.get("donor_id") or "").strip()
+                sub_email = str(d.get("donor_email") or "").strip().lower()
+                d["classification"] = d_cls_map.get(sub_did) or d_cls_map.get(sub_email) or ("Iqra Only" if alloc_comp == "iqra" else "Rethink Only")
+
+        # 1. Classification filter
+        if classification and classification.strip().lower() != "all":
+            c_target = classification.strip().lower()
+            computed_allocations = [
+                r for r in computed_allocations
+                if (r.get("classification") or "").strip().lower() == c_target
+            ]
+
+        # 2. First email date ranges
+        if first_emailed_from:
+            from_d = _parse_iso_date(first_emailed_from)
+            if from_d:
+                computed_allocations = [
+                    r for r in computed_allocations
+                    if _parse_iso_date(r.get("first_email_sent_at")) and _parse_iso_date(r.get("first_email_sent_at")) >= from_d
+                ]
+        if first_emailed_to:
+            to_d = _parse_iso_date(first_emailed_to)
+            if to_d:
+                computed_allocations = [
+                    r for r in computed_allocations
+                    if _parse_iso_date(r.get("first_email_sent_at")) and _parse_iso_date(r.get("first_email_sent_at")) <= to_d
+                ]
+
+        # 3. First mail sent preset / toggle (6 months ago, 3 months ago, 1 month ago, within 30 days)
+        if first_mail_6_months or (first_emailed_preset and first_emailed_preset.lower() == "6_months_ago"):
+            cutoff = today - datetime.timedelta(days=180)
+            computed_allocations = [
+                r for r in computed_allocations
+                if _parse_iso_date(r.get("first_email_sent_at")) and _parse_iso_date(r.get("first_email_sent_at")) <= cutoff
+            ]
+        elif first_emailed_preset and first_emailed_preset.lower() == "3_months_ago":
+            cutoff = today - datetime.timedelta(days=90)
+            computed_allocations = [
+                r for r in computed_allocations
+                if _parse_iso_date(r.get("first_email_sent_at")) and _parse_iso_date(r.get("first_email_sent_at")) <= cutoff
+            ]
+        elif first_emailed_preset and first_emailed_preset.lower() == "1_month_ago":
+            cutoff = today - datetime.timedelta(days=30)
+            computed_allocations = [
+                r for r in computed_allocations
+                if _parse_iso_date(r.get("first_email_sent_at")) and _parse_iso_date(r.get("first_email_sent_at")) <= cutoff
+            ]
+        elif first_emailed_preset and first_emailed_preset.lower() == "last_30_days":
+            cutoff = today - datetime.timedelta(days=30)
+            computed_allocations = [
+                r for r in computed_allocations
+                if _parse_iso_date(r.get("first_email_sent_at")) and _parse_iso_date(r.get("first_email_sent_at")) >= cutoff
+            ]
+
+        # 4. Response status & no_response toggle
+        if no_response or (response_status and response_status.lower() in ("no_response", "unanswered", "no_reply", "awaiting_reply")):
+            computed_allocations = [
+                r for r in computed_allocations
+                if int(r.get("outbound_emails_count") or 0) > 0 and int(r.get("inbound_replies_count") or 0) == 0 and not r.get("last_replied_at")
+            ]
+        elif response_status and response_status.lower() in ("replied", "has_reply", "responded"):
+            computed_allocations = [
+                r for r in computed_allocations
+                if int(r.get("inbound_replies_count") or 0) > 0 or bool(r.get("last_replied_at"))
+            ]
+
+        # 5. Email Sequence / Count ('0', '1', '2', '3_plus')
+        if email_sequence and email_sequence.lower() != "all":
+            seq = str(email_sequence).strip().lower()
+            if seq in ("0", "never", "none"):
+                computed_allocations = [r for r in computed_allocations if int(r.get("outbound_emails_count") or 0) == 0]
+            elif seq in ("1", "first", "first_mail", "1st"):
+                computed_allocations = [r for r in computed_allocations if int(r.get("outbound_emails_count") or 0) == 1]
+            elif seq in ("2", "second", "second_mail", "2nd"):
+                computed_allocations = [r for r in computed_allocations if int(r.get("outbound_emails_count") or 0) == 2]
+            elif seq in ("3_plus", "3+", "three_plus", "3"):
+                computed_allocations = [r for r in computed_allocations if int(r.get("outbound_emails_count") or 0) >= 3]
+
+        # 6. Contact Status ('contacted', 'not_contacted')
+        if contact_status and contact_status.lower() != "all":
+            cs = contact_status.strip().lower()
+            contacted_statuses = {
+                "contacted", "profile sent", "feedback sent", "welcome sent", 
+                "video sent", "replied", "emailed", "completed"
+            }
+            if cs in ("contacted", "emailed"):
+                computed_allocations = [
+                    r for r in computed_allocations 
+                    if int(r.get("outbound_emails_count") or 0) > 0 or (str(r.get("communication_status") or "").strip().lower() in contacted_statuses)
+                ]
+            elif cs in ("not_contacted", "never_contacted", "uncontacted"):
+                computed_allocations = [
+                    r for r in computed_allocations 
+                    if int(r.get("outbound_emails_count") or 0) == 0 and (str(r.get("communication_status") or "").strip().lower() not in contacted_statuses)
+                ]
+
+        # 7. Email Open Status ('opened', 'unopened')
+        if open_status and open_status.lower() != "all":
+            os_val = open_status.strip().lower()
+            if os_val == "opened":
+                computed_allocations = [
+                    r for r in computed_allocations
+                    if int(r.get("latest_email_open_count") or 0) > 0 or bool(r.get("latest_email_opened_at"))
+                ]
+            elif os_val == "unopened":
+                computed_allocations = [
+                    r for r in computed_allocations
+                    if int(r.get("outbound_emails_count") or 0) > 0 and int(r.get("latest_email_open_count") or 0) == 0 and not r.get("latest_email_opened_at")
+                ]
+
         if funded_status and funded_status != "all":
             computed_allocations = [r for r in computed_allocations if r["funding_status"] == funded_status]
         if needs_review is not None:
@@ -5068,11 +5631,13 @@ def _get_all_overdue_donors_data(
     min_days: int = 30,
     sponsorship_type: Optional[str] = None,
     target_status: Optional[str] = None,
+    classification: Optional[str] = None,
     search: Optional[str] = None,
     force_refresh: bool = False
 ):
     donors, _ = get_all_overdue_data(company_id=company_id, force_refresh=force_refresh)
     st_filter = sponsorship_type.strip().lower() if sponsorship_type and sponsorship_type.lower() != "all" else None
+    cls_filter = classification.strip().lower() if classification and classification.lower() != "all" else None
     search_low = search.strip().lower() if search and search.strip() else None
 
     filtered = []
@@ -5080,6 +5645,8 @@ def _get_all_overdue_donors_data(
         if d.get("waiting_days", 0) < min_days:
             continue
         if st_filter and d.get("sponsorship_type", "").lower() != st_filter:
+            continue
+        if cls_filter and str(d.get("classification") or "").strip().lower() != cls_filter:
             continue
         if target_status and target_status.lower() != "all":
             ts = target_status.strip().lower()
@@ -5106,11 +5673,13 @@ def _get_all_overdue_campaigns_data(
     min_days: int = 30,
     sponsorship_type: Optional[str] = None,
     target_status: Optional[str] = None,
+    classification: Optional[str] = None,
     search: Optional[str] = None,
     force_refresh: bool = False
 ):
     _, campaigns = get_all_overdue_data(company_id=company_id, force_refresh=force_refresh)
     st_filter = sponsorship_type.strip().lower() if sponsorship_type and sponsorship_type.lower() != "all" else None
+    cls_filter = classification.strip().lower() if classification and classification.lower() != "all" else None
     search_low = search.strip().lower() if search and search.strip() else None
 
     filtered = []
@@ -5118,6 +5687,8 @@ def _get_all_overdue_campaigns_data(
         if c.get("waiting_days", 0) < min_days:
             continue
         if st_filter and c.get("sponsorship_type", "").lower() != st_filter:
+            continue
+        if cls_filter and str(c.get("classification") or "").strip().lower() != cls_filter:
             continue
         if target_status and target_status.lower() != "all":
             ts = target_status.strip().lower()
@@ -5218,6 +5789,7 @@ def get_overdue_donors(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("all"),
     target_status: Optional[str] = Query("all"),
+    classification: Optional[str] = Query(None),
     min_days: Optional[int] = Query(30),
     severity: Optional[str] = Query("all"),
     search: Optional[str] = Query(None),
@@ -5234,6 +5806,7 @@ def get_overdue_donors(
         days = 30
     s_type = _unwrap_param(sponsorship_type, "all")
     t_status = _unwrap_param(target_status, "all")
+    cls_param = _unwrap_param(classification, None)
     sev = _unwrap_param(severity, "all")
     srch = _unwrap_param(search, None)
     pg = int(_unwrap_param(page, 1))
@@ -5246,6 +5819,7 @@ def get_overdue_donors(
         min_days=days,
         sponsorship_type=s_type,
         target_status=t_status,
+        classification=cls_param,
         search=srch,
         force_refresh=f_ref
     )
@@ -5284,6 +5858,7 @@ def get_overdue_campaigns(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("all"),
     target_status: Optional[str] = Query("all"),
+    classification: Optional[str] = Query(None),
     min_days: Optional[int] = Query(30),
     severity: Optional[str] = Query("all"),
     search: Optional[str] = Query(None),
@@ -5300,6 +5875,7 @@ def get_overdue_campaigns(
         days = 30
     s_type = _unwrap_param(sponsorship_type, "all")
     t_status = _unwrap_param(target_status, "all")
+    cls_param = _unwrap_param(classification, None)
     sev = _unwrap_param(severity, "all")
     srch = _unwrap_param(search, None)
     pg = int(_unwrap_param(page, 1))
@@ -5312,6 +5888,7 @@ def get_overdue_campaigns(
         min_days=days,
         sponsorship_type=s_type,
         target_status=t_status,
+        classification=cls_param,
         search=srch,
         force_refresh=f_ref
     )

@@ -122,12 +122,22 @@ def update_single_donor_record(
     target_table = "payout_settlements" if is_payout_target else "donations"
     target_donation_id = str(payload.donation_id).strip() if payload.donation_id else None
 
+    # Charity isolation: the record must belong to the charity this request acts for (the API guard has
+    # already checked the user may act for it). A record of another charity is reported as not found.
+    edit_company = str(payload.company_id or "").strip().lower()
+    scoped = bool(edit_company) and edit_company != "all" and "company_id" in df_raw.columns
+    in_company = (df_raw["company_id"].astype(str).str.strip().str.lower() == edit_company) if scoped else None
+
     # Resolve target_donation_id from SQLite rowid if donation_id was omitted
     if not target_donation_id and payload.row_id is not None:
         try:
             conn_find = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
             c_find = conn_find.cursor()
-            c_find.execute(f'SELECT "Donation ID" FROM {target_table} WHERE rowid = ?', (payload.row_id + 1,))
+            if scoped:
+                c_find.execute(f'SELECT "Donation ID" FROM {target_table} WHERE rowid = ? AND LOWER(COALESCE(company_id, \'rethink\')) = ?',
+                               (payload.row_id + 1, edit_company))
+            else:
+                c_find.execute(f'SELECT "Donation ID" FROM {target_table} WHERE rowid = ?', (payload.row_id + 1,))
             r_find = c_find.fetchone()
             conn_find.close()
             if r_find and r_find[0]:
@@ -139,10 +149,15 @@ def update_single_donor_record(
     target_idx = None
     if target_donation_id and "Donation ID" in df_raw.columns:
         d_id_lower = target_donation_id.lower()
-        matches = df_raw.index[df_raw["Donation ID"].astype(str).str.strip().str.lower() == d_id_lower].tolist()
+        id_match = df_raw["Donation ID"].astype(str).str.strip().str.lower() == d_id_lower
+        if scoped:
+            if id_match.any() and not (id_match & in_company).any():
+                raise HTTPException(status_code=404, detail="Record not found for this charity.")
+            id_match = id_match & in_company
+        matches = df_raw.index[id_match].tolist()
         if len(matches) > 0:
             target_idx = matches[0]
-    elif payload.row_id is not None and payload.row_id in df_raw.index:
+    elif payload.row_id is not None and payload.row_id in df_raw.index and (not scoped or bool(in_company.loc[payload.row_id])):
         target_idx = payload.row_id
         if "Donation ID" in df_raw.columns:
             target_donation_id = str(df_raw.loc[target_idx, "Donation ID"]).strip()
@@ -220,7 +235,11 @@ def update_single_donor_record(
         if valid_updates and target_donation_id:
             set_clauses = [f'"{c}" = ?' for c in valid_updates.keys()]
             params = list(valid_updates.values()) + [target_donation_id]
-            cursor.execute(f'UPDATE {target_table} SET {", ".join(set_clauses)} WHERE "Donation ID" = ?', params)
+            where = 'WHERE "Donation ID" = ?'
+            if scoped and "company_id" in db_cols:
+                where += " AND LOWER(COALESCE(company_id, 'rethink')) = ?"
+                params.append(edit_company)
+            cursor.execute(f'UPDATE {target_table} SET {", ".join(set_clauses)} {where}', params)
             conn.commit()
         conn.close()
     except Exception as sql_err:
@@ -233,6 +252,8 @@ def update_single_donor_record(
                 df_raw.loc[target_idx, col] = val
     elif target_donation_id and "Donation ID" in df_raw.columns:
         mask = df_raw["Donation ID"].astype(str).str.strip().str.lower() == target_donation_id.lower()
+        if scoped:
+            mask = mask & in_company
         if mask.any():
             for col, val in update_dict.items():
                 if col in df_raw.columns:
@@ -287,6 +308,10 @@ def bulk_edit_donors(
     df_raw = load_payouts_data(company_id=payload.company_id) if is_payout_bulk else load_data(company_id=payload.company_id)
     if df_raw.empty:
         raise HTTPException(status_code=400, detail="Target dataset is empty.")
+    # Checked before anything is written: the edited rows must merge back into the full file by index.
+    df_full = load_payouts_data(company_id="all") if is_payout_bulk else load_data(company_id="all")
+    if not df_full.index.is_unique or not df_raw.index.isin(df_full.index).all():
+        raise HTTPException(status_code=500, detail="Could not prepare a safe merge for this edit; nothing was changed.")
 
     # 1. Apply global filters to scope target dataframe
     filtered_df = _apply_filters(
@@ -367,14 +392,22 @@ def bulk_edit_donors(
                 for i in range(0, len(matching_don_ids), chunk_size):
                     chunk = matching_don_ids[i:i + chunk_size]
                     placeholders = ", ".join(["?"] * len(chunk))
+                    company_sql, company_params = "", []
+                    if "company_id" in db_cols:
+                        company_sql = " AND LOWER(COALESCE(company_id, 'rethink')) = ?"
+                        company_params = [str(payload.company_id).strip().lower()]
                     cursor.execute(
-                        f'UPDATE {target_table} SET {set_sql} WHERE "Donation ID" IN ({placeholders})',
-                        list(valid_updates.values()) + chunk
+                        f'UPDATE {target_table} SET {set_sql} WHERE "Donation ID" IN ({placeholders}){company_sql}',
+                        list(valid_updates.values()) + chunk + company_params
                     )
                 conn.commit()
             conn.close()
         except Exception as sql_bulk_err:
             print(f"[SQL Bulk Update Notice]: {sql_bulk_err}")
+
+    # df_raw holds only this charity's rows; the parquet file holds every charity. Put the edited rows
+    # back into the full dataset (same row order) instead of overwriting the file with one charity.
+    df_raw = pd.concat([df_full.drop(index=df_raw.index), df_raw]).sort_index()
 
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
 
@@ -1255,12 +1288,9 @@ def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Qu
     match_mask = _get_donor_matching_mask(df, donor_id_or_email) if not df.empty else pd.Series(False, index=df.index)
     donor_txns = df.loc[match_mask] if not df.empty else pd.DataFrame()
 
-    if donor_txns.empty:
-        df_all = load_data(company_id="all")
-        if not df_all.empty:
-            match_mask_all = _get_donor_matching_mask(df_all, donor_id_or_email)
-            donor_txns = df_all.loc[match_mask_all]
-            df = df_all
+    # No fallback to other charities: a donor that isn't in the requested charity is not found.
+    # (company_id omitted/'all' already searches every charity, and the API guard only allows that
+    # for accounts with access to all of them.)
 
     if donor_txns.empty:
         raise HTTPException(status_code=404, detail=f"Donor '{donor_id_or_email}' not found.")
@@ -1374,12 +1404,9 @@ def get_donor_history_paginated(
     match_mask = _get_donor_matching_mask(df, donor_id) if not df.empty else pd.Series(False, index=df.index)
     donor_txns = df.loc[match_mask] if not df.empty else pd.DataFrame()
 
-    if donor_txns.empty:
-        df_all = load_data(company_id="all")
-        if not df_all.empty:
-            match_mask_all = _get_donor_matching_mask(df_all, donor_id)
-            donor_txns = df_all.loc[match_mask_all]
-            df = df_all
+    # No fallback to other charities: a donor that isn't in the requested charity is not found.
+    # (company_id omitted/'all' already searches every charity, and the API guard only allows that
+    # for accounts with access to all of them.)
 
     if donor_txns.empty:
         return {"total_records": 0, "page": 1, "page_size": page_size, "total_pages": 1, "records": []}
@@ -1438,7 +1465,7 @@ def get_campaigns_list(company_id: Optional[str] = Query("rethink")):
             SELECT DISTINCT [Campaign Name]
             FROM donations
             {where_clause}
-            ORDER BY [Campaign Name] COLLATE NOCASE ASC
+            ORDER BY [Campaign Name] COLLATE NOCASE ASC, [Campaign Name] DESC
         """, params)
         campaigns = [r[0].strip() for r in cur.fetchall() if r[0] and str(r[0]).strip()]
         conn.close()

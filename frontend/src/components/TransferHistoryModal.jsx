@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { History, Search, Download, Trash2, X, RefreshCw, AlertTriangle, CheckCircle2, ArrowRight, FileSpreadsheet, ArrowRightLeft } from 'lucide-react';
-import { API_BASE_URL } from '../config';
+import { API_BASE_URL, downloadFile } from '../config';
 
 export default function TransferHistoryModal({
   isOpen,
@@ -86,7 +86,7 @@ export default function TransferHistoryModal({
 
   const handleExport = (format = 'csv') => {
     const codeParam = filterCode ? `&code=${encodeURIComponent(filterCode)}` : '';
-    window.open(`${API_BASE_URL}/api/expenses/transfers/export?format=${format}${codeParam}&company_id=${encodeURIComponent(activeCompany)}`, '_blank');
+    downloadFile(`${API_BASE_URL}/api/expenses/transfers/export?format=${format}${codeParam}&company_id=${encodeURIComponent(activeCompany)}`, `transfers.${format}`);
   };
 
   return (

@@ -45,6 +45,13 @@ def set_main_event_loop(loop: asyncio.AbstractEventLoop):
 
 @router.websocket("/events")
 async def websocket_events_endpoint(websocket: WebSocket):
+    # Live events carry donation/expense details: only signed-in sessions may listen.
+    # Browsers can't set headers on a WebSocket, so the session token comes as ?token=.
+    from core.auth import decode_access_token
+    claims = decode_access_token(websocket.query_params.get("token") or "") or {}
+    if not claims.get("sub"):
+        await websocket.close(code=1008)
+        return
     await manager.connect(websocket)
     try:
         while True:
