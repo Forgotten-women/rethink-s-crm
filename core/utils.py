@@ -1568,8 +1568,14 @@ DONOR_TIER_ORDER = [
 
 # ── AUTHENTICATION & RBAC UTILITIES ──────────────────────────────────────────
 
+_user_db_initialized = False
+
+
 def init_user_db():
     """Ensure users table exists in SQLite database with default super_admin and admin accounts."""
+    global _user_db_initialized
+    if _user_db_initialized:
+        return
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
         conn.execute("""
@@ -1603,6 +1609,7 @@ def init_user_db():
             """, seed_users)
             conn.commit()
         conn.close()
+        _user_db_initialized = True
     except Exception as e:
         print(f"User DB init notice: {e}")
 

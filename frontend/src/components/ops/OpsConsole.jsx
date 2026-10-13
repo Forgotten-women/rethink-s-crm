@@ -178,11 +178,15 @@ function StatusTab() {
       {error && <div className="p-3 rounded-xl bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300 border border-rose-200 dark:border-rose-900">{error}</div>}
       {data && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {data.platforms.map(p => (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {data.platforms.map(p => {
+              const label = p.platform === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
+                            (p.platform === 'givebrite_iqra' || p.platform === 'givebrite') ? 'GiveBrite (Iqra)' :
+                            'Madinah (Iqra)';
+              return (
               <div key={p.platform} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 flex flex-col gap-2.5 shadow-2xs">
                 <div className="flex items-center justify-between">
-                  <span className="font-bold text-sm capitalize text-slate-900 dark:text-slate-100">{p.platform === 'givebrite' ? 'GiveBrite (Iqra)' : 'Madinah (Iqra)'}</span>
+                  <span className="font-bold text-sm capitalize text-slate-900 dark:text-slate-100">{label}</span>
                   <StateBadge state={p.state} />
                 </div>
                 {p.issues.length > 0 && (
@@ -216,7 +220,7 @@ function StatusTab() {
                   </div>
                 )}
               </div>
-            ))}
+            );})}
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 shadow-2xs">
@@ -393,20 +397,25 @@ function SessionsTab() {
   };
 
   const captureCommands = [
-    { platform: 'madinah', cmd: 'node scripts/capture_platform_session.js madinah', targetCls: 'text-cyan-400 font-bold' },
-    { platform: 'givebrite', cmd: 'node scripts/capture_platform_session.js givebrite', targetCls: 'text-emerald-400 font-bold' }
+    { platform: 'madinah (iqra)', cmd: 'node scripts/capture_platform_session.js madinah', targetCls: 'text-cyan-400 font-bold' },
+    { platform: 'givebrite (iqra)', cmd: 'node scripts/capture_platform_session.js iqra', targetCls: 'text-emerald-400 font-bold' },
+    { platform: 'givebrite (rethink)', cmd: 'node scripts/capture_platform_session.js rethink', targetCls: 'text-purple-400 font-bold' }
   ];
 
   return (
     <div className="flex flex-col gap-4">
       {/* Session overview cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {sessions && Object.entries(sessions).map(([p, s]) => (
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {sessions && Object.entries(sessions).map(([p, s]) => {
+          const sessionLabel = p === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
+                               (p === 'givebrite_iqra' || p === 'givebrite') ? 'GiveBrite (Iqra)' :
+                               'Madinah (Iqra)';
+          return (
           <div key={p} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 grid grid-cols-2 gap-x-3 gap-y-1.5 shadow-2xs text-xs">
             <div className="col-span-2 flex items-center justify-between mb-1">
               <span className="font-bold capitalize text-sm text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
                 <span className={`w-2 h-2 rounded-full ${s.present ? 'bg-emerald-500' : 'bg-rose-500'}`} />
-                {p}
+                {sessionLabel}
               </span>
               <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${s.present ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-900' : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300 border border-rose-200 dark:border-rose-900'}`}>
                 {s.present ? 'Active Session' : 'Missing'}
@@ -427,7 +436,7 @@ function SessionsTab() {
             <span className="text-slate-500 dark:text-slate-400 font-medium">By</span>
             <span className="font-semibold truncate text-slate-800 dark:text-slate-200">{s.captured_by || 'automatic renewal'}</span>
           </div>
-        ))}
+        );})}
       </div>
 
       {/* Recommended interactive capture commands */}
@@ -449,20 +458,24 @@ function SessionsTab() {
           Or paste tokens manually
         </div>
         <div className="flex gap-2">
-          {['madinah', 'givebrite'].map(p => (
-            <button
-              key={p}
-              type="button"
-              onClick={() => setForm(f => ({ ...f, platform: p }))}
-              className={`px-3 py-1.5 rounded-lg font-bold text-xs capitalize transition-all ${
-                form.platform === p
-                  ? 'bg-blue-600 text-white shadow-sm shadow-blue-500/20'
-                  : 'bg-slate-100 dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
-              }`}
-            >
-              {p}
-            </button>
-          ))}
+          {['givebrite_iqra', 'givebrite_rethink', 'madinah'].map(p => {
+            const btnLabel = p === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
+                             p === 'givebrite_iqra' ? 'GiveBrite (Iqra)' : 'Madinah (Iqra)';
+            return (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setForm(f => ({ ...f, platform: p }))}
+                className={`px-3 py-1.5 rounded-lg font-bold text-xs capitalize transition-all ${
+                  form.platform === p
+                    ? 'bg-blue-600 text-white shadow-sm shadow-blue-500/20'
+                    : 'bg-slate-100 dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+                }`}
+              >
+                {btnLabel}
+              </button>
+            );
+          })}
         </div>
         <div className="flex flex-col gap-1.5">
           <label className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">

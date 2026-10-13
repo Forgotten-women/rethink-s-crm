@@ -22,6 +22,7 @@ def get_filter_options(
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
     campaign: Optional[str] = None,
+    giving_level: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,

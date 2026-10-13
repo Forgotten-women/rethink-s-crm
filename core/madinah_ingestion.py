@@ -366,120 +366,120 @@ def ingest_madinah_donations(
         return {"total_incoming": 0, "inserted": 0, "skipped": 0, "inserted_records": []}
 
     conn = get_db_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    d_ids = [str(d.get("donationId", "")).strip() for d in donations if d.get("donationId")]
-    tx_ids = [str(d.get("transactionId", "")).strip() for d in donations if d.get("transactionId")]
+        d_ids = [str(d.get("donationId", "")).strip() for d in donations if d.get("donationId")]
+        tx_ids = [str(d.get("transactionId", "")).strip() for d in donations if d.get("transactionId")]
 
-    # Check existing by Donation ID and charge_id
-    existing_d_ids = set()
-    if d_ids:
-        placeholders_d = ",".join(["?"] * len(d_ids))
-        cursor.execute(f"""
-            SELECT "Donation ID" FROM donations 
-            WHERE company_id = ? AND "Donation ID" IN ({placeholders_d})
-        """, [company_id] + d_ids)
-        existing_d_ids = {r[0] for r in cursor.fetchall()}
+        # Check existing by Donation ID and charge_id
+        existing_d_ids = set()
+        if d_ids:
+            placeholders_d = ",".join(["?"] * len(d_ids))
+            cursor.execute(f"""
+                SELECT "Donation ID" FROM donations 
+                WHERE company_id = ? AND "Donation ID" IN ({placeholders_d})
+            """, [company_id] + d_ids)
+            existing_d_ids = {r[0] for r in cursor.fetchall()}
 
-    existing_tx_ids = set()
-    if tx_ids:
-        placeholders_tx = ",".join(["?"] * len(tx_ids))
-        cursor.execute(f"""
-            SELECT charge_id FROM donations 
-            WHERE company_id = ? AND charge_id IN ({placeholders_tx})
-        """, [company_id] + tx_ids)
-        existing_tx_ids = {r[0] for r in cursor.fetchall()}
+        existing_tx_ids = set()
+        if tx_ids:
+            placeholders_tx = ",".join(["?"] * len(tx_ids))
+            cursor.execute(f"""
+                SELECT charge_id FROM donations 
+                WHERE company_id = ? AND charge_id IN ({placeholders_tx})
+            """, [company_id] + tx_ids)
+            existing_tx_ids = {r[0] for r in cursor.fetchall()}
 
-    new_donations = []
-    updated_records = []
+        new_donations = []
+        updated_records = []
 
-    for d in donations:
-        did = str(d.get("donationId", "")).strip()
-        txid = str(d.get("transactionId", "")).strip()
-        status_val = str(d.get("status", "")).strip().lower()
+        for d in donations:
+            did = str(d.get("donationId", "")).strip()
+            txid = str(d.get("transactionId", "")).strip()
+            status_val = str(d.get("status", "")).strip().lower()
 
-        # If incoming donation failed or cancelled, do not ingest as active revenue
-        if status_val and status_val != "success":
-            if did in existing_d_ids:
+            # If incoming donation failed or cancelled, do not ingest as active revenue
+            if status_val and status_val != "success":
+                if did in existing_d_ids:
+                    try:
+                        cursor.execute("""
+                            UPDATE donations
+                            SET Status = 'failed',
+                                "Total Online Donation Gross Amount in Settled Currency" = '0.0',
+                                "Total Online Donations Net Amount in Settled Currency" = 0.0,
+                                Amount = 0.0
+                            WHERE company_id = ? AND "Donation ID" = ?
+                        """, (company_id, did))
+                        if cursor.rowcount > 0:
+                            updated_records.append(did)
+                    except Exception as f_err:
+                        logger.warning(f"Error zeroing out failed donation {did}: {f_err}")
+                continue
+
+            if did not in existing_d_ids and txid not in existing_tx_ids:
+                new_donations.append(d)
+            elif did in existing_d_ids:
+                # Check and self-heal any discrepancies in settled currency or usdAmount
                 try:
+                    amt_val = float(d.get("amount", 0.0) or 0.0)
+                    u_amt = float(d.get("usdAmount") if d.get("usdAmount") is not None else amt_val)
+                    curr = str(d.get("currencyCode") or "USD").strip().upper()
+                    t_cls = classify_donor_amount(u_amt)
                     cursor.execute("""
                         UPDATE donations
-                        SET Status = 'failed',
-                            "Total Online Donation Gross Amount in Settled Currency" = '0.0',
-                            "Total Online Donations Net Amount in Settled Currency" = 0.0,
-                            Amount = 0.0
+                        SET "Settlement Currency" = 'USD',
+                            "Total Online Donation Gross Amount in Settled Currency" = ?,
+                            "Total Online Donations Net Amount in Settled Currency" = ?,
+                            "Total LTV" = ?,
+                            "Lifetime Donor Classification" = ?,
+                            "Transaction Donor Classification" = ?,
+                            "Donation Currency (DC)" = ?,
+                            "Donation Amount (in Donation Currency)" = ?,
+                            "Amount" = ?,
+                            "Currency" = ?
                         WHERE company_id = ? AND "Donation ID" = ?
-                    """, (company_id, did))
+                          AND ("Settlement Currency" != 'USD' OR "Total Online Donation Gross Amount in Settled Currency" != ?)
+                    """, (str(u_amt), u_amt, u_amt, t_cls, t_cls, curr, str(amt_val), amt_val, curr, company_id, did, str(u_amt)))
                     if cursor.rowcount > 0:
                         updated_records.append(did)
-                except Exception as f_err:
-                    logger.warning(f"Error zeroing out failed donation {did}: {f_err}")
-            continue
+                except Exception as u_err:
+                    logger.warning(f"Error checking settled amount for existing {did}: {u_err}")
 
-        if did not in existing_d_ids and txid not in existing_tx_ids:
-            new_donations.append(d)
-        elif did in existing_d_ids:
-            # Check and self-heal any discrepancies in settled currency or usdAmount
-            try:
-                amt_val = float(d.get("amount", 0.0) or 0.0)
-                u_amt = float(d.get("usdAmount") if d.get("usdAmount") is not None else amt_val)
-                curr = str(d.get("currencyCode") or "USD").strip().upper()
-                t_cls = classify_donor_amount(u_amt)
-                cursor.execute("""
-                    UPDATE donations
-                    SET "Settlement Currency" = 'USD',
-                        "Total Online Donation Gross Amount in Settled Currency" = ?,
-                        "Total Online Donations Net Amount in Settled Currency" = ?,
-                        "Total LTV" = ?,
-                        "Lifetime Donor Classification" = ?,
-                        "Transaction Donor Classification" = ?,
-                        "Donation Currency (DC)" = ?,
-                        "Donation Amount (in Donation Currency)" = ?,
-                        "Amount" = ?,
-                        "Currency" = ?
-                    WHERE company_id = ? AND "Donation ID" = ?
-                      AND ("Settlement Currency" != 'USD' OR "Total Online Donation Gross Amount in Settled Currency" != ?)
-                """, (str(u_amt), u_amt, u_amt, t_cls, t_cls, curr, str(amt_val), amt_val, curr, company_id, did, str(u_amt)))
-                if cursor.rowcount > 0:
-                    updated_records.append(did)
-            except Exception as u_err:
-                logger.warning(f"Error checking settled amount for existing {did}: {u_err}")
+        if updated_records:
+            conn.commit()
+            logger.info(f"Self-healed {len(updated_records)} existing Madinah records to settled USD amounts in SQLite.")
 
-    if updated_records:
-        conn.commit()
-        logger.info(f"Self-healed {len(updated_records)} existing Madinah records to settled USD amounts in SQLite.")
+        if not new_donations and not updated_records:
+            logger.info(f"All {len(donations)} incoming Madinah donations up-to-date in CRM. Zero insertions needed.")
+            return {"total_incoming": len(donations), "inserted": 0, "skipped": len(donations), "updated": 0}
 
-    if not new_donations and not updated_records:
+        records_to_insert = []
+        for d in new_donations:
+            c_name = normalize_campaign_text(d.get("campaignName", ""))
+            gl_obj = d.get("givingLevel") if isinstance(d.get("givingLevel"), dict) else {}
+            g_level = normalize_campaign_text(str(d.get("givingLevelTitle") or gl_obj.get("title") or d.get("giving_level") or ""))
+            cls_meta = resolve_madinah_classification(cursor, c_name, giving_level=g_level, company_id=company_id)
+            rec = build_madinah_record(d, classification_meta=cls_meta, company_id=company_id)
+            records_to_insert.append(rec)
+
+        if records_to_insert:
+            cursor.execute("PRAGMA table_info(donations);")
+            table_cols = [c[1] for c in cursor.fetchall()]
+
+            insert_rows = []
+            for r in records_to_insert:
+                insert_rows.append([r.get(col) for col in table_cols])
+
+            col_placeholders = ",".join(["?"] * len(table_cols))
+            quoted_cols = ",".join([f'"{col}"' for col in table_cols])
+            sql = f"INSERT INTO donations ({quoted_cols}) VALUES ({col_placeholders})"
+
+            cursor.executemany(sql, insert_rows)
+            conn.commit()
+            logger.info(f"Successfully committed {len(records_to_insert)} new Madinah donations into SQLite 'donations'.")
+    finally:
         conn.close()
-        logger.info(f"All {len(donations)} incoming Madinah donations up-to-date in CRM. Zero insertions needed.")
-        return {"total_incoming": len(donations), "inserted": 0, "skipped": len(donations), "updated": 0}
-
-    records_to_insert = []
-    for d in new_donations:
-        c_name = normalize_campaign_text(d.get("campaignName", ""))
-        gl_obj = d.get("givingLevel") if isinstance(d.get("givingLevel"), dict) else {}
-        g_level = normalize_campaign_text(str(d.get("givingLevelTitle") or gl_obj.get("title") or d.get("giving_level") or ""))
-        cls_meta = resolve_madinah_classification(cursor, c_name, giving_level=g_level, company_id=company_id)
-        rec = build_madinah_record(d, classification_meta=cls_meta, company_id=company_id)
-        records_to_insert.append(rec)
-
-    if records_to_insert:
-        cursor.execute("PRAGMA table_info(donations);")
-        table_cols = [c[1] for c in cursor.fetchall()]
-
-        insert_rows = []
-        for r in records_to_insert:
-            insert_rows.append([r.get(col) for col in table_cols])
-
-        col_placeholders = ",".join(["?"] * len(table_cols))
-        quoted_cols = ",".join([f'"{col}"' for col in table_cols])
-        sql = f"INSERT INTO donations ({quoted_cols}) VALUES ({col_placeholders})"
-
-        cursor.executemany(sql, insert_rows)
-        conn.commit()
-        logger.info(f"Successfully committed {len(records_to_insert)} new Madinah donations into SQLite 'donations'.")
-
-    conn.close()
 
     # Update Parquet cache for both inserted and self-healed records
     all_parquet_sync = list(records_to_insert)
@@ -540,9 +540,9 @@ def update_madinah_parquet_cache(new_records: List[Dict[str, Any]]) -> None:
     df_new = df_new[df_existing.columns]
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
 
-    # Deduplicate safely: only collapse rows with non-empty Donation IDs
+    # Deduplicate safely: only collapse rows with non-empty Donation IDs (keep="first" strictly preserves existing records/classifications)
     mask_has_id = df_combined["Donation ID"].notna() & (df_combined["Donation ID"].astype(str).str.strip() != "")
-    df_with_id = df_combined[mask_has_id].drop_duplicates(subset=["company_id", "Donation ID"], keep="last")
+    df_with_id = df_combined[mask_has_id].drop_duplicates(subset=["company_id", "Donation ID"], keep="first")
     df_no_id = df_combined[~mask_has_id]
     df_combined = pd.concat([df_with_id, df_no_id], ignore_index=True)
     atomic_write_parquet(df_combined, PARQUET_PATH)

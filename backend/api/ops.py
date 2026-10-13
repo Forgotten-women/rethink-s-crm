@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.api.auth import require_super_admin
-from config.settings import LOCAL_DB_PATH
+from config.settings import LOCAL_DB_PATH, GIVEBRITE_CHARITY_IDS
 from core.event_log import log_event, query_axiom, query_local, shipping_status
 
 router = APIRouter(prefix="/api/ops", tags=["Ops Console"], dependencies=[Depends(require_super_admin)])
@@ -24,11 +24,13 @@ router = APIRouter(prefix="/api/ops", tags=["Ops Console"], dependencies=[Depend
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TOKEN_FILES = {
     "givebrite": os.path.join(BASE_DIR, ".givebrite_token.json"),
+    "givebrite_iqra": os.path.join(BASE_DIR, ".givebrite_token.json"),
+    "givebrite_rethink": os.path.join(BASE_DIR, ".givebrite_rethink_token.json"),
     "madinah": os.path.join(BASE_DIR, ".madinah_token.json"),
 }
 HEALTH_FILE = os.path.join(BASE_DIR, "data_cache", "platform_health.json")
 SYNC_FILE = os.path.join(BASE_DIR, "data_cache", "platform_sync_data.json")
-GIVEBRITE_CHARITY_ID = os.environ.get("GIVEBRITE_IQRA_CHARITY_ID", "68625e0d6d1a99441e34e2ea")
+GIVEBRITE_CHARITY_ID = GIVEBRITE_CHARITY_IDS.get("iqra", "")
 MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
 
 
@@ -90,8 +92,10 @@ def _live_check(platform: str, token: Optional[str] = None) -> Dict[str, Any]:
                              headers={"Authorization": auth, "Accept": "application/json",
                                       "Origin": "https://www.madinah.com"}, timeout=12)
         else:
+            cid = "rethink" if "rethink" in platform else "iqra"
+            charity_id = GIVEBRITE_CHARITY_IDS.get(cid, GIVEBRITE_CHARITY_ID)
             r = requests.get("https://api-dashboard.givebrite.com/v1/dashboard/donations",
-                             params={"charity_id": GIVEBRITE_CHARITY_ID, "page": 1, "limit": 1},
+                             params={"charity_id": charity_id, "page": 1, "limit": 1},
                              headers={"Authorization": auth, "Accept": "application/json",
                                       "Origin": "https://dashboard.givebrite.com"}, timeout=12)
         return {"ok": r.status_code == 200, "http_status": r.status_code,
@@ -133,7 +137,7 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
         state = "down"
     elif (token.get("access_minutes_left") or 0) <= 0:
         issues.append("Access token expired")
-        state = "down" if platform == "givebrite" or (token.get("refresh_minutes_left") or 0) <= 0 else state
+        state = "down" if "givebrite" in platform or (token.get("refresh_minutes_left") or 0) <= 0 else state
     if platform == "madinah" and token.get("refresh_minutes_left") is not None:
         left_h = token["refresh_minutes_left"] / 60
         if left_h <= 0:
@@ -148,13 +152,15 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
     sync_data = dict(h)
     if not sync_data.get("last_ingested_at") or str(sync_data.get("last_ingested_at")).lower() in ("nan", "none", ""):
         try:
+            cid = "rethink" if "rethink" in platform else "iqra"
+            src = "givebrite" if "givebrite" in platform else "madinah"
             conn = sqlite3.connect(LOCAL_DB_PATH, timeout=2.0)
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
                 FROM donations
-                WHERE company_id = 'iqra' AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
-            """, (f"%{platform}%",))
+                WHERE company_id = ? AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
+            """, (cid, f"%{src}%"))
             row = cursor.fetchone()
             if row and row[0] and "nan" not in str(row[0]).lower():
                 sync_data["last_ingested_at"] = row[0]
@@ -198,7 +204,7 @@ def _outlook_status() -> List[Dict[str, Any]]:
 def ops_status(live: bool = Query(False)):
     health = _read_json(HEALTH_FILE)
     sync = _read_json(SYNC_FILE)
-    platforms = [_platform_status(p, health, live) for p in ("givebrite", "madinah")]
+    platforms = [_platform_status(p, health, live) for p in ("givebrite_iqra", "givebrite_rethink", "madinah")]
     services = [_service_state("platform-sync.service")]
     for s in services:
         if s["active"] != "active":
@@ -266,15 +272,20 @@ class SessionUpload(BaseModel):
     source: Optional[str] = "manual-capture"
 
 
+SESSION_PLATFORMS = ["givebrite_iqra", "givebrite_rethink", "madinah"]
+
+
 @router.get("/platform-sessions")
 def list_sessions():
-    return {p: _token_info(p) for p in TOKEN_FILES}
+    return {p: _token_info(p) for p in SESSION_PLATFORMS}
 
 
 @router.post("/platform-sessions/{platform}")
 def upload_session(platform: str, payload: SessionUpload, user: dict = Depends(require_super_admin)):
     """Stores a manually captured session after proving it works against the platform API."""
     platform = platform.lower()
+    if platform == "givebrite":
+        platform = "givebrite_iqra"
     if platform not in TOKEN_FILES:
         raise HTTPException(status_code=404, detail="Unknown platform")
     access = payload.accessToken.strip()

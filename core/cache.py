@@ -470,7 +470,8 @@ def cached(scopes: List[str], ttl: int = 3600, company_param: str = "company_id"
             ver = versions(scopes, company)
             if daily:
                 ver["day"] = time.strftime("%Y-%m-%d", time.gmtime())
-            raw_key = json.dumps({"e": endpoint, "p": params, "v": ver, "fmt": "gz1"}, sort_keys=True, default=str)
+            raw_key = json.dumps({"e": endpoint, "p": params, "v": ver, "c": code_version(), "fmt": "gz1"},
+                                 sort_keys=True, default=str)
             key = hashlib.sha256(raw_key.encode()).hexdigest()
             etag = f'W/"{key[:32]}"'
 
@@ -541,6 +542,29 @@ def cached(scopes: List[str], ttl: int = 3600, company_param: str = "company_id"
         wrapper.cache_scopes = scopes
         return wrapper
     return deco
+
+
+_CODE_VERSION: Optional[str] = None
+
+
+def code_version() -> str:
+    """Fingerprint of the deployed backend code (every .py under backend/, core/, config/). Part of every cache
+    key, so after a deploy the shared cache never serves a response computed by the previous code."""
+    global _CODE_VERSION
+    if _CODE_VERSION is None:
+        h = hashlib.sha1()
+        for folder in ("backend", "core", "config"):
+            for root, _dirs, files in sorted(os.walk(os.path.join(BASE_DIR, folder))):
+                for name in sorted(files):
+                    if name.endswith(".py"):
+                        try:
+                            with open(os.path.join(root, name), "rb") as f:
+                                h.update(name.encode())
+                                h.update(f.read())
+                        except OSError:
+                            pass
+        _CODE_VERSION = h.hexdigest()[:12]
+    return _CODE_VERSION
 
 
 def version_token(scopes: Iterable[str], company_id: Optional[str]) -> str:

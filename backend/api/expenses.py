@@ -25,8 +25,14 @@ from backend.api.auth import get_current_user, require_super_admin
 router = APIRouter(prefix="/api/expenses", tags=["Expense & Payment Tracking"])
 
 
+_expense_db_initialized = False
+
+
 def init_expense_db():
     """Initializes expense_requests and system_settings SQLite tables."""
+    global _expense_db_initialized
+    if _expense_db_initialized:
+        return
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
         cursor = conn.cursor()
@@ -109,6 +115,7 @@ def init_expense_db():
 
         conn.commit()
         conn.close()
+        _expense_db_initialized = True
     except Exception as e:
         print(f"Expense DB init notice: {e}")
 

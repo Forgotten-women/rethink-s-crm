@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH, PAYOUTS_PARQUET_PATH
@@ -30,8 +30,10 @@ def _extract_fundraiser_series(df: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------------------------------------
 # Attribution: which fundraiser each donation counts towards (computed when read - donation rows are not edited)
 #
-# Explicit assignments win over the platform's own fundraiser name, and the most specific page wins:
-#     fundraiser page link > community/team page link > campaign link > campaign name (+code) > platform name
+# Explicit assignments win over the platform's own fundraiser name, and the NARROWEST page wins - the matching
+# assignment whose page has the fewest donations (platform-neutral: on GiveBrite a person's page sits inside a team
+# inside a campaign, on LaunchGood a person's campaign sits inside a community). Equal size: fundraiser page >
+# community > campaign link > campaign name, then the older fundraiser.
 # Same page assigned to two fundraisers (only possible for campaign names; links are unique per charity):
 # the older fundraiser keeps it. Results are cached per charity on the donations version, so a new donation
 # (any process) or a changed assignment shows up on the next request.
@@ -59,11 +61,51 @@ def _donation_keys(df: pd.DataFrame, comp: str) -> pd.DataFrame:
     if hit and hit[0] == token and hit[1].index.equals(df.index):
         return hit[1]
     with _LINK_KEYS_LOCK:
+        from core.page_links import learn_host_platforms
         keys = donation_link_keys(df)
         keys["cname"] = _norm_campaign_name(df["Campaign Name"]) if "Campaign Name" in df.columns else ""
         keys["code"] = df["Code"].fillna("").astype(str).str.strip().str.lower() if "Code" in df.columns else ""
+        keys.attrs["host_platforms"] = learn_host_platforms(df)
         _LINK_KEYS_CACHE[comp] = (token, keys)
         return keys
+
+
+def _host_platforms(comp: str) -> Dict[str, str]:
+    """website -> platform learned from this charity's donations (works for any future platform too)."""
+    df = load_data(company_id=comp)
+    if df is None or df.empty:
+        return {}
+    return _donation_keys(df, comp).attrs.get("host_platforms", {})
+
+
+_SP_NAME_RE = __import__("re").compile(r"(^|[^a-z])(sp|sisters'? ?project)([^a-z]|$)|^sp[_-]", __import__("re").I)
+
+
+def is_sp_text(text: str) -> bool:
+    """SP (Sisters' Project) marker in a fundraiser name, campaign name or page link: 'SP-Khawlah', 'SP: ...',
+    'Sisters Project ...', LaunchGood pages named sp_xxx."""
+    t = str(text or "").strip().lower()
+    if not t:
+        return False
+    slug = t.rstrip("/").split("/")[-1].split("?")[0]
+    return bool(_SP_NAME_RE.search(t)) or slug.startswith(("sp_", "sp-"))
+
+
+def resolve_page_group(explicit: Optional[str], name: str, campaigns: List[str]) -> str:
+    """'SP' or 'MAIN'. An explicit choice wins; otherwise SP when the name or any assigned page/campaign is SP."""
+    e = str(explicit or "").strip().upper()
+    if e in ("SP", "MAIN"):
+        return e
+    return "SP" if is_sp_text(name) or any(is_sp_text(c) for c in campaigns) else "MAIN"
+
+
+def page_group_label(group: str, comp: str) -> str:
+    return "SP" if group == "SP" else ("Iqra" if comp == "iqra" else "Rethink")
+
+
+def platform_label(platform: str) -> str:
+    known = {"launchgood": "LaunchGood", "givebright": "GiveBrite", "madinah": "Madinah"}
+    return known.get(platform, platform.title() if platform and platform != "*" else "Any platform")
 
 
 def _load_assignments(comp: str) -> List[Dict[str, Any]]:
@@ -90,62 +132,88 @@ def attribute_donations(df: pd.DataFrame, comp: str, assignments: Optional[List[
     if df.empty or not assignments:
         return fn, aid, mtype
     keys = _donation_keys(df, comp)
-    # oldest fundraiser applied last so it wins a tie
-    ordered = sorted(assignments, key=lambda a: str(a.get("f_created") or ""), reverse=True)
+    import numpy as np
+    # Row positions per key, computed once (fast dictionary lookups instead of a scan per assignment)
+    index_of = {}
 
-    def apply(mask_values: pd.Series, winners: Dict[str, Any], match_type: str):
-        hit = mask_values.map(winners)
-        ok = hit.notna()
-        if ok.any():
-            fn.loc[ok] = hit[ok].map(lambda w: w[0])
-            aid.loc[ok] = hit[ok].map(lambda w: w[1])
-            mtype.loc[ok] = match_type
+    def positions(col: str, value) -> np.ndarray:
+        if col not in index_of:
+            index_of[col] = keys[col].reset_index(drop=True).groupby(keys[col].reset_index(drop=True), sort=False).indices
+        return index_of[col].get(value, np.empty(0, dtype=np.int64))
 
-    for match_type in MATCH_PRECEDENCE:
-        group = [a for a in ordered if a["match_type"] == match_type]
-        if not group:
+    if "cname_code" not in keys.columns:
+        keys["cname_code"] = keys["cname"] + "::" + keys["code"]
+    generic_code = keys["code"].isin(["", "all"]).to_numpy()
+
+    matched = []  # (assignment, row positions)
+    for a in assignments:
+        name = str(a["fundraiser_name"] or "").strip().lower()
+        if not name:
             continue
-        if match_type == "campaign_name":
-            by_name, by_name_code = {}, {}
-            for a in group:
-                name = str(a.get("campaign_name") or "").strip().lower().replace("–", "-").replace("—", "-")
-                code = str(a.get("code") or "ALL").strip().lower()
-                winner = (str(a["fundraiser_name"] or "").strip().lower(), a["assignment_id"])
-                if not name or not winner[0]:
-                    continue
-                if code in ("all", "unassigned", ""):
-                    by_name[name] = winner
-                else:
-                    by_name_code[f"{name}::{code}"] = winner
-                    by_name[f"{name}::__code_any"] = winner
-            apply(keys["cname"], by_name, match_type)
-            if by_name_code:
-                generic_code = keys["code"].isin(["", "all"])
-                apply(keys["cname"] + "::" + keys["code"], by_name_code, match_type)
-                apply((keys["cname"] + "::__code_any").where(generic_code), by_name, match_type)
-            continue
-        kind = LINK_MATCH_TYPES[match_type]
-        exact, any_family = {}, {}
-        for a in group:
-            key = a.get("match_key") or ""
-            winner = (str(a["fundraiser_name"] or "").strip().lower(), a["assignment_id"])
-            if not key or not winner[0]:
+        if a["match_type"] == "campaign_name":
+            cname = str(a.get("campaign_name") or "").strip().lower().replace("–", "-").replace("—", "-")
+            code = str(a.get("code") or "ALL").strip().lower()
+            if not cname:
                 continue
-            (any_family if key.split("|")[1] == "*" else exact)[key] = winner
-        if any_family:
-            apply(keys[f"{kind}_slug_key"], any_family, match_type)
-        if exact:
-            apply(keys[f"{kind}_key"], exact, match_type)
-    return fn, aid, mtype
+            if code in ("all", "unassigned", ""):
+                pos = positions("cname", cname)
+            else:
+                same_name = positions("cname", cname)
+                pos = np.union1d(positions("cname_code", f"{cname}::{code}"), same_name[generic_code[same_name]])
+        else:
+            key = a.get("match_key") or ""
+            kind = LINK_MATCH_TYPES.get(a["match_type"])
+            if not key or not kind:
+                continue
+            pos = positions(f"{kind}_slug_key" if key.split("|")[1] == "*" else f"{kind}_key", key)
+        matched.append((a, pos))
+
+    # The NARROWEST page wins: a donation goes to the matching assignment whose page has the fewest donations
+    # (a person's page inside a team inside a campaign - whatever the platform's hierarchy). Applied widest
+    # first so narrower ones overwrite. Equal size: fundraiser page > community > campaign link > campaign name,
+    # then the older fundraiser.
+    rank = {t: i for i, t in enumerate(MATCH_PRECEDENCE)}
+    matched.sort(key=lambda m: str(m[0].get("f_created") or ""), reverse=True)  # newest first -> older applied later
+    matched.sort(key=lambda m: (-len(m[1]), rank.get(m[0]["match_type"], 0)))      # stable: widest first
+    fn_arr, aid_arr, type_arr = fn.to_numpy(dtype=object).copy(), aid.to_numpy(dtype=object).copy(), mtype.to_numpy(dtype=object).copy()
+    for a, pos in matched:
+        if len(pos):
+            fn_arr[pos] = str(a["fundraiser_name"]).strip().lower()
+            aid_arr[pos] = a["assignment_id"]
+            type_arr[pos] = a["match_type"]
+    idx = df.index
+    return pd.Series(fn_arr, index=idx), pd.Series(aid_arr, index=idx, dtype=object), pd.Series(type_arr, index=idx, dtype=object)
+
+
+def platform_raised_amount(df: pd.DataFrame) -> pd.Series:
+    """What each donation adds to the page total SHOWN ON THE PLATFORM, in the charity's settlement currency,
+    so fundraiser totals match the platforms (the CRM elsewhere reports the net amount received after fees):
+      1. the platform's own per-page amount when it provides one (GiveBrite: amount_fundraiser / amount_campaign,
+         converted by the platform itself),
+      2. else the gross amount in the page's currency when that is the settlement currency (LaunchGood),
+      3. else the gross amount in the settlement currency,
+      4. else the net amount."""
+    def num(col):
+        return pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(float("nan"), index=df.index)
+    out = num("Total Online Donations Net Amount in Settled Currency")
+    gross_settled = num("Total Online Donation Gross Amount in Settled Currency")
+    out = out.where(~(gross_settled > 0), gross_settled)
+    proj = num("Donation Amount in Project Currency (May be approx.)")
+    pcur = df["Project Currency"].astype(str).str.strip().str.upper() if "Project Currency" in df.columns else pd.Series("", index=df.index)
+    scur = df["Settlement Currency"].astype(str).str.strip().str.upper() if "Settlement Currency" in df.columns else pd.Series("", index=df.index)
+    out = out.where(~((proj > 0) & pcur.str.len().between(3, 3) & (pcur == scur)), proj)
+    for col in ("amount_campaign", "amount_fundraiser"):  # fundraiser page amount wins over campaign amount
+        v = num(col)
+        out = out.where(~(v > 0), v)
+    return out.fillna(0.0)
 
 
 def _tracked_page_stats(df: pd.DataFrame, aid: pd.Series, assignments: List[Dict[str, Any]],
                         start_date: Optional[str], end_date: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
     """Per fundraiser: every assignment (campaign name or link) with the donations it brought in."""
-    amount_col = "Total Online Donations Net Amount in Settled Currency"
     out: Dict[str, List[Dict[str, Any]]] = {}
     work = pd.DataFrame({"aid": aid})
-    work["amt"] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0) if amount_col in df.columns else 0.0
+    work["amt"] = platform_raised_amount(df)
     date_col = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date"] if c in df.columns), None)
     work["day"] = df[date_col].fillna("").astype(str).str[:10] if date_col else ""
     work["email"] = df["Email"].fillna("").astype(str).str.strip().str.lower() if "Email" in df.columns else ""
@@ -328,9 +396,16 @@ def init_fundraiser_db():
             except Exception:
                 pass
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_company_key ON fundraiser_campaigns(company_id, match_key)")
+        # Page group: 'SP' (Sisters' Project pages) or 'MAIN' (the charity's own Rethink / Iqra pages); '' = automatic
+        try:
+            cursor.execute("ALTER TABLE fundraisers ADD COLUMN page_group TEXT DEFAULT ''")
+        except Exception:
+            pass
         
         # Purge legacy auto-sync campaign locks (id starting with fc_) so campaigns are not falsely locked
-        cursor.execute("DELETE FROM fundraiser_campaigns WHERE id LIKE 'fc_%'")
+        # (literal "fc_" prefix: in LIKE an unescaped "_" matches any character, which used to delete ordinary
+        #  uuid-id assignments starting with "fc")
+        cursor.execute("DELETE FROM fundraiser_campaigns WHERE id LIKE 'fc\\_%' ESCAPE '\\'")
 
         conn.commit()
         conn.close()
@@ -461,6 +536,7 @@ class CreateFundraiserRequest(BaseModel):
     status: Optional[str] = "ACTIVE"
     notes: Optional[str] = ""
     assigned_campaigns: Optional[List[CampaignAssignment]] = []
+    page_group: Optional[str] = ""  # 'SP' | 'MAIN' | '' (automatic)
 
 
 class UpdateFundraiserRequest(BaseModel):
@@ -475,6 +551,7 @@ class UpdateFundraiserRequest(BaseModel):
     status: Optional[str] = "ACTIVE"
     notes: Optional[str] = ""
     assigned_campaigns: Optional[List[CampaignAssignment]] = []
+    page_group: Optional[str] = ""
 
 
 class AssignDonationsRequest(BaseModel):
@@ -485,6 +562,58 @@ class AssignDonationsRequest(BaseModel):
     campaign_name: Optional[str] = None
     code: Optional[str] = None
     donor_emails: Optional[List[str]] = []
+
+
+_STATUS_RE = __import__("re").compile(r"^[A-Z0-9][A-Z0-9 _-]{0,29}$")
+
+
+def _clean_status(raw: Optional[str]) -> str:
+    """Any short status label (ACTIVE, PAUSED, COMPLETED, RAMADAN, or a custom one), stored upper-case."""
+    status_val = " ".join(str(raw or "ACTIVE").strip().upper().split()) or "ACTIVE"
+    if not _STATUS_RE.match(status_val):
+        raise HTTPException(status_code=400, detail="Status must be 1-30 letters, numbers, spaces, - or _.")
+    return status_val
+
+
+def _prepare_assignments(items: Optional[List["CampaignAssignment"]], comp: str, fundraiser_id: Optional[str], cur) -> List[tuple]:
+    """Validates assignments -> rows (campaign_name, code, platform, match_type, match_value, match_key).
+    A page link may belong to only one fundraiser per charity."""
+    from core.page_links import parse_page_link, page_key
+    rows, seen = [], set()
+    host_platforms = _host_platforms(comp) if any((c.match_type or "campaign_name") != "campaign_name" for c in items or []) else {}
+    for c in items or []:
+        match_type = (c.match_type or "campaign_name").strip().lower()
+        if match_type == "campaign_name":
+            name = (c.campaign_name or "").strip()
+            if name:
+                rows.append((name, (c.code or "ALL").strip(), (c.platform or "ALL").strip(), "campaign_name", "", ""))
+            continue
+        if match_type not in LINK_MATCH_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unknown assignment type '{match_type}'.")
+        raw = (c.match_value or c.campaign_name or "").strip()
+        parsed = parse_page_link(raw, host_platforms=host_platforms)
+        if not parsed:
+            raise HTTPException(status_code=400, detail=f"'{raw}' is not a page link (paste the full URL).")
+        kind, family, slug = parsed
+        if match_type == "fundraiser_url" and kind != "fundraiser":
+            kind = "fundraiser"  # staff said it's a fundraiser page; trust the stated type
+        elif match_type == "community_url" and kind not in ("community",):
+            kind = "community"
+        elif match_type == "campaign_url":
+            kind = "campaign"
+        key = page_key(kind, family, slug)
+        if key in seen:
+            continue
+        seen.add(key)
+        owner = cur.execute("""
+            SELECT f.name FROM fundraiser_campaigns fc JOIN fundraisers f ON f.id = fc.fundraiser_id
+            WHERE fc.company_id = ? AND fc.match_key = ? AND fc.fundraiser_id != ?""",
+            (comp, key, fundraiser_id or "")).fetchone()
+        if owner:
+            raise HTTPException(status_code=409, detail=f"{raw} is already assigned to fundraiser '{owner[0]}'.")
+        platform = platform_label(family) if family != "*" else "ALL"
+        rows.append((raw, "ALL", platform, match_type, raw, key))
+    return rows
 
 
 def _check_super_admin(user_role: str, can_edit_donors: bool = False):
@@ -711,7 +840,8 @@ def get_fundraisers_list(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     status_filter: Optional[str] = "ALL",
-    company_id: Optional[str] = Query("rethink")
+    company_id: Optional[str] = Query("rethink"),
+    page_group: Optional[str] = Query(None),
 ):
     """
     Returns list of all fundraisers with live aggregated metrics for the given company.
@@ -777,14 +907,17 @@ def get_fundraisers_list(
 
     # Load live transaction data for this company
     df_donations = load_data(company_id=comp)
-    amount_col = "Total Online Donations Net Amount in Settled Currency"
+    assignments_full = _load_assignments(comp)
+    tracked_pages_map: Dict[str, List[Dict[str, Any]]] = {}
 
     if df_donations is not None and not df_donations.empty:
-        fn_lower = _extract_fundraiser_series(df_donations)
+        # Platform fundraiser name, overridden by explicit assignments (links / campaign names) - see attribute_donations
+        fn_lower, attr_aid, _attr_type = attribute_donations(df_donations, comp, assignments_full)
+        tracked_pages_map = _tracked_page_stats(df_donations, attr_aid, assignments_full, start_date, end_date)
         valid_fn = (fn_lower != "")
         df_named = df_donations[valid_fn].copy()
         df_named["fn_lower"] = fn_lower[valid_fn]
-        df_named["net_num"] = pd.to_numeric(df_named[amount_col], errors="coerce").fillna(0.0) if amount_col in df_named.columns else 0.0
+        df_named["net_num"] = platform_raised_amount(df_named)  # page totals as the platforms show them
 
         if "_parsed_date" not in df_named.columns or df_named["_parsed_date"].dropna().astype(str).str.strip().isin(["", "nan", "none", "nat"]).all():
             date_cand = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)"] if c in df_named.columns), None)
@@ -883,6 +1016,12 @@ def get_fundraisers_list(
 
     # Map DB fundraisers by lowercase name to preserve custom settings (goal, notes, status, email, phone)
     db_fundraisers_by_name = {str(r.get("name") or "").strip().lower(): r for r in fundraiser_rows if r.get("name")}
+    # A fundraiser with assigned pages is listed even before its first donation arrives
+    for r in fundraiser_rows:
+        lname = str(r.get("name") or "").strip().lower()
+        if lname and lname not in all_time_campaigns_map and tracked_pages_map.get(r["id"]):
+            all_time_campaigns_map[lname] = [{"campaign_name": p["value"], "code": p["code"], "platform": p["match_label"]}
+                                             for p in tracked_pages_map[r["id"]]]
 
     # Fundraisers exist strictly in real-time based on having active campaigns containing them in live donations
     for fn_k, c_list in all_time_campaigns_map.items():
@@ -914,6 +1053,12 @@ def get_fundraisers_list(
             created_at = ""
 
         if status_clean != "ALL" and status.upper() != status_clean:
+            continue
+        group = resolve_page_group(f_meta.get("page_group") if f_meta else None, fname,
+                                   [c.get("campaign_name", "") for c in c_list]
+                                   + [p["value"] for p in (tracked_pages_map.get(fid, []) if f_meta else [])])
+        wanted_group = str(getattr(page_group, "default", page_group) or "").strip().upper()
+        if wanted_group in ("SP", "MAIN") and group != wanted_group:
             continue
 
         all_time_raised = float(all_time_raised_map.get(fn_k, 0.0))
@@ -960,7 +1105,11 @@ def get_fundraisers_list(
             "total_donations_count": txn_count,
             "period_donations_count": period_txns,
             "avg_donation": avg_donation,
-            "average_donation": avg_donation
+            "average_donation": avg_donation,
+            "tracked_pages": tracked_pages_map.get(fid, []) if f_meta else [],
+            "page_group": group,
+            "page_group_label": page_group_label(group, comp),
+            "page_group_explicit": bool(f_meta and str(f_meta.get("page_group") or "").strip()),
         }
 
         fundraisers_result.append(fundraiser_obj)
@@ -987,6 +1136,142 @@ def get_fundraisers_list(
         },
         "fundraisers": fundraisers_result
     }
+
+# ---------------------------------------------------------------------------------------------------------
+# Page-link check, statuses and Ramadan date presets (declared before "/{fundraiser_id}")
+# ---------------------------------------------------------------------------------------------------------
+DEFAULT_STATUSES = ["ACTIVE", "PAUSED", "COMPLETED", "RAMADAN"]
+RAMADAN_SETTING_KEY = "fundraiser_ramadan_periods"
+# 1st of Ramadan -> last day of Ramadan (Eid al-Fitr is the next day). Editable by super admins, because local
+# moon sighting can shift the start/end by a day.
+DEFAULT_RAMADAN_PERIODS = [
+    {"year": 2024, "start": "2024-03-11", "end": "2024-04-09"},
+    {"year": 2025, "start": "2025-03-01", "end": "2025-03-29"},
+    {"year": 2026, "start": "2026-02-18", "end": "2026-03-19"},
+    {"year": 2027, "start": "2027-02-08", "end": "2027-03-09", "estimated": True},
+]
+
+
+@router.get("/resolve-link")
+def resolve_fundraiser_link(company_id: str = Query(...), url: str = Query(...),
+                            match_type: Optional[str] = Query(None), exclude_fundraiser_id: Optional[str] = Query(None)):
+    """What a pasted page link matches in this charity's donations - before saving it as an assignment."""
+    from core.page_links import parse_page_link, page_key
+    comp = (company_id or "").strip().lower()
+    parsed = parse_page_link(url, host_platforms=_host_platforms(comp))
+    if not parsed:
+        raise HTTPException(status_code=400, detail="That doesn't look like a page link. Paste the full URL.")
+    kind, family, slug = parsed
+    forced = LINK_MATCH_TYPES.get((match_type or "").strip().lower())
+    if forced:
+        kind = forced
+    key = page_key(kind, family, slug)
+    out = {"kind": kind, "platform": platform_label(family),
+           "slug": slug, "match_type": f"{kind}_url", "match_key": key, "donations": 0, "raised": 0.0,
+           "latest_donation_date": None, "campaigns": [], "currently_credited_to": [], "assigned_to": None}
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        owner = conn.execute("""SELECT f.name FROM fundraiser_campaigns fc JOIN fundraisers f ON f.id = fc.fundraiser_id
+                                WHERE fc.company_id = ? AND fc.match_key = ? AND fc.fundraiser_id != ?""",
+                             (comp, key, exclude_fundraiser_id or "")).fetchone()
+        out["assigned_to"] = owner[0] if owner else None
+    finally:
+        conn.close()
+    df = load_data(company_id=comp)
+    if df is None or df.empty:
+        return out
+    keys = _donation_keys(df, comp)
+    mask = (keys[f"{kind}_slug_key"] == page_key(kind, "*", slug)) if family == "*" else (keys[f"{kind}_key"] == key)
+    if not mask.any():
+        return out
+    sub = df[mask]
+    fn, _aid, _t = attribute_donations(df, comp)
+    credited = fn[mask].replace("", "(unassigned)").value_counts().head(3)
+    date_col = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date"] if c in sub.columns), None)
+    days = sub[date_col].fillna("").astype(str).str[:10] if date_col else pd.Series(dtype=object)
+    out.update(
+        donations=int(mask.sum()),
+        raised=round(float(platform_raised_amount(sub).sum()), 2),
+        latest_donation_date=str(days[days.str.len() == 10].max()) if len(days) else None,
+        campaigns=sub["Campaign Name"].dropna().astype(str).str.strip().value_counts().head(5).index.tolist() if "Campaign Name" in sub.columns else [],
+        currently_credited_to=[{"fundraiser": k, "donations": int(v)} for k, v in credited.items()],
+    )
+    return out
+
+
+@router.get("/statuses")
+def get_fundraiser_statuses(company_id: Optional[str] = Query("rethink")):
+    comp = (company_id or "rethink").strip().lower()
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        q = "SELECT DISTINCT UPPER(TRIM(status)) FROM fundraisers WHERE COALESCE(TRIM(status), '') != ''"
+        used = [r[0] for r in conn.execute(q + (" AND company_id = ?" if comp != "all" else ""), (comp,) if comp != "all" else ())]
+    finally:
+        conn.close()
+    return {"statuses": DEFAULT_STATUSES + sorted(s for s in set(used) if s not in DEFAULT_STATUSES)}
+
+
+def _read_ramadan_periods() -> List[Dict[str, Any]]:
+    import json as _json
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        row = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key = ?", (RAMADAN_SETTING_KEY,)).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        conn.close()
+    try:
+        periods = _json.loads(row[0]) if row and row[0] else DEFAULT_RAMADAN_PERIODS
+    except ValueError:
+        periods = DEFAULT_RAMADAN_PERIODS
+    return sorted(periods, key=lambda p: p["year"])
+
+
+@router.get("/ramadan-periods")
+def get_ramadan_periods(company_id: Optional[str] = Query("rethink")):
+    """Ramadan start/end per year, used by the 'Ramadan' date presets (incl. 2/3/4 weeks after)."""
+    return {"periods": _read_ramadan_periods()}
+
+
+class RamadanPeriod(BaseModel):
+    year: int
+    start: str
+    end: str
+    estimated: Optional[bool] = False
+
+
+class RamadanPeriodsRequest(BaseModel):
+    company_id: Optional[str] = "rethink"
+    periods: List[RamadanPeriod]
+
+
+@router.put("/ramadan-periods")
+def update_ramadan_periods(payload: RamadanPeriodsRequest, request: Request):
+    import json as _json
+    user = getattr(request.state, "api_user", None) or {}
+    if user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Only Super Admins can change the Ramadan dates.")
+    clean = []
+    for p in payload.periods:
+        try:
+            start = datetime.strptime(p.start[:10], "%Y-%m-%d")
+            end = datetime.strptime(p.end[:10], "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Dates for {p.year} must be YYYY-MM-DD.")
+        if not (0 < (end - start).days <= 31):
+            raise HTTPException(status_code=400, detail=f"Ramadan {p.year}: the end must be 1-31 days after the start.")
+        clean.append({"year": p.year, "start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d"),
+                      "estimated": bool(p.estimated)})
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        with conn:
+            conn.execute("""INSERT INTO system_settings (setting_key, setting_value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+                            ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value,
+                            updated_at = CURRENT_TIMESTAMP""", (RAMADAN_SETTING_KEY, _json.dumps(clean)))
+    finally:
+        conn.close()
+    return {"periods": sorted(clean, key=lambda p: p["year"])}
+
 
 @router.get("/{fundraiser_id}")
 @cached(scopes=["fundraisers", "payouts", "donations", "classification"], ttl=21600)
@@ -1034,9 +1319,15 @@ def get_fundraiser_detail(
     total_raised_all_time = 0.0
     total_raised_period = 0.0
     assigned_campaigns = []
+    # defaults for a fundraiser whose pages have no donations yet
+    first_gift_all_time = latest_gift_all_time = first_gift_period = latest_gift_period = None
+    net_received_all_time = 0.0
+    is_filtered = bool(start_date or end_date)
 
+    tracked_pages: List[Dict[str, Any]] = []
     if df_donations is not None and not df_donations.empty:
-        fn_series = _extract_fundraiser_series(df_donations)
+        assignments_full = _load_assignments(comp)
+        fn_series, attr_aid, _attr_type = attribute_donations(df_donations, comp, assignments_full)
 
         # If not found in SQLite by ID, resolve real-time fundraiser profile from live donor data
         if not fundraiser:
@@ -1062,32 +1353,12 @@ def get_fundraiser_detail(
             raise HTTPException(status_code=404, detail="Fundraiser not found.")
 
         fname_clean = str(fundraiser.get("name") or "").strip().lower()
-        direct_match = (fn_series == fname_clean)
-
-        # Match unassigned / unclaimed donations belonging to this fundraiser's assigned campaigns
-        is_unassigned = fn_series.isin(["", "unassigned", "none", "nan", "null", "no one claimed", "<na>"])
-        c_match_mask = pd.Series(False, index=df_donations.index)
-
-        if db_assigned_campaigns and "Campaign Name" in df_donations.columns:
-            cname_series = (
-                df_donations["Campaign Name"].fillna("").astype(str).str.strip().str.lower()
-                .str.replace('–', '-', regex=False).str.replace('—', '-', regex=False)
-            )
-            code_series = df_donations["Code"].fillna("").astype(str).str.strip().str.lower() if "Code" in df_donations.columns else pd.Series("", index=df_donations.index)
-
-            for ac in db_assigned_campaigns:
-                ac_name = str(ac.get("campaign_name") or "").strip().lower().replace('–', '-').replace('—', '-')
-                ac_code = str(ac.get("code") or "ALL").strip().lower()
-                if not ac_name:
-                    continue
-                if ac_code in ["all", "unassigned", ""]:
-                    c_match_mask = c_match_mask | (cname_series == ac_name)
-                else:
-                    c_match_mask = c_match_mask | ((cname_series == ac_name) & ((code_series == ac_code) | (code_series == "all") | (code_series == "")))
-
-        claim_mask = direct_match | (is_unassigned & c_match_mask)
+        # Same attribution as the list: explicit page/campaign assignments first, then the platform's name
+        claim_mask = (fn_series == fname_clean)
+        own_assignments = [a for a in assignments_full if a["fundraiser_id"] == fundraiser.get("id")]
+        tracked_pages = _tracked_page_stats(df_donations, attr_aid, own_assignments, start_date, end_date).get(fundraiser.get("id"), [])
         sub_df = df_donations[claim_mask].copy()
-        if sub_df.empty:
+        if sub_df.empty and not own_assignments:
             raise HTTPException(status_code=404, detail="Fundraiser has no active campaigns or donations.")
 
         # Compute column helpers on the compact sub_df (instant execution)
@@ -1097,7 +1368,8 @@ def get_fundraiser_detail(
             if "Campaign Name" in sub_df.columns else ""
         )
         sub_df["code_lower"] = sub_df["Code"].fillna("").astype(str).str.strip().str.lower() if "Code" in sub_df.columns else ""
-        sub_df["net_num"] = pd.to_numeric(sub_df[amount_col], errors="coerce").fillna(0.0) if amount_col in sub_df.columns else 0.0
+        sub_df["net_num"] = platform_raised_amount(sub_df)  # as shown on the platform
+        net_received_all_time = float(pd.to_numeric(sub_df[amount_col], errors="coerce").fillna(0.0).sum()) if amount_col in sub_df.columns else 0.0
 
         if "_parsed_date" not in sub_df.columns or sub_df["_parsed_date"].dropna().astype(str).str.strip().isin(["", "nan", "none", "nat"]).all():
             date_cand = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)"] if c in sub_df.columns), None)
@@ -1263,6 +1535,8 @@ def get_fundraiser_detail(
     fundraiser["filter_end_date"] = end_date or ""
     fundraiser["inception_date"] = first_gift_all_time or fundraiser.get("start_date") or "N/A"
     fundraiser["total_raised_all_time"] = round(total_raised_all_time, 2)
+    fundraiser["net_received_all_time"] = round(net_received_all_time, 2)  # after platform fees, in settlement currency
+    fundraiser["amount_basis"] = "As shown on the platform (gross); net received after fees shown separately"
     fundraiser["total_raised_period"] = round(total_raised_period, 2)
 
     timeline_sorted = [{"month": k, "amount": round(v, 2)} for k, v in sorted(monthly_timeline.items())]
@@ -1272,7 +1546,8 @@ def get_fundraiser_detail(
         "assigned_campaigns": assigned_campaigns,
         "campaign_breakdown": sorted(campaign_breakdown, key=lambda x: x["gross_raised"], reverse=True),
         "monthly_timeline": timeline_sorted,
-        "recent_transactions": recent_transactions[:50]
+        "recent_transactions": recent_transactions[:50],
+        "tracked_pages": tracked_pages,
     }
 
 
@@ -1308,38 +1583,38 @@ def create_fundraiser(payload: CreateFundraiserRequest):
             payload.phone.strip() if payload.phone else "",
             float(payload.target_goal or 0.0),
             payload.start_date.strip() if payload.start_date else "",
-            payload.status.strip().upper() if payload.status else "ACTIVE",
+            _clean_status(payload.status),
             payload.notes.strip() if payload.notes else ""
         ))
 
+        cur.execute("UPDATE fundraisers SET page_group = ? WHERE id = ?",
+                    ((payload.page_group or "").strip().upper() if (payload.page_group or "").strip().upper() in ("SP", "MAIN") else "",
+                     fundraiser_id))
         # Insert campaign assignments and update donor records permanently for this company
-        if payload.assigned_campaigns:
-            for c in payload.assigned_campaigns:
-                cname = c.campaign_name.strip()
-                code = (c.code or "ALL").strip()
-                plat = (c.platform or "ALL").strip()
-                if cname:
-                    cur.execute("""
-                        INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, company_id, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (str(uuid.uuid4()), fundraiser_id, cname, code, plat, comp))
-
-                    if code.upper() in ["ALL", "UNASSIGNED", ""] or not code:
-                        cur.execute("""
-                            UPDATE donations 
-                            SET fundraiser_name = ? 
-                            WHERE [Campaign Name] = ? 
-                              AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-                              AND company_id = ?
-                        """, (f_name, cname, comp))
-                    else:
-                        cur.execute("""
-                            UPDATE donations 
-                            SET fundraiser_name = ? 
-                            WHERE [Campaign Name] = ? AND Code = ?
-                              AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
-                              AND company_id = ?
-                        """, (f_name, cname, code, comp))
+        for cname, code, plat, m_type, m_value, m_key in _prepare_assignments(payload.assigned_campaigns, comp, fundraiser_id, cur):
+            cur.execute("""
+                INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, company_id, created_at,
+                                                  match_type, match_value, match_key)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+            """, (str(uuid.uuid4()), fundraiser_id, cname, code, plat, comp, m_type, m_value, m_key))
+            if m_type != "campaign_name":
+                continue  # page links are attributed live when read; no donation rows are rewritten
+            if code.upper() in ["ALL", "UNASSIGNED", ""] or not code:
+                cur.execute("""
+                    UPDATE donations 
+                    SET fundraiser_name = ? 
+                    WHERE [Campaign Name] = ? 
+                      AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
+                      AND company_id = ?
+                """, (f_name, cname, comp))
+            else:
+                cur.execute("""
+                    UPDATE donations 
+                    SET fundraiser_name = ? 
+                    WHERE [Campaign Name] = ? AND Code = ?
+                      AND (fundraiser_name IS NULL OR TRIM(fundraiser_name) = '')
+                      AND company_id = ?
+                """, (f_name, cname, code, comp))
 
         conn.commit()
     finally:
@@ -1416,24 +1691,23 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
                     payload.phone.strip() if payload.phone else "",
                     float(payload.target_goal or 0.0),
                     payload.start_date.strip() if payload.start_date else "",
-                    payload.status.strip().upper() if payload.status else "ACTIVE",
+                    _clean_status(payload.status),
                     payload.notes.strip() if payload.notes else ""
                 ))
 
         # Get existing assigned campaigns for diffing
-        cur.execute("SELECT campaign_name, code FROM fundraiser_campaigns WHERE fundraiser_id = ?", (fundraiser_id,))
+        cur.execute("""SELECT campaign_name, code FROM fundraiser_campaigns WHERE fundraiser_id = ?
+                       AND COALESCE(NULLIF(match_type, ''), 'campaign_name') = 'campaign_name'""", (fundraiser_id,))
         old_campaigns = set((r[0].strip().lower(), (r[1] or "ALL").strip().lower()) for r in cur.fetchall())
 
+        # Validates links (and that no other fundraiser already owns them) before anything is changed
+        prepared = _prepare_assignments(payload.assigned_campaigns, comp, fundraiser_id, cur)
         new_campaigns_set = set()
         new_campaigns_list = []
-        if payload.assigned_campaigns:
-            for c in payload.assigned_campaigns:
-                cn = c.campaign_name.strip()
-                cd = (c.code or "ALL").strip()
-                pl = (c.platform or "ALL").strip()
-                if cn:
-                    new_campaigns_set.add((cn.lower(), cd.lower()))
-                    new_campaigns_list.append((cn, cd, pl))
+        for cn, cd, pl, m_type, _m_value, _m_key in prepared:
+            if m_type == "campaign_name":
+                new_campaigns_set.add((cn.lower(), cd.lower()))
+                new_campaigns_list.append((cn, cd, pl))
 
         # 1. If name changed, update all existing donations that had the old fundraiser name for this company
         if old_name.strip().lower() != new_name.lower():
@@ -1493,18 +1767,22 @@ def update_fundraiser(fundraiser_id: str, payload: UpdateFundraiserRequest):
             payload.phone.strip() if payload.phone else "",
             float(payload.target_goal or 0.0),
             payload.start_date.strip() if payload.start_date else "",
-            payload.status.strip().upper() if payload.status else "ACTIVE",
+            _clean_status(payload.status),
             payload.notes.strip() if payload.notes else "",
             fundraiser_id
         ))
 
+        cur.execute("UPDATE fundraisers SET page_group = ? WHERE id = ?",
+                    ((payload.page_group or "").strip().upper() if (payload.page_group or "").strip().upper() in ("SP", "MAIN") else "",
+                     fundraiser_id))
         # Re-assign campaigns in fundraiser_campaigns
         cur.execute("DELETE FROM fundraiser_campaigns WHERE fundraiser_id = ?", (fundraiser_id,))
-        for cn, cd, pl in new_campaigns_list:
+        for cn, cd, pl, m_type, m_value, m_key in prepared:
             cur.execute("""
-                INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, company_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (str(uuid.uuid4()), fundraiser_id, cn, cd, pl, comp))
+                INSERT INTO fundraiser_campaigns (id, fundraiser_id, campaign_name, code, platform, company_id, created_at,
+                                                  match_type, match_value, match_key)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+            """, (str(uuid.uuid4()), fundraiser_id, cn, cd, pl, comp, m_type, m_value, m_key))
 
         conn.commit()
     finally:

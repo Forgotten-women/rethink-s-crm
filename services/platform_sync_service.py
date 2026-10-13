@@ -40,6 +40,7 @@ if BASE_DIR not in sys.path:
 # Load environment variables
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+from config.settings import GIVEBRITE_CHARITY_IDS
 from core.givebrite_ingestion import (
     ingest_givebrite_donations,
     run_historical_backfill,
@@ -57,6 +58,10 @@ set_service_name("platform-sync")
 DATA_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 MADINAH_TOKEN_FILE = os.path.join(BASE_DIR, ".madinah_token.json")
 GIVEBRITE_TOKEN_FILE = os.path.join(BASE_DIR, ".givebrite_token.json")
+GIVEBRITE_TOKEN_FILES = {
+    "iqra": os.path.join(BASE_DIR, ".givebrite_token.json"),
+    "rethink": os.path.join(BASE_DIR, ".givebrite_rethink_token.json"),
+}
 MASTER_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "platform_sync_data.json")
 MADINAH_SYNC_FILE = os.path.join(DATA_CACHE_DIR, "madinah_sync_data.json")
 HEALTH_FILE = os.path.join(DATA_CACHE_DIR, "platform_health.json")
@@ -64,7 +69,7 @@ HEALTH_FILE = os.path.join(DATA_CACHE_DIR, "platform_health.json")
 # Service Configuration
 SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", 60))  # standard interval
 DEEP_SYNC_INTERVAL_SEC = 1800  # 30 minutes for deep campaign catalog scans
-GIVEBRITE_CHARITY_ID = os.environ.get("GIVEBRITE_IQRA_CHARITY_ID", "68625e0d6d1a99441e34e2ea")
+GIVEBRITE_CHARITY_ID = GIVEBRITE_CHARITY_IDS.get("iqra", "")
 MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
 
 # Logging setup
@@ -123,15 +128,15 @@ class PlatformSyncService:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Rethink-CRM-Sync/1.0"})
         self.last_deep_sync = 0.0
-        self.backfill_completed = False
-        self.madinah_backfill_completed = False
+        self.backfill_completed = {"iqra": True, "rethink": True}
+        self.madinah_backfill_completed = True
         self.health: Dict[str, Dict[str, Any]] = {}
         try:
             with open(HEALTH_FILE, "r", encoding="utf-8") as f:
                 self.health = json.load(f)
         except Exception:
             self.health = {}
-        for p in ("givebrite", "madinah"):
+        for p in ("givebrite", "givebrite_iqra", "givebrite_rethink", "madinah"):
             self.health.setdefault(p, {})
             self.health[p]["consecutive_failures"] = 0
 
@@ -140,13 +145,13 @@ class PlatformSyncService:
             from core.database import get_db_connection
             conn = get_db_connection()
             cur = conn.cursor()
-            for plat in ("madinah", "givebrite"):
+            for plat, comp in (("madinah", "iqra"), ("givebrite", "iqra"), ("givebrite_iqra", "iqra"), ("givebrite_rethink", "rethink")):
                 if plat in self.health and (not self.health[plat].get("last_ingested_at") or str(self.health[plat].get("last_ingested_at")).lower() in ("nan", "none", "")):
                     cur.execute("""
                         SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
                         FROM donations
-                        WHERE company_id = 'iqra' AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
-                    """, (f"%{plat}%",))
+                        WHERE company_id = ? AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
+                    """, (comp, f"%{plat.split('_')[0]}%",))
                     r = cur.fetchone()
                     if r and r[0] and "nan" not in str(r[0]).lower():
                         self.health[plat]["last_ingested_at"] = r[0]
@@ -283,45 +288,49 @@ class PlatformSyncService:
             access_token = f"Bearer {access_token}"
         return access_token
 
-    def get_givebrite_token(self, force_refresh: bool = False) -> str:
+    def get_givebrite_token(self, company_id: str = "iqra", force_refresh: bool = False) -> str:
         """Loads and auto-renews Givebrite JWT Bearer token (<10m to expiry or force_refresh) via Playwright."""
+        cid = company_id.lower()
+        token_file = GIVEBRITE_TOKEN_FILES.get(cid, GIVEBRITE_TOKEN_FILE)
         now = time.time()
         need_refresh = force_refresh
         access_token = ""
 
-        if not os.path.exists(GIVEBRITE_TOKEN_FILE):
+        if not os.path.exists(token_file):
             need_refresh = True
         elif not need_refresh:
             try:
-                with open(GIVEBRITE_TOKEN_FILE, "r", encoding="utf-8") as f:
+                with open(token_file, "r", encoding="utf-8") as f:
                     token_data = json.load(f)
                 access_token = token_data.get("accessToken", "")
                 exp = parse_jwt_exp(access_token)
                 time_left_sec = exp - now if exp else 0
                 if not exp or time_left_sec < 600:  # Less than 10 minutes remaining
-                    logger.info(f"GiveBrite JWT expiring soon (Time remaining: {time_left_sec/60:.1f}m). Auto-renewing...")
+                    logger.info(f"GiveBrite ({cid}) JWT expiring soon (Time remaining: {time_left_sec/60:.1f}m). Auto-renewing...")
                     need_refresh = True
             except Exception:
                 need_refresh = True
 
         if need_refresh:
-            logger.info("Initiating headless GiveBrite Playwright token auto-renewal...")
+            logger.info(f"Initiating headless GiveBrite ({cid}) Playwright token auto-renewal...")
             try:
                 script_path = os.path.join(BASE_DIR, "scripts", "get_givebrite_jwt.js")
-                res = subprocess.run(["node", script_path], cwd=BASE_DIR, capture_output=True, text=True, timeout=60)
+                res = subprocess.run(["node", script_path, cid], cwd=BASE_DIR, capture_output=True, text=True, timeout=60)
                 if res.returncode == 0:
-                    with open(GIVEBRITE_TOKEN_FILE, "r", encoding="utf-8") as f:
+                    with open(token_file, "r", encoding="utf-8") as f:
                         token_data = json.load(f)
                     access_token = token_data.get("accessToken", "")
-                    logger.info("GiveBrite token auto-refreshed successfully via Playwright.")
-                    self._note_token_refresh("givebrite", None, method="browser-login")
+                    logger.info(f"GiveBrite ({cid}) token auto-refreshed successfully via Playwright.")
+                    self._note_token_refresh(f"givebrite_{cid}", None, method="browser-login")
+                    if cid == "iqra":
+                        self._note_token_refresh("givebrite", None, method="browser-login")
                 else:
-                    logger.error(f"GiveBrite auto-refresh failed (code {res.returncode}): {res.stderr[:200]}")
-                    self._note_token_refresh("givebrite", f"Browser login failed (code {res.returncode}): {res.stderr[:150]}",
+                    logger.error(f"GiveBrite ({cid}) auto-refresh failed (code {res.returncode}): {res.stderr[:200]}")
+                    self._note_token_refresh(f"givebrite_{cid}", f"Browser login failed (code {res.returncode}): {res.stderr[:150]}",
                                              method="browser-login")
             except Exception as e:
-                logger.error(f"GiveBrite auto-refresh exception: {e}")
-                self._note_token_refresh("givebrite", f"Browser login error: {e}", method="browser-login")
+                logger.error(f"GiveBrite ({cid}) auto-refresh exception: {e}")
+                self._note_token_refresh(f"givebrite_{cid}", f"Browser login error: {e}", method="browser-login")
 
         if not access_token.startswith("Bearer "):
             access_token = f"Bearer {access_token}"
@@ -494,8 +503,10 @@ class PlatformSyncService:
     # -------------------------------------------------------------------------
     # Sync Logic: Givebrite (Direct CRM Ingestion)
     # -------------------------------------------------------------------------
-    def sync_givebrite(self, is_deep: bool = False) -> dict:
-        auth_header = self.get_givebrite_token()
+    def sync_givebrite(self, company_id: str = "iqra", is_deep: bool = False) -> dict:
+        cid = company_id.lower()
+        auth_header = self.get_givebrite_token(company_id=cid)
+        charity_id = GIVEBRITE_CHARITY_IDS.get(cid, GIVEBRITE_CHARITY_ID)
         headers = {
             "Authorization": auth_header,
             "Accept": "application/json",
@@ -505,7 +516,8 @@ class PlatformSyncService:
         today = self.get_today_str()
 
         result = {
-            "platform": "givebrite",
+            "platform": f"givebrite_{cid}",
+            "company_id": cid,
             "synced_at": datetime.now(timezone.utc).isoformat(),
             "status": "ok",
             "donations_ingested": 0,
@@ -516,22 +528,22 @@ class PlatformSyncService:
         }
 
         # 1. Startup Historical Backfill (Non-destructive, skips existing IDs)
-        if not self.backfill_completed:
+        if not self.backfill_completed.get(cid):
             try:
-                logger.info("Executing initial 60-day non-destructive GiveBrite historical backfill...")
-                bf_res = run_historical_backfill(auth_header, days=60, charity_id=GIVEBRITE_CHARITY_ID, company_id="iqra")
-                self.backfill_completed = True
-                logger.info(f"Backfill finished: {bf_res['inserted']} inserted, {bf_res['skipped']} already present.")
+                logger.info(f"Executing initial 60-day non-destructive GiveBrite ({cid}) historical backfill...")
+                bf_res = run_historical_backfill(auth_header, days=60, charity_id=charity_id, company_id=cid)
+                self.backfill_completed[cid] = True
+                logger.info(f"Backfill ({cid}) finished: {bf_res['inserted']} inserted, {bf_res['skipped']} already present.")
             except Exception as bf_ex:
-                logger.error(f"Initial backfill notice: {bf_ex}")
+                logger.error(f"Initial backfill ({cid}) notice: {bf_ex}")
 
         # 2. Latest Real-Time Donations Stream -> Direct CRM Ingestion (SQLite + Parquet)
-        url_gb_donations = f"{GIVEBRITE_API_BASE}/donations?charity_id={GIVEBRITE_CHARITY_ID}&page=1&limit=50&sort_value=-1&sort_title=created_at"
+        url_gb_donations = f"{GIVEBRITE_API_BASE}/donations?charity_id={charity_id}&page=1&limit=50&sort_value=-1&sort_title=created_at"
         try:
             r = self.session.get(url_gb_donations, headers=headers, timeout=12)
             if r.status_code == 401:
-                logger.warning("[GiveBrite] Received HTTP 401. Performing immediate token renewal...")
-                auth_header = self.get_givebrite_token(force_refresh=True)
+                logger.warning(f"[GiveBrite {cid}] Received HTTP 401. Performing immediate token renewal...")
+                auth_header = self.get_givebrite_token(company_id=cid, force_refresh=True)
                 headers["Authorization"] = auth_header
                 r = self.session.get(url_gb_donations, headers=headers, timeout=12)
 
@@ -540,19 +552,25 @@ class PlatformSyncService:
                 docs = data.get("docs", [])
                 result["total_donations_count"] = data.get("total", 0)
 
-                # Direct persistence to SQLite and Parquet (strictly company_id='iqra')
-                ingest_res = ingest_givebrite_donations(docs, headers=headers, company_id="iqra")
+                # Direct persistence to SQLite and Parquet (strictly company_id=cid)
+                ingest_res = ingest_givebrite_donations(docs, headers=headers, company_id=cid)
                 result["donations_ingested"] = ingest_res.get("inserted", 0)
                 result["donations_skipped"] = ingest_res.get("skipped", 0)
                 if ingest_res.get("inserted", 0) > 0:
-                    logger.info(f"[GiveBrite Ingestion] Successfully persisted {ingest_res['inserted']} new donations into CRM DB & Parquet.")
-                self._record_cycle("givebrite", True, 200, None, result["donations_ingested"], len(docs))
+                    logger.info(f"[GiveBrite {cid} Ingestion] Successfully persisted {ingest_res['inserted']} new donations into CRM DB & Parquet.")
+                self._record_cycle(f"givebrite_{cid}", True, 200, None, result["donations_ingested"], len(docs))
+                if cid == "iqra":
+                    self._record_cycle("givebrite", True, 200, None, result["donations_ingested"], len(docs))
             else:
-                logger.warning(f"Givebrite donations HTTP {r.status_code}")
-                self._record_cycle("givebrite", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
+                logger.warning(f"Givebrite ({cid}) donations HTTP {r.status_code}")
+                self._record_cycle(f"givebrite_{cid}", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
+                if cid == "iqra":
+                    self._record_cycle("givebrite", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
         except Exception as ex:
-            logger.error(f"Givebrite donations error: {ex}")
-            self._record_cycle("givebrite", False, None, f"Donations fetch error: {ex}")
+            logger.error(f"Givebrite ({cid}) donations error: {ex}")
+            self._record_cycle(f"givebrite_{cid}", False, None, f"Donations fetch error: {ex}")
+            if cid == "iqra":
+                self._record_cycle("givebrite", False, None, f"Donations fetch error: {ex}")
 
         time.sleep(0.2)
 
@@ -566,12 +584,12 @@ class PlatformSyncService:
             if r.status_code == 200:
                 result["collection_stats"] = r.json()
         except Exception as ex:
-            logger.error(f"Givebrite collection stats error: {ex}")
+            logger.error(f"Givebrite ({cid}) collection stats error: {ex}")
 
         # 4. Campaign List & Impact Catalog Refresh (In deep sync)
         if is_deep:
             try:
-                camp_url = f"{GIVEBRITE_API_BASE}/campaign?charity_id={GIVEBRITE_CHARITY_ID}&page=1&limit=100"
+                camp_url = f"{GIVEBRITE_API_BASE}/campaign?charity_id={charity_id}&page=1&limit=100"
                 camp_headers = dict(headers)
                 camp_headers["x-tenant-id"] = "gbx"
                 r = self.session.get(camp_url, headers=camp_headers, timeout=(5, 25))
@@ -596,16 +614,16 @@ class PlatformSyncService:
                                         "amount": imp.get("amount")
                                     }
                     if impact_catalog:
-                        impacts_file = os.path.join(DATA_CACHE_DIR, "givebrite_impacts.json")
+                        impacts_file = os.path.join(DATA_CACHE_DIR, f"givebrite_impacts_{cid}.json" if cid != "iqra" else "givebrite_impacts.json")
                         atomic_write_json(impacts_file, impact_catalog)
                         try:
                             from core.givebrite_ingestion import invalidate_master_impacts_cache
                             invalidate_master_impacts_cache()
                         except Exception:
                             pass
-                        logger.info(f"[GiveBrite Deep Sync] Refreshed master impact catalog with {len(impact_catalog)} impacts across {len(docs)} campaigns.")
+                        logger.info(f"[GiveBrite {cid} Deep Sync] Refreshed impact catalog with {len(impact_catalog)} impacts across {len(docs)} campaigns.")
             except Exception as ex:
-                logger.error(f"Givebrite campaigns/impacts sync error: {ex}")
+                logger.error(f"Givebrite ({cid}) campaigns/impacts sync error: {ex}")
 
         return result
 
@@ -621,7 +639,8 @@ class PlatformSyncService:
         logger.info(f"Initiating {'DEEP' if is_deep else 'STANDARD'} API sync cycle...")
 
         madinah_data = {}
-        givebrite_data = {}
+        givebrite_iqra_data = {}
+        givebrite_rethink_data = {}
 
         try:
             madinah_data = self.sync_madinah(is_deep=is_deep)
@@ -634,17 +653,31 @@ class PlatformSyncService:
         time.sleep(0.5)
 
         try:
-            givebrite_data = self.sync_givebrite(is_deep=is_deep)
+            givebrite_iqra_data = self.sync_givebrite(company_id="iqra", is_deep=is_deep)
             logger.info(
-                f"[Givebrite] Processed live feed (New Ingested: {givebrite_data.get('donations_ingested', 0)}, "
-                f"Skipped: {givebrite_data.get('donations_skipped', 0)}, Total Platform: {givebrite_data.get('total_donations_count', 0)})."
+                f"[Givebrite Iqra] Processed live feed (New Ingested: {givebrite_iqra_data.get('donations_ingested', 0)}, "
+                f"Skipped: {givebrite_iqra_data.get('donations_skipped', 0)}, Total Platform: {givebrite_iqra_data.get('total_donations_count', 0)})."
             )
         except Exception as ex:
-            logger.error(f"Givebrite sync failure: {ex}")
+            logger.error(f"Givebrite (Iqra) sync failure: {ex}")
+            self._record_cycle("givebrite_iqra", False, None, f"Sync crashed: {ex}")
             self._record_cycle("givebrite", False, None, f"Sync crashed: {ex}")
-            givebrite_data = {"platform": "givebrite", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
+            givebrite_iqra_data = {"platform": "givebrite_iqra", "company_id": "iqra", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
 
-        # Atomic writes for service status monitoring (No large intermediate JSON cache files)
+        time.sleep(0.5)
+
+        try:
+            givebrite_rethink_data = self.sync_givebrite(company_id="rethink", is_deep=is_deep)
+            logger.info(
+                f"[Givebrite Rethink] Processed live feed (New Ingested: {givebrite_rethink_data.get('donations_ingested', 0)}, "
+                f"Skipped: {givebrite_rethink_data.get('donations_skipped', 0)}, Total Platform: {givebrite_rethink_data.get('total_donations_count', 0)})."
+            )
+        except Exception as ex:
+            logger.error(f"Givebrite (Rethink) sync failure: {ex}")
+            self._record_cycle("givebrite_rethink", False, None, f"Sync crashed: {ex}")
+            givebrite_rethink_data = {"platform": "givebrite_rethink", "company_id": "rethink", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
+
+        # Atomic writes for service status monitoring
         try:
             atomic_write_json(MADINAH_SYNC_FILE, madinah_data)
 
@@ -659,19 +692,15 @@ class PlatformSyncService:
                 "summary": {
                     "madinah_recent_donations": len(madinah_data.get("donations_latest", [])),
                     "madinah_total_revenue": madinah_data.get("overview", {}).get("totalRevenue", 0),
-                    "givebrite_new_ingested": givebrite_data.get("donations_ingested", 0),
-                    "givebrite_total_donations": givebrite_data.get("total_donations_count", 0),
-                    "givebrite_total_raised_gbp": givebrite_data.get("collection_stats", {}).get("raised", 0)
+                    "givebrite_iqra_new_ingested": givebrite_iqra_data.get("donations_ingested", 0),
+                    "givebrite_iqra_total_donations": givebrite_iqra_data.get("total_donations_count", 0),
+                    "givebrite_rethink_new_ingested": givebrite_rethink_data.get("donations_ingested", 0),
+                    "givebrite_rethink_total_donations": givebrite_rethink_data.get("total_donations_count", 0),
                 },
                 "madinah": madinah_data,
-                "givebrite": {
-                    "platform": "givebrite",
-                    "synced_at": givebrite_data.get("synced_at"),
-                    "status": givebrite_data.get("status"),
-                    "donations_ingested": givebrite_data.get("donations_ingested", 0),
-                    "total_donations_count": givebrite_data.get("total_donations_count", 0),
-                    "collection_stats": givebrite_data.get("collection_stats", {})
-                }
+                "givebrite": givebrite_iqra_data,
+                "givebrite_iqra": givebrite_iqra_data,
+                "givebrite_rethink": givebrite_rethink_data
             }
 
             atomic_write_json(MASTER_SYNC_FILE, master_data)

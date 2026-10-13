@@ -23,6 +23,12 @@ DEFAULT_COMPANIES = {
     "iqra": {"id": "iqra", "name": "Iqra", "short_code": "Iqra", "accent_color": "emerald", "logo_url": ""},
 }
 
+# GiveBrite Platform Charity IDs per company (strictly loaded from environment variables)
+GIVEBRITE_CHARITY_IDS = {
+    "iqra": os.environ.get("GIVEBRITE_IQRA_CHARITY_ID", "").strip(),
+    "rethink": os.environ.get("GIVEBRITE_RETHINK_CHARITY_ID", "").strip(),
+}
+
 # Database Connection URLs
 LOCAL_DB_URL = f"sqlite:///{LOCAL_DB_PATH}"
 raw_db_url = os.environ.get("DATABASE_URL", LOCAL_DB_URL).strip()

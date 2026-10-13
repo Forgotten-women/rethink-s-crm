@@ -59,6 +59,7 @@ class BulkEditDonorsRequest(BaseModel):
     filter_donor_country: Optional[str] = None
     filter_campaign_search: Optional[str] = None
     filter_campaign: Optional[str] = None
+    filter_giving_level: Optional[str] = None
     filter_gift_aid: Optional[str] = None
     filter_start_date: Optional[str] = None
     filter_end_date: Optional[str] = None
@@ -331,7 +332,8 @@ def bulk_edit_donors(
         payload.filter_end_date,
         programme_fund=payload.filter_programme_fund,
         campaign=payload.filter_campaign,
-        company_id=payload.company_id
+        company_id=payload.company_id,
+        giving_level=payload.filter_giving_level
     )
 
     # 2. Apply search filter with multi-Donation ID support
@@ -527,7 +529,7 @@ def _apply_search_to_df(df: pd.DataFrame, search_str: str, search_fields: str = 
     return df.loc[mask]
 
 
-def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, subheading=None, country=None, code=None, zakat=None, donor_country=None, campaign_search=None, gift_aid=None, start_date=None, end_date=None, programme_fund=None, campaign=None, company_id=None):
+def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, subheading=None, country=None, code=None, zakat=None, donor_country=None, campaign_search=None, gift_aid=None, start_date=None, end_date=None, programme_fund=None, campaign=None, company_id=None, giving_level=None):
     if df is None or df.empty:
         return df
 
@@ -541,6 +543,13 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
 
     if isinstance(campaign, str) and campaign.strip() and campaign != "All Campaigns" and "Campaign Name" in df.columns:
         mask &= (df["Campaign Name"].astype(str).str.strip().str.lower() == campaign.strip().lower())
+
+    if isinstance(giving_level, str) and giving_level.strip() and giving_level != "All Giving Levels" and "Giving Level Title" in df.columns:
+        gl_clean = giving_level.strip()
+        if gl_clean.lower() in ["__default__", "default (general)", "default", "none"]:
+            mask &= (df["Giving Level Title"].isna() | df["Giving Level Title"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "n/a", "default (general)"]))
+        else:
+            mask &= (df["Giving Level Title"].astype(str).str.strip().str.lower() == gl_clean.lower())
 
     if isinstance(payment_type, str) and payment_type.strip() and payment_type != "All Payment Types" and "Payment Frequency" in df.columns:
         norm_type = payment_type.strip()
@@ -662,6 +671,7 @@ def get_donors_paginated(
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
     campaign: Optional[str] = None,
+    giving_level: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
@@ -670,8 +680,19 @@ def get_donors_paginated(
     Ultra-fast SQL Paginated Endpoint (< 100ms) with multi-Donation ID and scoped field text search.
     Strictly queries donations data without payout records, partitioned by company_id.
     """
+    page_val = getattr(page, "default", page)
+    page_val = int(page_val) if isinstance(page_val, (int, str, float)) and str(page_val).isdigit() else 1
+    page = max(1, page_val)
+
+    ps_val = getattr(page_size, "default", page_size)
+    ps_val = int(ps_val) if isinstance(ps_val, (int, str, float)) and str(ps_val).isdigit() else 100
+    page_size = max(1, min(1000, ps_val))
+
+    cid_val = getattr(company_id, "default", company_id)
+    comp = str(cid_val or "rethink").lower().strip()
+
+    is_payout_query = bool(source and str(source).strip().lower() in ["launchgood payout", "payout", "payouts"])
     target_table = "donations"
-    comp = str(company_id or "rethink").lower().strip()
 
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -771,6 +792,14 @@ def get_donors_paginated(
             if campaign and str(campaign).strip() and campaign != "All Campaigns" and "Campaign Name" in avail_cols:
                 where_clauses.append('LOWER("Campaign Name") = ?')
                 params.append(campaign.strip().lower())
+
+            if giving_level and str(giving_level).strip() and giving_level != "All Giving Levels" and "Giving Level Title" in avail_cols:
+                gl_clean = str(giving_level).strip()
+                if gl_clean.lower() in ["__default__", "default (general)", "default", "none"]:
+                    where_clauses.append('(LOWER(COALESCE("Giving Level Title", \'\')) IN (\'\', \'nan\', \'none\', \'null\', \'n/a\', \'default (general)\') OR "Giving Level Title" IS NULL)')
+                else:
+                    where_clauses.append('LOWER(TRIM(COALESCE("Giving Level Title", \'\'))) = ?')
+                    params.append(gl_clean.lower())
 
             if gift_aid and gift_aid != "All Gift Aid Status":
                 where_clauses.append('("Gift Aid (yes or no)" LIKE ? OR "is_giftaid" = ?)')
@@ -897,7 +926,7 @@ def get_donors_paginated(
             "records": []
         }
 
-    filtered_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=campaign, company_id=comp)
+    filtered_df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, campaign=campaign, company_id=comp, giving_level=giving_level)
     display_df = _apply_search_to_df(filtered_df, search, search_fields=search_fields)
 
     total_records = len(display_df)
@@ -945,6 +974,7 @@ def export_donors(
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
     campaign: Optional[str] = None,
+    giving_level: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
@@ -974,7 +1004,8 @@ def export_donors(
         end_date=end_date,
         programme_fund=programme_fund,
         campaign=campaign,
-        company_id=company_id
+        company_id=company_id,
+        giving_level=giving_level
     )
     display_df = _apply_search_to_df(filtered_df, search, search_fields=search_fields)
 

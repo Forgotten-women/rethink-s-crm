@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { ChevronDown, RotateCcw, Search, Filter, Calendar } from 'lucide-react';
+import { ChevronDown, RotateCcw, Search, Filter, Calendar, X } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
 export default function HorizontalFilters({ filters, onFilterChange, onResetFilters, accentColor = 'cyan', activeCompany = 'rethink' }) {
@@ -111,6 +111,38 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
             className="bg-transparent border-none outline-none text-xs text-slate-800 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 w-full"
           />
         </div>
+
+        {/* Active Campaign Filter Badge */}
+        {filters?.campaign && filters.campaign !== 'All Campaigns' && (
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-cyan-500/10 border border-cyan-500/40 text-cyan-700 dark:text-cyan-300 text-xs font-bold shadow-xs">
+            <span className="truncate max-w-[180px]" title={filters.campaign}>🎯 {filters.campaign}</span>
+            <button
+              type="button"
+              onClick={() => onFilterChange('campaign', 'All Campaigns')}
+              className="p-0.5 hover:bg-cyan-500/20 rounded-full transition-colors cursor-pointer shrink-0"
+              title="Clear Campaign Filter"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
+
+        {/* Active Giving Level Filter Badge */}
+        {filters?.giving_level && filters.giving_level !== 'All Giving Levels' && (
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-indigo-500/10 border border-indigo-500/40 text-indigo-700 dark:text-indigo-300 text-xs font-bold shadow-xs">
+            <span className="truncate max-w-[160px]" title={filters.giving_level === '__DEFAULT__' ? 'Default (General)' : filters.giving_level}>
+              🎁 {filters.giving_level === '__DEFAULT__' ? 'Default (General)' : filters.giving_level}
+            </span>
+            <button
+              type="button"
+              onClick={() => onFilterChange('giving_level', 'All Giving Levels')}
+              className="p-0.5 hover:bg-indigo-500/20 rounded-full transition-colors cursor-pointer shrink-0"
+              title="Clear Giving Level Filter"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
 
         {/* Payment Type Pill */}
         <div className="relative">

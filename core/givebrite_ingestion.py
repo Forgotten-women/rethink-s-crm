@@ -19,6 +19,7 @@ Key Principles:
 
 import os
 import sys
+import json
 import time
 import logging
 from datetime import datetime, timezone, timedelta
@@ -32,7 +33,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from config.settings import LOCAL_DB_PATH, PARQUET_PATH
+from config.settings import LOCAL_DB_PATH, PARQUET_PATH, GIVEBRITE_CHARITY_IDS
 from core.database import get_db_connection
 from core.data_processor import atomic_write_parquet, invalidate_data_cache
 from core.utils import classify_donor_amount
@@ -45,7 +46,8 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 GIVEBRITE_API_BASE = "https://api-dashboard.givebrite.com/v1/dashboard"
-DEFAULT_CHARITY_ID = "68625e0d6d1a99441e34e2ea"  # Iqra Charity GiveBrite ID
+DEFAULT_CHARITY_ID = GIVEBRITE_CHARITY_IDS.get("iqra", "")
+ALLOWED_COMPANIES = {"iqra", "rethink"}
 
 # Standard benchmark exchange rates to GBP for GiveBrite multi-currency settlement
 FX_BENCHMARKS: Dict[str, float] = {
@@ -234,7 +236,8 @@ def extract_givebrite_campaign_and_giving_level(
     doc: Dict[str, Any],
     det: Optional[Dict[str, Any]] = None,
     cursor: Optional[Any] = None,
-    master_impacts: Optional[Dict[str, Any]] = None
+    master_impacts: Optional[Dict[str, Any]] = None,
+    company_id: str = "iqra"
 ) -> Dict[str, Any]:
     """
     Robust extraction of GiveBrite campaign name, slug, URL, and giving level title/amount.
@@ -251,7 +254,11 @@ def extract_givebrite_campaign_and_giving_level(
     camp_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (doc.get("campaign") if isinstance(doc.get("campaign"), dict) else {})
     campaign_name = str(camp_obj.get("name") or "").strip()
     campaign_slug = str(camp_obj.get("slug") or "").strip()
-    campaign_url = f"https://donate.iqracharity.org/{campaign_slug}" if campaign_slug else ""
+    if campaign_slug:
+        campaign_url = f"https://rethink-charity.givebrite.com/{campaign_slug}" if company_id == "rethink" else f"https://donate.iqracharity.org/{campaign_slug}"
+    else:
+        campaign_url = ""
+    campaign_id = str(camp_obj.get("_id") or camp_obj.get("id") or "").strip()
 
     # 2. Extract cart items chosen by donor
     giving_level_title = ""
@@ -298,7 +305,7 @@ def extract_givebrite_campaign_and_giving_level(
                 except (ValueError, TypeError):
                     pass
 
-    # 3. Check Multi-Tenant Widgets if campaign still missing
+    # 3. Check Multi-Tenant Widgets if campaign still missing (Iqra widgets only)
     created_at_str = str(det.get("created_at") or doc.get("created_at") or "")
     tenants = det.get("x_tenant_id") or doc.get("x_tenant_id") or []
     if isinstance(tenants, str):
@@ -306,7 +313,7 @@ def extract_givebrite_campaign_and_giving_level(
     elif not isinstance(tenants, list):
         tenants = []
 
-    if not campaign_name:
+    if not campaign_name and company_id == "iqra":
         if any(t in ("dhulhijjah-giving", "dhgx") for t in tenants):
             campaign_name = "🌙The Best 10 Days | HOPE WIDOWS VILLAGE & ABNAA AS SHAAM SCHOOL🏡"
             campaign_slug = "the-best-10-days"
@@ -325,29 +332,9 @@ def extract_givebrite_campaign_and_giving_level(
                 campaign_slug = "iftaar-campaign"
                 campaign_url = "https://donate.iqracharity.org/iftaar-campaign"
 
-    # 4. Check comments/notes intent
-    if not campaign_name:
-        comments = det.get("comment") or doc.get("comment") or []
-        comm_text = ""
-        if isinstance(comments, list):
-            comm_text = " ".join([str(c.get("message", "")) for c in comments if isinstance(c, dict)]).upper()
-        elif isinstance(comments, str):
-            comm_text = comments.upper()
+    # 4. (Hardcoded comment keyword mapping removed to prevent tenant cross-contamination)
 
-        if "EDUCATION" in comm_text:
-            campaign_name = "STEM SCHOOL"
-            campaign_slug = "stem-school"
-            campaign_url = "https://donate.iqracharity.org/stem-school"
-            if not giving_level_title:
-                giving_level_title = "Education Category"
-        elif "UMM LUTFI" in comm_text:
-            campaign_name = "DAR Al-AFIYA, DAMASCUS: First-of-its kind Sanctuary for Survivors, Widows & Orphans"
-            campaign_slug = "dar-al-afiya-damascus"
-            campaign_url = "https://donate.iqracharity.org/dar-al-afiya-damascus"
-            if not giving_level_title:
-                giving_level_title = "Ref: Umm Lutfi"
-
-    # 5. Check subscription inheritance from database
+    # 5. Check subscription inheritance from database (partitioned by company_id)
     gw_resp = det.get("gateway_response") if isinstance(det.get("gateway_response"), dict) else (doc.get("gateway_response") if isinstance(doc.get("gateway_response"), dict) else {})
     sub_id = str(gw_resp.get("subscription_id") or det.get("subscription_id") or doc.get("subscription_id") or "").strip()
     if not campaign_name and sub_id and cursor:
@@ -355,10 +342,10 @@ def extract_givebrite_campaign_and_giving_level(
             cursor.execute("""
                 SELECT "Campaign Name", "Campaign URL", "Giving Level Title"
                 FROM donations
-                WHERE subscription_id = ? AND "Campaign Name" IS NOT NULL AND "Campaign Name" != '' AND "Campaign Name" != 'nan'
+                WHERE company_id = ? AND subscription_id = ? AND "Campaign Name" IS NOT NULL AND "Campaign Name" != '' AND "Campaign Name" != 'nan'
                 ORDER BY "Created Date (UTC)" ASC
                 LIMIT 1
-            """, (sub_id,))
+            """, (company_id, sub_id,))
             parent_row = cursor.fetchone()
             if parent_row and parent_row[0]:
                 campaign_name = parent_row[0].strip()
@@ -380,19 +367,13 @@ def extract_givebrite_campaign_and_giving_level(
                 except (ValueError, TypeError):
                     pass
 
-    # 7. Fallback campaign mapping based on giving level keyword
-    if not campaign_name and giving_level_title:
-        if "Most Needy" in giving_level_title:
-            campaign_name = "Most Needy Appeal"
-        elif "Shelter" in giving_level_title:
-            campaign_name = "Shelter Gaza’s Displaced Families with Lauren"
-        elif "Food Pack" in giving_level_title:
-            campaign_name = "“Feed a Family in East Africa – Just £35 Provides a Full Food Pack for 5 People.”"
+    # 7. (Hardcoded giving level keyword mapping removed to preserve genuine platform campaign truth)
 
     return {
         "campaign_name": campaign_name,
         "campaign_slug": campaign_slug,
         "campaign_url": campaign_url,
+        "campaign_id": campaign_id,
         "giving_level_title": giving_level_title,
         "giving_level_amount": giving_level_amount,
         "giving_level_qty": giving_level_qty,
@@ -460,18 +441,21 @@ def build_donation_record(
         charge_id = payment_intent_id
 
     # Campaign & Giving Level (Robust resolution)
+    camp_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (doc.get("campaign") if isinstance(doc.get("campaign"), dict) else {})
     if extracted_campaign is not None:
         campaign_name = str(extracted_campaign.get("campaign_name") or "").strip()
         campaign_slug = str(extracted_campaign.get("campaign_slug") or "").strip()
         campaign_url = str(extracted_campaign.get("campaign_url") or "").strip()
+        campaign_id = str(extracted_campaign.get("campaign_id") or camp_obj.get("_id") or camp_obj.get("id") or "").strip()
         giving_level_title = str(extracted_campaign.get("giving_level_title") or "").strip()
         giving_level_amount = float(extracted_campaign.get("giving_level_amount") or 0.0)
         giving_level_qty = float(extracted_campaign.get("giving_level_qty") or 1.0)
     else:
-        ext = extract_givebrite_campaign_and_giving_level(doc, det=det)
+        ext = extract_givebrite_campaign_and_giving_level(doc, det=det, company_id=company_id)
         campaign_name = ext["campaign_name"]
         campaign_slug = ext["campaign_slug"]
         campaign_url = ext["campaign_url"]
+        campaign_id = str(ext.get("campaign_id") or camp_obj.get("_id") or camp_obj.get("id") or "").strip()
         giving_level_title = ext["giving_level_title"]
         giving_level_amount = ext["giving_level_amount"]
         giving_level_qty = ext["giving_level_qty"]
@@ -497,6 +481,14 @@ def build_donation_record(
     t_url = f"https://donate.iqracharity.org/{t_slug}" if t_slug else ""
 
     offline_flag = bool(det.get("offline", doc.get("offline", False)))
+
+    # Comments & Notes
+    comments_list = det.get("comment") or doc.get("comment") or []
+    donor_comments = ""
+    if isinstance(comments_list, list):
+        donor_comments = "; ".join([str(c.get("message", "")).strip() for c in comments_list if isinstance(c, dict) and c.get("message")])
+    elif isinstance(comments_list, str):
+        donor_comments = comments_list.strip()
 
     # Classification fields
     meta = classification_meta or {
@@ -622,7 +614,7 @@ def build_donation_record(
         "UTM / Referral Source": "",
         "Source User Profile": "",
         "Number of Donors": 1.0,
-        "Comments": "",
+        "Comments": donor_comments,
         "Email (for tax receipt)": email,
         "Payment Type": payment_method,
         "Platform": "GiveBright",
@@ -641,7 +633,7 @@ def build_donation_record(
         "is_giftaid": "true" if is_giftaid else "false",
         "created_at": iso_raw,
         "offline": "true" if offline_flag else "false",
-        "campaign_id": str(camp_obj.get("_id") or ""),
+        "campaign_id": campaign_id,
         "fundraiser_id": f_id,
         "team_id": t_id,
         "campaign_url": campaign_url,
@@ -691,137 +683,136 @@ def ingest_givebrite_donations(
     - Atomically persists into SQLite and updates donations_cache.parquet.
     - Guarantees strict multi-tenancy (company_id = 'iqra').
     """
-    assert company_id == "iqra", f"Tenant violation: GiveBrite sync must only run for 'iqra', got: {company_id}"
+    assert company_id in ALLOWED_COMPANIES, f"Tenant violation: GiveBrite sync must run for one of {ALLOWED_COMPANIES}, got: {company_id}"
 
     if not docs:
         return {"total_incoming": 0, "inserted": 0, "skipped": 0}
 
     conn = get_db_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    # Step 1: Identify incoming IDs (both MongoDB _id and mysqlID) and query DB for existing records
-    incoming_ids = []
-    for d in docs:
-        if d.get("_id"):
-            incoming_ids.append(str(d.get("_id")).strip())
-        if d.get("mysqlID"):
-            incoming_ids.append(str(d.get("mysqlID")).strip())
-    incoming_ids = list(dict.fromkeys(incoming_ids))
+        # Step 1: Identify incoming IDs (both MongoDB _id and mysqlID) and query DB for existing records
+        incoming_ids = []
+        for d in docs:
+            if d.get("_id"):
+                incoming_ids.append(str(d.get("_id")).strip())
+            if d.get("mysqlID"):
+                incoming_ids.append(str(d.get("mysqlID")).strip())
+        incoming_ids = list(dict.fromkeys(incoming_ids))
 
-    if not incoming_ids:
-        conn.close()
-        return {"total_incoming": 0, "inserted": 0, "skipped": 0}
+        if not incoming_ids:
+            return {"total_incoming": 0, "inserted": 0, "skipped": 0}
 
-    # Query existing IDs using index across both Donation ID and _id
-    placeholders = ",".join(["?"] * len(incoming_ids))
-    cursor.execute(f"""
-        SELECT "Donation ID", _id FROM donations 
-        WHERE company_id = ? AND ("Donation ID" IN ({placeholders}) OR _id IN ({placeholders}))
-    """, [company_id] + incoming_ids + incoming_ids)
-    existing_ids = set()
-    for row in cursor.fetchall():
-        if row[0]:
-            existing_ids.add(str(row[0]).strip())
-        if row[1]:
-            existing_ids.add(str(row[1]).strip())
-
-    # Also check charge_id and payment_intent_id to prevent duplicates across webhook & live sync
-    incoming_tx_ids = []
-    for d in docs:
-        gw_resp = d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {}
-        ch_id = gw_resp.get("charge_id") or d.get("charge_id")
-        pi_id = gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id")
-        if ch_id:
-            incoming_tx_ids.append(str(ch_id).strip())
-        if pi_id:
-            incoming_tx_ids.append(str(pi_id).strip())
-    incoming_tx_ids = list(dict.fromkeys(incoming_tx_ids))
-
-    existing_tx_ids = set()
-    if incoming_tx_ids:
-        tx_placeholders = ",".join(["?"] * len(incoming_tx_ids))
+        # Query existing IDs using index across both Donation ID and _id
+        placeholders = ",".join(["?"] * len(incoming_ids))
         cursor.execute(f"""
-            SELECT charge_id, "Customer Ref" FROM donations 
-            WHERE company_id = ? AND (charge_id IN ({tx_placeholders}) OR "Customer Ref" IN ({tx_placeholders}))
-        """, [company_id] + incoming_tx_ids + incoming_tx_ids)
+            SELECT "Donation ID", _id FROM donations 
+            WHERE company_id = ? AND ("Donation ID" IN ({placeholders}) OR _id IN ({placeholders}))
+        """, [company_id] + incoming_ids + incoming_ids)
+        existing_ids = set()
         for row in cursor.fetchall():
             if row[0]:
-                existing_tx_ids.add(str(row[0]).strip())
+                existing_ids.add(str(row[0]).strip())
             if row[1]:
-                existing_tx_ids.add(str(row[1]).strip())
+                existing_ids.add(str(row[1]).strip())
 
-    def _is_existing(d):
-        d_id = str(d.get("_id") or "").strip()
-        m_id = str(d.get("mysqlID") or "").strip()
-        if (d_id and d_id in existing_ids) or (m_id and m_id in existing_ids):
-            return True
-        gw_resp = d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {}
-        ch_id = str(gw_resp.get("charge_id") or d.get("charge_id") or "").strip()
-        pi_id = str(gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id") or "").strip()
-        if (ch_id and ch_id in existing_tx_ids) or (pi_id and pi_id in existing_tx_ids):
-            return True
-        return False
+        # Also check charge_id and payment_intent_id to prevent duplicates across webhook & live sync
+        incoming_tx_ids = []
+        for d in docs:
+            gw_resp = d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {}
+            ch_id = gw_resp.get("charge_id") or d.get("charge_id")
+            pi_id = gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id")
+            if ch_id:
+                incoming_tx_ids.append(str(ch_id).strip())
+            if pi_id:
+                incoming_tx_ids.append(str(pi_id).strip())
+        incoming_tx_ids = list(dict.fromkeys(incoming_tx_ids))
 
-    new_docs = [d for d in docs if not _is_existing(d)]
+        existing_tx_ids = set()
+        if incoming_tx_ids:
+            tx_placeholders = ",".join(["?"] * len(incoming_tx_ids))
+            cursor.execute(f"""
+                SELECT charge_id, "Customer Ref" FROM donations 
+                WHERE company_id = ? AND (charge_id IN ({tx_placeholders}) OR "Customer Ref" IN ({tx_placeholders}))
+            """, [company_id] + incoming_tx_ids + incoming_tx_ids)
+            for row in cursor.fetchall():
+                if row[0]:
+                    existing_tx_ids.add(str(row[0]).strip())
+                if row[1]:
+                    existing_tx_ids.add(str(row[1]).strip())
 
-    if not new_docs:
+        def _is_existing(d):
+            d_id = str(d.get("_id") or "").strip()
+            m_id = str(d.get("mysqlID") or "").strip()
+            if (d_id and d_id in existing_ids) or (m_id and m_id in existing_ids):
+                return True
+            gw_resp = d.get("gateway_response") if isinstance(d.get("gateway_response"), dict) else {}
+            ch_id = str(gw_resp.get("charge_id") or d.get("charge_id") or "").strip()
+            pi_id = str(gw_resp.get("payment_intent_id") or gw_resp.get("stripe_payment_id") or "").strip()
+            if (ch_id and ch_id in existing_tx_ids) or (pi_id and pi_id in existing_tx_ids):
+                return True
+            return False
+
+        new_docs = [d for d in docs if not _is_existing(d)]
+
+        if not new_docs:
+            logger.info(f"All {len(docs)} incoming GiveBrite donations already exist in CRM. Zero insertions needed.")
+            return {"total_incoming": len(docs), "inserted": 0, "skipped": len(docs)}
+
+        logger.info(f"Found {len(new_docs)} NEW GiveBrite donations to ingest out of {len(docs)} incoming.")
+
+        # Step 2: Enrich new donations with full details if headers provided
+        records_to_insert = []
+        session = requests.Session()
+
+        for idx, doc in enumerate(new_docs):
+            doc_id = str(doc.get("_id")).strip()
+            det = None
+
+            if headers:
+                try:
+                    detail_url = f"{GIVEBRITE_API_BASE}/donations/{doc_id}"
+                    det_resp = session.get(detail_url, headers=headers, timeout=10)
+                    if det_resp.status_code == 200:
+                        det = det_resp.json()
+                    time.sleep(0.05)  # Polite pacing
+                except Exception as det_ex:
+                    logger.warning(f"Could not fetch detail for {doc_id}: {det_ex}")
+
+            # Extract campaign and giving level robustly
+            extracted = extract_givebrite_campaign_and_giving_level(doc, det=det, cursor=cursor, company_id=company_id)
+            c_name = extracted["campaign_name"]
+            g_level = extracted["giving_level_title"]
+
+            # Classification resolution
+            cls_meta = resolve_classification(cursor, c_name, g_level, company_id=company_id)
+
+            # Build normalized record
+            rec = build_donation_record(doc, det=det, classification_meta=cls_meta, extracted_campaign=extracted, company_id=company_id)
+            records_to_insert.append(rec)
+
+        # Step 3: Insert new records into SQLite
+        if records_to_insert:
+            # Get SQLite table columns
+            cursor.execute("PRAGMA table_info(donations);")
+            table_cols = [c[1] for c in cursor.fetchall()]
+
+            # Prepare parameterized INSERT
+            insert_rows = []
+            for r in records_to_insert:
+                row_vals = [r.get(col) for col in table_cols]
+                insert_rows.append(row_vals)
+
+            col_placeholders = ",".join(["?"] * len(table_cols))
+            quoted_cols = ",".join([f'"{col}"' for col in table_cols])
+            sql = f"INSERT INTO donations ({quoted_cols}) VALUES ({col_placeholders})"
+
+            cursor.executemany(sql, insert_rows)
+            conn.commit()
+            logger.info(f"Successfully committed {len(records_to_insert)} new GiveBrite donations into SQLite 'donations'.")
+    finally:
         conn.close()
-        logger.info(f"All {len(docs)} incoming GiveBrite donations already exist in CRM. Zero insertions needed.")
-        return {"total_incoming": len(docs), "inserted": 0, "skipped": len(docs)}
-
-    logger.info(f"Found {len(new_docs)} NEW GiveBrite donations to ingest out of {len(docs)} incoming.")
-
-    # Step 2: Enrich new donations with full details if headers provided
-    records_to_insert = []
-    session = requests.Session()
-
-    for idx, doc in enumerate(new_docs):
-        doc_id = str(doc.get("_id")).strip()
-        det = None
-
-        if headers:
-            try:
-                detail_url = f"{GIVEBRITE_API_BASE}/donations/{doc_id}"
-                det_resp = session.get(detail_url, headers=headers, timeout=10)
-                if det_resp.status_code == 200:
-                    det = det_resp.json()
-                time.sleep(0.05)  # Polite pacing
-            except Exception as det_ex:
-                logger.warning(f"Could not fetch detail for {doc_id}: {det_ex}")
-
-        # Extract campaign and giving level robustly
-        extracted = extract_givebrite_campaign_and_giving_level(doc, det=det, cursor=cursor)
-        c_name = extracted["campaign_name"]
-        g_level = extracted["giving_level_title"]
-
-        # Classification resolution
-        cls_meta = resolve_classification(cursor, c_name, g_level, company_id=company_id)
-
-        # Build normalized record
-        rec = build_donation_record(doc, det=det, classification_meta=cls_meta, extracted_campaign=extracted, company_id=company_id)
-        records_to_insert.append(rec)
-
-    # Step 3: Insert new records into SQLite
-    if records_to_insert:
-        # Get SQLite table columns
-        cursor.execute("PRAGMA table_info(donations);")
-        table_cols = [c[1] for c in cursor.fetchall()]
-
-        # Prepare parameterized INSERT
-        insert_rows = []
-        for r in records_to_insert:
-            row_vals = [r.get(col) for col in table_cols]
-            insert_rows.append(row_vals)
-
-        col_placeholders = ",".join(["?"] * len(table_cols))
-        quoted_cols = ",".join([f'"{col}"' for col in table_cols])
-        sql = f"INSERT INTO donations ({quoted_cols}) VALUES ({col_placeholders})"
-
-        cursor.executemany(sql, insert_rows)
-        conn.commit()
-        logger.info(f"Successfully committed {len(records_to_insert)} new GiveBrite donations into SQLite 'donations'.")
-
-    conn.close()
 
     # Step 4: Update Parquet Cache & Invalidate in-memory cache
     if records_to_insert:
@@ -868,10 +859,10 @@ def update_parquet_cache(new_records: List[Dict[str, Any]]) -> None:
     # Reorder to match existing
     df_new = df_new[df_existing.columns]
 
-    # Concatenate, deduplicate safely and write atomically
+    # Concatenate, deduplicate safely and write atomically (keep="first" strictly preserves existing records/classifications)
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     mask_has_id = df_combined["Donation ID"].notna() & (df_combined["Donation ID"].astype(str).str.strip() != "")
-    df_with_id = df_combined[mask_has_id].drop_duplicates(subset=["company_id", "Donation ID"], keep="last")
+    df_with_id = df_combined[mask_has_id].drop_duplicates(subset=["company_id", "Donation ID"], keep="first")
     df_no_id = df_combined[~mask_has_id]
     df_combined = pd.concat([df_with_id, df_no_id], ignore_index=True)
     atomic_write_parquet(df_combined, PARQUET_PATH)
@@ -882,14 +873,16 @@ def update_parquet_cache(new_records: List[Dict[str, Any]]) -> None:
 def run_historical_backfill(
     token: str,
     days: int = 60,
-    charity_id: str = DEFAULT_CHARITY_ID,
+    charity_id: Optional[str] = None,
     company_id: str = "iqra"
 ) -> Dict[str, Any]:
     """
     Performs non-destructive 60-day backfill for GiveBrite donations.
     Paginates backwards until reaching 'from_date', skipping all existing IDs.
     """
-    assert company_id == "iqra", "Tenant isolation violation!"
+    assert company_id in ALLOWED_COMPANIES, f"Tenant isolation violation: {company_id}"
+    if not charity_id:
+        charity_id = GIVEBRITE_CHARITY_IDS.get(company_id, DEFAULT_CHARITY_ID)
     
     headers = {
         "Authorization": f"Bearer {token.replace('Bearer ', '').strip()}",

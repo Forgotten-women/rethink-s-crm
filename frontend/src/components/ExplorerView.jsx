@@ -81,6 +81,10 @@ const COLUMN_ALIASES = {
   'special_case': 'Special Case',
   'Country': 'Project Country',
   'Zakat Eligibility': 'Zakat',
+  'Giving Level Title': 'Giving Level',
+  'giving_level_title': 'Giving Level',
+  'giving_level': 'Giving Level',
+  'Has Giving Level': 'Has Giving Level',
   'charge_id': 'Stripe Charge ID',
   'subscription_id': 'Subscription ID',
   'sub_id': 'Subscription ID',
@@ -146,7 +150,7 @@ const getStoredPreset = () => {
   }
 };
 
-export default function ExplorerView({ user, filters, onSelectDonor, onDataChange, activeCompany = 'rethink', companies = [] }) {
+export default function ExplorerView({ user, filters, onFilterChange, onResetFilters, onSelectDonor, onDataChange, activeCompany = 'rethink', companies = [] }) {
   const [data, setData] = useState({ total_records: 0, page: 1, page_size: 100, total_pages: 1, available_columns: [], records: [] });
   const [loading, setLoading] = useState(true);
   
@@ -225,6 +229,26 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
   const [cellMessage, setCellMessage] = useState('');
 
   // Classification lookups for smart quick-pick and auto-enrichment
+  // Auto-include Giving Level column if giving_level filter is active
+  useEffect(() => {
+    if (filters?.giving_level && filters.giving_level !== 'All Giving Levels') {
+      setSelectedColumns(prev => {
+        const glCol = 'Giving Level Title';
+        if (data.available_columns?.includes(glCol) && !prev.includes(glCol)) {
+          const campIdx = prev.indexOf('Campaign Name');
+          const next = [...prev];
+          if (campIdx !== -1) {
+            next.splice(campIdx + 1, 0, glCol);
+          } else {
+            next.push(glCol);
+          }
+          return next;
+        }
+        return prev;
+      });
+    }
+  }, [filters?.giving_level, data.available_columns]);
+
   const [campaignCodesLookup, setCampaignCodesLookup] = useState({});
   const [codeMap, setCodeMap] = useState({});
 
@@ -329,6 +353,9 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
       if (filters.end_date) params.append('end_date', filters.end_date);
       if (filters.campaign && filters.campaign !== 'All Campaigns') {
         params.append('campaign', filters.campaign);
+      }
+      if (filters.giving_level && filters.giving_level !== 'All Giving Levels') {
+        params.append('giving_level', filters.giving_level);
       }
     }
 
@@ -652,6 +679,7 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
         filter_donor_country: filters?.donor_country,
         filter_campaign_search: filters?.campaign_search,
         filter_campaign: (filters?.campaign && filters.campaign !== 'All Campaigns') ? filters.campaign : null,
+        filter_giving_level: (filters?.giving_level && filters.giving_level !== 'All Giving Levels') ? filters.giving_level : null,
         filter_gift_aid: filters?.gift_aid,
         filter_start_date: filters?.start_date,
         filter_end_date: filters?.end_date
@@ -723,6 +751,9 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
       if (filters.campaign && filters.campaign !== 'All Campaigns') {
         params.append('campaign', filters.campaign);
       }
+      if (filters.giving_level && filters.giving_level !== 'All Giving Levels') {
+        params.append('giving_level', filters.giving_level);
+      }
       if (filters.gift_aid) params.append('gift_aid', filters.gift_aid);
       if (filters.start_date) params.append('start_date', filters.start_date);
       if (filters.end_date) params.append('end_date', filters.end_date);
@@ -756,6 +787,47 @@ export default function ExplorerView({ user, filters, onSelectDonor, onDataChang
           <span className="text-[10px] font-black uppercase tracking-wider bg-indigo-500/20 text-indigo-300 px-3 py-1.5 rounded-xl border border-indigo-500/30 shrink-0">
             🔒 Read-Only Consolidated View
           </span>
+        </div>
+      )}
+
+      {/* Active Classification Filter Notice Banner */}
+      {((filters?.campaign && filters.campaign !== 'All Campaigns') || (filters?.giving_level && filters.giving_level !== 'All Giving Levels')) && (
+        <div className="p-3.5 rounded-2xl bg-cyan-950/40 border border-cyan-500/30 text-cyan-200 text-xs flex flex-wrap items-center justify-between gap-3 shadow-md animate-fade-in">
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span className="font-extrabold text-white flex items-center gap-1.5">
+              <Filter className="w-4 h-4 text-cyan-400" /> Active Classification Filter:
+            </span>
+            {filters?.campaign && filters.campaign !== 'All Campaigns' && (
+              <span className="px-2.5 py-1 rounded-lg bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold">
+                🎯 Campaign: <b>{filters.campaign}</b>
+              </span>
+            )}
+            {filters?.giving_level && filters.giving_level !== 'All Giving Levels' && (
+              <span className="px-2.5 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 font-bold">
+                🎁 Giving Level: <b>{filters.giving_level === '__DEFAULT__' ? 'Default (General)' : filters.giving_level}</b>
+              </span>
+            )}
+            {filters?.source && filters.source !== 'All Sources (Combined)' && (
+              <span className="px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 border border-white/10 font-bold">
+                Platform: <b>{filters.source}</b>
+              </span>
+            )}
+            {filters?.code && filters.code !== 'All Codes' && (
+              <span className="px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 border border-white/10 font-mono font-bold">
+                Code: <b>{filters.code}</b>
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              onFilterChange?.('campaign', 'All Campaigns');
+              onFilterChange?.('giving_level', 'All Giving Levels');
+            }}
+            className="btn-secondary text-[11px] px-2.5 py-1 text-cyan-400 hover:text-white border-cyan-500/30 flex items-center gap-1 cursor-pointer"
+          >
+            <X className="w-3 h-3" /> Clear Classification Filter
+          </button>
         </div>
       )}
 

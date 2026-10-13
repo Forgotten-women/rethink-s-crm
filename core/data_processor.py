@@ -1915,7 +1915,8 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
         ("Direct Debit Ref" in df.columns and "Amount" in df.columns) or
         ("Bank Ref" in df.columns and "Amount" in df.columns and ("Due" in df.columns or "Date Due" in df.columns or "Date of collection" in df.columns or "Details" in df.columns))
     )
-    is_rethink_website = not already_multi_platform and (("Reference" in df.columns and "Donor First Name" in df.columns and ("Project Name" in df.columns or "Processor" in df.columns)) or (str(platform).lower() in ["rethink website", "website", "rethink_website"]))
+    has_non_ws_platform = "Platform" in df.columns and df["Platform"].astype(str).str.lower().str.contains("launchgood|givebright|madinah|paysuite", regex=True, na=False).any()
+    is_rethink_website = not already_multi_platform and not has_non_ws_platform and (("Reference" in df.columns and "Donor First Name" in df.columns and ("Project Name" in df.columns or "Processor" in df.columns)) or (str(platform).lower() in ["rethink website", "website", "rethink_website"]))
     is_madinah = False
     is_givebright = False
     
@@ -2169,9 +2170,14 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             if valid_mask.any():
                 df.loc[valid_mask, f] = mapped_vals[valid_mask]
 
-        # Seed new website projects into rethink_website_classifications
-        avail_ws_cols = [c for c in ["Campaign Name", "Community Name", "Country", "Zakat Eligibility", "Code"] if c in df.columns]
-        unique_cnames = df[avail_ws_cols].drop_duplicates(subset=["Campaign Name"]) if "Campaign Name" in df.columns else pd.DataFrame()
+        # Seed new website projects into rethink_website_classifications (strictly for genuine website donations)
+        if "Platform" in df.columns:
+            ws_subset = df[df["Platform"].astype(str).str.lower().isin(["website", "rethink website"])]
+        else:
+            ws_subset = df
+
+        avail_ws_cols = [c for c in ["Campaign Name", "Community Name", "Country", "Zakat Eligibility", "Code"] if c in ws_subset.columns]
+        unique_cnames = ws_subset[avail_ws_cols].drop_duplicates(subset=["Campaign Name"]) if ("Campaign Name" in ws_subset.columns and not ws_subset.empty) else pd.DataFrame()
         new_rules = []
         for _, r in unique_cnames.iterrows():
             cn = str(r.get("Campaign Name", "")).strip()
@@ -2186,11 +2192,24 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
         if new_rules:
             conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
             try:
-                conn.executemany("""
-                    INSERT OR IGNORE INTO rethink_website_classifications (campaign_name, code, community_name, heading, sub_heading, country, zakat_eligibility, is_primary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, new_rules)
-                conn.commit()
+                # Do not auto-seed campaigns that already exist under another platform (e.g. launchgood, givebright)
+                placeholders = ",".join("?" for _ in new_rules)
+                cur = conn.cursor()
+                cur.execute(f"""
+                    SELECT LOWER(TRIM(campaign_name)) 
+                    FROM platform_campaign_mappings 
+                    WHERE LOWER(platform) NOT IN ('website', 'rethink_website') 
+                      AND LOWER(TRIM(campaign_name)) IN ({placeholders})
+                """, [r[0].lower() for r in new_rules])
+                existing_other = {row_e[0] for row_e in cur.fetchall()}
+                filtered_rules = [r for r in new_rules if r[0].lower() not in existing_other]
+
+                if filtered_rules:
+                    conn.executemany("""
+                        INSERT OR IGNORE INTO rethink_website_classifications (campaign_name, code, community_name, heading, sub_heading, country, zakat_eligibility, is_primary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, filtered_rules)
+                    conn.commit()
             except Exception as e:
                 print(f"Error seeding new website rules: {e}")
             finally:

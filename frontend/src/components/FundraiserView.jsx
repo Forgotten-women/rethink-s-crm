@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   HeartHandshake, PlusCircle, Search, Filter, Calendar, Target, 
   TrendingUp, Users, DollarSign, Edit3, Trash2, Eye, X, Check, 
@@ -50,6 +51,47 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   // Filters & View State
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
+  const [statusOptions, setStatusOptions] = useState(['ACTIVE', 'PAUSED', 'COMPLETED', 'RAMADAN']);
+  const [ramadanPeriods, setRamadanPeriods] = useState([]);
+  const [ramadanChoice, setRamadanChoice] = useState('');
+  const [ramadanOpen, setRamadanOpen] = useState(false);
+  const [ramadanYear, setRamadanYear] = useState(null);
+  const ramadanRef = useRef(null);
+  const ramadanPanelRef = useRef(null);
+  const [ramadanPos, setRamadanPos] = useState(null);
+  useEffect(() => {
+    if (!ramadanOpen) return undefined;
+    // The panel is rendered at the top level of the page (portal) so cards below can never cover it
+    const place = () => {
+      const r = ramadanRef.current?.getBoundingClientRect();
+      if (r) setRamadanPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) });
+    };
+    place();
+    const close = (e) => {
+      if (ramadanRef.current?.contains(e.target) || ramadanPanelRef.current?.contains(e.target)) return;
+      setRamadanOpen(false);
+    };
+    const esc = (e) => { if (e.key === 'Escape') setRamadanOpen(false); };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', esc);
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      document.removeEventListener('mousedown', close); document.removeEventListener('keydown', esc);
+      window.removeEventListener('resize', place); window.removeEventListener('scroll', place, true);
+    };
+  }, [ramadanOpen]);
+  // Page separator: the charity's own pages (Rethink / Iqra) vs SP pages
+  const [pageGroupFilter, setPageGroupFilter] = useState('ALL');
+  const mainGroupLabel = activeCompany === 'iqra' ? 'Iqra' : 'Rethink';
+
+  // Status list (incl. RAMADAN and any custom status in use) and the Ramadan date presets
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/api/fundraisers/statuses?company_id=${encodeURIComponent(activeCompany)}`)
+      .then(r => (r.ok ? r.json() : null)).then(d => { if (d?.statuses) setStatusOptions(d.statuses); }).catch(() => {});
+    fetch(`${API_BASE_URL}/api/fundraisers/ramadan-periods?company_id=${encodeURIComponent(activeCompany)}`)
+      .then(r => (r.ok ? r.json() : null)).then(d => { if (d?.periods) setRamadanPeriods(d.periods); }).catch(() => {});
+  }, [activeCompany]);
   const [dateFilterMode, setDateFilterMode] = useState('all'); // 'all', 'this_year', 'last_year', 'last_30', 'last_90', 'custom'
   const [customStartDate, setCustomStartDate] = useState('');
   const [customEndDate, setCustomEndDate] = useState('');
@@ -100,6 +142,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   // Synchronize applied date filters based on preset buttons
   const handleDatePresetChange = (mode) => {
     setDateFilterMode(mode);
+    setRamadanChoice('');
     setCurrentPage(1);
     const today = new Date();
     if (mode === 'all') {
@@ -141,6 +184,40 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
     }
   };
 
+  // Ramadan presets: 'YYYY|weeks|mode' - mode 'incl' = Ramadan + N weeks after, 'after' = only the N weeks after
+  const shiftDays = (iso, days) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const fmtDay = (iso) => new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+  const ramadanRange = (year, weeks, mode) => {
+    const r = ramadanPeriods.find(p => String(p.year) === String(year));
+    if (!r) return null;
+    const n = Number(weeks);
+    return { start: mode === 'after' ? shiftDays(r.end, 1) : r.start, end: n > 0 ? shiftDays(r.end, 7 * n) : r.end };
+  };
+  const ramadanLabel = (choice) => {
+    if (!choice) return '';
+    const [year, weeks, mode] = choice.split('|');
+    const rg = ramadanRange(year, weeks, mode);
+    const what = mode === 'after' ? `${weeks} wks after Ramadan ${year}` : `Ramadan ${year}${Number(weeks) ? ` + ${weeks} wks` : ''}`;
+    return rg ? `${what} · ${fmtDay(rg.start)} – ${fmtDay(rg.end)}` : what;
+  };
+
+  const handleRamadanPreset = (choice) => {
+    setRamadanChoice(choice);
+    if (!choice) return;
+    const [year, weeks, mode] = choice.split('|');
+    const r = ramadanPeriods.find(p => String(p.year) === year);
+    if (!r) return;
+    const n = Number(weeks);
+    const start = mode === 'after' ? shiftDays(r.end, 1) : r.start;
+    const end = n > 0 ? shiftDays(r.end, 7 * n) : r.end;
+    setDateFilterMode('ramadan');
+    setAppliedStartDate(start);
+    setAppliedEndDate(end);
+    setCustomStartDate(start);
+    setCustomEndDate(end);
+    setCurrentPage(1);
+  };
+
   const handleApplyCustomDateRange = (e) => {
     if (e) e.preventDefault();
     setAppliedStartDate(customStartDate);
@@ -150,6 +227,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
 
   const handleClearDateFilter = () => {
     setDateFilterMode('all');
+    setRamadanChoice('');
     setAppliedStartDate('');
     setAppliedEndDate('');
     setCustomStartDate('');
@@ -275,6 +353,8 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
       }
     };
     window.addEventListener('focus', handleFocus);
+    // New donations from ANY source (platform sync, webhooks, other users) arrive via the live stream within ~1 s
+    window.addEventListener('crm:data-changed', handleFocus);
 
     return () => {
       if (socket) {
@@ -284,6 +364,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
       }
       if (fallbackInterval) clearInterval(fallbackInterval);
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('crm:data-changed', handleFocus);
     };
   }, [appliedStartDate, appliedEndDate, statusFilter, activeCompany]);
 
@@ -347,10 +428,16 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
           (c.code && c.code.toLowerCase().includes(searchQuery.toLowerCase()))
         );
       
+      const matchPage = !searchQuery || (f.tracked_pages || []).some(tp => (tp.value || '').toLowerCase().includes(searchQuery.toLowerCase()));
       const matchStatus = statusFilter === 'ALL' || f.status === statusFilter;
-      return matchSearch && matchStatus;
+      const matchGroup = pageGroupFilter === 'ALL' || (f.page_group || 'MAIN') === pageGroupFilter;
+      return (matchSearch || matchPage) && matchStatus && matchGroup;
     });
-  }, [fundraisersData.fundraisers, searchQuery, statusFilter]);
+  }, [fundraisersData.fundraisers, searchQuery, statusFilter, pageGroupFilter]);
+  const pageGroupCounts = useMemo(() => {
+    const list = (fundraisersData.fundraisers || []).filter(f => f.assigned_campaigns && f.assigned_campaigns.length);
+    return { ALL: list.length, MAIN: list.filter(f => (f.page_group || 'MAIN') === 'MAIN').length, SP: list.filter(f => f.page_group === 'SP').length };
+  }, [fundraisersData.fundraisers]);
 
   // Sort filtered fundraisers
   const sortedFundraisers = useMemo(() => {
@@ -846,6 +933,18 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               />
             </div>
 
+            {/* Page separator: Rethink / Iqra pages vs SP pages */}
+            <div className="flex items-center gap-0.5 p-0.5 rounded-lg" role="group" aria-label="Page group" style={{ border: '1px solid var(--input-border)' }}>
+              {[['ALL', 'All pages'], ['MAIN', `${mainGroupLabel} pages`], ['SP', 'SP pages']].map(([g, label]) => (
+                <button key={g} type="button" onClick={() => { setPageGroupFilter(g); setCurrentPage(1); }}
+                  className={`px-2 py-1 rounded-md text-[11px] font-bold transition-all ${pageGroupFilter === g
+                    ? (g === 'SP' ? 'bg-pink-500/20 text-pink-600 dark:text-pink-300' : 'bg-cyan-500/20 text-cyan-600 dark:text-cyan-300')
+                    : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-200'}`}>
+                  {label} ({pageGroupCounts[g]})
+                </button>
+              ))}
+            </div>
+
             {/* Status Filter */}
             <select
               value={statusFilter}
@@ -857,9 +956,9 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }}
             >
               <option value="ALL">All Statuses</option>
-              <option value="ACTIVE">Active Only</option>
-              <option value="PAUSED">Paused</option>
-              <option value="COMPLETED">Completed</option>
+              {statusOptions.map(st => (
+                <option key={st} value={st}>{st === 'ACTIVE' ? 'Active Only' : st.charAt(0) + st.slice(1).toLowerCase()}</option>
+              ))}
             </select>
 
             {/* Sort Filter */}
@@ -917,6 +1016,88 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                 {p.label}
               </button>
             ))}
+
+            {ramadanPeriods.length > 0 && (() => {
+              const years = [...ramadanPeriods].sort((a, b) => b.year - a.year);
+              const todayIso = new Date().toISOString().slice(0, 10);
+              const defaultYear = (years.find(p => p.start <= todayIso) || years[years.length - 1]).year;
+              const year = ramadanYear ?? (ramadanChoice ? Number(ramadanChoice.split('|')[0]) : defaultYear);
+              const period = years.find(p => p.year === year);
+              const active = dateFilterMode === 'ramadan' && ramadanChoice;
+              const option = (weeks, mode, label) => {
+                const value = `${year}|${weeks}|${mode}`;
+                const rg = ramadanRange(year, weeks, mode);
+                const selected = ramadanChoice === value && dateFilterMode === 'ramadan';
+                return (
+                  <button key={value} type="button" onClick={() => { handleRamadanPreset(value); setRamadanOpen(false); }}
+                    className={`flex flex-col items-start px-2 py-1.5 rounded-lg border text-left transition-all ${selected
+                      ? 'border-violet-500 bg-violet-500/15 text-violet-700 dark:text-violet-200'
+                      : 'border-transparent hover:border-violet-400/50 hover:bg-violet-500/5'}`}
+                    style={selected ? undefined : { color: 'var(--text-main)' }}>
+                    <span className="text-[11px] font-bold">{label}</span>
+                    {rg && <span className="text-[10px] whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{fmtDay(rg.start)} – {fmtDay(rg.end)}</span>}
+                  </button>
+                );
+              };
+              return (
+                <div className="relative" ref={ramadanRef}>
+                  <button type="button" onClick={() => setRamadanOpen(o => !o)} aria-expanded={ramadanOpen} aria-haspopup="dialog"
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-bold flex items-center gap-1.5 border transition-all ${active
+                      ? 'bg-violet-500/20 text-violet-700 dark:text-violet-200 border-violet-500/40'
+                      : 'border-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-200'}`}>
+                    <span aria-hidden="true">🌙</span>
+                    {active ? ramadanLabel(ramadanChoice) : 'Ramadan'}
+                    <ChevronDown className={`w-3 h-3 transition-transform ${ramadanOpen ? 'rotate-180' : ''}`} />
+                  </button>
+                  {active && (
+                    <button type="button" aria-label="Clear Ramadan filter" onClick={() => handleDatePresetChange('all')}
+                      className="absolute -right-1.5 -top-1.5 w-4 h-4 rounded-full bg-violet-600 text-white flex items-center justify-center shadow">
+                      <X className="w-2.5 h-2.5" />
+                    </button>
+                  )}
+                  {ramadanOpen && ramadanPos && createPortal(
+                    <div role="dialog" aria-label="Ramadan periods" ref={ramadanPanelRef}
+                      className="fixed z-[90] w-[21rem] max-w-[calc(100vw-1rem)] rounded-xl border shadow-2xl p-3 flex flex-col gap-2.5"
+                      style={{ top: ramadanPos.top, right: ramadanPos.right, backgroundColor: 'var(--bg-canvas)', borderColor: 'var(--border-glass)' }}>
+                      <div className="flex gap-1 flex-wrap">
+                        {years.map(p => (
+                          <button key={p.year} type="button" onClick={() => setRamadanYear(p.year)}
+                            className={`px-2.5 py-1 rounded-full text-[11px] font-bold border ${p.year === year
+                              ? 'bg-violet-600 text-white border-violet-600' : 'border-slate-300/60 dark:border-slate-600'}`}
+                            style={p.year === year ? undefined : { color: 'var(--text-muted)' }}>
+                            {p.year}{p.estimated ? '*' : ''}
+                          </button>
+                        ))}
+                      </div>
+                      {period && (
+                        <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                          Ramadan {period.year}: <b style={{ color: 'var(--text-main)' }}>{fmtDay(period.start)} – {fmtDay(period.end)} {period.year}</b>
+                          {period.estimated && <span> · estimated dates</span>}
+                        </div>
+                      )}
+                      <div>
+                        <div className="text-[10px] uppercase font-bold mb-1" style={{ color: 'var(--text-sub)' }}>Ramadan plus the weeks after</div>
+                        <div className="grid grid-cols-2 gap-1">
+                          {option(0, 'incl', 'Ramadan only')}
+                          {option(2, 'incl', '+ 2 weeks')}
+                          {option(3, 'incl', '+ 3 weeks')}
+                          {option(4, 'incl', '+ 4 weeks')}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase font-bold mb-1" style={{ color: 'var(--text-sub)' }}>Only after Ramadan</div>
+                        <div className="grid grid-cols-3 gap-1">
+                          {option(2, 'after', '2 weeks')}
+                          {option(3, 'after', '3 weeks')}
+                          {option(4, 'after', '4 weeks')}
+                        </div>
+                      </div>
+                    </div>,
+                    document.body
+                  )}
+                </div>
+              );
+            })()}
 
             {/* View Mode Toggle */}
             <div className="flex items-center gap-1 ml-2 pl-2 border-l" style={{ borderColor: 'var(--border-glass)' }}>
@@ -1048,7 +1229,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               >
                 {/* Status Indicator Bar */}
                 <div className={`absolute top-0 left-0 right-0 h-1 ${
-                  f.status === 'ACTIVE' ? 'bg-cyan-500' : f.status === 'COMPLETED' ? 'bg-emerald-500' : 'bg-slate-500'
+                  f.status === 'ACTIVE' ? 'bg-cyan-500' : f.status === 'COMPLETED' ? 'bg-emerald-500' : f.status === 'RAMADAN' ? 'bg-violet-500' : 'bg-slate-500'
                 }`} />
 
                 {/* Card Top: Profile & Status */}
@@ -1075,9 +1256,16 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                         ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30' 
                         : f.status === 'COMPLETED'
                         ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/30'
+                        : f.status === 'RAMADAN'
+                        ? 'bg-violet-500/15 text-violet-600 dark:text-violet-300 border-violet-500/30'
                         : 'bg-slate-500/15 text-slate-600 dark:text-slate-400 border-slate-500/30'
                     }`}>
                       {f.status}
+                    </span>
+                    <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider shrink-0 border ${f.page_group === 'SP'
+                      ? 'bg-pink-500/15 text-pink-600 dark:text-pink-300 border-pink-500/30'
+                      : 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border-cyan-500/20'}`}>
+                      {f.page_group_label || mainGroupLabel}
                     </span>
                   </div>
 
@@ -1185,6 +1373,27 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                       )}
                     </div>
                   </div>
+
+                  {/* ── Tracked page links (live) ─────────────────────── */}
+                  {(f.tracked_pages || []).some(tp => tp.match_type !== 'campaign_name') && (
+                    <div className="mt-2">
+                      <div className="text-[10px] uppercase font-bold mb-1" style={{ color: 'var(--text-sub)' }}>
+                        Tracked pages ({f.tracked_pages.filter(tp => tp.match_type !== 'campaign_name').length})
+                      </div>
+                      <div className="flex flex-col gap-0.5 max-h-20 overflow-y-auto pr-1">
+                        {f.tracked_pages.filter(tp => tp.match_type !== 'campaign_name').map(tp => (
+                          <div key={tp.assignment_id} className="flex items-center justify-between gap-2 text-[10px]" title={tp.value}>
+                            <span className="truncate" style={{ color: 'var(--text-main)' }}>
+                              <span className="font-bold text-violet-600 dark:text-violet-300">{tp.match_label}</span> · {tp.value.replace(/^https?:\/\/(www\.)?/, '')}
+                            </span>
+                            <span className="shrink-0 font-bold" style={{ color: 'var(--text-muted)' }}>
+                              £{(isDateFiltered ? tp.raised_period : tp.raised_all_time).toLocaleString()} · {isDateFiltered ? tp.donations_period : tp.donations_all_time}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Card Bottom: Drilldown & Admin Actions */}
@@ -1526,6 +1735,11 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                       </>
                     )}
                     <span>• Goal: £{drilldownData?.fundraiser?.target_goal?.toLocaleString() || '0'}</span>
+                    {drilldownData?.fundraiser?.net_received_all_time !== undefined && (
+                      <span title="Totals here are what the platforms show (gross). This is what reached the charity after platform fees.">
+                        • Net received after fees: £{Number(drilldownData.fundraiser.net_received_all_time).toLocaleString()}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1722,6 +1936,36 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                       </button>
                     )}
                   </div>
+
+                  {/* Tracked pages & campaigns: what each assignment brought in (live) */}
+                  {(drilldownData?.tracked_pages || []).length > 0 && (
+                    <div className="glass-panel p-3">
+                      <h4 className="text-xs font-bold mb-2 flex items-center gap-1.5" style={{ color: 'var(--text-main)' }}>
+                        <Layers className="w-3.5 h-3.5 text-violet-500" /> Tracked pages &amp; campaigns ({drilldownData.tracked_pages.length})
+                      </h4>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-[11px]">
+                          <thead><tr style={{ color: 'var(--text-sub)' }} className="text-left">
+                            <th className="py-1 pr-2">Type</th><th className="py-1 pr-2">Page / campaign</th>
+                            <th className="py-1 pr-2 text-right">{drilldownData?.fundraiser?.is_custom_filtered ? 'Period' : 'Raised'}</th>
+                            <th className="py-1 pr-2 text-right">Gifts</th><th className="py-1 pr-2 text-right">Donors</th><th className="py-1 text-right">Latest gift</th>
+                          </tr></thead>
+                          <tbody>
+                            {drilldownData.tracked_pages.map(tp => (
+                              <tr key={tp.assignment_id} className="border-t" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}>
+                                <td className="py-1 pr-2 whitespace-nowrap font-bold text-violet-600 dark:text-violet-300">{tp.match_label}</td>
+                                <td className="py-1 pr-2 max-w-[260px] truncate" title={tp.value}>{tp.value}</td>
+                                <td className="py-1 pr-2 text-right font-bold">£{(drilldownData?.fundraiser?.is_custom_filtered ? tp.raised_period : tp.raised_all_time).toLocaleString()}</td>
+                                <td className="py-1 pr-2 text-right">{drilldownData?.fundraiser?.is_custom_filtered ? tp.donations_period : tp.donations_all_time}</td>
+                                <td className="py-1 pr-2 text-right">{tp.donors}</td>
+                                <td className="py-1 text-right">{tp.latest_donation_date || '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Monthly Timeline */}
                   {(drilldownData?.monthly_timeline || []).length > 0 && (

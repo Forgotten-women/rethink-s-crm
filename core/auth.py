@@ -96,8 +96,14 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+_user_db_initialized = False
+
+
 def init_user_db():
     """Ensure users table exists in SQLite database with default accounts and granular permissions."""
+    global _user_db_initialized
+    if _user_db_initialized:
+        return
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
         conn.execute("""
@@ -154,6 +160,7 @@ def init_user_db():
             conn.commit()
 
         conn.close()
+        _user_db_initialized = True
     except Exception as e:
         print(f"User DB init notice: {e}")
 

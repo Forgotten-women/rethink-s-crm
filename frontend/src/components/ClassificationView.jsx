@@ -25,7 +25,8 @@ import {
   Filter,
   Plus,
   Edit3,
-  Sparkles
+  Sparkles,
+  Table
 } from 'lucide-react';
 import { API_BASE_URL, downloadFile } from '../config';
 import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
@@ -56,7 +57,7 @@ function cleanText(val) {
   return s;
 }
 
-export default function ClassificationView({ user, activeCompany = 'rethink', companies = [] }) {
+export default function ClassificationView({ user, activeCompany = 'rethink', companies = [], onNavigateToExplorer }) {
   const isConsolidated = activeCompany === 'all';
   // Enforce company platform partitioning
   // Iqra: LaunchGood, GiveBrite, Madinah, Master
@@ -2019,9 +2020,25 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                       🎁 {r['Giving Level']}
                                     </span>
                                     {(Number(r.donation_count) > 0 || Number(r.total_amount) > 0) && (
-                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
-                                        {r.donation_count || 0} donors • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                                      </span>
+                                      <div className="flex items-center gap-1.5 flex-wrap">
+                                        <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                          {r.donation_count || 0} donations • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => onNavigateToExplorer?.({
+                                            campaign: r['Campaign Name'],
+                                            giving_level: r['Giving Level'],
+                                            code: r['Code'],
+                                            platform: platform
+                                          })}
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 border border-cyan-300/40 hover:bg-cyan-100 dark:hover:bg-cyan-900/50 transition-all cursor-pointer shadow-2xs"
+                                          title={`View ${r.donation_count || 0} donations in Data Explorer`}
+                                        >
+                                          <Table className="w-2.5 h-2.5" />
+                                          <span>View Data</span>
+                                        </button>
+                                      </div>
                                     )}
                                   </div>
                                 ) : (
@@ -2030,9 +2047,25 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                       Default (General)
                                     </span>
                                     {(Number(r.donation_count) > 0 || Number(r.total_amount) > 0) && (
-                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
-                                        {r.donation_count || 0} donors • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                                      </span>
+                                      <div className="flex items-center gap-1.5 flex-wrap">
+                                        <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                          {r.donation_count || 0} donations • £{Number(r.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => onNavigateToExplorer?.({
+                                            campaign: r['Campaign Name'],
+                                            giving_level: '__DEFAULT__',
+                                            code: r['Code'],
+                                            platform: platform
+                                          })}
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 border border-cyan-300/40 hover:bg-cyan-100 dark:hover:bg-cyan-900/50 transition-all cursor-pointer shadow-2xs"
+                                          title={`View ${r.donation_count || 0} donations in Data Explorer`}
+                                        >
+                                          <Table className="w-2.5 h-2.5" />
+                                          <span>View Data</span>
+                                        </button>
+                                      </div>
                                     )}
                                   </div>
                                 )}
@@ -2260,8 +2293,23 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                   <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180 text-cyan-500' : ''}`} />
                                 </button>
                                 {c.donation_count > 0 && (
-                                  <div className="text-[10px] font-semibold text-slate-500 dark:text-slate-400 mt-1">
-                                    Total: {c.donation_count} donors • £{Number(c.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                  <div className="flex flex-col gap-1 mt-1">
+                                    <div className="text-[10px] font-semibold text-slate-500 dark:text-slate-400">
+                                      Total: {c.donation_count} donations • £{Number(c.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => onNavigateToExplorer?.({
+                                        campaign: c.campaign_name,
+                                        giving_level: 'All Giving Levels',
+                                        platform: platform
+                                      })}
+                                      className="inline-flex items-center gap-1 self-start px-2 py-0.5 rounded-md text-[10px] font-bold bg-cyan-50 text-cyan-700 dark:bg-cyan-950/50 dark:text-cyan-300 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 border border-cyan-300/40 transition-all cursor-pointer shadow-2xs"
+                                      title={`View all ${c.donation_count} donations for ${c.campaign_name} in Data Explorer`}
+                                    >
+                                      <Table className="w-2.5 h-2.5" />
+                                      <span>View All {c.donation_count} Donations</span>
+                                    </button>
                                   </div>
                                 )}
                               </td>
@@ -2370,9 +2418,25 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                           🎁 {rule['Giving Level']}
                                         </span>
                                         {(Number(rule.donation_count) > 0 || Number(rule.total_amount) > 0) && (
-                                          <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
-                                            {rule.donation_count || 0} donors • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                                          </span>
+                                          <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                            <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                              {rule.donation_count || 0} donations • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                            </span>
+                                            <button
+                                              type="button"
+                                              onClick={() => onNavigateToExplorer?.({
+                                                campaign: c.campaign_name,
+                                                giving_level: rule['Giving Level'],
+                                                code: rule['Code'],
+                                                platform: platform
+                                              })}
+                                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-800/60 border border-indigo-300/30 transition-all cursor-pointer shadow-2xs"
+                                              title={`View ${rule.donation_count || 0} donations for ${rule['Giving Level']} in Data Explorer`}
+                                            >
+                                              <Table className="w-2.5 h-2.5" />
+                                              <span>View Data</span>
+                                            </button>
+                                          </div>
                                         )}
                                       </div>
                                     ) : (
@@ -2381,9 +2445,25 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                           Default (General)
                                         </span>
                                         {(Number(rule.donation_count) > 0 || Number(rule.total_amount) > 0) && (
-                                          <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
-                                            {rule.donation_count || 0} donors • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                                          </span>
+                                          <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                            <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">
+                                              {rule.donation_count || 0} donations • £{Number(rule.total_amount || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                                            </span>
+                                            <button
+                                              type="button"
+                                              onClick={() => onNavigateToExplorer?.({
+                                                campaign: c.campaign_name,
+                                                giving_level: '__DEFAULT__',
+                                                code: rule['Code'],
+                                                platform: platform
+                                              })}
+                                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-800/60 border border-indigo-300/30 transition-all cursor-pointer shadow-2xs"
+                                              title={`View ${rule.donation_count || 0} default donations for ${c.campaign_name} in Data Explorer`}
+                                            >
+                                              <Table className="w-2.5 h-2.5" />
+                                              <span>View Data</span>
+                                            </button>
+                                          </div>
                                         )}
                                       </div>
                                     )}

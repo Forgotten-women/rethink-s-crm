@@ -286,15 +286,17 @@ async def _cache_warmup_loop():
     lock = try_exclusive("cache_warmup")
     if lock is None:
         return  # another worker is the warmer
-    from backend.api import classifications, metrics, overview, tracker
+    from backend.api import classifications, fundraisers, metrics, overview, tracker
     settle_seconds = 90
     jobs = {
         "rethink": [(classifications.get_launchgood_matrix, {}), (classifications.get_givebright_matrix, {}),
                     (metrics.get_metrics_summary, {}), (overview.get_overview_top_campaigns, {})]
-                   + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")],
+                   + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")]
+                   + [(fundraisers.get_fundraisers_list, {})],
         "iqra": [(classifications.get_madinah_matrix, {}), (classifications.get_givebright_matrix, {}),
                  (metrics.get_metrics_summary, {}), (overview.get_overview_top_campaigns, {})]
-                + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")],
+                + [(tracker.get_qualifying_donors, {"sponsorship_type": t}) for t in ("Orphan", "Widow", "Hafiz", "Ex-Prisoner")]
+                + [(fundraisers.get_fundraisers_list, {})],
     }
     warmed_token, seen_token, seen_at = {}, {}, {}
     while True:

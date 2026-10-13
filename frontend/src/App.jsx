@@ -40,6 +40,7 @@ const INITIAL_FILTERS = {
   donor_country: 'All Donor Countries',
   campaign: 'All Campaigns',
   campaign_search: '',
+  giving_level: 'All Giving Levels',
   gift_aid: 'All Gift Aid Status',
   start_date: '',
   end_date: ''
@@ -263,6 +264,29 @@ export default function App() {
     setFilters(INITIAL_FILTERS);
   };
 
+  const handleNavigateToExplorer = ({ campaign, giving_level, platform, code } = {}) => {
+    let sourceFilter = 'All Sources (Combined)';
+    if (platform) {
+      const pLower = String(platform).toLowerCase();
+      if (pLower === 'launchgood') sourceFilter = 'LaunchGood';
+      else if (pLower === 'givebright' || pLower === 'givebrite') sourceFilter = 'GiveBright';
+      else if (pLower === 'paysuite') sourceFilter = 'Paysuite';
+      else if (pLower === 'website') sourceFilter = 'Rethink Website';
+      else if (pLower === 'madinah') sourceFilter = 'Madinah';
+    }
+
+    setFilters({
+      ...INITIAL_FILTERS,
+      campaign: campaign || 'All Campaigns',
+      giving_level: (giving_level !== undefined && giving_level !== null && giving_level !== '') 
+        ? giving_level 
+        : (giving_level === '' ? '__DEFAULT__' : 'All Giving Levels'),
+      source: sourceFilter,
+      code: (code && code !== 'Unassigned') ? code : 'All Codes',
+    });
+    setActiveTab('explorer');
+  };
+
   // ---- Hidden ops console (super admins): Konami code ↑ ↑ ↓ ↓ ← → ← → B A ----
   const [opsOpen, setOpsOpen] = useState(false); // false | 'status' | 'logs' | 'sessions' | 'cache'
   const [opsHealth, setOpsHealth] = useState(null);
@@ -462,6 +486,8 @@ export default function App() {
                   key={`${activeCompany}-${dataVersion}`} 
                   user={user} 
                   filters={filters} 
+                  onFilterChange={handleFilterChange}
+                  onResetFilters={handleResetFilters}
                   onSelectDonor={setSelectedDonor} 
                   onDataChange={handleDataChange} 
                   activeCompany={activeCompany}
@@ -501,6 +527,7 @@ export default function App() {
                   user={user} 
                   onDataChange={handleDataChange} 
                   activeCompany={activeCompany}
+                  onNavigateToExplorer={handleNavigateToExplorer}
                 />
               )}
               {activeTab === 'expenses' && (
