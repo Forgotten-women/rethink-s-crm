@@ -646,6 +646,39 @@ def init_classification_db():
                 WHERE m.platform IN ('website', 'rethink_website');
             """)
 
+            cur.execute("DROP VIEW IF EXISTS stripe_link_classifications")
+            cur.execute("""
+                CREATE VIEW stripe_link_classifications AS
+                SELECT 
+                    COALESCE(m.company_id, 'rethink') AS company_id,
+                    m.campaign_name,
+                    COALESCE(m.giving_level, '') AS giving_level,
+                    m.code,
+                    COALESCE(m.special_case, '') AS special_case,
+                    COALESCE(c.special_treatment, '') AS special_treatment,
+                    COALESCE(m.community_name, 'N/A') AS community_name,
+                    COALESCE(m.campaign_url, '') AS campaign_url,
+                    COALESCE(c.department, 'Unassigned') AS department,
+                    COALESCE(c.office, 'Unassigned') AS office,
+                    COALESCE(c.portfolio, '') AS portfolio,
+                    COALESCE(c.programme_fund, '') AS programme_fund,
+                    COALESCE(c.fund_code, '') AS fund_code,
+                    COALESCE(c.legacy_non_zakat_code, '') AS legacy_non_zakat_code,
+                    COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
+                    COALESCE(c.department, 'Unassigned') AS heading,
+                    COALESCE(c.office, 'Unassigned') AS sub_heading,
+                    COALESCE(c.country, 'Unassigned') AS country,
+                    COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
+                    COALESCE(m.is_primary, 1) AS is_primary,
+                    COALESCE(m.donor_name, '') AS donor_name,
+                    COALESCE(m.donor_email, '') AS donor_email
+                FROM platform_campaign_mappings m
+                LEFT JOIN master_project_codes c 
+                    ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
+                   AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
+                WHERE m.platform IN ('stripe', 'payment_links');
+            """)
+
             cur.execute("DROP VIEW IF EXISTS madinah_classifications")
             cur.execute("""
                 CREATE VIEW madinah_classifications AS
@@ -1897,6 +1930,49 @@ def get_rethink_website_classification_matrix(df_raw=None, company_id: Optional[
 def save_rethink_website_classification_matrix(matrix_df, company_id: str = "rethink"):
     """Saves updated Rethink Website classification matrix into two-tier architecture."""
     return save_platform_matrix_rules("website", matrix_df, company_id=company_id)
+
+
+def get_stripe_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
+    """Returns the stripe_link_classifications matrix DataFrame with (Campaign Name, Giving Level, Code) granularity for a company."""
+    init_classification_db()
+    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
+    comp = str(company_id or "rethink").lower().strip()
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    try:
+        where_clause = " WHERE LOWER(COALESCE(company_id, 'rethink')) = ?" if comp != "all" else ""
+        params = [comp] if comp != "all" else []
+        db_matrix = pd.read_sql_query(f"""
+            SELECT 
+                campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
+                COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(community_name, 'N/A') as "Community Name",
+                COALESCE(campaign_url, '') as "Campaign URL",
+                COALESCE(heading, 'Unassigned') as "Heading",
+                COALESCE(sub_heading, 'Unassigned') as "Sub-Heading",
+                COALESCE(country, 'Unassigned') as "Country",
+                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
+                COALESCE(special_case, '') as "Special Case",
+                COALESCE(is_primary, 1) as "is_primary",
+                company_id
+            FROM stripe_link_classifications
+            {where_clause}
+        """, conn, params=params)
+    except Exception:
+        db_matrix = pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Community Name", "Campaign URL"] + [c for c in target_cols if c != "Code"] + ["Special Case", "is_primary"])
+    finally:
+        conn.close()
+
+    if not db_matrix.empty:
+        return db_matrix.fillna("Unassigned").reset_index(drop=True)
+
+    return pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Community Name", "Campaign URL"] + [c for c in target_cols if c != "Code"] + ["Special Case", "is_primary"])
+
+
+def save_stripe_classification_matrix(matrix_df, company_id: str = "rethink"):
+    """Saves updated Stripe classification matrix into two-tier architecture."""
+    return save_platform_matrix_rules("stripe", matrix_df, company_id=company_id)
 
 
 def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):

@@ -38,9 +38,11 @@ import {
   CheckCheck,
   Calendar,
   ShieldCheck,
-  Filter
+  Filter,
+  Sparkles
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import StripePayoutsPanel from './payouts/StripePayoutsPanel';
 
 const ALL_SHEET10_SPECIAL_CASES = [
   'Zarang bike',
@@ -163,9 +165,10 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   const canEdit = user?.role === 'super_admin' || user?.role === 'admin' || user?.can_edit_donors === 1;
   const currSymbol = '£';
   const isPaysuite = selectedPlatform === 'paysuite';
+  const isStripe = selectedPlatform === 'stripe';
 
   // Dynamic Platform Counts per Tenant
-  const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0 });
+  const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0, stripe: 0 });
 
   // State Refs to ensure zero stale-closure drift on async/event updates
   const selectedPlatformRef = useRef(selectedPlatform);
@@ -187,13 +190,18 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
 
   const fetchPlatformCounts = () => {
     const companyParam = `&company_id=${encodeURIComponent(activeCompanyRef.current)}`;
+    const token = localStorage.getItem('analytics_token');
+    const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+
     Promise.all([
-      fetch(`${API_BASE_URL}/api/payouts/summary?platform=launchgood&currency=${currency}${companyParam}`).then(r => r.ok ? r.json() : {}),
-      fetch(`${API_BASE_URL}/api/payouts/summary?platform=paysuite&currency=${currency}${companyParam}`).then(r => r.ok ? r.json() : {})
-    ]).then(([lgRes, psRes]) => {
+      fetch(`${API_BASE_URL}/api/payouts/summary?platform=launchgood&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/summary?platform=paysuite&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/stripe/list?limit=100`, { headers }).then(r => r.ok ? r.json() : {})
+    ]).then(([lgRes, psRes, stripeRes]) => {
       setPlatformCounts({
         launchgood: lgRes?.total_transactions || 0,
-        paysuite: psRes?.total_transactions || 0
+        paysuite: psRes?.total_transactions || 0,
+        stripe: stripeRes?.payouts?.length || 0
       });
     }).catch(err => console.error('Error fetching platform counts:', err));
   };
@@ -651,8 +659,14 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       {/* Header & Control Bar */}
       <div className="flex flex-wrap items-center justify-between gap-4 pb-2 border-b border-slate-200 dark:border-white/10">
         <div className="flex items-center gap-3">
-          <div className={`p-3 bg-gradient-to-tr ${isPaysuite ? 'from-amber-600 to-orange-500 shadow-amber-500/20' : 'from-emerald-600 to-teal-500 shadow-teal-500/20'} rounded-2xl shadow-lg text-white transition-all`}>
-            {isPaysuite ? <CreditCard className="w-6 h-6" /> : <Layers className="w-6 h-6" />}
+          <div className={`p-3 bg-gradient-to-tr ${
+            isStripe 
+              ? 'from-cyan-600 to-blue-500 shadow-cyan-500/20'
+              : isPaysuite 
+              ? 'from-amber-600 to-orange-500 shadow-amber-500/20' 
+              : 'from-emerald-600 to-teal-500 shadow-teal-500/20'
+          } rounded-2xl shadow-lg text-white transition-all`}>
+            {isStripe ? <CreditCard className="w-6 h-6" /> : isPaysuite ? <CreditCard className="w-6 h-6" /> : <Layers className="w-6 h-6" />}
           </div>
           <div>
             <div className="flex items-center gap-2.5">
@@ -660,15 +674,19 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                 Payout Reconciliation Center
               </h1>
               <span className={`text-xs px-2.5 py-0.5 rounded-full font-bold uppercase ${
-                isPaysuite 
+                isStripe
+                  ? 'bg-cyan-100 text-cyan-800 dark:bg-cyan-500/20 dark:text-cyan-400'
+                  : isPaysuite 
                   ? 'bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-400' 
                   : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-500/20 dark:text-emerald-400'
               }`}>
-                {isPaysuite ? 'Paysuite Direct Debit' : 'LaunchGood Payouts'}
+                {isStripe ? 'Stripe Payouts (Rethink)' : isPaysuite ? 'Paysuite Direct Debit' : 'LaunchGood Payouts'}
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-medium">
-              {isPaysuite 
+              {isStripe
+                ? 'Stripe bank payouts, automated read-only reconciliation, CRM code re-sync, approval workflow, and #rt-payouts distribution'
+                : isPaysuite 
                 ? 'Monthly direct debit settlement cycles, collection status audits, failure tracking, and reference classification mapping'
                 : 'Gross settlement tracking, processing fee audits, reserve withholdings, and bank payout batch reconciliation'}
             </p>
@@ -676,7 +694,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Platform Selector Switcher */}
+          {/* Platform Selector Switcher (4 Options: LaunchGood, Paysuite, GiveBrite, Stripe) */}
           <div className="flex items-center p-1 bg-slate-100 dark:bg-slate-800/90 rounded-2xl border border-slate-200 dark:border-white/10 shadow-inner">
             <button
               onClick={() => {
@@ -687,7 +705,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                 setDonorPage(1);
               }}
               className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                !isPaysuite
+                selectedPlatform === 'launchgood'
                   ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20'
                   : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
@@ -695,7 +713,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               <Zap className="w-3.5 h-3.5" />
               <span>LaunchGood</span>
               <span className={`text-[10px] px-1.5 py-0.2 rounded-md font-mono font-black ${
-                !isPaysuite ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
+                selectedPlatform === 'launchgood' ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
               }`}>
                 {platformCounts.launchgood.toLocaleString()}
               </span>
@@ -724,45 +742,82 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                 {platformCounts.paysuite.toLocaleString()}
               </span>
             </button>
+
+            <button
+              onClick={() => {
+                setSelectedPlatform('stripe');
+                setSelectedBatch('ALL');
+                setStatusFilter('ALL');
+                setCurrentPage(1);
+                setDonorPage(1);
+              }}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                isStripe
+                  ? 'bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow-md shadow-cyan-500/20'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <CreditCard className="w-3.5 h-3.5" />
+              <span>Stripe</span>
+              <span className={`text-[10px] px-1.5 py-0.2 rounded-md font-mono font-black ${
+                isStripe ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
+              }`}>
+                {platformCounts.stripe.toLocaleString()}
+              </span>
+            </button>
           </div>
 
-          {/* Export Multi-Sheet Excel Button */}
-          <button
-            onClick={handleExportExcel}
-            disabled={exporting || loading}
-            className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
-            title={`Download multi-sheet Excel report (.xlsx) for ${isPaysuite ? 'Paysuite' : 'LaunchGood'}`}
-          >
-            {exporting ? (
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <FileSpreadsheet className="w-3.5 h-3.5" />
-            )}
-            <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
-          </button>
+          {!isStripe && (
+            <>
+              {/* Export Multi-Sheet Excel Button */}
+              <button
+                onClick={handleExportExcel}
+                disabled={exporting || loading}
+                className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
+                title={`Download multi-sheet Excel report (.xlsx) for ${isPaysuite ? 'Paysuite' : 'LaunchGood'}`}
+              >
+                {exporting ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                )}
+                <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
+              </button>
 
-          {/* Super Admin Purge Payout Button (Only for LaunchGood) */}
-          {isSuperAdmin && !isPaysuite && (
-            <button
-              onClick={() => setShowPurgeModal(true)}
-              className="px-3.5 py-2 text-xs font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/60 rounded-xl border border-rose-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
-              title="Delete all LaunchGood payout settlement data from the system"
-            >
-              <Trash2 className="w-3.5 h-3.5 text-rose-500" />
-              <span>Purge</span>
-            </button>
+              {/* Super Admin Purge Payout Button (Only for LaunchGood) */}
+              {isSuperAdmin && !isPaysuite && (
+                <button
+                  onClick={() => setShowPurgeModal(true)}
+                  className="px-3.5 py-2 text-xs font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/60 rounded-xl border border-rose-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
+                  title="Delete all LaunchGood payout settlement data from the system"
+                >
+                  <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                  <span>Purge</span>
+                </button>
+              )}
+
+              <button 
+                onClick={() => fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter)}
+                disabled={loading}
+                className="px-3.5 py-2 text-xs font-bold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-700/80 rounded-xl border border-slate-300 dark:border-white/10 transition-all flex items-center gap-2 cursor-pointer shadow-sm disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-emerald-500' : ''}`} />
+                <span>Refresh</span>
+              </button>
+            </>
           )}
-
-          <button 
-            onClick={() => fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter)}
-            disabled={loading}
-            className="px-3.5 py-2 text-xs font-bold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-700/80 rounded-xl border border-slate-300 dark:border-white/10 transition-all flex items-center gap-2 cursor-pointer shadow-sm disabled:opacity-50"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-emerald-500' : ''}`} />
-            <span>Refresh</span>
-          </button>
         </div>
       </div>
+
+      {/* RENDER STRIPE PAYOUTS SUITE WHEN STRIPE IS SELECTED */}
+      {isStripe ? (
+        <StripePayoutsPanel
+          user={user}
+          isSuperAdmin={isSuperAdmin}
+          activeCompany={activeCompany}
+        />
+      ) : (
+        <>
 
       {/* Notice for tenants with no payout settlement files uploaded */}
       {activeCompany === 'iqra' && summary.total_transactions === 0 && !loading && (
@@ -2901,6 +2956,8 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
 
     </div>

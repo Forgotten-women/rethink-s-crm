@@ -22,6 +22,8 @@ from core.data_processor import (
     get_givebright_classification_matrix,
     save_givebright_classification_matrix,
     get_madinah_classification_matrix,
+    get_stripe_classification_matrix,
+    save_stripe_classification_matrix,
     normalize_classification_import_df,
     get_code_to_classification_map,
     sync_matrix_classifications_to_donors,
@@ -801,9 +803,134 @@ def get_madinah_matrix(company_id: Optional[str] = Query("iqra")):
     return _compute_matrix_summary(df, comp, "Madinah")
 
 
+@router.get("/stripe")
+@cached(scopes=["donations", "classification"], ttl=86400)
+def get_stripe_matrix(company_id: Optional[str] = Query("rethink")):
+    """Returns Stripe Payment Links classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
+    comp = (company_id or "rethink").strip().lower()
+    try:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+        query = """
+            SELECT 
+                campaign_name as "Campaign Name",
+                COALESCE(giving_level, '') as "Giving Level",
+                COALESCE(code, 'Unassigned') as "Code",
+                COALESCE(community_name, 'N/A') as "Community Name",
+                COALESCE(campaign_url, '') as "Campaign URL",
+                COALESCE(department, heading, 'Unassigned') as "Department",
+                COALESCE(office, sub_heading, 'Unassigned') as "Office",
+                COALESCE(portfolio, '') as "Portfolio",
+                COALESCE(heading, department, 'Unassigned') as "Heading",
+                COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
+                COALESCE(country, 'Unassigned') as "Country",
+                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
+                COALESCE(special_case, '') as "Special Case",
+                COALESCE(is_primary, 1) as "is_primary",
+                company_id
+            FROM stripe_link_classifications
+        """
+        if comp != "all":
+            query += " WHERE company_id = ?"
+            df = pd.read_sql_query(query, conn, params=(comp,))
+        else:
+            df = pd.read_sql_query(query, conn)
+        conn.close()
+    except Exception as e:
+        print(f"[Stripe Matrix Query Notice]: {e}")
+        df = get_stripe_classification_matrix(company_id=comp)
+
+    return _compute_matrix_summary(_clean_matrix_df(df), comp, "Stripe Links")
+
+
+@router.post("/stripe/sync")
+def sync_stripe_payment_links(payload: dict):
+    """
+    Syncs payment links from Stripe API (strictly READ-ONLY) into platform_campaign_mappings.
+    Discovers newly created payment links and updates active status.
+    """
+    user_role = payload.get("user_role", "")
+    comp = (payload.get("company_id") or "rethink").strip().lower()
+    if user_role not in ["super_admin", "admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Syncing Stripe payment links is restricted to administrators."
+        )
+    
+    import stripe
+    stripe_key = os.getenv("STRIPE_SECRET_KEY") or os.getenv("STRIPE_API_KEY")
+    if not stripe_key:
+        raise HTTPException(status_code=400, detail="Stripe API key is not configured in environment.")
+
+    stripe.api_key = stripe_key
+    try:
+        links_data = stripe.PaymentLink.list(limit=100)
+        items = links_data.get("data", []) if hasattr(links_data, "get") else getattr(links_data, "data", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch payment links from Stripe API: {e}")
+
+    conn = get_db_connection(timeout=30.0)
+    synced_count = 0
+    new_count = 0
+    try:
+        with conn:
+            cur = conn.cursor()
+            for item in items:
+                item_dict = item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                pl_id = item_dict.get("id")
+                if not pl_id:
+                    continue
+                url = item_dict.get("url") or ""
+                active = 1 if item_dict.get("active") else 0
+                curr = str(item_dict.get("currency") or "gbp").upper()
+                giving_level = f"{curr} ({pl_id})"
+
+                cur.execute("""
+                    SELECT id, code, campaign_name FROM platform_campaign_mappings
+                    WHERE platform = 'stripe' AND (community_name = ? OR giving_level = ?)
+                    LIMIT 1
+                """, (pl_id, giving_level))
+                existing = cur.fetchone()
+
+                if existing:
+                    cur.execute("""
+                        UPDATE platform_campaign_mappings
+                        SET is_primary = ?, campaign_url = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (active, url, existing[0]))
+                    synced_count += 1
+                else:
+                    name = ""
+                    try:
+                        full_pl = stripe.PaymentLink.retrieve(pl_id, expand=["line_items.data.price.product"])
+                        li = (full_pl.line_items.data or [None])[0] if hasattr(full_pl, "line_items") else None
+                        if li and hasattr(li, "price") and hasattr(li.price, "product"):
+                            name = getattr(li.price.product, "name", "")
+                    except Exception:
+                        pass
+                    if not name:
+                        name = f"Stripe Link {pl_id}"
+
+                    cur.execute("""
+                        INSERT INTO platform_campaign_mappings (
+                            platform, company_id, campaign_name, giving_level, code,
+                            community_name, campaign_url, is_primary, donor_name, donor_email, special_case
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', '')
+                    """, ("stripe", comp, name, giving_level, "ALL-GEN-GEN-GEN", pl_id, url, active))
+                    new_count += 1
+                    synced_count += 1
+    finally:
+        conn.close()
+
+    invalidate_payouts_cache()
+    return {
+        "status": "success",
+        "message": f"Successfully synced {synced_count} Stripe payment links ({new_count} new links discovered)."
+    }
+
+
 @router.get("/export")
 def export_classifications(
-    platform: str = Query("launchgood", pattern="^(launchgood|givebright|givebrite|madinah|paysuite|website|rethink_website|master)$"),
+    platform: str = Query("launchgood", pattern="^(launchgood|givebright|givebrite|madinah|paysuite|website|rethink_website|stripe|master)$"),
     format: str = Query("csv", pattern="^(csv|xlsx)$"),
     company_id: Optional[str] = Query("rethink")
 ):
@@ -850,6 +977,8 @@ def export_classifications(
             res = get_paysuite_matrix(company_id=comp)
         elif p_clean in ["website", "rethink_website", "rethink website"]:
             res = get_rethink_website_matrix(company_id=comp)
+        elif p_clean == "stripe":
+            res = get_stripe_matrix(company_id=comp)
         else:
             res = get_launchgood_matrix(company_id=comp)
 
@@ -1057,8 +1186,7 @@ def delete_single_rule(payload: DeleteRuleRequest):
     cname = sanitize_text(payload.campaign_name.strip())
     gl_name = sanitize_text((payload.giving_level or "").strip())
     code = sanitize_text(payload.code.strip()) if payload.code else None
-    platform = payload.platform.lower()
-    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
+    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=60.0)
@@ -1152,8 +1280,7 @@ def clear_platform_rules(payload: ClearPlatformRequest):
             detail="Wiping classification rules is restricted to Super Admin accounts."
         )
 
-    platform = payload.platform.lower()
-    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else "launchgood")))
+    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=30.0)

@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, stream, tracker, webhooks
+from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, stripe_payouts, stream, tracker, webhooks
 
 app = FastAPI(
     title="Crowdfunding Analytics & Enterprise CRM API",
@@ -101,6 +101,7 @@ app.include_router(events.router)
 app.include_router(stream.router)  # authenticates its own ?token= (EventSource can't send headers)
 app.include_router(tracker.router)
 app.include_router(payouts.router, dependencies=_GUARDED)
+app.include_router(stripe_payouts.router, dependencies=_GUARDED)
 app.include_router(fundraisers.router, dependencies=_GUARDED)
 app.include_router(webhooks.router)
 

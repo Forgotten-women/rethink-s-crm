@@ -12,7 +12,14 @@ scratch/
 node_modules/
 *.csv
 *.xlsx
-
+*_givebrite_token.json
+*_madinah_token.json
+*_jwt_secret.json
+*_madinah_api_reference.md
+*_givebrite_api_reference.md
+*_givebrite_rethink_token.json
+*_madinah_rethink_token.json
+*_cache_token.json
 # Raw Parquet Caches (Must stay local/ignored to prevent PII exposure)
 *.parquet
 *.parquet.tmp

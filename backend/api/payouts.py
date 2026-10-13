@@ -886,11 +886,11 @@ def get_payouts_summary(
         
         net_payout = float(abs(payouts_df["net_amt"].sum())) if not payouts_df.empty else float(donations_df["net_amt"].sum() - total_fees)
         
-        disbursement_summary = _generate_disbursement_summary(df, curr_selected, platform="launchgood")
-        ledger_breakdown = _generate_ledger_breakdown(df, platform="launchgood")
+        disbursement_summary = _generate_disbursement_summary(df, curr_selected, platform=plat)
+        ledger_breakdown = _generate_ledger_breakdown(df, platform=plat)
 
         return {
-            "platform": "launchgood",
+            "platform": plat,
             "currency": curr_selected,
             "batch": target_batch,
             "total_gross": round(total_gross, 2),
