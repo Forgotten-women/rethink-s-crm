@@ -2149,8 +2149,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                           type="button"
                                           onClick={() => onNavigateToExplorer?.({
                                             campaign: r['Campaign Name'],
-                                            giving_level: '__DEFAULT__',
-                                            code: r['Code'],
+                                            giving_level: platform === 'website' ? 'All Giving Levels' : '__DEFAULT__',
+                                            code: platform === 'website' ? undefined : r['Code'],
                                             platform: platform
                                           })}
                                           className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 border border-cyan-300/40 hover:bg-cyan-100 dark:hover:bg-cyan-900/50 transition-all cursor-pointer shadow-2xs"
@@ -2547,8 +2547,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                               type="button"
                                               onClick={() => onNavigateToExplorer?.({
                                                 campaign: c.campaign_name,
-                                                giving_level: '__DEFAULT__',
-                                                code: rule['Code'],
+                                                giving_level: platform === 'website' ? 'All Giving Levels' : '__DEFAULT__',
+                                                code: platform === 'website' ? undefined : rule['Code'],
                                                 platform: platform
                                               })}
                                               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-800/60 border border-indigo-300/30 transition-all cursor-pointer shadow-2xs"

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH
 from core.database import get_db_connection, _DB_LOCK
 from core.data_processor import (
+    clean_campaign_url,
     get_classification_matrix,
     load_data,
     save_classification_matrix,
@@ -694,6 +695,10 @@ def _clean_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df_clean["Special Case"] = ""
         df_clean["special_case"] = ""
+    # A missing link is shown (and saved back) as blank, never as "Unassigned"
+    for url_col in ("Campaign URL", "campaign_url"):
+        if url_col in df_clean.columns:
+            df_clean[url_col] = df_clean[url_col].map(clean_campaign_url)
     return df_clean
 
 
@@ -791,7 +796,47 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
         print(f"[Website Matrix Query Notice]: {e}")
         df = get_rethink_website_classification_matrix(company_id=comp)
 
-    return _compute_matrix_summary(_clean_matrix_df(df), comp, "Rethink Website")
+    return _compute_matrix_summary(_attach_website_donation_stats(_clean_matrix_df(df), comp), comp, "Rethink Website")
+
+
+def _attach_website_donation_stats(df: pd.DataFrame, comp: str) -> pd.DataFrame:
+    """Donation count / amount per website campaign (rules here are per campaign, not per giving level), so the
+    matrix shows them and "View Data" opens the same donations. Put on one row per campaign (the primary one),
+    as the screen adds up a campaign's rows."""
+    if df is None or df.empty or "Campaign Name" not in df.columns:
+        return df
+    df = df.copy()
+    df["donation_count"] = 0
+    df["total_amount"] = 0.0
+    try:
+        from core.analytics_engine import get_duckdb_connection
+        con = get_duckdb_connection()
+        if not con or not os.path.exists(PARQUET_PATH):
+            return df
+        company_filter = "AND LOWER(COALESCE(\"company_id\", 'rethink')) = ?" if comp != "all" else ""
+        stats = con.execute(f"""
+            SELECT LOWER(TRIM("Campaign Name")) AS k,
+                   COUNT(*) AS donation_count,
+                   SUM(TRY_CAST(REPLACE(REPLACE(COALESCE(CAST("Total Online Donation Gross Amount in Settled Currency" AS VARCHAR),
+                       CAST("Donation Amount (in Donation Currency)" AS VARCHAR), '0'), '£', ''), ',', '') AS DOUBLE)) AS total_amount
+            FROM '{PARQUET_PATH.replace(chr(92), '/')}'
+            WHERE LOWER(COALESCE("Platform", '')) IN ('rethink website', 'website')
+              AND "Campaign Name" IS NOT NULL {company_filter}
+            GROUP BY 1
+        """, [comp] if comp != "all" else []).df()
+    except Exception as e:
+        print(f"[Website Matrix Stats Notice]: {e}")
+        return df
+    by_key = {r.k: (int(r.donation_count), round(float(r.total_amount or 0.0), 2)) for r in stats.itertuples()}
+    keys = df["Campaign Name"].astype(str).str.strip().str.lower()
+    primary = pd.to_numeric(df.get("is_primary", 0), errors="coerce").fillna(0)
+    order = df.assign(_k=keys, _p=primary).sort_values("_p", ascending=False)
+    first_rows = order.drop_duplicates("_k").index
+    for idx in first_rows:
+        hit = by_key.get(keys[idx])
+        if hit:
+            df.at[idx, "donation_count"], df.at[idx, "total_amount"] = hit
+    return df
 
 
 @router.get("/madinah")

@@ -152,6 +152,43 @@ const getStoredPreset = () => {
   }
 };
 
+// Amount columns and which field holds their currency. Every other numeric column (Transfer ID, Number of
+// Donors, ...) is not money. Amounts are shown in the row's own currency: Madinah settles in USD, so a "£" in
+// front of its settled amounts was wrong.
+const SETTLED_MONEY_COLUMNS = new Set([
+  'Total Online Donations Net Amount in Settled Currency',
+  'Total Online Donation Gross Amount in Settled Currency',
+  'Total Processing Fees Paid by CC In Settled Currency',
+  'Total LTV',
+  'fee_amount',
+]);
+const DONATION_CCY_MONEY_COLUMNS = new Set([
+  'Donation Amount (in Donation Currency)',
+  'Zakat Amount (in Donation Currency)',
+]);
+const CURRENCY_SYMBOLS = { GBP: '£', USD: '$', EUR: '€', CAD: 'CA$', AUD: 'A$' };
+
+function moneyColumnCurrency(col, row) {
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = String(row?.[k] ?? '').trim().toUpperCase();
+      if (/^[A-Z]{3}$/.test(v)) return v;
+    }
+    return 'GBP';
+  };
+  if (SETTLED_MONEY_COLUMNS.has(col)) return pick('Settlement Currency', 'Currency');
+  if (DONATION_CCY_MONEY_COLUMNS.has(col)) return pick('Donation Currency (DC)', 'Currency', 'Settlement Currency');
+  if (col === 'Donation Amount in Project Currency (May be approx.)') return pick('Project Currency', 'Settlement Currency');
+  return null;
+}
+
+function formatMoney(val, ccy) {
+  const n = typeof val === 'number' ? val : parseFloat(String(val ?? '').replace(/[£$€,]/g, ''));
+  const amount = Number.isFinite(n) ? n.toFixed(2) : '0.00';
+  const symbol = CURRENCY_SYMBOLS[ccy];
+  return symbol ? `${symbol}${amount}` : `${amount} ${ccy}`;
+}
+
 export default function ExplorerView({ user, filters, onFilterChange, onResetFilters, onSelectDonor, onDataChange, activeCompany = 'rethink', companies = [] }) {
   const [data, setData] = useState({ total_records: 0, page: 1, page_size: 100, total_pages: 1, available_columns: [], records: [] });
   const [loading, setLoading] = useState(true);
@@ -1690,13 +1727,22 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
                             </td>
                           );
                         }
-                        if (c === 'Total Online Donations Net Amount in Settled Currency' || typeof val === 'number') {
+                        const moneyCurrency = moneyColumnCurrency(c, row);
+                        if (moneyCurrency) {
                           return (
                             <td 
                               key={c} 
                               className="font-mono text-cyan-400 font-extrabold whitespace-nowrap"
                             >
-                              £{typeof val === 'number' ? val.toFixed(2) : parseFloat(val || 0).toFixed(2)}
+                              {formatMoney(val, moneyCurrency)}
+                            </td>
+                          );
+                        }
+                        if (typeof val === 'number') {
+                          // IDs (Transfer ID 26571.0) and counts are numbers too, but not money
+                          return (
+                            <td key={c} className="font-mono whitespace-nowrap">
+                              {Number.isInteger(val) ? String(val) : String(val).replace(/\.0+$/, '')}
                             </td>
                           );
                         }

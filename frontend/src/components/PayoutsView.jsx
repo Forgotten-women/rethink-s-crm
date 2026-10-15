@@ -170,6 +170,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   // Dynamic Platform Counts per Tenant
   const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0, stripe: 0 });
   const [stripeRefreshKey, setStripeRefreshKey] = useState(0);
+  const [isSyncingPaysuite, setIsSyncingPaysuite] = useState(false);
 
   // State Refs to ensure zero stale-closure drift on async/event updates
   const selectedPlatformRef = useRef(selectedPlatform);
@@ -194,10 +195,15 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
     const token = localStorage.getItem('analytics_token');
     const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
 
+    const comp = activeCompanyRef.current;
+    // Only this charity's own payout sources: the Stripe list used to be fetched with no charity, so Iqra's tab
+    // showed Rethink's 100 Stripe payouts
     Promise.all([
       fetch(`${API_BASE_URL}/api/payouts/summary?platform=launchgood&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {}),
-      fetch(`${API_BASE_URL}/api/payouts/summary?platform=paysuite&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {}),
-      fetch(`${API_BASE_URL}/api/payouts/stripe/list?limit=100`, { headers }).then(r => r.ok ? r.json() : {})
+      comp === 'rethink'
+        ? fetch(`${API_BASE_URL}/api/payouts/summary?platform=paysuite&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {})
+        : Promise.resolve({}),
+      fetch(`${API_BASE_URL}/api/payouts/stripe/list?limit=100&company_id=${encodeURIComponent(comp)}`, { headers }).then(r => r.ok ? r.json() : {})
     ]).then(([lgRes, psRes, stripeRes]) => {
       setPlatformCounts({
         launchgood: lgRes?.total_transactions || 0,
@@ -210,6 +216,42 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   useEffect(() => {
     fetchPlatformCounts();
   }, [activeCompany, currency]);
+
+  // Payout sources this charity has (PaySuite and the connected Stripe account are Rethink's)
+  const [availablePlatforms, setAvailablePlatforms] = useState(['launchgood']);
+  useEffect(() => {
+    const token = localStorage.getItem('analytics_token');
+    const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+    fetch(`${API_BASE_URL}/api/payouts/platforms?company_id=${encodeURIComponent(activeCompany)}`, { headers })
+      .then(r => r.ok ? r.json() : { platforms: ['launchgood'] })
+      .then(d => {
+        const list = Array.isArray(d.platforms) && d.platforms.length ? d.platforms : ['launchgood'];
+        setAvailablePlatforms(list);
+        if (!list.includes(selectedPlatformRef.current)) {
+          setSelectedPlatform('launchgood');
+          setSelectedBatch('ALL');
+          setStatusFilter('ALL');
+          setCurrentPage(1);
+          setDonorPage(1);
+        }
+      })
+      .catch(() => setAvailablePlatforms(['launchgood']));
+  }, [activeCompany]);
+
+  // PaySuite disbursal checks (Paid collections vs the payout PaySuite sent to the bank), keyed by DisbursalId
+  const [paysuiteChecks, setPaysuiteChecks] = useState({});
+  const fetchPaysuiteChecks = () => {
+    if (activeCompanyRef.current !== 'rethink') { setPaysuiteChecks({}); return; }
+    const token = localStorage.getItem('analytics_token');
+    const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+    fetch(`${API_BASE_URL}/api/payouts/paysuite/disbursals?company_id=rethink`, { headers })
+      .then(r => r.ok ? r.json() : { disbursals: [] })
+      .then(d => setPaysuiteChecks(Object.fromEntries((d.disbursals || []).map(x => [String(x.disbursal_id), x]))))
+      .catch(() => setPaysuiteChecks({}));
+  };
+  useEffect(() => {
+    if (isPaysuite) fetchPaysuiteChecks();
+  }, [isPaysuite, activeCompany]);
 
   // Real-Time WebSocket & Window Focus Listener for Live Sync (Zero-Polling)
   useEffect(() => {
@@ -563,6 +605,37 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       });
   };
 
+  const handleSyncPaysuite = async () => {
+    setIsSyncingPaysuite(true);
+    try {
+      // The PaySuite account is Rethink's: always synced into Rethink, never into the charity that happens to be open
+      const companyParam = '?company_id=rethink';
+      const token = localStorage.getItem('analytics_token');
+      const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+      const r = await fetch(`${API_BASE_URL}/api/payouts/paysuite/sync${companyParam}`, {
+        method: 'POST',
+        headers
+      });
+      const data = await r.json();
+      if (r.ok && data.status === 'success') {
+        const crmRes = data.crm_reconciliation || {};
+        const crmMsg = crmRes.skipped ? `CRM donations not changed (${crmRes.skipped}).` : `Added ${crmRes.donations_added || 0} CRM donations.`;
+        alert(`✅ Access PaySuite synced: ${data.total_fetched || 0} records (${data.new_payments || 0} new, ${data.updated_payments || 0} updated). ${crmMsg}`);
+        fetchPlatformCounts();
+        fetchPaysuiteChecks();
+        fetchPayoutData(debouncedSearch, selectedBatch, 'paysuite', statusFilter, true);
+        fetchDonorsData(debouncedSearch, selectedBatch, donorPage, donorPageSize, 'paysuite', statusFilter, true);
+        if (typeof onDataChange === 'function') onDataChange();
+      } else {
+        alert(`❌ PaySuite sync failed: ${data.detail || data.message || 'Unknown error'}`);
+      }
+    } catch (err) {
+      alert(`❌ Network error syncing PaySuite: ${err.message}`);
+    } finally {
+      setIsSyncingPaysuite(false);
+    }
+  };
+
   const handleExportExcel = async () => {
     try {
       setExporting(true);
@@ -736,6 +809,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               </span>
             </button>
 
+            {availablePlatforms.includes('paysuite') && (
             <button
               onClick={() => {
                 setSelectedPlatform('paysuite');
@@ -759,7 +833,9 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                 {platformCounts.paysuite.toLocaleString()}
               </span>
             </button>
+            )}
 
+            {availablePlatforms.includes('stripe') && (
             <button
               onClick={() => {
                 setSelectedPlatform('stripe');
@@ -782,6 +858,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                 {platformCounts.stripe.toLocaleString()}
               </span>
             </button>
+            )}
           </div>
 
           {/* Export Multi-Sheet Excel Button */}
@@ -798,6 +875,19 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             )}
             <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' && !isStripe ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
           </button>
+
+          {/* Sync PaySuite API Button (the PaySuite account is Rethink's) */}
+          {isPaysuite && activeCompany === 'rethink' && (
+            <button
+              onClick={handleSyncPaysuite}
+              disabled={isSyncingPaysuite || loading}
+              className="px-3.5 py-2 text-xs font-bold text-amber-900 dark:text-amber-100 bg-amber-100 dark:bg-amber-950/60 hover:bg-amber-200 dark:hover:bg-amber-900/60 rounded-xl border border-amber-500/40 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm disabled:opacity-50"
+              title="Sync live BACS Direct Debit collections from Access PaySuite DDCMS API"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingPaysuite ? 'animate-spin text-amber-600' : 'text-amber-600'}`} />
+              <span>{isSyncingPaysuite ? 'Syncing...' : 'Sync PaySuite API'}</span>
+            </button>
+          )}
 
           {/* Super Admin Purge Payout Button (Only for LaunchGood) */}
           {isSuperAdmin && !isPaysuite && !isStripe && (
@@ -848,9 +938,9 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               <Zap className="w-5 h-5" />
             </div>
             <div>
-              <div className="font-bold text-white text-xs">No Payout Settlements Uploaded for Iqra</div>
+              <div className="font-bold text-white text-xs">No payout settlements for Iqra yet</div>
               <p className="text-slate-300 text-[11px] mt-0.5">
-                Iqra donor data is currently active for <b>Madinah</b> (16,700 records). Payout reconciliation batches will populate here once settlement reports for Iqra are uploaded.
+                Iqra's donations come mainly through <b>Madinah</b> and GiveBrite. Payout batches appear here once settlement reports are uploaded; Madinah payouts will be added from its Payouts API.
               </p>
             </div>
           </div>
@@ -907,6 +997,17 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                   }`}
                 >
                   <span className="font-semibold">{label}</span>
+                  {isPaysuite && /^\d{4}-\d{2}$/.test(cleanId) && (
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-200 dark:bg-slate-700 text-slate-500 uppercase tracking-wider">Legacy</span>
+                  )}
+                  {isPaysuite && paysuiteChecks[cleanId]?.adds_up === true && (
+                    <span title={`Paid collections equal PaySuite's payout of £${paysuiteChecks[cleanId].bank_amount} on ${paysuiteChecks[cleanId].bank_date}`}
+                          className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">Adds Up</span>
+                  )}
+                  {isPaysuite && paysuiteChecks[cleanId]?.adds_up === false && (
+                    <span title={`Paid collections £${paysuiteChecks[cleanId].total_amount} vs payout £${paysuiteChecks[cleanId].bank_amount}`}
+                          className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-500/20 text-rose-600 dark:text-rose-400">£{Math.abs(paysuiteChecks[cleanId].difference).toFixed(2)} off</span>
+                  )}
                   <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-mono font-bold ${isSelected ? 'bg-white/20 text-white' : isPaysuite ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'}`}>
                     £{Number(b.transfer_amount || 0).toLocaleString('en-GB', { maximumFractionDigits: 0 })}
                   </span>

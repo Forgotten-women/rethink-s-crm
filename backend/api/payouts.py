@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query, HTTPException, Response
+from fastapi import APIRouter, Depends, Query, HTTPException, Response
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from core.cache import cached
@@ -36,6 +36,7 @@ from core.data_processor import (
     invalidate_paysuite_payouts_cache as _core_invalidate_paysuite_payouts_cache
 )
 from core.database import get_db_connection, _DB_LOCK
+from backend.api.auth import require_super_admin
 
 router = APIRouter(prefix="/api/payouts", tags=["Payouts Reconciliation"])
 
@@ -922,6 +923,20 @@ def get_payouts_summary(
         }
 
 
+@router.get("/platforms")
+def get_payout_platforms(company_id: str = Query("rethink")):
+    """Payout sources this charity actually has, so the Payouts tabs don't offer another charity's account
+    (PaySuite client REC and the connected Stripe account are Rethink's)."""
+    from core.stripe_accounts import is_connected
+    comp = str(company_id or "rethink").strip().lower()
+    platforms = ["launchgood"]
+    if comp == PAYSUITE_COMPANY:
+        platforms.append("paysuite")
+    if comp != "all" and is_connected(comp):
+        platforms.append("stripe")
+    return {"company_id": comp, "platforms": platforms}
+
+
 @router.get("/batches")
 @cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payout_batches(
@@ -983,7 +998,12 @@ def get_payout_batches(
                     "unpaid_count": unpaid_cnt,
                     "currency": "GBP"
                 })
-            batch_records.sort(key=lambda x: x["transfer_id"], reverse=True)
+            # Newest collection month first (Transfer IDs are DisbursalIds or "YYYY-MM", neither sorts by date;
+            # uploaded rows hold day-first dates like "01/09/2026")
+            def _batch_day(rec):
+                day = pd.to_datetime(rec["created_date"], errors="coerce", dayfirst=not str(rec["created_date"])[:4].isdigit())
+                return day if pd.notna(day) else pd.Timestamp.min
+            batch_records.sort(key=_batch_day, reverse=True)
         else:
             for t_id, g in df.groupby("transfer_id"):
                 c_date = str(g["Created Date (UTC)"].dropna().min() or "N/A")
@@ -2079,3 +2099,182 @@ def export_payouts_excel(
     except Exception as e:
         print(f"[Error] Excel reconciliation export error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate reconciliation report: {str(e)}")
+
+
+# -----------------------------------------------------------------------------
+# Access PaySuite (DDCMS v3) Endpoints
+# -----------------------------------------------------------------------------
+
+# The connected PaySuite account (client REC) is Rethink's. Its data is only ever filed under Rethink, whatever
+# charity the caller has open - otherwise an Iqra session would write Rethink's direct debits into Iqra.
+PAYSUITE_COMPANY = "rethink"
+
+
+def _paysuite_company(requested: Optional[str]) -> str:
+    comp = str(requested or PAYSUITE_COMPANY).strip().lower()
+    if comp != PAYSUITE_COMPANY:
+        raise HTTPException(status_code=404, detail=f"PaySuite isn't connected for '{comp}'.")
+    return comp
+
+
+@router.post("/paysuite/sync", dependencies=[Depends(require_super_admin)])
+def trigger_paysuite_sync(
+    company_id: str = Query(PAYSUITE_COMPANY, description="Must be rethink (the PaySuite account's charity)"),
+    is_backfill: bool = Query(False, description="Run full backfill from 2026-01-01"),
+    from_date: Optional[str] = Query(None, description="Custom start date (YYYY-MM-DD)")
+):
+    """Triggers an on-demand Access PaySuite Direct Debit synchronization (super admins; it rewrites the
+    2026+ PaySuite donations)."""
+    from core.paysuite_sync import sync_paysuite_payments
+    comp = _paysuite_company(company_id)
+    try:
+        res = sync_paysuite_payments(from_date=from_date, company_id=comp, is_backfill=is_backfill)
+        invalidate_payouts_cache(company_id=comp)
+        return res
+    except Exception as e:
+        logger_msg = f"PaySuite sync failed: {e}"
+        print(f"[Error] {logger_msg}")
+        raise HTTPException(status_code=500, detail=logger_msg)
+
+
+@router.get("/paysuite/sync-status")
+def get_paysuite_sync_status(
+    company_id: str = Query("rethink", description="Company ID (default: rethink)")
+):
+    """Returns the current PaySuite synchronization state, counts, and last run timestamp."""
+    from core.paysuite_sync import get_sync_state
+    comp = str(company_id or "rethink").lower().strip()
+    from core.paysuite_sync import init_paysuite_tables
+    init_paysuite_tables()
+    conn = get_db_connection(timeout=10.0)
+    try:
+        cur = conn.cursor()
+        # Count total payments (collections only - PaySuite's payout credits are not donations)
+        cur.execute("""SELECT COUNT(*), ROUND(SUM(CASE WHEN status = 'Paid' THEN amount ELSE 0 END), 2)
+                       FROM paysuite_payments WHERE company_id = ? AND COALESCE(is_credit, 0) = 0""", (comp,))
+        p_row = cur.fetchone() or (0, 0.0)
+        total_payments = p_row[0] or 0
+        total_amount = p_row[1] or 0.0
+
+        # Count disbursals
+        cur.execute("SELECT COUNT(*) FROM paysuite_disbursals WHERE company_id = ?", (comp,))
+        total_disbursals = (cur.fetchone() or (0,))[0]
+
+        # Count customers
+        cur.execute("SELECT COUNT(*) FROM paysuite_customers WHERE company_id = ?", (comp,))
+        total_customers = (cur.fetchone() or (0,))[0]
+
+        last_sync = get_sync_state("last_sync_at")
+        backfill_done = get_sync_state("backfill_completed") == "true"
+
+        return {
+            "platform": "paysuite",
+            "company_id": comp,
+            "configured": bool(os.environ.get("ACCESSPAYSUITE_API_KEY")),
+            "last_sync_at": last_sync,
+            "backfill_completed": backfill_done,
+            "total_payments": total_payments,
+            "total_gross_amount": total_amount,
+            "total_disbursals": total_disbursals,
+            "total_customers": total_customers,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/paysuite/disbursals")
+def get_paysuite_disbursals(
+    company_id: str = Query("rethink", description="Company ID (default: rethink)")
+):
+    """
+    Returns PaySuite settlement disbursals with 'adds up to the penny' verification.
+    Real API disbursals are linked to genuine BACS settlement batches;
+    pre-2026 batches are marked with is_legacy = True.
+    """
+    comp = str(company_id or "rethink").lower().strip()
+    from core.paysuite_sync import init_paysuite_tables
+    init_paysuite_tables()
+    conn = get_db_connection(timeout=15.0)
+    try:
+        # 1. Real API disbursals. "Adds up" compares the batch's Paid collections with the payout credit PaySuite
+        # actually sent to the bank (matched in sync) - an independent figure, not the same sum twice.
+        disb_df = pd.read_sql_query("""
+            SELECT
+                d.id as disbursal_id,
+                d.disbursal_date,
+                d.status,
+                d.bank_amount,
+                d.bank_date,
+                d.unpaid_amount,
+                d.unpaid_count,
+                ROUND(COALESCE(SUM(CASE WHEN p.status = 'Paid' THEN p.amount END), 0.0), 2) as paid_sum,
+                SUM(CASE WHEN p.status = 'Paid' THEN 1 ELSE 0 END) as paid_count
+            FROM paysuite_disbursals d
+            LEFT JOIN paysuite_payments p ON d.id = p.disbursal_id AND p.company_id = d.company_id
+                                          AND COALESCE(p.is_credit, 0) = 0
+            WHERE d.company_id = ?
+            GROUP BY d.id
+            ORDER BY d.disbursal_date DESC
+        """, conn, params=(comp,))
+
+        results = []
+        for _, r in disb_df.iterrows():
+            paid = float(r["paid_sum"] or 0.0)
+            bank = None if pd.isna(r["bank_amount"]) else float(r["bank_amount"])
+            results.append({
+                "disbursal_id": r["disbursal_id"],
+                "batch_label": (pd.to_datetime(r["disbursal_date"], errors="coerce").strftime("%B %Y") + " Collection")
+                               if pd.notna(pd.to_datetime(r["disbursal_date"], errors="coerce")) else f"Disbursal #{str(r['disbursal_id'])[:8]}",
+                "disbursal_date": r["disbursal_date"],
+                "bank_date": None if pd.isna(r["bank_date"]) else str(r["bank_date"])[:10],
+                "total_amount": paid,
+                "bank_amount": bank,
+                "actual_sum": paid,
+                "difference": None if bank is None else round(bank - paid, 2),
+                "payment_count": int(r["paid_count"] or 0),
+                "actual_count": int(r["paid_count"] or 0),
+                "unpaid_amount": float(r["unpaid_amount"] or 0.0),
+                "unpaid_count": int(r["unpaid_count"] or 0),
+                "adds_up": None if bank is None else round(bank - paid, 2) == 0.0,
+                "is_legacy": False,
+                "status": r["status"] or "Disbursed",
+            })
+
+        # 2. Legacy month batches uploaded from Excel before the API ledger (Transfer ID = "YYYY-MM" before 2026;
+        # their "Date of collection" is day-first text, so it can't be compared as a string)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                "Transfer ID",
+                MAX("Batch Label"),
+                ROUND(SUM("Donation Amount"), 2),
+                COUNT(*)
+            FROM paysuite_payout_settlements
+            WHERE "Transfer ID" GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]' AND "Transfer ID" < '2026-01'
+              AND LOWER(COALESCE(company_id, 'rethink')) = ?
+            GROUP BY "Transfer ID"
+            ORDER BY "Transfer ID" DESC
+        """, (comp,))
+
+        for row in cur.fetchall():
+            results.append({
+                "disbursal_id": row[0],
+                "batch_label": row[1] or f"Batch #{row[0]} (Legacy)",
+                "disbursal_date": f"{row[0]}-01",
+                "bank_date": None,
+                "total_amount": float(row[2] or 0.0),
+                "bank_amount": None,
+                "actual_sum": float(row[2] or 0.0),
+                "difference": None,
+                "payment_count": int(row[3] or 0),
+                "actual_count": int(row[3] or 0),
+                "unpaid_amount": 0.0,
+                "unpaid_count": 0,
+                "adds_up": None,  # no bank figure for uploaded months
+                "is_legacy": True,
+                "status": "Legacy Import",
+            })
+
+        return {"disbursals": results}
+    finally:
+        conn.close()

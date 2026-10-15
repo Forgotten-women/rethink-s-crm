@@ -136,7 +136,7 @@ class PlatformSyncService:
                 self.health = json.load(f)
         except Exception:
             self.health = {}
-        for p in ("givebrite", "givebrite_iqra", "givebrite_rethink", "madinah"):
+        for p in ("givebrite", "givebrite_iqra", "givebrite_rethink", "madinah", "stripe", "paysuite"):
             self.health.setdefault(p, {})
             self.health[p]["consecutive_failures"] = 0
 
@@ -495,6 +495,13 @@ class PlatformSyncService:
                 )
                 if r.status_code == 200:
                     result["campaigns"] = r.json().get("data", {}).get("campaigns", [])
+                    try:
+                        from core.madinah_ingestion import save_madinah_campaign_links
+                        added = save_madinah_campaign_links(result["campaigns"])
+                        if added:
+                            logger.info(f"Madinah campaign links: {added} added/updated")
+                    except Exception as link_ex:
+                        logger.warning(f"Madinah campaign links not saved: {link_ex}")
             except Exception as ex:
                 logger.error(f"Madinah campaign dashboard error: {ex}")
 
@@ -541,6 +548,7 @@ class PlatformSyncService:
         total_ingested = 0
         total_skipped = 0
         total_docs_seen = 0
+        fetch_error = None
         page = 1
         max_sync_pages = 10
 
@@ -583,18 +591,21 @@ class PlatformSyncService:
                     break
             except Exception as ex:
                 logger.error(f"Givebrite ({cid}) donations error on page {page}: {ex}")
+                fetch_error = str(ex)
                 break
 
         result["donations_ingested"] = total_ingested
         result["donations_skipped"] = total_skipped
         if total_ingested > 0:
             logger.info(f"[GiveBrite {cid} Ingestion] Successfully persisted {total_ingested} new donations into CRM DB & Parquet across {page} pages.")
-        self._record_cycle(f"givebrite_{cid}", True, 200, None, total_ingested, total_docs_seen)
-        if cid == "iqra":
-            self._record_cycle("givebrite", True, 200, None, total_ingested, total_docs_seen)
-            self._record_cycle(f"givebrite_{cid}", False, None, f"Donations fetch error: {ex}")
+        if fetch_error:
+            self._record_cycle(f"givebrite_{cid}", False, None, f"Donations fetch error: {fetch_error}")
             if cid == "iqra":
-                self._record_cycle("givebrite", False, None, f"Donations fetch error: {ex}")
+                self._record_cycle("givebrite", False, None, f"Donations fetch error: {fetch_error}")
+        else:
+            self._record_cycle(f"givebrite_{cid}", True, 200, None, total_ingested, total_docs_seen)
+            if cid == "iqra":
+                self._record_cycle("givebrite", True, 200, None, total_ingested, total_docs_seen)
 
         time.sleep(0.2)
 
@@ -639,6 +650,13 @@ class PlatformSyncService:
                                     }
                     if impact_catalog:
                         impacts_file = os.path.join(DATA_CACHE_DIR, f"givebrite_impacts_{cid}.json" if cid != "iqra" else "givebrite_impacts.json")
+                        # Only the newest campaigns come back here: add to the catalogue, never shrink it, so
+                        # older donations' impact IDs still resolve to their campaign and giving level.
+                        try:
+                            with open(impacts_file, "r", encoding="utf-8") as f_old:
+                                impact_catalog = {**json.load(f_old), **impact_catalog}
+                        except (OSError, ValueError):
+                            pass
                         atomic_write_json(impacts_file, impact_catalog)
                         try:
                             from core.givebrite_ingestion import invalidate_master_impacts_cache
@@ -722,6 +740,23 @@ class PlatformSyncService:
             self._record_cycle("stripe", False, None, f"Sync crashed: {ex}")
             stripe_data = {"platform": "stripe", "error": str(ex)}
 
+        # Access PaySuite (DDCMS v3): Direct Debit live collections & disbursals
+        paysuite_data = {}
+        try:
+            from core.paysuite_sync import poll_paysuite_sync
+            paysuite_data = poll_paysuite_sync(company_id="rethink")
+            err = paysuite_data.get("error")
+            # Between hourly runs the poller only says "waiting": that's not a sync, so it must not count as a
+            # success (it reset the failure counter, and repeated failures never raised the Ops alarm)
+            if paysuite_data.get("status") != "waiting":
+                self._record_cycle("paysuite", not err, 200 if not err else None, err,
+                                   fetched=paysuite_data.get("total_fetched", 0))
+            logger.info(f"[PaySuite] Poll result: {paysuite_data.get('status')} | Ingested: {paysuite_data.get('new_payments', 0)} | Updated: {paysuite_data.get('updated_payments', 0)}")
+        except Exception as ex:
+            logger.error(f"PaySuite sync failure: {ex}")
+            self._record_cycle("paysuite", False, None, f"Sync crashed: {ex}")
+            paysuite_data = {"platform": "paysuite", "error": str(ex)}
+
         # Atomic writes for service status monitoring
         try:
             atomic_write_json(MADINAH_SYNC_FILE, madinah_data)
@@ -741,12 +776,14 @@ class PlatformSyncService:
                     "givebrite_iqra_total_donations": givebrite_iqra_data.get("total_donations_count", 0),
                     "givebrite_rethink_new_ingested": givebrite_rethink_data.get("donations_ingested", 0),
                     "givebrite_rethink_total_donations": givebrite_rethink_data.get("total_donations_count", 0),
+                    "paysuite_new_payments": paysuite_data.get("new_payments", 0),
                 },
                 "madinah": madinah_data,
                 "givebrite": givebrite_iqra_data,
                 "givebrite_iqra": givebrite_iqra_data,
                 "givebrite_rethink": givebrite_rethink_data,
-                "stripe": stripe_data
+                "stripe": stripe_data,
+                "paysuite": paysuite_data
             }
 
             atomic_write_json(MASTER_SYNC_FILE, master_data)

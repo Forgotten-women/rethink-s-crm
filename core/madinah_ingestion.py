@@ -50,6 +50,56 @@ if not logger.handlers:
 MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
 
 
+# campaignId -> public link. The donations feed only carries campaignId; the link uses the campaign's
+# randomToken from the campaign dashboard, saved here by the deep sync and the link backfill script.
+MADINAH_LINKS_PATH = os.path.join(BASE_DIR, "data_cache", "madinah_campaign_links.json")
+_links_cache: Dict[str, Any] = {"mtime": None, "links": {}}
+
+
+def madinah_campaign_link(random_token: Any) -> str:
+    token = str(random_token or "").strip()
+    return f"https://www.madinah.com/{token}" if token and "/" not in token and " " not in token else ""
+
+
+def save_madinah_campaign_links(campaigns: List[Dict[str, Any]]) -> int:
+    """Merges dashboard campaigns ({campaignId, randomToken}) into the saved catalogue. Returns entries added/changed."""
+    import json
+    links = dict(_load_madinah_links())
+    changed = 0
+    for c in campaigns or []:
+        cid = str(c.get("campaignId") or "").strip()
+        url = madinah_campaign_link(c.get("randomToken"))
+        if cid and url and links.get(cid) != url:
+            links[cid] = url
+            changed += 1
+    if changed:
+        tmp = MADINAH_LINKS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(links, f, indent=1, sort_keys=True)
+        os.replace(tmp, MADINAH_LINKS_PATH)
+    return changed
+
+
+def _load_madinah_links() -> Dict[str, str]:
+    import json
+    try:
+        mtime = os.path.getmtime(MADINAH_LINKS_PATH)
+    except OSError:
+        return {}
+    if _links_cache["mtime"] != mtime:
+        try:
+            with open(MADINAH_LINKS_PATH, encoding="utf-8") as f:
+                _links_cache["links"] = json.load(f)
+            _links_cache["mtime"] = mtime
+        except (OSError, ValueError):
+            return _links_cache["links"]
+    return _links_cache["links"]
+
+
+def madinah_url_for_campaign(campaign_id: Any) -> str:
+    return _load_madinah_links().get(str(campaign_id or "").strip(), "")
+
+
 def parse_madinah_date(date_str: Optional[str]) -> Tuple[str, str, str]:
     """
     Parses Madinah ISO-8601 UTC date string (e.g. '2026-10-05T22:44:24.000Z')
@@ -87,7 +137,8 @@ def resolve_madinah_classification(
     cursor,
     campaign_name: str,
     giving_level: str = "",
-    company_id: str = "iqra"
+    company_id: str = "iqra",
+    campaign_url: str = ""
 ) -> Dict[str, Any]:
     """
     Resolves project classification code for Madinah campaigns using 2-Tier logic:
@@ -142,9 +193,9 @@ def resolve_madinah_classification(
                 if not cursor.fetchone():
                     cursor.execute("""
                         INSERT INTO platform_campaign_mappings (
-                            company_id, platform, campaign_name, giving_level, code, created_at, updated_at
-                        ) VALUES (?, 'madinah', ?, '', 'Unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, (company_id, c_name))
+                            company_id, platform, campaign_name, giving_level, code, campaign_url, created_at, updated_at
+                        ) VALUES (?, 'madinah', ?, '', 'Unassigned', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (company_id, c_name, campaign_url or None))
                     logger.info(f"Auto-registered new Madinah campaign in CRM: '{c_name}'")
             except Exception as reg_err:
                 logger.warning(f"Madinah auto-registration notice for '{c_name}': {reg_err}")
@@ -224,6 +275,7 @@ def build_madinah_record(
     status_str = "succeeded" if status_raw == "success" else status_raw
     campaign_name = str(doc.get("campaignName") or "").strip()
     campaign_id = str(doc.get("campaignId") or "").strip()
+    campaign_link = madinah_url_for_campaign(campaign_id)
 
     is_recurring = bool(doc.get("isRecurring", False))
     frequency = "recurring" if is_recurring else "one-off"
@@ -293,7 +345,7 @@ def build_madinah_record(
         "Shipping Zip": "",
         "Shipping Country": "",
         "Campaign Name": normalize_campaign_text(campaign_name),
-        "Campaign URL": "",
+        "Campaign URL": campaign_link,
         "Project Impact Location": meta.get("country") or "",
         "Community Name": "",
         "Community URL": "",
@@ -321,7 +373,7 @@ def build_madinah_record(
         "campaign_id": campaign_id,
         "fundraiser_id": "",
         "team_id": "",
-        "campaign_url": "",
+        "campaign_url": campaign_link,
         "fundraiser_name": "",
         "fundraiser_url": "",
         "team_name": "",
@@ -459,7 +511,8 @@ def ingest_madinah_donations(
             c_name = normalize_campaign_text(d.get("campaignName", ""))
             gl_obj = d.get("givingLevel") if isinstance(d.get("givingLevel"), dict) else {}
             g_level = normalize_campaign_text(str(d.get("givingLevelTitle") or gl_obj.get("title") or d.get("giving_level") or ""))
-            cls_meta = resolve_madinah_classification(cursor, c_name, giving_level=g_level, company_id=company_id)
+            cls_meta = resolve_madinah_classification(cursor, c_name, giving_level=g_level, company_id=company_id,
+                                                      campaign_url=madinah_url_for_campaign(d.get("campaignId")))
             rec = build_madinah_record(d, classification_meta=cls_meta, company_id=company_id)
             records_to_insert.append(rec)
 

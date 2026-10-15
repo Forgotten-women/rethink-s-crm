@@ -169,6 +169,53 @@ def canonicalize_special_case(sc_str) -> str:
     return trimmed
 
 
+_URL_PLACEHOLDERS = {"", "unassigned", "nan", "none", "null", "n/a", "na", "-"}
+
+
+def clean_campaign_url(value: Any) -> str:
+    """A campaign link, or "" when the value is not one.
+
+    The matrix used to store placeholders ("Unassigned", "nan"), community names and bare slugs in
+    campaign_url. Only absolute http(s) links are kept; a scheme-less "host/path" gets https:// added.
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    u = str(value).strip()
+    if u.lower() in _URL_PLACEHOLDERS or " " in u:
+        return ""
+    if u.lower().startswith(("http://", "https://")):
+        return u
+    host = u.split("/", 1)[0].lower()
+    if "/" in u and "." in host and host.replace(".", "").replace("-", "").isalnum():
+        return "https://" + u
+    return ""
+
+
+# Domains a platform's campaign links live on (platforms not listed accept any link)
+_PLATFORM_LINK_HOSTS = {
+    "launchgood": ("launchgood.com",),
+    "givebright": ("givebrite.com", "iqracharity.org"),
+    "madinah": ("madinah.com",),
+}
+
+
+def campaign_url_for_platform(value: Any, platform: str) -> str:
+    """clean_campaign_url, and "" when the link is on another platform's domain."""
+    url = clean_campaign_url(value)
+    hosts = _PLATFORM_LINK_HOSTS.get(str(platform or "").lower())
+    if url and hosts:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        if not any(host == h or host.endswith("." + h) for h in hosts):
+            return ""
+    return url
+
+
 def canonical_campaign_key(text: Any) -> str:
     """
     Produces a normalized canonical key for campaign name matching:
@@ -951,17 +998,21 @@ def _dedupe_matrix_rows(merged_raw: pd.DataFrame) -> pd.DataFrame:
         sc_grp = first_valid(m, sc_ok(m), "Special Case", grp_keys).reindex(pd.MultiIndex.from_frame(base[grp_keys]))
         base["Special Case"] = np.where(sc_code.notna().to_numpy(), sc_code.to_numpy(),
                                         np.where(sc_grp.notna().to_numpy(), sc_grp.to_numpy(), ""))
-    grp_index = pd.MultiIndex.from_frame(base[grp_keys])
+    # Counts: each kept row keeps its own (campaign, giving level, code) count, which is what its "View Data"
+    # opens. Donations in the group whose code has no kept row (e.g. "Unassigned" gifts next to an unassigned
+    # rule) are added ONCE, to the group's first row. Copying the whole group's total onto every code variant
+    # made a 4-code campaign show 4 x its donations and "View Data" open far fewer than the row said.
+    first_of_group = ~base.duplicated(subset=grp_keys, keep="first")
     for col, as_int in (("donation_count", True), ("total_amount", False)):
         if col not in m.columns:
             continue
-        sums = pd.to_numeric(m[col], errors="coerce").groupby([m["_c"], m["_g"]]).sum(min_count=1).reindex(grp_index).to_numpy()
-        cur = pd.to_numeric(base[col], errors="coerce")
-        need = (cur.isna() | (cur == 0)).to_numpy() & ~np.isnan(sums.astype(float)) & (np.nan_to_num(sums.astype(float)) > 0)
-        sums_f = np.nan_to_num(sums.astype(float))
-        fill = sums_f.astype("int64") if as_int else np.round(sums_f, 2)
-        base[col] = base[col].astype(object)
-        base.loc[need, col] = fill[need]
+        group_total = pd.to_numeric(m[col], errors="coerce").fillna(0).groupby([m["_c"], m["_g"]]).sum()
+        own = pd.to_numeric(base[col], errors="coerce").fillna(0)
+        kept_total = own.groupby([base["_c"], base["_g"]]).sum()
+        leftover = (group_total.reindex(kept_total.index).fillna(0) - kept_total).clip(lower=0)
+        add = pd.Series(list(zip(base["_c"], base["_g"])), index=base.index).map(leftover).fillna(0).where(first_of_group, 0)
+        total = own + add
+        base[col] = total.round(0).astype("int64") if as_int else total.round(2)
     base = base.sort_values(keys, kind="mergesort")
     return base.drop(columns=["_c", "_g", "_code", "_ord"])
 
@@ -1041,7 +1092,9 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                     COUNT(*) as donation_count,
                     SUM(TRY_CAST(REPLACE(REPLACE(COALESCE(CAST("Total Online Donation Gross Amount in Settled Currency" AS VARCHAR), CAST("Donation Amount (in Donation Currency)" AS VARCHAR), '0'), '£', ''), ',', '') AS DOUBLE)) as total_amount
                 FROM '{PARQUET_PATH.replace(chr(92), '/')}'
-                WHERE LOWER(COALESCE("Platform", '')) NOT IN ('givebright', 'givebrite', 'paysuite', 'madinah')
+                -- LaunchGood donations only. "Everything except GiveBrite/PaySuite/Madinah" also pulled in the
+                -- Rethink Website / Stripe gifts, whose "View Data" (filtered to LaunchGood) then showed nothing.
+                WHERE LOWER(COALESCE("Platform", '')) IN ('launchgood', '')
                   AND "Campaign Name" IS NOT NULL
                   AND LOWER(TRIM(CAST("Campaign Name" AS VARCHAR))) NOT IN ('', 'nan', 'none', 'null', 'n/a', 'unassigned')
                   {company_filter}
@@ -1054,7 +1107,7 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
         df_donations = df_raw if (df_raw is not None and not df_raw.empty) else load_data(company_id=comp)
         if df_donations is not None and not df_donations.empty and "Campaign Name" in df_donations.columns:
             plat_series = df_donations.get("Platform", pd.Series("", index=df_donations.index)).astype(str).str.lower()
-            lg_mask = ~plat_series.isin(["givebright", "givebrite", "paysuite", "madinah"])
+            lg_mask = plat_series.isin(["launchgood", "", "nan", "none"])
             lg_df = df_donations[lg_mask] if lg_mask.any() else df_donations.iloc[0:0]
 
             if not lg_df.empty:
@@ -1218,6 +1271,19 @@ def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink
     if df.empty or "Campaign Name" not in df.columns:
         return 0
 
+    # Every row belongs to the charity in its own company_id. Callers used to pass the whole multi-charity
+    # frame with no company, which filed Iqra's GiveBrite/Madinah campaigns under Rethink.
+    if "company_id" in df.columns:
+        row_comp = df["company_id"].fillna("").astype(str).str.lower().str.strip().replace("", "rethink")
+        present = {c for c in row_comp.unique() if c and c not in ("all", "nan", "none")}
+        if present != {comp}:
+            return sum(sync_donors_to_classification_matrix(df[row_comp == c], company_id=c) for c in sorted(present))
+
+    if "Campaign URL" in df.columns:
+        # Only real links reach the matrix; "first" below then picks the first valid one per campaign
+        df = df.copy()
+        df["Campaign URL"] = df["Campaign URL"].map(clean_campaign_url).replace("", np.nan)
+
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     synced_total = 0
@@ -1244,6 +1310,9 @@ def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink
         for plat_name, p_df in platforms_data:
             if p_df.empty:
                 continue
+            if "Campaign URL" in p_df.columns:
+                p_df = p_df.copy()
+                p_df["Campaign URL"] = p_df["Campaign URL"].map(lambda u: campaign_url_for_platform(u, plat_name)).replace("", np.nan)
 
             agg_cols = {}
             for c_name, fn in [
@@ -1289,7 +1358,7 @@ def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink
                     master_rows.append((code, dept, off, port, country, zakat, comp))
 
                 comm = str(r.get("Community Name") or "N/A").strip()
-                curl = str(r.get("Campaign URL") or "").strip()
+                curl = clean_campaign_url(r.get("Campaign URL"))
                 # These rows are aggregated from DONATIONS, so First/Last Name and Email belong to
                 # whichever donor gave last - not the campaign's organizer. Never store them as the
                 # campaign contact; organizers live in the Fundraisers registry. Empty values leave
@@ -1687,7 +1756,7 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
             master_code_rows.append((code, dept, off, port, country, zakat, comp))
 
         comm = fix_mojibake(str(row.get("Community Name", "N/A"))).strip()
-        curl = str(row.get("Campaign URL", "") or "").strip()
+        curl = clean_campaign_url(row.get("Campaign URL", ""))
         is_prim = 1 if row.get("is_primary") in [1, True, "1", "true", "True"] else 0
         d_name = str(row.get("Donor Name", "") or "").strip()
         d_email = str(row.get("Donor Email", "") or "").strip()
@@ -4243,10 +4312,15 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
                 on=["Campaign Name", "Giving Level", "Code"],
                 how="outer",
                 suffixes=('', '_db')
-            ).fillna("Unassigned")
+            )
+            # Saved link first, the donations' link only when no rule has one. (This used to run after
+            # fillna("Unassigned"), so every saved link was replaced by "Unassigned" and saved back.)
             if "Campaign URL_db" in merged.columns:
-                merged["Campaign URL"] = merged["Campaign URL"].replace("", "").combine_first(merged["Campaign URL_db"])
+                saved_url = merged["Campaign URL_db"].map(clean_campaign_url)
+                donor_url = merged["Campaign URL"].map(clean_campaign_url) if "Campaign URL" in merged.columns else ""
+                merged["Campaign URL"] = saved_url.where(saved_url != "", donor_url)
                 merged.drop(columns=["Campaign URL_db"], inplace=True)
+            merged = merged.fillna("Unassigned")
             merged_raw = merged
     else:
         merged_raw = db_matrix
@@ -4301,6 +4375,8 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
 
     text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary"]]
     deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
+    if "Campaign URL" in deduped_df.columns:
+        deduped_df["Campaign URL"] = deduped_df["Campaign URL"].map(clean_campaign_url)
     return deduped_df.reset_index(drop=True)
 
 
@@ -4385,10 +4461,15 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
                 on=["Campaign Name", "Giving Level", "Code"],
                 how="outer",
                 suffixes=('', '_db')
-            ).fillna("Unassigned")
+            )
+            # Saved link first, the donations' link only when no rule has one. (This used to run after
+            # fillna("Unassigned"), so every saved link was replaced by "Unassigned" and saved back.)
             if "Campaign URL_db" in merged.columns:
-                merged["Campaign URL"] = merged["Campaign URL"].replace("", "").combine_first(merged["Campaign URL_db"])
+                saved_url = merged["Campaign URL_db"].map(clean_campaign_url)
+                donor_url = merged["Campaign URL"].map(clean_campaign_url) if "Campaign URL" in merged.columns else ""
+                merged["Campaign URL"] = saved_url.where(saved_url != "", donor_url)
                 merged.drop(columns=["Campaign URL_db"], inplace=True)
+            merged = merged.fillna("Unassigned")
             merged_raw = merged
     else:
         merged_raw = db_matrix
@@ -4439,6 +4520,8 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
 
     text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary"]]
     deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
+    if "Campaign URL" in deduped_df.columns:
+        deduped_df["Campaign URL"] = deduped_df["Campaign URL"].map(clean_campaign_url)
     return deduped_df.reset_index(drop=True)
 
 

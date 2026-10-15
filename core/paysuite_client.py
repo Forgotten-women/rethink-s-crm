@@ -180,62 +180,88 @@ class PaySuiteClient:
         to_date: Optional[str] = None,
         status: Optional[str] = None,
         page: int = 1,
-        limit: int = 50,
+        limit: int = 100,
     ) -> Dict[str, Any]:
         """
-        POST /client/{clientCode}/payments
-        Searches payments with optional date/status filters and pagination.
+        POST /client/{clientCode}/payments - read-only search.
+        Verified against the live API (15 Oct 2026): the body takes PageNumber / PageSize / CollectionDateFrom /
+        CollectionDateTo ("Page", "Limit" and "FromDate" are silently ignored) and the reply is
+        {"Pagination": {Page, PageSize, TotalPages, TotalRecords}, "Data": [payments]}.
+        Returned as {"TotalPages", "TotalRecords", "Page", "Payments"}.
         """
         body: Dict[str, Any] = {
-            "Page": max(1, int(page)),
-            "Limit": max(1, min(100, int(limit))),
+            "PageNumber": max(1, int(page)),
+            "PageSize": max(1, min(100, int(limit))),
         }
         if from_date:
-            body["FromDate"] = from_date
+            body["CollectionDateFrom"] = from_date
         if to_date:
-            body["ToDate"] = to_date
+            body["CollectionDateTo"] = to_date
         if status:
             body["Status"] = status
 
-        res = self._request("POST", "/payments", json_body=body)
-        return res or {"TotalRecords": 0, "TotalPages": 0, "Page": page, "Payments": []}
+        res = self._request("POST", "/payments", json_body=body) or {}
+        pagination = res.get("Pagination") or {}
+        return {
+            "TotalPages": int(pagination.get("TotalPages") or res.get("TotalPages") or 0),
+            "TotalRecords": int(pagination.get("TotalRecords") or res.get("TotalRecords") or 0),
+            "Page": int(pagination.get("Page") or page),
+            "Payments": res.get("Data") if res.get("Data") is not None else (res.get("Payments") or []),
+        }
 
     def iter_all_payments(
         self,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         status: Optional[str] = None,
-        page_size: int = 50,
+        page_size: int = 100,
         max_pages: Optional[int] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
-        Paginates through all payments matching the criteria, yielding individual payment records.
+        Yields every payment collected between from_date and to_date (default: today), each exactly once.
+
+        The search has no stable sort order: paging through 898 records returned 40 twice and silently
+        skipped 40 others. So the range is fetched in date windows small enough to come back in ONE page
+        (a window that holds more is split in half), and each window must return as many distinct records
+        as its TotalRecords says, or this raises rather than handing back a partial ledger.
+        max_pages caps the number of API calls (testing).
         """
-        current_page = 1
-        total_pages = 1
+        from datetime import date, timedelta
 
-        while current_page <= total_pages:
-            if max_pages and current_page > max_pages:
+        start = date.fromisoformat((from_date or "2000-01-01")[:10])
+        end = date.fromisoformat(to_date[:10]) if to_date else date.today() + timedelta(days=31)
+        size = max(1, min(100, int(page_size)))
+        calls = 0
+        seen = set()
+
+        windows = []
+        cursor = start
+        while cursor <= end:  # calendar months first
+            month_end = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            windows.append((cursor, min(month_end, end)))
+            cursor = month_end + timedelta(days=1)
+
+        while windows:
+            w_from, w_to = windows.pop(0)
+            if max_pages and calls >= max_pages:
                 break
-
-            data = self.search_payments(
-                from_date=from_date,
-                to_date=to_date,
-                status=status,
-                page=current_page,
-                limit=page_size,
-            )
-
-            total_pages = data.get("TotalPages", 1)
-            payments = data.get("Payments", [])
-
-            if not payments:
-                break
-
-            for p in payments:
-                yield p
-
-            current_page += 1
+            data = self.search_payments(from_date=w_from.isoformat(), to_date=w_to.isoformat(),
+                                        status=status, page=1, limit=size)
+            calls += 1
+            total = data["TotalRecords"]
+            if total > size:
+                if w_from == w_to:
+                    raise PaySuiteAPIError(f"PaySuite: {total} payments on {w_from} exceed one page of {size}")
+                mid = w_from + (w_to - w_from) // 2
+                windows[:0] = [(w_from, mid), (mid + timedelta(days=1), w_to)]
+                continue
+            batch = {p.get("Id"): p for p in data["Payments"] if p.get("Id")}
+            if len(batch) != total:
+                raise PaySuiteAPIError(f"PaySuite {w_from}..{w_to}: {len(batch)} distinct payments returned, {total} expected")
+            for pid, p in batch.items():
+                if pid not in seen:
+                    seen.add(pid)
+                    yield p
 
 
 # Default module-level client singleton

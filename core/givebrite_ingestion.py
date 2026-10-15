@@ -133,7 +133,8 @@ def resolve_classification(
     cursor,
     campaign_name: str,
     giving_level: str,
-    company_id: str = "iqra"
+    company_id: str = "iqra",
+    campaign_url: str = ""
 ) -> Dict[str, Any]:
     """
     2-Tier Classification Resolution:
@@ -188,9 +189,9 @@ def resolve_classification(
                 if not cursor.fetchone():
                     cursor.execute("""
                         INSERT INTO platform_campaign_mappings (
-                            company_id, platform, campaign_name, giving_level, code, created_at, updated_at
-                        ) VALUES (?, 'givebright', ?, ?, 'Unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, (company_id, c_name, g_level))
+                            company_id, platform, campaign_name, giving_level, code, campaign_url, created_at, updated_at
+                        ) VALUES (?, 'givebright', ?, ?, 'Unassigned', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (company_id, c_name, g_level, campaign_url or None))
                     logger.info(f"Auto-registered new unmapped pair in CRM: Campaign='{c_name}' | Level='{g_level}'")
             except Exception as auto_reg_err:
                 logger.warning(f"Auto-registration notice for '{c_name}': {auto_reg_err}")
@@ -231,26 +232,47 @@ def resolve_classification(
 _MASTER_IMPACTS_CACHE: Optional[Dict[str, Any]] = None
 
 
-def get_master_impact_map() -> Dict[str, Any]:
+GIVEBRITE_LINK_BASES = {
+    "rethink": "https://rethink-charity.givebrite.com",
+    "iqra": "https://donate.iqracharity.org",
+}
+
+
+def givebrite_link(slug: Any, company_id: str = "iqra") -> str:
+    """Public GiveBrite page for a campaign/fundraiser/team slug, on that charity's own domain."""
+    slug = str(slug or "").strip().strip("/")
+    base = GIVEBRITE_LINK_BASES.get(str(company_id or "").lower().strip())
+    return f"{base}/{slug}" if slug and base and " " not in slug else ""
+
+
+def clean_url(value: Any) -> str:
+    from core.data_processor import clean_campaign_url
+    return clean_campaign_url(value)
+
+
+def get_master_impact_map(company_id: str = "iqra") -> Dict[str, Any]:
     """
-    Returns the cached dictionary mapping GiveBrite impact IDs to their
+    Returns the cached dictionary mapping this charity's GiveBrite impact IDs to their
     associated campaign name, slug, giving level title, and amount.
     """
     global _MASTER_IMPACTS_CACHE
-    if _MASTER_IMPACTS_CACHE is not None:
-        return _MASTER_IMPACTS_CACHE
+    cid = str(company_id or "iqra").lower().strip()
+    if not isinstance(_MASTER_IMPACTS_CACHE, dict) or "__by_company__" not in _MASTER_IMPACTS_CACHE:
+        _MASTER_IMPACTS_CACHE = {"__by_company__": {}}
+    by_company = _MASTER_IMPACTS_CACHE["__by_company__"]
+    if cid in by_company:
+        return by_company[cid]
 
-    impacts_path = os.path.join(BASE_DIR, "data_cache", "givebrite_impacts.json")
+    impacts_path = os.path.join(BASE_DIR, "data_cache", "givebrite_impacts.json" if cid == "iqra" else f"givebrite_impacts_{cid}.json")
+    catalog = {}
     if os.path.exists(impacts_path):
         try:
             with open(impacts_path, "r", encoding="utf-8") as f:
-                _MASTER_IMPACTS_CACHE = json.load(f)
-                return _MASTER_IMPACTS_CACHE
+                catalog = json.load(f)
         except Exception as ex:
-            logger.warning(f"Failed to load givebrite_impacts.json: {ex}")
-
-    _MASTER_IMPACTS_CACHE = {}
-    return _MASTER_IMPACTS_CACHE
+            logger.warning(f"Failed to load {os.path.basename(impacts_path)}: {ex}")
+    by_company[cid] = catalog
+    return catalog
 
 
 def invalidate_master_impacts_cache() -> None:
@@ -275,16 +297,13 @@ def extract_givebrite_campaign_and_giving_level(
         det = doc
 
     if master_impacts is None:
-        master_impacts = get_master_impact_map()
+        master_impacts = get_master_impact_map(company_id)
 
     # 1. Direct campaign object
     camp_obj = det.get("campaign") if isinstance(det.get("campaign"), dict) else (doc.get("campaign") if isinstance(doc.get("campaign"), dict) else {})
     campaign_name = str(camp_obj.get("name") or "").strip()
     campaign_slug = str(camp_obj.get("slug") or "").strip()
-    if campaign_slug:
-        campaign_url = f"https://rethink-charity.givebrite.com/{campaign_slug}" if company_id == "rethink" else f"https://donate.iqracharity.org/{campaign_slug}"
-    else:
-        campaign_url = ""
+    campaign_url = givebrite_link(campaign_slug, company_id)
     campaign_id = str(camp_obj.get("_id") or camp_obj.get("id") or "").strip()
 
     # 2. Extract cart items chosen by donor
@@ -323,7 +342,7 @@ def extract_givebrite_campaign_and_giving_level(
                 campaign_name = imp_info["campaign_name"].strip()
                 campaign_slug = imp_info.get("campaign_slug", "").strip()
                 if campaign_slug:
-                    campaign_url = f"https://donate.iqracharity.org/{campaign_slug}"
+                    campaign_url = givebrite_link(campaign_slug, company_id)
             if not giving_level_title and imp_info.get("giving_level"):
                 giving_level_title = imp_info["giving_level"].strip()
             if giving_level_amount == 0.0 and imp_info.get("amount"):
@@ -499,13 +518,13 @@ def build_donation_record(
     f_id = str(fundraiser_obj.get("_id") or "").strip() if fundraiser_obj else ""
     f_name = str(fundraiser_obj.get("name") or "").strip() if fundraiser_obj else ""
     f_slug = str(fundraiser_obj.get("slug") or "").strip() if fundraiser_obj else ""
-    f_url = f"https://donate.iqracharity.org/{f_slug}" if f_slug else ""
+    f_url = givebrite_link(f_slug, company_id)
 
     team_obj = det.get("team") if isinstance(det.get("team"), dict) else (doc.get("team") if isinstance(doc.get("team"), dict) else {})
     t_id = str(team_obj.get("_id") or "").strip() if team_obj else ""
     t_name = str(team_obj.get("name") or "").strip() if team_obj else ""
     t_slug = str(team_obj.get("slug") or "").strip() if team_obj else ""
-    t_url = f"https://donate.iqracharity.org/{t_slug}" if t_slug else ""
+    t_url = givebrite_link(t_slug, company_id)
 
     offline_flag = bool(det.get("offline", doc.get("offline", False)))
 
@@ -810,7 +829,8 @@ def ingest_givebrite_donations(
             g_level = extracted["giving_level_title"]
 
             # Classification resolution
-            cls_meta = resolve_classification(cursor, c_name, g_level, company_id=company_id)
+            cls_meta = resolve_classification(cursor, c_name, g_level, company_id=company_id,
+                                              campaign_url=clean_url(extracted.get("campaign_url")))
 
             # Build normalized record
             rec = build_donation_record(doc, det=det, classification_meta=cls_meta, extracted_campaign=extracted, company_id=company_id)

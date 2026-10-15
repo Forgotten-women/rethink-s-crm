@@ -178,28 +178,42 @@ function StatusTab() {
       {error && <div className="p-3 rounded-xl bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300 border border-rose-200 dark:border-rose-900">{error}</div>}
       {data && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
             {data.platforms.map(p => {
               const label = p.platform === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
                             (p.platform === 'givebrite_iqra' || p.platform === 'givebrite') ? 'GiveBrite (Iqra)' :
+                            p.platform === 'paysuite' ? 'Access PaySuite (Direct Debit)' :
                             'Madinah (Iqra)';
               return (
               <div key={p.platform} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 flex flex-col gap-2.5 shadow-2xs">
                 <div className="flex items-center justify-between">
-                  <span className="font-bold text-sm capitalize text-slate-900 dark:text-slate-100">{label}</span>
+                  <span className="font-bold text-sm text-slate-900 dark:text-slate-100">{label}</span>
                   <StateBadge state={p.state} />
                 </div>
                 {p.issues.length > 0 && (
-                  <ul className="list-disc pl-4 text-rose-700 dark:text-rose-300 flex flex-col gap-0.5">{p.issues.map((i, n) => <li key={n}>{i}</li>)}</ul>
+                  <ul className="list-disc pl-4 text-rose-700 dark:text-rose-300 flex flex-col gap-0.5 text-xs">{p.issues.map((i, n) => <li key={n}>{i}</li>)}</ul>
                 )}
                 <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-slate-600 dark:text-slate-300 text-xs">
-                  <span>Last successful sync</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ok_at)}</span>
+                  <span>Last successful sync</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ok_at || p.sync?.last_sync_at)}</span>
                   <span>Failures in a row</span><span className="font-semibold text-slate-900 dark:text-slate-100">{p.sync?.consecutive_failures ?? 0}</span>
                   <span>Last API status</span><span className="font-semibold text-slate-900 dark:text-slate-100">{p.sync?.last_http_status ?? '—'}</span>
-                  <span>Access token</span><span className="font-semibold text-slate-900 dark:text-slate-100">{p.token.present ? fmtLeft(p.token.access_minutes_left) : 'missing'}</span>
+                  <span>{p.platform === 'paysuite' ? 'Auth Mode' : 'Access token'}</span>
+                  <span className="font-semibold text-slate-900 dark:text-slate-100">
+                    {p.platform === 'paysuite' ? (p.token?.present ? 'API Key (Active)' : 'Missing Key') : (p.token.present ? fmtLeft(p.token.access_minutes_left) : 'missing')}
+                  </span>
                   {p.platform === 'madinah' && (<><span>Refresh token</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtLeft(p.token.refresh_minutes_left)}</span></>)}
-                  <span>Session renewed</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_token_refresh_at || p.token.retrieved_at)}</span>
-                  <span>Last new donation</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ingested_at)}</span>
+                  {p.platform !== 'paysuite' && (
+                    <>
+                      <span>Session renewed</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_token_refresh_at || p.token.retrieved_at)}</span>
+                      <span>Last new donation</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ingested_at)}</span>
+                    </>
+                  )}
+                  {p.platform === 'paysuite' && (
+                    <>
+                      <span>Schedule</span><span className="font-semibold text-slate-900 dark:text-slate-100">Hourly (last 30 days)</span>
+                      <span>Last sync</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_sync_at)}</span>
+                    </>
+                  )}
                 </div>
                 {p.sync?.last_error && (
                   <div className="text-[11px]">
@@ -216,7 +230,7 @@ function StatusTab() {
                 )}
                 {p.live_check && (
                   <div className={`text-[11px] font-semibold ${p.live_check.ok ? 'text-emerald-600' : 'text-rose-600'}`}>
-                    Live check: {p.live_check.ok ? 'API answered normally' : `failed (${p.live_check.http_status || 'error'}) ${p.live_check.detail || ''}`}
+                    Live check: {p.live_check.ok ? (p.live_check.detail || 'API answered normally') : `failed (${p.live_check.http_status || 'error'}) ${p.live_check.detail || ''}`}
                   </div>
                 )}
               </div>

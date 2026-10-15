@@ -81,8 +81,24 @@ def _token_info(platform: str) -> Dict[str, Any]:
 
 def _live_check(platform: str, token: Optional[str] = None) -> Dict[str, Any]:
     """One read-only request with the given (or stored) token. Never refreshes or logs in."""
+    if platform == "paysuite":
+        try:
+            from core.paysuite_client import PaySuiteClient
+            # One quick attempt: the sync client's 30 s x 3 retries could hold the Ops page for ~90 s
+            client = PaySuiteClient(timeout=8, max_retries=1)
+            if not client.is_configured():
+                return {"ok": False, "detail": "PaySuite API key not configured in environment"}
+            info = client.get_client_info()
+            return {
+                "ok": bool(info),
+                "http_status": 200 if info else 500,
+                "detail": f"Access PaySuite DDCMS v3 answered normally (Client: {client.client_code})" if info else "Empty response"
+            }
+        except Exception as e:
+            return {"ok": False, "detail": str(e)[:200]}
+
     if token is None:
-        token = (_read_json(TOKEN_FILES[platform]).get("accessToken") or "").strip()
+        token = (_read_json(TOKEN_FILES.get(platform, "")).get("accessToken") or "").strip()
     if not token:
         return {"ok": False, "detail": "No stored token"}
     auth = token if token.startswith("Bearer ") else f"Bearer {token}"
@@ -115,6 +131,76 @@ def _service_state(name: str) -> Dict[str, Any]:
 
 
 def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[str, Any]:
+    if platform == "paysuite":
+        from core.paysuite_client import get_paysuite_client
+        from core.paysuite_sync import get_sync_state
+        client = get_paysuite_client()
+        configured = client.is_configured()
+        h = health.get("paysuite", {}) if isinstance(health, dict) else {}
+        issues: List[str] = []
+        state = "ok"
+        if not configured:
+            issues.append("ACCESSPAYSUITE_API_KEY not configured in .env")
+            state = "down"
+
+        try:
+            last_sync = get_sync_state("last_sync_at") or h.get("last_ok_at")
+        except Exception as e:  # one card must never take the whole status page down (was a 500)
+            last_sync = h.get("last_ok_at")
+            issues.append(f"Sync state unreadable: {str(e)[:120]}")
+            state = "warning" if state == "ok" else state
+        last_ok_age = _age_minutes(last_sync)
+        if last_ok_age is None:
+            issues.append("No sync recorded yet")
+            state = "warning" if state == "ok" else state
+        elif last_ok_age > 180:  # Hourly schedule -> warning after 3 hours
+            issues.append(f"Last successful sync {int(last_ok_age)} min ago")
+            state = "warning" if state == "ok" else state
+
+        if h.get("consecutive_failures", 0) >= 3:
+            issues.append(f"{h['consecutive_failures']} failed sync cycles in a row")
+            state = "down"
+
+        try:
+            if get_sync_state("crm_apply_approved_rethink") != "true":
+                issues.append("Collections are synced but not yet added to the CRM (awaiting migration approval)")
+                state = "warning" if state == "ok" else state
+        except Exception:
+            pass
+
+        # Check for unassigned mandates in needs classification
+        try:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=2.0)
+            unassigned_count = conn.execute("""
+                SELECT COUNT(*) FROM platform_campaign_mappings 
+                WHERE platform = 'paysuite' AND LOWER(COALESCE(company_id, 'rethink')) = 'rethink'
+                  AND UPPER(TRIM(COALESCE(code, ''))) IN ('', 'UNASSIGNED', 'NONE', 'NAN')
+            """).fetchone()[0]
+            conn.close()
+            if unassigned_count > 0:
+                issues.append(f"{unassigned_count} PaySuite mandate(s) need classification")
+        except Exception:
+            pass
+
+        sync_data = dict(h)
+        if last_sync:
+            sync_data["last_sync_at"] = last_sync
+
+        out = {
+            "platform": "paysuite",
+            "name": "Access PaySuite (Direct Debit)",
+            "state": state,
+            "issues": issues,
+            "token": {"present": configured, "captured_by": "API Key (.env)"},
+            "sync": sync_data
+        }
+        if live:
+            out["live_check"] = _live_check("paysuite")
+            if not out["live_check"]["ok"]:
+                out["state"] = "down"
+                out["issues"].append(f"Live API check failed ({out['live_check'].get('http_status', 'error')})")
+        return out
+
     h = health.get(platform, {}) if isinstance(health, dict) else {}
     token = _token_info(platform)
     issues: List[str] = []
@@ -204,7 +290,7 @@ def _outlook_status() -> List[Dict[str, Any]]:
 def ops_status(live: bool = Query(False)):
     health = _read_json(HEALTH_FILE)
     sync = _read_json(SYNC_FILE)
-    platforms = [_platform_status(p, health, live) for p in ("givebrite_iqra", "givebrite_rethink", "madinah")]
+    platforms = [_platform_status(p, health, live) for p in ("givebrite_iqra", "givebrite_rethink", "madinah", "paysuite")]
     services = [_service_state("platform-sync.service")]
     for s in services:
         if s["active"] != "active":
