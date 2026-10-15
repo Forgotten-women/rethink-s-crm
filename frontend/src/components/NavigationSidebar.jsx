@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake } from 'lucide-react';
+import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
 const resolveLogoUrl = (url) => {
@@ -15,6 +15,7 @@ const tabs = [
   { id: 'kanban', label: 'Kanban Pipeline', icon: Columns },
   { id: 'ltv', label: 'Lifetime LTV', icon: Crown },
   { id: 'explorer', label: 'Data Explorer', icon: Table },
+  { id: 'donors', label: 'Donors', icon: Users },
   { id: 'fundraisers', label: 'Fundraisers', icon: HeartHandshake },
   { id: 'payouts', label: 'Payout Reconciliation', icon: DollarSign },
   { id: 'tracker', label: 'Sponsorship Tracker', icon: Target },

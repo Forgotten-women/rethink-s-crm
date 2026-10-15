@@ -677,6 +677,27 @@ class PlatformSyncService:
             self._record_cycle("givebrite_rethink", False, None, f"Sync crashed: {ex}")
             givebrite_rethink_data = {"platform": "givebrite_rethink", "company_id": "rethink", "error": str(ex), "synced_at": datetime.now(timezone.utc).isoformat()}
 
+        # Stripe (Rethink's account): live ledger of every money movement + payouts. GET-only towards Stripe.
+        stripe_data = {}
+        try:
+            from core.stripe_ledger import poll_stripe_ledger
+            stripe_data = poll_stripe_ledger()
+            per_company = {k: v for k, v in stripe_data.items() if isinstance(v, dict)}
+            failed = {k: v["error"] for k, v in per_company.items() if v.get("error")}
+            for comp, res in per_company.items():
+                new_rows = (res.get("recent") or {}).get("new", 0) + (res.get("backfill") or {}).get("new", 0)
+                if new_rows:
+                    log_event("sync.stripe_ledger", category="sync", platform="stripe", company_id=comp, count=new_rows,
+                              message=f"stripe ({comp}): {new_rows} new movement(s) recorded")
+                logger.info(f"[Stripe {comp}] Ledger poll: {res.get('recent')} | payouts {res.get('payouts')} | crm {res.get('crm')}")
+            self._record_cycle("stripe", not failed, 200 if not failed else None,
+                               "; ".join(f"{k}: {v}" for k, v in failed.items()) or None,
+                               fetched=sum((v.get("recent") or {}).get("seen", 0) for v in per_company.values()))
+        except Exception as ex:
+            logger.error(f"Stripe ledger sync failure: {ex}")
+            self._record_cycle("stripe", False, None, f"Sync crashed: {ex}")
+            stripe_data = {"platform": "stripe", "error": str(ex)}
+
         # Atomic writes for service status monitoring
         try:
             atomic_write_json(MADINAH_SYNC_FILE, madinah_data)
@@ -700,7 +721,8 @@ class PlatformSyncService:
                 "madinah": madinah_data,
                 "givebrite": givebrite_iqra_data,
                 "givebrite_iqra": givebrite_iqra_data,
-                "givebrite_rethink": givebrite_rethink_data
+                "givebrite_rethink": givebrite_rethink_data,
+                "stripe": stripe_data
             }
 
             atomic_write_json(MASTER_SYNC_FILE, master_data)

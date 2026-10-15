@@ -1485,13 +1485,63 @@ def _sponsorship_base(comp: str, s_type: str) -> Optional[Dict[str, Any]]:
         return base
 
 
+def _filter_qualifying(donors_list, comp, s_type, date_from, date_to, min_total, max_total, min_waiting_days, has_email):
+    """Left-panel filters of the allocation matrix. Slots and totals stay lifetime figures (they drive allocation);
+    a date window only picks donors who gave to this sponsorship type in it and adds what they gave then
+    (window_total)."""
+    out = donors_list
+    if date_from or date_to:
+        df = load_data(company_id=comp)
+        lo = pd.to_datetime(date_from, errors="coerce") if date_from else None
+        hi = pd.to_datetime(date_to, errors="coerce") + pd.Timedelta(days=1) if date_to else None
+        totals: Dict[str, float] = {}
+        if df is not None and not df.empty and "Donor ID" in df.columns:
+            mask = _sponsorship_masks(df).get(s_type, pd.Series(False, index=df.index))
+            dcol = next((c for c in ("_parsed_date", "Created Date (UTC)", "Settled Date (UTC)") if c in df.columns), None)
+            if dcol:
+                dts = pd.to_datetime(df[dcol], errors="coerce", format="mixed")
+                sel = mask & dts.notna()
+                if lo is not None:
+                    sel &= dts >= lo
+                if hi is not None:
+                    sel &= dts < hi
+                amt_col = "Total Online Donations Net Amount in Settled Currency"
+                amts = pd.to_numeric(df.loc[sel, amt_col], errors="coerce").fillna(0.0) if amt_col in df.columns else pd.Series(0.0, index=df.index[sel])
+                totals = amts.groupby(df.loc[sel, "Donor ID"].astype(str).str.strip()).sum().to_dict()
+        kept = []
+        for d in out:
+            if d.get("is_manual"):
+                made = pd.to_datetime((d.get("oldest_donation_date") or "")[:10], errors="coerce")
+                ok = not pd.isna(made) and (lo is None or made >= lo) and (hi is None or made < hi)
+                if ok:
+                    kept.append({**d, "window_total": d.get("total_donated")})
+            elif str(d.get("donor_id")).strip() in totals:
+                kept.append({**d, "window_total": round(float(totals[str(d.get("donor_id")).strip()]), 2)})
+        out = kept
+    if min_total is not None:
+        out = [d for d in out if float(d.get("total_donated") or 0) >= float(min_total)]
+    if max_total is not None:
+        out = [d for d in out if float(d.get("total_donated") or 0) <= float(max_total)]
+    if min_waiting_days is not None:
+        out = [d for d in out if int(d.get("waiting_days") or 0) >= int(min_waiting_days)]
+    if has_email in ("yes", "no"):
+        out = [d for d in out if ("@" in str(d.get("donor_email") or "")) == (has_email == "yes")]
+    return out
+
+
 @router.get("/qualifying-donors")
 @cached(scopes=["donations", "classification", "tracker"], ttl=21600, daily=True)
 def get_qualifying_donors(
     company_id: Optional[str] = Query("rethink"),
     sponsorship_type: Optional[str] = Query("Orphan"),
     search: Optional[str] = Query(None),
-    classification: Optional[str] = Query(None)
+    classification: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, description="gave to this sponsorship type on/after"),
+    date_to: Optional[str] = Query(None, description="gave to this sponsorship type on/before"),
+    min_total: Optional[float] = Query(None),
+    max_total: Optional[float] = Query(None),
+    min_waiting_days: Optional[int] = Query(None),
+    has_email: Optional[str] = Query(None),
 ):
     """
     Returns qualifying donors for a given sponsorship type along with capacity calculations:
@@ -1831,6 +1881,10 @@ def get_qualifying_donors(
             "allocated_beneficiaries": m_allocated_items
         })
 
+    donors_list = _filter_qualifying(donors_list, comp, s_type,
+                                     _unwrap_param(date_from, "") or None, _unwrap_param(date_to, "") or None,
+                                     _unwrap_param(min_total, None), _unwrap_param(max_total, None),
+                                     _unwrap_param(min_waiting_days, None), _unwrap_param(has_email, "") or None)
     donors_list.sort(key=lambda x: (x["remaining_slots"] > 0, x["allocated_count"] > 0, x["total_donated"]), reverse=True)
     return {
         "sponsorship_type": s_type,
@@ -5919,6 +5973,11 @@ def email_tracking_pixel(tracking_id: str, request: Request):
                 last_opened_user_agent = ?
             WHERE tracking_id = ?
         """, (client_ip, user_agent, tracking_id))
+        try:  # direct (non-allocation) emails sent from the Donors / email campaigns screens
+            cur.execute("""UPDATE crm_email_messages SET open_count = COALESCE(open_count, 0) + 1,
+                               opened_at = COALESCE(opened_at, CURRENT_TIMESTAMP) WHERE tracking_id = ?""", (tracking_id,))
+        except sqlite3.OperationalError:
+            pass
         
         # Update allocation's communication_status if not yet replied
         cur.execute("""
@@ -7106,7 +7165,7 @@ def get_sponsorship_donor_details(donor_key: str, company_id: Optional[str] = Qu
                 "target_amount": target, "max_slots": max_slots, "slots_used": used,
                 "slots_remaining": max(0, round(max_slots - used, 2)),
             })
-        rel = rows[any_mask].sort_values("_dt", ascending=False).head(300)
+        rel = rows[any_mask].sort_values("_dt", ascending=False).head(3000)
         rel_native = _native_amounts(rel)
         type_of = pd.Series("", index=rows.index)
         for s_type, mask in masks.items():
@@ -7126,6 +7185,11 @@ def get_sponsorship_donor_details(donor_key: str, company_id: Optional[str] = Qu
                 "payment_method": _clean(r.get("Payment Type")),
                 "platform": _clean(r.get("Platform")),
                 "status": _clean(r.get("Status")),
+                "code": _clean(r.get("Code")),
+                "heading": _clean(r.get("Heading")),
+                "sub_heading": _clean(r.get("Sub-Heading")),
+                "giving_level": _clean(r.get("Giving Level Title")),
+                "fundraiser": _clean(r.get("fundraiser_name")),
             })
         dated = rows.sort_values("_dt", ascending=False)
         for _, r in dated.iterrows():

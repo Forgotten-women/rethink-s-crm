@@ -1,6 +1,8 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal, Globe } from 'lucide-react';
+import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal, Globe, Receipt, Plus } from 'lucide-react';
 import { API_BASE_URL, downloadFile } from '../config';
+import DonationDetailModal from './DonationDetailModal';
+import AddDonationModal from './AddDonationModal';
 import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
 
 const DEFAULT_EXPLORER_COLUMNS = [
@@ -254,6 +256,8 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
 
   // Single Donor Record Modal Edit State
   const [editingDonorModal, setEditingDonorModal] = useState(null); // { row, fields }
+  const [openDonation, setOpenDonation] = useState(null); // { id, company, row }
+  const [addingDonation, setAddingDonation] = useState(false);
   const [editModalSaving, setEditModalSaving] = useState(false);
   const [editModalMsg, setEditModalMsg] = useState('');
 
@@ -841,6 +845,12 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          {canEdit && (
+            <button type="button" onClick={() => setAddingDonation(true)}
+              className="text-xs font-bold px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5" title="Record an offline / manual donation">
+              <Plus className="w-3.5 h-3.5" /> Add donation
+            </button>
+          )}
           {/* Export Dropdown Group */}
           <div className="relative inline-block text-left">
             <div className="flex items-center bg-slate-900/90 border border-emerald-500/30 p-1 rounded-xl shadow-lg">
@@ -1263,6 +1273,10 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
       </div>
 
       {/* Single Donor Record Edit Modal */}
+      {openDonation && (
+        <DonationDetailModal donationId={openDonation.id} companyId={openDonation.company} initial={openDonation.row} onClose={() => setOpenDonation(null)} onChanged={() => onDataChange?.()} />
+      )}
+      {addingDonation && <AddDonationModal company={activeCompany} onClose={() => setAddingDonation(false)} onCreated={() => onDataChange?.()} />}
       {editingDonorModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in">
           <div className="bg-slate-900 border border-white/15 rounded-3xl p-6 max-w-xl w-full shadow-2xl flex flex-col gap-5 max-h-[90vh] overflow-y-auto">
@@ -1570,7 +1584,12 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
                   return (
                     <tr 
                       key={rowIdx} 
-                      className="hover:bg-cyan-500/5 transition-colors group"
+                      className={`hover:bg-cyan-500/5 transition-colors group ${row['Donation ID'] ? 'cursor-pointer' : ''}`}
+                      onClick={(e) => {
+                        if (!row['Donation ID'] || e.target.closest('button, a, input, select, textarea, label')) return;
+                        if (window.getSelection && String(window.getSelection()).length) return;
+                        setOpenDonation({ id: String(row['Donation ID']), company: activeCompany === 'all' ? String(row.company_id || '').toLowerCase() : activeCompany, row });
+                      }}
                     >
                       {/* Actions Column on Extreme Left */}
                       <td className="whitespace-nowrap text-center pl-4 w-20">
@@ -1583,6 +1602,16 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
                           >
                             <Eye className="w-3.5 h-3.5" />
                           </button>
+                          {row['Donation ID'] && (
+                            <button
+                              type="button"
+                              onClick={() => setOpenDonation({ id: String(row['Donation ID']), company: activeCompany === 'all' ? String(row.company_id || '').toLowerCase() : activeCompany, row })}
+                              className="p-1.5 rounded-lg text-sky-400 hover:bg-sky-500/15 transition-all cursor-pointer"
+                              title="View full donation details"
+                            >
+                              <Receipt className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                           {canEdit && (
                             <button
                               type="button"

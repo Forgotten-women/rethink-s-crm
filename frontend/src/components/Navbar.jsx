@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Zap, LogOut, User, Sun, Moon, TrendingUp, Gift, Layers, Euro, ChevronDown, Check, Building2, Globe } from 'lucide-react';
+import { Zap, LogOut, User, Sun, Moon, TrendingUp, Gift, Layers, PoundSterling, ChevronDown, Check, Building2, Globe } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
 const resolveLogoUrl = (url) => {
@@ -294,10 +294,10 @@ export default function Navbar({
               <div className="flex flex-col flex-1 pl-4 pr-0">
                 <div className="flex items-center justify-between mb-0.5">
                   <span className="text-[9px] font-extrabold uppercase tracking-widest text-slate-400 dark:text-slate-500">Avg Donation</span>
-                  <Euro className="w-3 h-3 text-slate-300 dark:text-slate-600" />
+                  <PoundSterling className="w-3 h-3 text-slate-300 dark:text-slate-600" />
                 </div>
                 <span className="text-sm font-black text-emerald-500 font-mono tracking-tight">
-                  €{Number(metrics.avg_donation || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  £{Number(metrics.avg_donation || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
               </div>
 

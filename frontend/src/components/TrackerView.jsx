@@ -14,6 +14,8 @@ import AllocationDonorsEditor from './tracker/AllocationDonorsEditor';
 import SponsorshipDonorPanel from './tracker/SponsorshipDonorPanel';
 import EmailDispatcherModal from './tracker/EmailDispatcherModal';
 import EmailQueueView from './tracker/EmailQueueView';
+import EmailCampaignsView from './tracker/EmailCampaignsView';
+import AddDonationModal, { canEditRecords } from './AddDonationModal';
 import BeneficiaryImportModal from './tracker/BeneficiaryImportModal';
 import BulkEmailModal from './tracker/BulkEmailModal';
 import TrackerFilterBar from './tracker/TrackerFilterBar';
@@ -226,6 +228,11 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // --- DONORS LEFT PANEL SEARCH & PAGINATION STATE ---
   const [donorSearchQuery, setDonorSearchQuery] = useState('');
   const [donorSlotFilter, setDonorSlotFilter] = useState('all'); // 'all' | 'available' | 'full'
+  // Left-panel filters of the allocation matrix (server side: date window, amounts, waiting days, email)
+  const [leftFilters, setLeftFilters] = useState({});
+  const [leftFiltersOpen, setLeftFiltersOpen] = useState(false);
+  const leftFiltersRef = useRef(false);
+  const [addingDonation, setAddingDonation] = useState(false);
   const [donorClassificationFilter, setDonorClassificationFilter] = useState('all');
   const [donorPage, setDonorPage] = useState(1);
   const [donorPageSize, setDonorPageSize] = useState(10);
@@ -640,6 +647,19 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       })
       .catch(err => console.error('Error fetching filtered tracker lists:', err));
   };
+
+  useEffect(() => {
+    const active = Object.values(leftFilters).some(v => v !== '' && v != null);
+    if (!active) {
+      if (leftFiltersRef.current) { leftFiltersRef.current = false; loadBeneficiariesAndAllocations(); }
+      return;
+    }
+    leftFiltersRef.current = true;
+    const qs = new URLSearchParams({ company_id: activeCompany, sponsorship_type: selectedDonorType });
+    Object.entries(leftFilters).forEach(([k, v]) => { if (v !== '' && v != null) qs.set(k, v); });
+    fetch(`${API_BASE_URL}/api/tracker/qualifying-donors?${qs.toString()}`)
+      .then(r => (r.ok ? r.json() : null)).then(d => { if (d) setQualifyingDonors(d.donors || []); }).catch(() => {});
+  }, [JSON.stringify(leftFilters), selectedDonorType, activeCompany]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadBeneficiariesAndAllocations = () => {
     setLoadingData(true);
@@ -2261,6 +2281,18 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           </button>
 
           <button
+            onClick={() => setActiveTab('campaigns')}
+            className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
+              activeTab === 'campaigns'
+                ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            <Mail className="w-4 h-4" />
+            Email Campaigns
+          </button>
+
+          <button
             onClick={() => setActiveTab('templates')}
             className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
               activeTab === 'templates'
@@ -2286,6 +2318,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           <EmailQueueView companyId={activeCompany} sponsorshipTypes={['Orphan', 'Widow', 'Ex-Prisoner', 'Hafiz']} onOpenDonor={openDonor} />
         )
       )}
+
+      {activeTab === 'campaigns' && <EmailCampaignsView companyId={isConsolidated ? 'all' : activeCompany} />}
 
       {activeTab === 'beneficiaries' && (
         <div className="flex flex-col gap-5">
@@ -2885,6 +2919,17 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 <UserPlus className="w-3.5 h-3.5" />
                 Add Manual Donor
               </button>
+              {!isConsolidated && canEditRecords() && (
+                <button
+                  type="button"
+                  onClick={() => setAddingDonation(true)}
+                  className="px-3 py-1.5 rounded-lg border border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 font-bold text-xs flex items-center gap-1.5 transition-all ml-2"
+                  title="Record an offline / manual donation in the CRM (counts towards this sponsorship type)"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add donation
+                </button>
+              )}
             </div>
           </div>
 
@@ -3013,6 +3058,31 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           {loadingData ? '···' : `${filteredQualifyingDonors.length} matching`}
                         </span>
                       </div>
+
+                      {/* More filters (left list only) */}
+                      <div className="text-[11px]">
+                        <button type="button" onClick={() => setLeftFiltersOpen(o => !o)} className="font-semibold text-blue-600 dark:text-blue-400 flex items-center gap-1">
+                          <Filter className="w-3 h-3" /> More filters{Object.values(leftFilters).filter(v => v !== '' && v != null).length ? ` (${Object.values(leftFilters).filter(v => v !== '' && v != null).length})` : ''}
+                        </button>
+                        {leftFiltersOpen && (
+                          <div className="mt-1.5 grid grid-cols-2 gap-1.5 p-2 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700">
+                            {[['date_from', `Gave to ${selectedDonorType} from`, 'date'], ['date_to', 'to', 'date'], ['min_total', 'Total ≥ £', 'number'], ['max_total', 'Total ≤ £', 'number'], ['min_waiting_days', 'Waiting ≥ days', 'number']].map(([k, l, t]) => (
+                              <label key={k} className="flex flex-col gap-0.5 font-semibold text-slate-500">{l}
+                                <input type={t} min="0" value={leftFilters[k] ?? ''} onChange={e => setLeftFilters(f => ({ ...f, [k]: e.target.value }))}
+                                  className="px-1.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] font-normal" />
+                              </label>
+                            ))}
+                            <label className="flex flex-col gap-0.5 font-semibold text-slate-500">Has email
+                              <select value={leftFilters.has_email ?? ''} onChange={e => setLeftFilters(f => ({ ...f, has_email: e.target.value }))} className="px-1.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] font-normal">
+                                <option value="">Any</option><option value="yes">Yes</option><option value="no">No</option>
+                              </select>
+                            </label>
+                            {Object.values(leftFilters).some(v => v !== '' && v != null) && (
+                              <button type="button" onClick={() => setLeftFilters({})} className="col-span-2 text-left text-rose-500 font-semibold">Clear these filters</button>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     {/* Donors Paginated Cards Stream */}
@@ -3085,6 +3155,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 <div className="font-black text-slate-800 dark:text-white text-xs md:text-sm">
                                   £{d.total_donated.toLocaleString()}
                                 </div>
+                                {d.window_total != null && (
+                                  <div className="text-[10px] font-semibold text-violet-600 dark:text-violet-300">£{Number(d.window_total).toLocaleString()} in dates</div>
+                                )}
                                 <span className="text-[10px] text-slate-400 uppercase font-semibold">
                                   {d.is_manual ? 'Manual Total' : 'Total Donated'}
                                 </span>
@@ -7510,6 +7583,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         </div>
       )}
 
+      {addingDonation && (
+        <AddDonationModal company={activeCompany} defaults={{ campaign_name: `${selectedDonorType} Sponsorship` }}
+          onClose={() => setAddingDonation(false)} onCreated={() => loadBeneficiariesAndAllocations()} />
+      )}
       <SponsorshipDonorPanel
         donorKey={donorPanelKey}
         companyId={activeCompany}
@@ -7600,7 +7677,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {/* ========================================================= */}
       {conversationAllocation && (
         <div className="fixed inset-0 z-50 flex items-center justify-end bg-black/50 backdrop-blur-xs">
-          <div className="bg-white dark:bg-slate-900 w-full max-w-lg h-full border-l border-slate-200 dark:border-slate-800 shadow-2xl p-6 flex flex-col gap-4 animate-in slide-in-from-right duration-200">
+          <div className="bg-white dark:bg-slate-900 w-[min(1100px,96vw)] max-w-[96vw] h-full border-l border-slate-200 dark:border-slate-800 shadow-2xl p-6 flex flex-col gap-4 animate-in slide-in-from-right duration-200">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 rounded-lg bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400">

@@ -13,6 +13,7 @@ import csv
 import json
 import time
 import io
+import re
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
@@ -34,13 +35,10 @@ if not logger.handlers:
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
-# Stripe API configuration (read-only)
-STRIPE_SECRET_KEY = (
-    os.environ.get("RETHINK_STRIPE_SECRET_KEY")
-    or os.environ.get("STRIPE_RETHINK_SECRET_KEY")
-    or os.environ.get("STRIPE_SECRET_KEY")
-    or ""
-).strip()
+# Stripe API configuration (read-only). Keys are per charity: core/stripe_accounts.py
+from core.stripe_accounts import stripe_key, is_connected  # noqa: E402
+
+STRIPE_SECRET_KEY = stripe_key("rethink")  # kept for older imports; new code passes the charity
 
 STRIPE_ACCOUNT_ID = (
     os.environ.get("RETHINK_STRIPE_ACCOUNT")
@@ -48,13 +46,19 @@ STRIPE_ACCOUNT_ID = (
     or ""
 ).strip()
 STRIPE_API_BASE = "https://api.stripe.com/v1"
+# Default charity when none is given. Every payout, line and classification is stored under the charity whose
+# Stripe account it came from, and read with that charity's key only.
+STRIPE_COMPANY = "rethink"
 REPORTS_DIR = os.path.join(BASE_DIR, "data_cache", "stripe_payout_reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
-def _stripe_headers() -> Dict[str, str]:
+def _stripe_headers(company_id: str = STRIPE_COMPANY) -> Dict[str, str]:
+    key = stripe_key(company_id)
+    if not key:
+        raise RuntimeError(f"Stripe isn't connected for '{company_id}'.")
     return {
-        "Authorization": f"Bearer {STRIPE_SECRET_KEY}",
+        "Authorization": f"Bearer {key}",
         "Accept": "application/json"
     }
 
@@ -126,6 +130,19 @@ def init_stripe_payout_tables() -> None:
                 FOREIGN KEY (payout_id) REFERENCES stripe_payout_reports(payout_id)
             )
         """)
+        # Added 13 Oct 2026: the payout's own figures from Stripe, the adds-up check and classification state
+        for table, col, decl in (
+            ("stripe_payout_reports", "lines_net", "REAL"),
+            ("stripe_payout_reports", "difference", "REAL"),
+            ("stripe_payout_reports", "adds_up", "INTEGER"),
+            ("stripe_payout_reports", "unassigned_lines", "INTEGER DEFAULT 0"),
+            ("stripe_payout_reports", "review_lines", "INTEGER DEFAULT 0"),
+            ("stripe_payout_reports", "reconciled_at", "TEXT"),
+            ("stripe_payout_items", "classified_by", "TEXT"),
+        ):
+            have = {r[1] for r in cursor.execute(f"PRAGMA table_info({table})")}
+            if col not in have:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_stripe_payout_items_pid ON stripe_payout_items(payout_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_stripe_payout_items_did ON stripe_payout_items(donation_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_stripe_payout_items_cid ON stripe_payout_items(charge_id)")
@@ -137,7 +154,63 @@ def init_stripe_payout_tables() -> None:
 init_stripe_payout_tables()
 
 
-def list_stripe_payouts(limit: int = 25) -> List[Dict[str, Any]]:
+def get_stripe_payout(payout_id: str, company_id: str = STRIPE_COMPANY) -> Dict[str, Any]:
+    """The payout exactly as Stripe has it (GET only): amount, currency, status and arrival date."""
+    r = requests.get(f"{STRIPE_API_BASE}/payouts/{payout_id}", headers=_stripe_headers(company_id), timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Stripe payout {payout_id} could not be read: {r.status_code}")
+    p = r.json()
+    ts = lambda v: datetime.fromtimestamp(v, tz=timezone.utc) if v else None  # noqa: E731
+    return {
+        "payout_id": p["id"],
+        "amount": round(float(p.get("amount") or 0) / 100.0, 2),
+        "currency": str(p.get("currency") or "gbp").upper(),
+        "status": p.get("status") or "unknown",
+        "arrival_date": ts(p.get("arrival_date")).strftime("%Y-%m-%d") if p.get("arrival_date") else "",
+        "created_at": ts(p.get("created")).isoformat() if p.get("created") else "",
+        "automatic": bool(p.get("automatic")),
+    }
+
+
+UNASSIGNED = "Unassigned"
+# Placeholder "codes" that mean "not classified" in any capitalisation (the matrix screen saves them upper-case)
+_NOT_A_CODE = {"", "UNASSIGNED", "NONE", "NAN", "N/A", "NULL"}
+# Descriptions Stripe writes when a payment carries no project at all; mapping one of these to a code would
+# classify every such gift the same way, so they stay per-line ("Needs classification") instead.
+_GENERIC_DESCRIPTION = re.compile(
+    r"^(one-off payment of .* via stripe|subscription of .* via stripe|subscription (update|creation)|"
+    r"payment for invoice.*|general website donation)$", re.I)
+# Classification sources that are a best guess rather than a rule, and so need a person to confirm
+REVIEW_SOURCES = {"donor_history"}
+
+
+def _unassigned_meta(classified_by: str = "none") -> Dict[str, str]:
+    return {"code": UNASSIGNED, "heading": UNASSIGNED, "subheading": UNASSIGNED, "department": "", "office": "",
+            "portfolio": "", "country": "", "programme_fund": "", "fund_code": UNASSIGNED, "zakat_eligibility": "",
+            "classified_by": classified_by}
+
+
+def _register_unassigned_stripe_name(cursor, company_id: str, project_name: str) -> None:
+    """Puts an unknown Stripe project name into the classification matrix as Unassigned (as GiveBrite does),
+    so classifying it once there classifies every line that carries it."""
+    name = (project_name or "").strip()
+    if not name or _GENERIC_DESCRIPTION.match(name):
+        return
+    try:
+        cursor.execute("""SELECT 1 FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id,'rethink')) = ?
+                          AND platform = 'stripe' AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?)) LIMIT 1""",
+                       (company_id, name))
+        if not cursor.fetchone():
+            # Upper-case, as the matrix screen saves it, so a later Save doesn't add a second "variant"
+            cursor.execute("""INSERT OR IGNORE INTO platform_campaign_mappings
+                              (company_id, platform, campaign_name, giving_level, code, created_at, updated_at)
+                              VALUES (?, 'stripe', ?, '', 'UNASSIGNED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                           (company_id, name))
+    except Exception as reg_err:
+        logger.warning(f"Could not register Stripe project '{name}' for classification: {reg_err}")
+
+
+def list_stripe_payouts(limit: int = 25, company_id: str = STRIPE_COMPANY) -> List[Dict[str, Any]]:
     """
     Queries Stripe API for recent payouts (READ-ONLY) and merges them with
     local approval and reconciliation state from the CRM database.
@@ -145,9 +218,9 @@ def list_stripe_payouts(limit: int = 25) -> List[Dict[str, Any]]:
     url = f"{STRIPE_API_BASE}/payouts"
     params = {"limit": limit}
     try:
-        r = requests.get(url, headers=_stripe_headers(), params=params, timeout=12)
+        r = requests.get(url, headers=_stripe_headers(company_id), params=params, timeout=12)
         if r.status_code != 200:
-            logger.error(f"Failed to list Stripe payouts: {r.status_code} {r.text}")
+            logger.error(f"Failed to list Stripe payouts: {r.status_code}")
             return []
         data = r.json()
         payouts_raw = data.get("data", [])
@@ -162,9 +235,10 @@ def list_stripe_payouts(limit: int = 25) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT payout_id, approval_status, approved_by, approved_at, slack_sent_at,
-                   total_transactions, total_gross, total_fees, total_net, funds_summary_json, zakat_summary_json, csv_path
-            FROM stripe_payout_reports
-        """)
+                   total_transactions, total_gross, total_fees, total_net, funds_summary_json, zakat_summary_json, csv_path,
+                   lines_net, difference, adds_up, unassigned_lines, review_lines, reconciled_at
+            FROM stripe_payout_reports WHERE LOWER(COALESCE(company_id, 'rethink')) = ?
+        """, (str(company_id).lower(),))
         for row in cursor.fetchall():
             local_reports[row[0]] = {
                 "approval_status": row[1] or "pending",
@@ -177,7 +251,13 @@ def list_stripe_payouts(limit: int = 25) -> List[Dict[str, Any]]:
                 "total_net": row[8],
                 "funds_summary": json.loads(row[9]) if row[9] else {},
                 "zakat_summary": json.loads(row[10]) if row[10] else {},
-                "is_reconciled": bool(row[11] and os.path.exists(row[11]))
+                "is_reconciled": bool(row[11] and os.path.exists(row[11])),
+                "lines_net": row[12],
+                "difference": row[13],
+                "adds_up": None if row[14] is None else bool(row[14]),
+                "unassigned_lines": row[15] or 0,
+                "review_lines": row[16] or 0,
+                "reconciled_at": row[17],
             }
     finally:
         conn.close()
@@ -209,20 +289,26 @@ def list_stripe_payouts(limit: int = 25) -> List[Dict[str, Any]]:
             "total_fees": local.get("total_fees"),
             "total_net": local.get("total_net"),
             "funds_summary": local.get("funds_summary", {}),
-            "zakat_summary": local.get("zakat_summary", {})
+            "zakat_summary": local.get("zakat_summary", {}),
+            "lines_net": local.get("lines_net"),
+            "difference": local.get("difference"),
+            "adds_up": local.get("adds_up"),
+            "unassigned_lines": local.get("unassigned_lines", 0),
+            "review_lines": local.get("review_lines", 0),
+            "reconciled_at": local.get("reconciled_at"),
         })
 
     return result
 
 
-def _fetch_stripe_invoice_details(invoice_id: str) -> Dict[str, Any]:
+def _fetch_stripe_invoice_details(invoice_id: str, company_id: str = STRIPE_COMPANY) -> Dict[str, Any]:
     """Retrieves invoice with expanded subscription and lines (READ-ONLY)."""
     if not invoice_id:
         return {}
     url = f"{STRIPE_API_BASE}/invoices/{invoice_id}"
     params = [("expand[]", "subscription"), ("expand[]", "lines.data.price.product")]
     try:
-        r = requests.get(url, headers=_stripe_headers(), params=params, timeout=12)
+        r = requests.get(url, headers=_stripe_headers(company_id), params=params, timeout=12)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
@@ -235,7 +321,9 @@ def _match_crm_classification(
     giving_level: str = "",
     company_id: str = "rethink",
     cursor: Optional[Any] = None,
-    payment_link_id: Optional[str] = None
+    payment_link_id: Optional[str] = None,
+    source_type: Optional[str] = None,
+    register_unknown: bool = True,
 ) -> Dict[str, str]:
     """
     Matches campaign text strictly against our CRM's master classification table (platform_campaign_mappings)
@@ -244,11 +332,10 @@ def _match_crm_classification(
     """
     clean_name = (campaign_name or "").strip()
     clean_level = (giving_level or "").strip()
-    c_low = clean_name.lower()
     comp = str(company_id or "rethink").lower().strip()
 
-    # Special Case: Stripe fees
-    if "fee" in c_low or "billing" in c_low or "per auth" in c_low or "usage fee" in c_low:
+    # Stripe's own fees: decided by the line type, never by the words in a project name ("Coffee morning")
+    if source_type == "fee":
         if cursor:
             cursor.execute("""
                 SELECT department, office, portfolio, country, programme_fund, fund_code, zakat_eligibility,
@@ -267,7 +354,8 @@ def _match_crm_classification(
                     "fund_code": fee_row[5] or "F-ADM",
                     "zakat_eligibility": fee_row[6] or "Non-Zakat",
                     "heading": fee_row[7] or "Finance & Operations",
-                    "subheading": fee_row[8] or "Platform & Processing Fees"
+                    "subheading": fee_row[8] or "Platform & Processing Fees",
+                    "classified_by": "fee",
                 }
         return {
             "code": "STRIPE-FEE",
@@ -279,10 +367,12 @@ def _match_crm_classification(
             "country": "United Kingdom",
             "programme_fund": "Unrestricted / Overhead (outside 6 funds)",
             "fund_code": "F-ADM",
-            "zakat_eligibility": "Non-Zakat"
+            "zakat_eligibility": "Non-Zakat",
+            "classified_by": "fee",
         }
 
     resolved_code = None
+    classified_by = "none"
 
     if cursor:
         # 0. Direct match by Stripe Payment Link ID / URL in platform_campaign_mappings
@@ -296,12 +386,13 @@ def _match_crm_classification(
                       OR giving_level LIKE '%' || ? || '%'
                       OR campaign_url LIKE '%' || ? || '%'
                   )
+                  AND UPPER(TRIM(COALESCE(code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
                 ORDER BY is_primary DESC, rowid DESC
                 LIMIT 1
             """, (comp, payment_link_id, payment_link_id, payment_link_id))
             row = cursor.fetchone()
-            if row and row[0]:
-                resolved_code = row[0].strip()
+            if row and row[0] and row[0].strip().upper() not in _NOT_A_CODE:
+                resolved_code, classified_by = row[0].strip(), "payment_link"
 
         # 1. Match in platform_campaign_mappings by giving level
         if not resolved_code and clean_name and clean_level:
@@ -310,12 +401,13 @@ def _match_crm_classification(
                 WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
                   AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?)) 
                   AND LOWER(TRIM(giving_level)) = LOWER(TRIM(?))
+                  AND UPPER(TRIM(COALESCE(code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
                 ORDER BY (platform = 'stripe') DESC, (platform IN ('website', 'rethink_website')) DESC, is_primary DESC, rowid DESC
                 LIMIT 1
             """, (comp, clean_name, clean_level))
             row = cursor.fetchone()
-            if row and row[0]:
-                resolved_code = row[0].strip()
+            if row and row[0] and row[0].strip().upper() not in _NOT_A_CODE:
+                resolved_code, classified_by = row[0].strip(), "campaign_and_level"
 
         # 2. Exact match in platform_campaign_mappings by campaign name
         if not resolved_code and clean_name:
@@ -323,12 +415,13 @@ def _match_crm_classification(
                 SELECT code FROM platform_campaign_mappings
                 WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
                   AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                  AND UPPER(TRIM(COALESCE(code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
                 ORDER BY (platform = 'stripe') DESC, (platform IN ('website', 'rethink_website')) DESC, is_primary DESC, rowid DESC
                 LIMIT 1
             """, (comp, clean_name))
             row = cursor.fetchone()
-            if row and row[0]:
-                resolved_code = row[0].strip()
+            if row and row[0] and row[0].strip().upper() not in _NOT_A_CODE:
+                resolved_code, classified_by = row[0].strip(), "campaign"
 
         # 3. Direct match in master_project_codes by code
         if not resolved_code and clean_name:
@@ -339,26 +432,18 @@ def _match_crm_classification(
             """, (clean_name,))
             row = cursor.fetchone()
             if row and row[0]:
-                resolved_code = row[0].strip()
+                resolved_code, classified_by = row[0].strip(), "code"
 
-        # 4. Keyword / partial matching in platform_campaign_mappings
-        if not resolved_code and clean_name:
-            cursor.execute("""
-                SELECT code FROM platform_campaign_mappings
-                WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
-                  AND LENGTH(TRIM(campaign_name)) >= 3
-                  AND (? LIKE '%' || LOWER(TRIM(campaign_name)) || '%' OR LOWER(TRIM(campaign_name)) LIKE '%' || ? || '%')
-                ORDER BY (platform = 'stripe') DESC, (platform IN ('website', 'rethink_website')) DESC, is_primary DESC, LENGTH(campaign_name) DESC
-                LIMIT 1
-            """, (comp, c_low, c_low))
-            row = cursor.fetchone()
-            if row and row[0]:
-                resolved_code = row[0].strip()
+        # (No partial/keyword matching: short names such as "os" matched unrelated projects.)
 
     if not resolved_code:
-        resolved_code = "ALL-GEN-GEN-GEN"
+        # Nothing matched: say so, instead of quietly filing the gift under the general fund
+        if cursor and register_unknown:
+            _register_unassigned_stripe_name(cursor, comp, clean_name)
+        return _unassigned_meta()
 
     meta = {
+        "classified_by": classified_by,
         "code": resolved_code,
         "heading": "General",
         "subheading": "General",
@@ -426,11 +511,67 @@ REPORT_COLUMNS = [
 ]
 
 
+def _payout_rows_from_api(payout_id: str, company_id: str = STRIPE_COMPANY) -> List[Dict[str, Any]]:
+    """Every balance transaction paid out in this payout, as rows shaped like Stripe's itemised payout report
+    (same keys as REPORT_COLUMNS), read with GET /v1/balance_transactions?payout=…&expand[]=data.source."""
+    rows: List[Dict[str, Any]] = []
+    # The PaymentIntent is expanded too: its metadata is what Stripe's report calls "payment_metadata"
+    params: Dict[str, Any] = {"payout": payout_id, "limit": 100, "expand[]": ["data.source", "data.source.payment_intent"]}
+    while True:
+        r = requests.get(f"{STRIPE_API_BASE}/balance_transactions", headers=_stripe_headers(company_id), params=params, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Stripe balance transactions for {payout_id} could not be read: {r.status_code}")
+        page = r.json()
+        for bt in page.get("data", []):
+            if bt.get("type") == "payout":
+                continue  # the payout itself, not a line in it
+            src = bt.get("source") if isinstance(bt.get("source"), dict) else {}
+            charge = src
+            if src.get("object") == "refund":
+                charge = src.get("charge") if isinstance(src.get("charge"), dict) else {"id": src.get("charge") or ""}
+            billing = charge.get("billing_details") or {}
+            pi = charge.get("payment_intent") if isinstance(charge.get("payment_intent"), dict) else {}
+            # Same precedence as Stripe's report: the PaymentIntent's metadata, else the charge's (or refund's)
+            meta = {k: v for k, v in (charge.get("metadata") or {}).items() if v}
+            if src is not charge:
+                meta.update({k: v for k, v in (src.get("metadata") or {}).items() if v})
+            meta.update({k: v for k, v in (pi.get("metadata") or {}).items() if v})
+            cents = lambda v: f"{(v or 0) / 100.0:.2f}"  # noqa: E731
+            ts = lambda v: datetime.fromtimestamp(v, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if v else ""  # noqa: E731
+            row = {
+                "balance_transaction_id": bt.get("id"),
+                "created": ts(bt.get("created")),
+                "available_on": ts(bt.get("available_on")),
+                "gross": cents(bt.get("amount")),
+                "fee": cents(bt.get("fee")),
+                "net": cents(bt.get("net")),
+                "currency": bt.get("currency") or "gbp",
+                "charge_id": charge.get("id") if str(charge.get("id") or "").startswith(("ch_", "py_")) else "",
+                "payment_intent_id": pi.get("id") or (charge.get("payment_intent") if isinstance(charge.get("payment_intent"), str) else ""),
+                "customer_id": charge.get("customer") if isinstance(charge.get("customer"), str) else "",
+                "customer_email": billing.get("email") or charge.get("receipt_email") or "",
+                "customer_name": billing.get("name") or "",
+                "payment_method_type": (charge.get("payment_method_details") or {}).get("type") or "",
+                "reporting_category": bt.get("reporting_category") or bt.get("type") or "",
+                "description": bt.get("description") or charge.get("description") or "",
+                "source_object": src.get("object") or "",
+            }
+            for key in ("Donor Name", "Donor Email", "Donor Phone", "Donor Address", "Project Name", "Project Reference",
+                        "Location Name", "Location Reference", "Gift Aid?", "Zakat?", "Appeal",
+                        "Payment Reference Code", "Stripe Data Reference"):
+                row[f"payment_metadata[{key}]"] = str(meta.get(key) or "")
+            rows.append(row)
+        if not page.get("has_more") or not page.get("data"):
+            break
+        params["starting_after"] = page["data"][-1]["id"]
+    return rows
+
+
 def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict[str, Any]:
     """
     Executes the complete Stripe Payout reconciliation workflow:
-    1. Requests Stripe Reporting API report run for the payout with full 28 custom metadata columns.
-    2. Downloads itemized balance transaction CSV.
+    1. Reads the payout and its balance transactions (with their charges and metadata) from the Stripe API - GET only.
+    2. Checks the lines add up to the payout amount.
     3. Deep-enriches recurring subscriptions, invoices, and contactless transactions.
     4. Enriches GiveBrite rows via direct join with CRM donations.
     5. Maps Website donations using platform_campaign_mappings and master_project_codes.
@@ -438,59 +579,18 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
     7. Saves enriched report and registers in database with 'pending' approval status.
     """
     logger.info(f"Starting Stripe Payout reconciliation for: {payout_id}")
+    company_id = str(company_id or "rethink").strip().lower()
+    payout = get_stripe_payout(payout_id, company_id)  # the real amount/status/arrival date, to check the lines against
+    if not payout["automatic"]:
+        raise ValueError("This is a manual payout: Stripe doesn't record which payments went into a manual payout, "
+                         "so it can't be itemised. Only automatic payouts can be reconciled line by line.")
 
     import stripe
-    stripe.api_key = STRIPE_SECRET_KEY
+    api_key = stripe_key(company_id)  # passed per call (never the global), so two charities can't mix keys
 
-    # Step 1: Check if an existing succeeded report run with full custom columns already exists
-    file_id = None
-    try:
-        existing_runs = stripe.reporting.ReportRun.list(limit=25)
-        for r in existing_runs.data:
-            p_dict = r.parameters.to_dict() if hasattr(r.parameters, "to_dict") else (r.parameters if isinstance(r.parameters, dict) else {})
-            p_cols = p_dict.get("columns") or []
-            if p_dict.get("payout") == payout_id and r.status == "succeeded" and r.result and len(p_cols) >= 20:
-                file_id = r.result.id
-                logger.info(f"Reusing existing completed Stripe report run {r.id} with custom columns (file: {file_id})")
-                break
-    except Exception as list_err:
-        logger.warning(f"Notice listing existing report runs: {list_err}")
-
-    # If no completed run exists with custom columns, create one and poll
-    if not file_id:
-        try:
-            run_data = stripe.reporting.ReportRun.create(
-                report_type="payout_reconciliation.by_id.itemized.4",
-                parameters={"payout": payout_id, "columns": REPORT_COLUMNS}
-            )
-            run_id = run_data.id
-            logger.info(f"Report Run created: {run_id}, status: {run_data.status}")
-
-            completed = run_data
-            attempts = 0
-            max_attempts = 35
-            while completed.status == "pending" and attempts < max_attempts:
-                time.sleep(2)
-                attempts += 1
-                completed = stripe.reporting.ReportRun.retrieve(run_id)
-                logger.info(f"Polling report {run_id}... status: {completed.status} (attempt {attempts})")
-
-            if completed.status == "succeeded" and completed.result:
-                file_id = completed.result.id
-            else:
-                raise TimeoutError(f"Report run {run_id} failed or timed out with status: {completed.status}")
-        except Exception as run_err:
-            logger.error(f"Error in Stripe report run: {run_err}")
-            raise
-
-    logger.info(f"Downloading Stripe generated CSV file: {file_id}")
-    r_file = requests.get(f"https://files.stripe.com/v1/files/{file_id}/contents", headers=_stripe_headers(), timeout=30)
-    if r_file.status_code != 200:
-        raise RuntimeError(f"Failed to download report file from Stripe: {r_file.status_code}")
-
-    raw_csv_text = r_file.text
-    reader = csv.DictReader(io.StringIO(raw_csv_text))
-    raw_rows = list(reader)
+    # Step 1: the payout's lines straight from the API (GET only, nothing is created in Stripe). Each line comes
+    # with its charge/refund, so the charge id, payment intent and the donation's metadata are always present.
+    raw_rows = _payout_rows_from_api(payout_id, company_id)
 
     # Step 3: Enrich rows against CRM database
     conn = get_db_connection(timeout=15.0)
@@ -503,6 +603,8 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
     enriched_count = 0
     funds_breakdown: Dict[str, float] = {}
     zakat_breakdown: Dict[str, float] = {}
+    unassigned_lines = 0
+    review_lines = 0
 
     try:
         for row in raw_rows:
@@ -540,7 +642,7 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                 source_type = "fee"
                 donor_name = "[Stripe Platform Fee]"
                 proj_name = desc or "Billing - Usage Fee"
-                meta = _match_crm_classification(proj_name, cursor=cursor)
+                meta = _match_crm_classification(proj_name, cursor=cursor, source_type="fee")
 
             # Check Case 2: GiveBrite Donation (matches description 'GB-donation-' or charge_id)
             elif desc.startswith("GB-donation-") or "gbx" in desc.lower() or (ch_id and "GB-" in desc):
@@ -552,9 +654,9 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                     SELECT [First Name], [Last Name], [Email], [Campaign Name], [Giving Level Title],
                            [Code], [Department], [Office], [Portfolio], [Country], [Programme Fund], [Fund Code], [Zakat Eligibility]
                     FROM donations
-                    WHERE [Donation ID] = ? OR [charge_id] = ? OR [_id] = ?
+                    WHERE LOWER(company_id) = ? AND ([Donation ID] = ? OR [charge_id] = ? OR [_id] = ?)
                     LIMIT 1
-                """, (donation_id, ch_id, donation_id))
+                """, (company_id, donation_id, ch_id, donation_id))
                 crm_row = cursor.fetchone()
 
                 if crm_row:
@@ -575,7 +677,8 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                             "country": crm_row[9] or "",
                             "programme_fund": crm_row[10] or "",
                             "fund_code": crm_row[11] or "",
-                            "zakat_eligibility": crm_row[12] or "Zakat"
+                            "zakat_eligibility": crm_row[12] or "Zakat",
+                            "classified_by": "crm_donation",
                         }
                     else:
                         meta = _match_crm_classification(proj_name, giving_level, company_id=company_id, cursor=cursor)
@@ -585,7 +688,7 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
 
             # Check Case 3: Contactless / Sign Pay Terminal Reader
             elif "sign pay" in desc.lower() or row.get("payment_method_type") == "card_present":
-                source_type = "terminal"
+                source_type = "sign_pay"
                 donor_name = donor_name or "Contactless Donor (Sign Pay)"
                 donor_email = donor_email or "in-person@terminal"
                 clean_desc = desc.replace("Payment via Sign Pay", "Sign Pay - General").replace("Sign Pay - ", "").strip()
@@ -596,10 +699,10 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
             # Check Case 4: Recurring Subscriptions / Invoices where project name was omitted
             else:
                 pl_id = None
+                found_invoice = False
                 if not proj_name and pi_id:
-                    source_type = "subscription"
                     try:
-                        pi_obj = stripe.PaymentIntent.retrieve(pi_id)
+                        pi_obj = stripe.PaymentIntent.retrieve(pi_id, api_key=api_key)
                         pi_dict = pi_obj.to_dict() if hasattr(pi_obj, "to_dict") else dict(pi_obj)
                         
                         # Find invoice ID
@@ -609,7 +712,8 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                             inv_id = p_details.get("order_reference")
 
                         if inv_id:
-                            inv = stripe.Invoice.retrieve(inv_id, expand=["lines.data.price.product", "subscription"])
+                            found_invoice = True
+                            inv = stripe.Invoice.retrieve(inv_id, expand=["lines.data.price.product", "subscription"], api_key=api_key)
                             inv_dict = inv.to_dict() if hasattr(inv, "to_dict") else dict(inv)
                             lines = (inv_dict.get("lines") or {}).get("data", [])
                             line_item = lines[0] if lines else {}
@@ -639,10 +743,10 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                             stripe_data_ref = meta_src.get("Stripe Data Reference") or stripe_data_ref or ""
                         else:
                             # Check checkout sessions for payment link
-                            sessions = stripe.checkout.Session.list(payment_intent=pi_id, limit=1)
+                            sessions = stripe.checkout.Session.list(payment_intent=pi_id, limit=1, api_key=api_key)
                             if sessions.data and sessions.data[0].payment_link:
                                 pl_id = sessions.data[0].payment_link
-                                pl = stripe.PaymentLink.retrieve(pl_id, expand=["line_items.data.price.product"])
+                                pl = stripe.PaymentLink.retrieve(pl_id, expand=["line_items.data.price.product"], api_key=api_key)
                                 li = (pl.line_items.data or [None])[0] if hasattr(pl, "line_items") else None
                                 if li and hasattr(li, "price") and hasattr(li.price, "product"):
                                     proj_name = getattr(li.price.product, "name", "")
@@ -652,7 +756,7 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                 # If Direct Debit (py_...) or subscription update without project, check customer subscriptions
                 if not proj_name and row.get("customer_id"):
                     try:
-                        subs = stripe.Subscription.list(customer=row.get("customer_id"), limit=1, expand=["data.items.data.price.product"])
+                        subs = stripe.Subscription.list(customer=row.get("customer_id"), limit=1, expand=["data.items.data.price.product"], api_key=api_key)
                         if subs.data:
                             sub_obj = subs.data[0]
                             sub_items = sub_obj.items.data if hasattr(sub_obj, "items") else []
@@ -664,19 +768,36 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                         logger.debug(f"Customer subscription lookup note: {sub_err2}")
 
                 # If still empty, check previous donation in CRM donations table
+                guessed_from_history = False
                 if not proj_name and donor_email:
+                    # Same charity only; a guess from the donor's last gift, so it is flagged for review
                     cursor.execute("""
                         SELECT [Campaign Name] FROM donations
-                        WHERE LOWER(TRIM(Email)) = LOWER(TRIM(?)) AND [Campaign Name] IS NOT NULL AND [Campaign Name] != ''
+                        WHERE LOWER(company_id) = ? AND LOWER(TRIM(Email)) = LOWER(TRIM(?))
+                          AND [Campaign Name] IS NOT NULL AND [Campaign Name] != ''
                         ORDER BY rowid DESC LIMIT 1
-                    """, (donor_email,))
+                    """, (company_id, donor_email))
                     prev_d = cursor.fetchone()
                     if prev_d and prev_d[0]:
                         proj_name = prev_d[0]
+                        guessed_from_history = True
 
+                # Label by what Stripe says it was: an invoice = subscription, a payment link = payment link
+                if found_invoice or desc.lower().startswith(("subscription", "payment for invoice")):
+                    source_type = "subscription"
+                elif pl_id:
+                    source_type = "payment_link"
                 proj_name = proj_name or desc or "General Website Donation"
                 meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor, payment_link_id=pl_id)
+                if guessed_from_history and meta.get("code") != UNASSIGNED:
+                    meta["classified_by"] = "donor_history"
                 enriched_count += 1
+
+            # Money going back out (refunds, disputes) keeps its project/classification but is labelled as such
+            if cat in ("refund", "refund_failure", "dispute", "dispute_reversal"):
+                source_type = cat
+            elif cat == "charge_failure":
+                source_type = "failed_payment"  # e.g. a Direct Debit that bounced: Stripe takes the money back
 
             # Build enriched row
             enriched_row = dict(row)
@@ -722,8 +843,8 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                     project_name, project_reference, location_name, location_reference,
                     gift_aid, zakat_status, appeal, payment_reference_code, stripe_data_reference,
                     code, heading, subheading, department, office,
-                    portfolio, country, programme_fund, fund_code, zakat_eligibility
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    portfolio, country, programme_fund, fund_code, zakat_eligibility, classified_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 row.get("balance_transaction_id"), payout_id, ch_id, pi_id,
                 source_type, donation_id, row.get("created"), gross, fee, net,
@@ -731,8 +852,19 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                 proj_name, proj_ref, loc_name, loc_ref,
                 gift_aid, zakat_status, appeal, pmt_ref_code, stripe_data_ref,
                 meta["code"], meta["heading"], meta["subheading"], meta["department"], meta["office"],
-                meta["portfolio"], meta["country"], meta["programme_fund"], meta["fund_code"], meta["zakat_eligibility"]
+                meta["portfolio"], meta["country"], meta["programme_fund"], meta["fund_code"], meta["zakat_eligibility"],
+                meta.get("classified_by") or "none"
             ))
+            if meta.get("code") == UNASSIGNED:
+                unassigned_lines += 1
+            elif meta.get("classified_by") in REVIEW_SOURCES:
+                review_lines += 1
+
+        # Lines Stripe no longer lists for this payout (re-run) must not linger
+        seen_ids = [r.get("balance_transaction_id") for r in raw_rows if r.get("balance_transaction_id")]
+        if seen_ids:
+            cursor.execute(f"DELETE FROM stripe_payout_items WHERE payout_id = ? AND balance_transaction_id NOT IN ({','.join('?' * len(seen_ids))})",
+                           (payout_id, *seen_ids))
 
         # Save enriched CSV file to reports directory
         ts_now = int(time.time())
@@ -760,19 +892,34 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
             writer.writeheader()
             writer.writerows(enriched_rows)
 
-        # Register report record in database
+        # Register the payout with Stripe's own figures, and check the lines add up to what was paid out.
+        # A re-run keeps an existing approval (the upsert never touches the approval columns).
         now_iso = datetime.now(timezone.utc).isoformat()
+        lines_net = round(total_net, 2)
+        difference = round(payout["amount"] - lines_net, 2)
         cursor.execute("""
-            INSERT OR REPLACE INTO stripe_payout_reports (
+            INSERT INTO stripe_payout_reports (
                 payout_id, company_id, amount, currency, status, arrival_date, created_at,
                 total_transactions, total_gross, total_fees, total_net, approval_status,
-                funds_summary_json, zakat_summary_json, csv_path, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                funds_summary_json, zakat_summary_json, csv_path, updated_at,
+                lines_net, difference, adds_up, unassigned_lines, review_lines, reconciled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(payout_id) DO UPDATE SET
+                company_id = excluded.company_id, amount = excluded.amount, currency = excluded.currency,
+                status = excluded.status, arrival_date = excluded.arrival_date, created_at = excluded.created_at,
+                total_transactions = excluded.total_transactions, total_gross = excluded.total_gross,
+                total_fees = excluded.total_fees, total_net = excluded.total_net,
+                funds_summary_json = excluded.funds_summary_json, zakat_summary_json = excluded.zakat_summary_json,
+                csv_path = excluded.csv_path, updated_at = excluded.updated_at, lines_net = excluded.lines_net,
+                difference = excluded.difference, adds_up = excluded.adds_up,
+                unassigned_lines = excluded.unassigned_lines, review_lines = excluded.review_lines,
+                reconciled_at = excluded.reconciled_at
         """, (
-            payout_id, company_id, round(total_net, 2), "GBP", "paid",
-            datetime.now(timezone.utc).strftime("%Y-%m-%d"), now_iso, len(enriched_rows),
-            round(total_gross, 2), round(total_fees, 2), round(total_net, 2),
-            json.dumps(funds_breakdown), json.dumps(zakat_breakdown), csv_path, now_iso
+            payout_id, company_id, payout["amount"], payout["currency"], payout["status"],
+            payout["arrival_date"], payout["created_at"], len(enriched_rows),
+            round(total_gross, 2), round(total_fees, 2), lines_net,
+            json.dumps(funds_breakdown), json.dumps(zakat_breakdown), csv_path, now_iso,
+            lines_net, difference, int(abs(difference) < 0.005), unassigned_lines, review_lines, now_iso
         ))
 
         conn.commit()
@@ -788,7 +935,14 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
         "total_net": round(total_net, 2),
         "funds_breakdown": funds_breakdown,
         "zakat_breakdown": zakat_breakdown,
-        "csv_path": csv_path
+        "csv_path": csv_path,
+        "payout_amount": payout["amount"],
+        "payout_status": payout["status"],
+        "arrival_date": payout["arrival_date"],
+        "difference": difference,
+        "adds_up": abs(difference) < 0.005,
+        "unassigned_lines": unassigned_lines,
+        "review_lines": review_lines,
     }
     logger.info(f"Reconciliation completed for {payout_id}: {len(enriched_rows)} rows enriched.")
     return summary
@@ -801,12 +955,14 @@ def resync_payout_with_crm(payout_id: str, company_id: str = "rethink") -> Dict[
     Re-evaluates every item in the payout against the current CRM tables.
     """
     logger.info(f"Re-syncing Stripe payout {payout_id} with updated CRM classifications...")
+    company_id = str(company_id or "rethink").strip().lower()
     conn = get_db_connection(timeout=15.0)
     cursor = conn.cursor()
 
     try:
         cursor.execute("""
-            SELECT balance_transaction_id, donation_id, project_name, net, charge_id, source_type
+            SELECT balance_transaction_id, donation_id, project_name, net, charge_id, source_type, classified_by,
+                   code, fund_code, zakat_eligibility
             FROM stripe_payout_items WHERE payout_id = ?
         """, (payout_id,))
         items = cursor.fetchall()
@@ -817,38 +973,54 @@ def resync_payout_with_crm(payout_id: str, company_id: str = "rethink") -> Dict[
         funds_breakdown: Dict[str, float] = {}
         zakat_breakdown: Dict[str, float] = {}
         total_net = 0.0
+        unassigned_lines = 0
+        review_lines = 0
 
-        for b_id, d_id, proj_name, net_val, ch_id, src_type in items:
+        for b_id, d_id, proj_name, net_val, ch_id, src_type, prev_by, prev_code, prev_fund, prev_zakat in items:
             net = float(net_val or 0.0)
             total_net += net
+
+            if prev_by == "manual":
+                # Classified by a person for this line only: keep it
+                funds_breakdown[prev_fund or "Unknown"] = round(funds_breakdown.get(prev_fund or "Unknown", 0.0) + net, 2)
+                zakat_breakdown[prev_zakat or "Non-Zakat"] = round(zakat_breakdown.get(prev_zakat or "Non-Zakat", 0.0) + net, 2)
+                updated_count += 1
+                continue
 
             # If GiveBrite, check donations table directly
             if src_type == "givebrite" and d_id:
                 cursor.execute("""
                     SELECT [Code], [Department], [Office], [Portfolio], [Country], [Programme Fund], [Fund Code], [Zakat Eligibility]
-                    FROM donations WHERE [Donation ID] = ? LIMIT 1
-                """, (d_id,))
+                    FROM donations WHERE LOWER(company_id) = ? AND [Donation ID] = ? LIMIT 1
+                """, (company_id, d_id))
                 d_row = cursor.fetchone()
                 if d_row and d_row[0] and d_row[0] != "Unassigned":
                     meta = {
                         "code": d_row[0], "department": d_row[1] or "", "office": d_row[2] or "",
                         "portfolio": d_row[3] or "", "country": d_row[4] or "",
                         "programme_fund": d_row[5] or "", "fund_code": d_row[6] or "",
-                        "zakat_eligibility": d_row[7] or "Zakat"
+                        "zakat_eligibility": d_row[7] or "Zakat",
+                        "heading": d_row[1] or "", "subheading": d_row[2] or "", "classified_by": "crm_donation",
                     }
                 else:
-                    meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor)
+                    meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor, source_type=src_type)
             else:
-                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor)
+                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor, source_type=src_type)
+            if prev_by == "donor_history" and meta.get("code") != UNASSIGNED:
+                meta["classified_by"] = "donor_history"
+            if meta.get("code") == UNASSIGNED:
+                unassigned_lines += 1
+            elif meta.get("classified_by") in REVIEW_SOURCES:
+                review_lines += 1
 
             cursor.execute("""
                 UPDATE stripe_payout_items
                 SET code = ?, heading = ?, subheading = ?, department = ?, office = ?, portfolio = ?, country = ?,
-                    programme_fund = ?, fund_code = ?, zakat_eligibility = ?
+                    programme_fund = ?, fund_code = ?, zakat_eligibility = ?, classified_by = ?
                 WHERE balance_transaction_id = ?
             """, (
                 meta["code"], meta["heading"], meta["subheading"], meta["department"], meta["office"], meta["portfolio"], meta["country"],
-                meta["programme_fund"], meta["fund_code"], meta["zakat_eligibility"], b_id
+                meta["programme_fund"], meta["fund_code"], meta["zakat_eligibility"], meta.get("classified_by") or "none", b_id
             ))
             updated_count += 1
 
@@ -912,9 +1084,9 @@ def resync_payout_with_crm(payout_id: str, company_id: str = "rethink") -> Dict[
 
         cursor.execute("""
             UPDATE stripe_payout_reports
-            SET funds_summary_json = ?, zakat_summary_json = ?, updated_at = ?
+            SET funds_summary_json = ?, zakat_summary_json = ?, updated_at = ?, unassigned_lines = ?, review_lines = ?
             WHERE payout_id = ?
-        """, (json.dumps(funds_breakdown), json.dumps(zakat_breakdown), now_iso, payout_id))
+        """, (json.dumps(funds_breakdown), json.dumps(zakat_breakdown), now_iso, unassigned_lines, review_lines, payout_id))
 
         conn.commit()
     finally:
@@ -926,11 +1098,82 @@ def resync_payout_with_crm(payout_id: str, company_id: str = "rethink") -> Dict[
         "refreshed_items": updated_count,
         "funds_breakdown": funds_breakdown,
         "zakat_breakdown": zakat_breakdown,
-        "total_net": round(total_net, 2)
+        "total_net": round(total_net, 2),
+        "unassigned_lines": unassigned_lines,
+        "review_lines": review_lines,
     }
 
 
-def approve_and_send_to_slack(payout_id: str, approved_by: str = "Admin") -> Dict[str, Any]:
+def classify_payout_line(balance_transaction_id: str, code: str, company_id: str = "rethink",
+                         apply_to_project: bool = False) -> Dict[str, Any]:
+    """Classifies one payout line by hand. With apply_to_project, the line's project name is also mapped to this
+    code in the classification matrix (platform 'stripe'), so every line carrying it follows on the next resync."""
+    company_id = str(company_id or "rethink").strip().lower()
+    code = (code or "").strip()
+    conn = get_db_connection(timeout=15.0)
+    try:
+        cursor = conn.cursor()
+        item = cursor.execute("""SELECT i.payout_id, i.project_name, LOWER(COALESCE(r.company_id, 'rethink'))
+                                 FROM stripe_payout_items i JOIN stripe_payout_reports r ON r.payout_id = i.payout_id
+                                 WHERE i.balance_transaction_id = ?""", (balance_transaction_id,)).fetchone()
+        if not item or item[2] != company_id:
+            raise LookupError("Payout line not found for this charity.")
+        row = cursor.execute("""SELECT department, office, portfolio, country, programme_fund, fund_code, zakat_eligibility,
+                                       COALESCE(heading, department), COALESCE(sub_heading, office)
+                                FROM master_project_codes
+                                WHERE code = ? AND LOWER(COALESCE(company_id, 'rethink')) = ? LIMIT 1""",
+                             (code, company_id)).fetchone()
+        if not row:
+            raise ValueError(f"'{code}' is not one of {company_id}'s project codes.")
+        cursor.execute("""UPDATE stripe_payout_items SET code = ?, department = ?, office = ?, portfolio = ?, country = ?,
+                                 programme_fund = ?, fund_code = ?, zakat_eligibility = ?, heading = ?, subheading = ?,
+                                 classified_by = 'manual'
+                          WHERE balance_transaction_id = ?""", (code, *row, balance_transaction_id))
+        if apply_to_project and (item[1] or "").strip() and not _GENERIC_DESCRIPTION.match(item[1].strip()):
+            name = item[1].strip()
+            cursor.execute("""DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id,'rethink')) = ?
+                              AND platform = 'stripe' AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                              AND COALESCE(giving_level, '') = '' AND UPPER(TRIM(code)) = 'UNASSIGNED'""", (company_id, name))
+            cursor.execute("""INSERT OR IGNORE INTO platform_campaign_mappings
+                              (company_id, platform, campaign_name, giving_level, code, created_at, updated_at)
+                              VALUES (?, 'stripe', ?, '', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""", (company_id, name, code))
+            # The other lines of that project are no longer "classified by hand"
+            cursor.execute("""UPDATE stripe_payout_items SET classified_by = 'campaign'
+                              WHERE LOWER(TRIM(project_name)) = LOWER(TRIM(?)) AND balance_transaction_id = ?""",
+                           (name, balance_transaction_id))
+        conn.commit()
+        payout_id = item[0]
+    finally:
+        conn.close()
+    # Refresh totals/CSV of every payout of this charity that may carry the project
+    resync_payout_with_crm(payout_id, company_id)
+    if apply_to_project:
+        conn = get_db_connection(timeout=10.0)
+        try:
+            others = [r[0] for r in conn.execute("""SELECT DISTINCT i.payout_id FROM stripe_payout_items i
+                        JOIN stripe_payout_reports r ON r.payout_id = i.payout_id
+                        WHERE LOWER(COALESCE(r.company_id,'rethink')) = ? AND i.payout_id != ?
+                          AND LOWER(TRIM(i.project_name)) = LOWER(TRIM(?))""", (company_id, payout_id, item[1] or ""))]
+        finally:
+            conn.close()
+        for other in others:
+            resync_payout_with_crm(other, company_id)
+    return {"success": True, "balance_transaction_id": balance_transaction_id, "code": code, "payout_id": payout_id}
+
+
+class ApprovalBlocked(ValueError):
+    """The payout can't be approved yet (doesn't add up / unclassified lines)."""
+
+
+def _company_channel(company_id: str) -> str:
+    from core.stripe_accounts import slack_channel
+    channel = slack_channel(company_id)
+    if not channel:
+        raise ApprovalBlocked(f"No Slack channel is set for {company_id}'s payout reports.")
+    return channel
+
+
+def approve_and_send_to_slack(payout_id: str, approved_by: str = "Admin", company_id: str = STRIPE_COMPANY) -> Dict[str, Any]:
     """
     Approves a reconciled Stripe Payout and uploads the verified reconciliation report to Slack #rt-payouts.
     """
@@ -939,12 +1182,19 @@ def approve_and_send_to_slack(payout_id: str, approved_by: str = "Admin") -> Dic
         cursor = conn.cursor()
         cursor.execute("""
             SELECT csv_path, total_transactions, total_gross, total_fees, total_net,
-                   funds_summary_json, zakat_summary_json
+                   funds_summary_json, zakat_summary_json, adds_up, difference, unassigned_lines
             FROM stripe_payout_reports WHERE payout_id = ?
         """, (payout_id,))
         row = cursor.fetchone()
         if not row or not row[0]:
             raise ValueError(f"Reconciliation report not found for payout {payout_id}")
+        if row[7] is None:
+            raise ApprovalBlocked("Re-run Reconcile on this payout first, so its lines can be checked against Stripe's payout amount.")
+        if not row[7]:
+            raise ApprovalBlocked(f"The lines don't add up to the payout: £{abs(row[8] or 0):,.2f} "
+                                  f"{'missing' if (row[8] or 0) > 0 else 'too much'}. Re-run Reconcile before approving.")
+        if row[9]:
+            raise ApprovalBlocked(f"{row[9]} line(s) still need a classification. Classify them, then approve.")
 
         csv_path = row[0]
         summary = {
@@ -965,7 +1215,8 @@ def approve_and_send_to_slack(payout_id: str, approved_by: str = "Admin") -> Dic
         file_path=csv_path,
         payout_id=payout_id,
         summary=summary,
-        approved_by=approved_by
+        approved_by=approved_by,
+        channel_id=_company_channel(company_id),
     )
 
     # Update approval and Slack timestamps in DB
@@ -992,7 +1243,7 @@ def approve_and_send_to_slack(payout_id: str, approved_by: str = "Admin") -> Dic
     }
 
 
-def resend_payout_to_slack(payout_id: str) -> Dict[str, Any]:
+def resend_payout_to_slack(payout_id: str, company_id: str = STRIPE_COMPANY) -> Dict[str, Any]:
     """
     Resends an already approved payout report to Slack #rt-payouts.
     """
@@ -1027,7 +1278,8 @@ def resend_payout_to_slack(payout_id: str) -> Dict[str, Any]:
         file_path=csv_path,
         payout_id=payout_id,
         summary=summary,
-        approved_by=approved_by
+        approved_by=approved_by,
+        channel_id=_company_channel(company_id),
     )
 
     now_iso = datetime.now(timezone.utc).isoformat()

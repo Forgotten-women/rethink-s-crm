@@ -7,15 +7,38 @@ import {
   Layers, CheckCircle2, Award, ArrowUpRight, LayoutGrid, List, Sparkles,
   ArrowRight, ExternalLink, Activity, ChevronLeft, ChevronsLeft,
   ChevronsRight, ArrowUpDown, ArrowDown, ArrowUp, SlidersHorizontal,
-  ChevronDown, ChevronUp
+  ChevronDown, ChevronUp, Plus
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 import FundraiserFormModal from './FundraiserFormModal';
+import AddDonationModal, { canEditRecords } from './AddDonationModal';
 
 export default function FundraiserView({ user, accentColor = 'cyan', activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
   // Strictly enforce that only Super Admin accounts can manage fundraisers
   const isSuperAdmin = user?.role?.toLowerCase() === 'super_admin';
+  const canEditPages = canEditRecords(user) && activeCompany !== 'all';
+  const [linkFormFor, setLinkFormFor] = useState(null);
+  const [linkType, setLinkType] = useState('fundraiser_url');
+  const [linkValue, setLinkValue] = useState('');
+  const [linkBusy, setLinkBusy] = useState(false);
+  const [linkError, setLinkError] = useState('');
+  const [addingDonationFor, setAddingDonationFor] = useState(null);
+  const addPageLink = async (fid) => {
+    setLinkBusy(true); setLinkError('');
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/fundraisers/${encodeURIComponent(fid)}/links`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ company_id: activeCompany, match_type: linkType, value: linkValue.trim() }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.detail || `Error ${res.status}`);
+      setLinkFormFor(null); setLinkValue(''); loadFundraisers(true);
+    } catch (e) { setLinkError(e.message); } finally { setLinkBusy(false); }
+  };
+  const removePageLink = async (fid, linkId) => {
+    if (!window.confirm('Stop tracking this page for this fundraiser?')) return;
+    const res = await fetch(`${API_BASE_URL}/api/fundraisers/${encodeURIComponent(fid)}/links/${encodeURIComponent(linkId)}?company_id=${encodeURIComponent(activeCompany)}`, { method: 'DELETE' });
+    if (res.ok) loadFundraisers(true);
+  };
 
   // Data State
   const [fundraisersData, setFundraisersData] = useState({ summary: {}, fundraisers: [] });
@@ -54,6 +77,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const [statusOptions, setStatusOptions] = useState(['ACTIVE', 'PAUSED', 'COMPLETED', 'RAMADAN']);
   const [ramadanPeriods, setRamadanPeriods] = useState([]);
   const [ramadanChoice, setRamadanChoice] = useState('');
+  const [txFilter, setTxFilter] = useState('');
   const [ramadanOpen, setRamadanOpen] = useState(false);
   const [ramadanYear, setRamadanYear] = useState(null);
   const ramadanRef = useRef(null);
@@ -1386,12 +1410,39 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                             <span className="truncate" style={{ color: 'var(--text-main)' }}>
                               <span className="font-bold text-violet-600 dark:text-violet-300">{tp.match_label}</span> · {tp.value.replace(/^https?:\/\/(www\.)?/, '')}
                             </span>
-                            <span className="shrink-0 font-bold" style={{ color: 'var(--text-muted)' }}>
+                            <span className="shrink-0 font-bold flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
                               £{(isDateFiltered ? tp.raised_period : tp.raised_all_time).toLocaleString()} · {isDateFiltered ? tp.donations_period : tp.donations_all_time}
+                              {canEditPages && tp.assignment_id && <button type="button" onClick={(e) => { e.stopPropagation(); removePageLink(f.id, tp.assignment_id); }} title="Stop tracking this page" className="text-rose-400 hover:text-rose-600"><X className="w-3 h-3" /></button>}
                             </span>
                           </div>
                         ))}
                       </div>
+                    </div>
+                  )}
+                  {canEditPages && (
+                    <div className="mt-2" onClick={e => e.stopPropagation()}>
+                      {linkFormFor === f.id ? (
+                        <div className="flex flex-col gap-1.5 p-2 rounded-lg border border-violet-500/30 bg-violet-500/5">
+                          <div className="flex gap-1.5">
+                            <select value={linkType} onChange={e => setLinkType(e.target.value)} className="px-1.5 py-1 text-[11px] rounded-md" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }}>
+                              <option value="fundraiser_url">Fundraiser page</option><option value="campaign_url">Campaign page</option>
+                              <option value="community_url">Community / team page</option><option value="campaign_name">Campaign name</option>
+                            </select>
+                            <input autoFocus value={linkValue} onChange={e => setLinkValue(e.target.value)} placeholder={linkType === 'campaign_name' ? 'Exact campaign name' : 'Paste the page link'}
+                              className="flex-1 min-w-0 px-2 py-1 text-[11px] rounded-md" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }} />
+                          </div>
+                          <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>A new page with no donations yet is fine: its donations count for {f.name} as soon as they arrive.</div>
+                          {linkError && <div className="text-[10px] text-rose-500">{linkError}</div>}
+                          <div className="flex justify-end gap-2">
+                            <button type="button" onClick={() => { setLinkFormFor(null); setLinkError(''); }} className="text-[11px]" style={{ color: 'var(--text-sub)' }}>Cancel</button>
+                            <button type="button" disabled={linkBusy || !linkValue.trim()} onClick={() => addPageLink(f.id)} className="px-2 py-0.5 text-[11px] rounded-md bg-violet-600 text-white font-bold disabled:opacity-40">{linkBusy ? 'Adding…' : 'Track page'}</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button type="button" onClick={() => { setLinkFormFor(f.id); setLinkValue(''); setLinkError(''); }} className="text-[11px] font-semibold text-violet-600 dark:text-violet-300 flex items-center gap-1">
+                          <Plus className="w-3 h-3" /> Add page link
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1698,7 +1749,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
       {selectedFundraiserId && (
         <div className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-sm animate-in fade-in">
           <div 
-            className="w-full max-w-2xl h-full glass-panel border-l shadow-2xl flex flex-col overflow-hidden animate-in slide-in-from-right duration-300 rounded-none" 
+            className="w-[min(1400px,96vw)] max-w-[96vw] h-full glass-panel border-l shadow-2xl flex flex-col overflow-hidden animate-in slide-in-from-right duration-300 rounded-none" 
             style={{ backgroundColor: 'var(--drawer-bg)', borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}
           >
             
@@ -1744,6 +1795,12 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                 </div>
               </div>
               <div className="flex items-center gap-1.5">
+                {canEditPages && drilldownData?.fundraiser && (
+                  <button type="button" onClick={() => setAddingDonationFor(drilldownData.fundraiser)}
+                    className="px-2.5 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1" title="Record an offline donation for this fundraiser">
+                    <Plus className="w-3.5 h-3.5" /> Add donation
+                  </button>
+                )}
                 <button
                   onClick={() => loadDrilldown(selectedFundraiserId, drilldownStartDate, drilldownEndDate)}
                   disabled={loadingDrilldown}
@@ -1990,28 +2047,49 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                     </div>
                   )}
 
-                  {/* Recent Donations Log */}
+                  {/* Every donation in the period, with full detail */}
                   <div>
-                    <h4 className="text-xs font-extrabold uppercase tracking-wider mb-2 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
-                      <Clock className="w-3.5 h-3.5 text-cyan-500" /> Recent Transactions ({drilldownData?.recent_transactions?.length || 0})
-                    </h4>
-                    <div className="border rounded-lg overflow-hidden max-h-52 overflow-y-auto custom-scrollbar" style={{ borderColor: 'var(--border-glass)' }}>
+                    <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
+                      <h4 className="text-xs font-extrabold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+                        <Clock className="w-3.5 h-3.5 text-cyan-500" /> Donations ({(drilldownData?.transactions_total ?? drilldownData?.recent_transactions?.length ?? 0).toLocaleString()}{drilldownData?.transactions_total > (drilldownData?.recent_transactions?.length || 0) ? `, newest ${drilldownData.recent_transactions.length.toLocaleString()} shown` : ''})
+                      </h4>
+                      <span className="relative">
+                        <Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input id="fundraiser-tx-filter" value={txFilter} onChange={e => setTxFilter(e.target.value)} placeholder="Filter donor, campaign, code…"
+                          className="pl-7 pr-2 py-1 text-xs rounded-lg w-64" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }} />
+                      </span>
+                    </div>
+                    <div className="border rounded-lg overflow-auto max-h-[50vh] custom-scrollbar" style={{ borderColor: 'var(--border-glass)' }}>
                       <table className="w-full text-left text-xs border-collapse">
-                        <thead>
+                        <thead className="sticky top-0 z-10">
                           <tr className="border-b" style={{ backgroundColor: 'var(--table-header-bg)', borderColor: 'var(--border-glass)' }}>
-                            <th className="py-1.5 px-2.5 font-bold" style={{ color: 'var(--text-muted)' }}>Date</th>
-                            <th className="py-1.5 px-2.5 font-bold" style={{ color: 'var(--text-muted)' }}>Donor</th>
-                            <th className="py-1.5 px-2.5 font-bold" style={{ color: 'var(--text-muted)' }}>Campaign</th>
-                            <th className="py-1.5 px-2.5 font-bold text-right" style={{ color: 'var(--text-muted)' }}>Amount</th>
+                            {['Date', 'Donor', 'Email', 'Campaign', 'Giving level', 'Code', 'Heading', 'Sub-heading', 'Tracked page', 'Gift Aid', 'Status', 'Platform', 'Donation ID', 'Raised', 'Net received'].map(h => (
+                              <th key={h} className={`py-1.5 px-2.5 font-bold whitespace-nowrap ${h === 'Raised' || h === 'Net received' ? 'text-right' : ''}`} style={{ color: 'var(--text-muted)' }}>{h}</th>
+                            ))}
                           </tr>
                         </thead>
                         <tbody className="divide-y" style={{ borderColor: 'var(--border-glass)' }}>
-                          {(drilldownData?.recent_transactions || []).map((tx, i) => (
-                            <tr key={i} className="hover:bg-slate-200/40 dark:hover:bg-slate-800/40 transition-colors">
-                              <td className="py-1.5 px-2.5 text-[10px]" style={{ color: 'var(--text-sub)' }}>{tx.date}</td>
-                              <td className="py-1.5 px-2.5 font-bold" style={{ color: 'var(--text-main)' }}>{tx.donor_name}</td>
-                              <td className="py-1.5 px-2.5 truncate max-w-[140px]" style={{ color: 'var(--text-muted)' }}>{tx.campaign_name}</td>
-                              <td className="py-1.5 px-2.5 font-bold text-emerald-600 dark:text-emerald-400 text-right">£{tx.amount.toFixed(2)}</td>
+                          {(drilldownData?.recent_transactions || []).filter(tx => {
+                            const q = txFilter.trim().toLowerCase();
+                            return !q || [tx.donor_name, tx.email, tx.campaign_name, tx.code, tx.heading, tx.sub_heading, tx.giving_level, tx.donation_id, tx.tracked_page]
+                              .some(v => String(v || '').toLowerCase().includes(q));
+                          }).map((tx, i) => (
+                            <tr key={`${tx.donation_id}-${i}`} className="hover:bg-slate-200/40 dark:hover:bg-slate-800/40 transition-colors">
+                              <td className="py-1.5 px-2.5 whitespace-nowrap font-mono text-[11px]" style={{ color: 'var(--text-sub)' }}>{tx.date}</td>
+                              <td className="py-1.5 px-2.5 font-bold whitespace-nowrap" style={{ color: 'var(--text-main)' }}>{tx.donor_name}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{tx.email}</td>
+                              <td className="py-1.5 px-2.5 min-w-[12rem]" style={{ color: 'var(--text-main)' }} title={tx.campaign_name}>{tx.campaign_name}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{tx.giving_level || '—'}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap font-mono" style={{ color: 'var(--text-main)' }}>{tx.code}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-main)' }}>{tx.heading || '—'}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-main)' }}>{tx.sub_heading || '—'}</td>
+                              <td className="py-1.5 px-2.5 max-w-[16rem] truncate" style={{ color: 'var(--text-muted)' }} title={tx.tracked_page}>{(tx.tracked_page || '—').replace(/^https?:\/\/(www\.)?/, '')}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{tx.gift_aid || '—'}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{tx.status || '—'}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{tx.platform}</td>
+                              <td className="py-1.5 px-2.5 whitespace-nowrap font-mono text-[10px]" style={{ color: 'var(--text-muted)' }}>{tx.donation_id}</td>
+                              <td className="py-1.5 px-2.5 font-bold text-emerald-600 dark:text-emerald-400 text-right whitespace-nowrap tabular-nums">£{Number(tx.amount || 0).toFixed(2)}</td>
+                              <td className="py-1.5 px-2.5 text-right whitespace-nowrap tabular-nums" style={{ color: 'var(--text-muted)' }}>{tx.net_received == null ? '—' : `£${Number(tx.net_received).toFixed(2)}`}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -2025,6 +2103,11 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
         </div>
       )}
 
+      {addingDonationFor && (
+        <AddDonationModal company={activeCompany} defaults={{ fundraiser_name: addingDonationFor.name || '' }}
+          onClose={() => setAddingDonationFor(null)}
+          onCreated={() => { loadFundraisers(true); if (selectedFundraiserId) loadDrilldown(selectedFundraiserId, drilldownStartDate, drilldownEndDate); }} />
+      )}
     </div>
   );
 }

@@ -358,6 +358,16 @@ textarea:focus-visible {
   animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* Wide detail panels (donor, fundraiser, beneficiary): room for every column without cramming */
+.drawer-content.drawer-wide {
+  width: min(1400px, 96vw);
+  max-width: 96vw;
+  overflow: hidden;
+}
+@media (max-width: 640px) {
+  .drawer-content.drawer-wide { width: 100vw; max-width: 100vw; }
+}
+
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }

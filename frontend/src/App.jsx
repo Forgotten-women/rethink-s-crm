@@ -12,6 +12,7 @@ const OverviewView = lazyPage(() => import('./components/OverviewView'));
 const LtvView = lazyPage(() => import('./components/LtvView'));
 const KanbanBoard = lazyPage(() => import('./components/KanbanBoard'));
 const ExplorerView = lazyPage(() => import('./components/ExplorerView'));
+const DonorsView = lazyPage(() => import('./components/DonorsView'));
 const ClassificationView = lazyPage(() => import('./components/ClassificationView'));
 const ExpenseView = lazyPage(() => import('./components/ExpenseView'));
 const AdminView = lazyPage(() => import('./components/AdminView'));
@@ -480,6 +481,9 @@ export default function App() {
                   onSelectDonor={setSelectedDonor} 
                   activeCompany={activeCompany}
                 />
+              )}
+              {activeTab === 'donors' && (
+                <DonorsView key={activeCompany} activeCompany={activeCompany} onSelectDonor={setSelectedDonor} user={user} />
               )}
               {activeTab === 'explorer' && (
                 <ExplorerView 

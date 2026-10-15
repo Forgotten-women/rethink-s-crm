@@ -31,9 +31,14 @@ import {
   X
 } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
+import StripeReconciliationQueue, { ClassifyLineForm } from './StripeReconciliationQueue';
 
 export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCompany = 'rethink' }) {
   const [payouts, setPayouts] = useState([]);
+  // Each charity's own Stripe account; a workspace without one (or 'all') shows a notice, never another charity's data
+  const company = String(activeCompany || '').toLowerCase();
+  const [accounts, setAccounts] = useState(null);
+  const connected = !!accounts?.some(a => a.company_id === company);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
@@ -54,6 +59,8 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
   const [itemsLoading, setItemsLoading] = useState(false);
   const [sourceTypeFilter, setSourceTypeFilter] = useState('ALL');
   const [itemsPage, setItemsPage] = useState(1);
+  const [classifyingLine, setClassifyingLine] = useState(null);
+  const [queueKey, setQueueKey] = useState(0);
 
   // Toast / Feedback message
   const [feedback, setFeedback] = useState(null);
@@ -72,7 +79,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/payouts/stripe/list?limit=30`, {
+      const res = await fetch(`${API_BASE_URL}/api/payouts/stripe/list?limit=30&company_id=${encodeURIComponent(company)}`, {
         headers: getAuthHeaders()
       });
       if (!res.ok) {
@@ -80,6 +87,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
       }
       const data = await res.json();
       setPayouts(data.payouts || []);
+      setQueueKey(k => k + 1);
     } catch (err) {
       setError(err.message || 'Error communicating with Stripe Reconciliation API');
     } finally {
@@ -88,8 +96,13 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
   };
 
   useEffect(() => {
-    fetchPayouts();
+    fetch(`${API_BASE_URL}/api/payouts/stripe/accounts`, { headers: getAuthHeaders() })
+      .then(r => (r.ok ? r.json() : { accounts: [] })).then(d => setAccounts(d.accounts || [])).catch(() => setAccounts([]));
   }, []);
+
+  useEffect(() => {
+    if (connected) fetchPayouts();
+  }, [connected, company]);
 
   const handleCopy = (text, id) => {
     navigator.clipboard.writeText(text);
@@ -107,13 +120,17 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
           'Content-Type': 'application/json',
           ...getAuthHeaders()
         },
-        body: JSON.stringify({ payout_id: payoutId, company_id: activeCompany })
+        body: JSON.stringify({ payout_id: payoutId, company_id: company })
       });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.detail || 'Failed to reconcile payout');
       }
-      showFeedback('success', `Payout ${payoutId} reconciled! ${data.summary?.total_rows || 0} transactions classified.`);
+      const sm = data.summary || {};
+      showFeedback(sm.adds_up === false || sm.unassigned_lines ? 'error' : 'success',
+        `Payout ${payoutId} reconciled: ${sm.total_rows || 0} lines` +
+        (sm.adds_up === false ? ` — the lines are £${Math.abs(sm.difference || 0).toFixed(2)} away from Stripe's payout amount.` : ', adding up to the penny.') +
+        (sm.unassigned_lines ? ` ${sm.unassigned_lines} line(s) need classification.` : ''));
       await fetchPayouts();
     } catch (err) {
       showFeedback('error', err.message);
@@ -132,7 +149,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
           'Content-Type': 'application/json',
           ...getAuthHeaders()
         },
-        body: JSON.stringify({ payout_id: payoutId, company_id: activeCompany })
+        body: JSON.stringify({ payout_id: payoutId, company_id: company })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -159,7 +176,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
           'Content-Type': 'application/json',
           ...getAuthHeaders()
         },
-        body: JSON.stringify({ payout_id: pid, approved_by: approverName })
+        body: JSON.stringify({ payout_id: pid, approved_by: approverName, company_id: company })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -185,7 +202,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
           'Content-Type': 'application/json',
           ...getAuthHeaders()
         },
-        body: JSON.stringify({ payout_id: payoutId })
+        body: JSON.stringify({ payout_id: payoutId, company_id: company })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -205,7 +222,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
     setItemsLoading(true);
     try {
       const srcParam = srcType && srcType !== 'ALL' ? `&source_type=${srcType}` : '';
-      const res = await fetch(`${API_BASE_URL}/api/payouts/stripe/items?payout_id=${encodeURIComponent(payoutId)}&page=${page}&page_size=50${srcParam}`, {
+      const res = await fetch(`${API_BASE_URL}/api/payouts/stripe/items?company_id=${encodeURIComponent(company)}&payout_id=${encodeURIComponent(payoutId)}&page=${page}&page_size=50${srcParam}`, {
         headers: getAuthHeaders()
       });
       if (!res.ok) throw new Error('Failed to load itemized transactions');
@@ -229,6 +246,23 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
   const totalVolume = payouts.reduce((acc, p) => acc + (p.amount || 0), 0);
   const reconciledCount = payouts.filter(p => p.is_reconciled).length;
   const approvedCount = payouts.filter(p => p.approval_status === 'approved').length;
+
+  if (accounts && !connected) {
+    return (
+      <div className="p-6 rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 text-sm text-slate-600 dark:text-slate-300 flex items-start gap-3">
+        <Info className="w-5 h-5 text-cyan-500 shrink-0 mt-0.5" />
+        <div>
+          <div className="font-bold text-slate-900 dark:text-white">
+            {company === 'all' ? 'Choose a charity to see its Stripe payouts' : `Stripe isn't connected for ${company.charAt(0).toUpperCase() + company.slice(1)} yet`}
+          </div>
+          <div className="text-xs mt-1">
+            Each charity's payouts come from its own Stripe account only.
+            {accounts.length > 0 && ` Connected: ${accounts.map(a => a.label).join(', ')}.`}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -319,6 +353,9 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
         </div>
       </div>
 
+      {/* Live ledger + classification queue */}
+      <StripeReconciliationQueue company={company} refreshKey={queueKey} onChanged={fetchPayouts} />
+
       {/* Payouts Table Card */}
       <div className="rounded-2xl border border-slate-200 dark:border-white/10 bg-white/90 dark:bg-slate-900/90 shadow-sm overflow-hidden backdrop-blur-xl">
         <div className="p-4 border-b border-slate-200 dark:border-white/10 flex items-center justify-between flex-wrap gap-3">
@@ -326,7 +363,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
             <CreditCard className="w-4 h-4 text-cyan-500" />
             <h2 className="text-sm font-bold text-slate-900 dark:text-white">Stripe Bank Payout Batches</h2>
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 font-semibold">
-              Rethink Charity Payouts
+              {accounts?.find(a => a.company_id === company)?.label || company} Payouts
             </span>
           </div>
 
@@ -395,6 +432,29 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                             <AlertCircle className="w-3 h-3" /> Awaiting Approval
                           </span>
                         )
+                      )}
+
+                      {/* Do the lines add up to what Stripe paid out? */}
+                      {isReconciled && p.adds_up === true && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center gap-1"
+                          title={`Lines total £${Number(p.lines_net || 0).toFixed(2)} = Stripe payout £${Number(p.amount || 0).toFixed(2)}`}>
+                          <Check className="w-3 h-3" /> Adds up to the penny
+                        </span>
+                      )}
+                      {isReconciled && p.adds_up === false && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-600 dark:text-rose-400 flex items-center gap-1">
+                          <AlertCircle className="w-3 h-3" /> £{Math.abs(Number(p.difference || 0)).toFixed(2)} {Number(p.difference) > 0 ? 'missing' : 'too much'}
+                        </span>
+                      )}
+                      {isReconciled && (p.adds_up === null || p.adds_up === undefined) && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-500/15 text-slate-500 flex items-center gap-1" title="Reconciled before the adds-up check existed">
+                          <Info className="w-3 h-3" /> Re-reconcile to check total
+                        </span>
+                      )}
+                      {isReconciled && p.unassigned_lines > 0 && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                          <AlertCircle className="w-3 h-3" /> {p.unassigned_lines} unclassified
+                        </span>
                       )}
                     </div>
 
@@ -491,8 +551,10 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                     {isReconciled && !isApproved && (
                       <button
                         onClick={() => setApprovalModalPayout(p)}
-                        className="px-3 py-1.5 text-xs font-bold rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-md shadow-emerald-500/20 transition-all flex items-center gap-1.5 cursor-pointer"
-                        title="Review fund allocations and post approved payout to Slack #rt-payouts"
+                        disabled={p.adds_up !== true || p.unassigned_lines > 0}
+                        className="px-3 py-1.5 text-xs font-bold rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-md shadow-emerald-500/20 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                        title={p.adds_up !== true ? 'The lines must add up to the payout amount first (re-reconcile)'
+                          : p.unassigned_lines > 0 ? 'Classify every line first' : 'Review fund allocations and post approved payout to Slack #rt-payouts'}
                       >
                         <Send className="w-3.5 h-3.5" />
                         <span>Review & Approve</span>
@@ -527,7 +589,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                     {/* 6. Download Enriched CSV */}
                     {isReconciled && (
                       <a
-                        href={`${API_BASE_URL}/api/payouts/stripe/download?payout_id=${encodeURIComponent(p.payout_id)}`}
+                        href={`${API_BASE_URL}/api/payouts/stripe/download?company_id=${encodeURIComponent(company)}&payout_id=${encodeURIComponent(p.payout_id)}`}
                         download
                         className="px-2.5 py-1.5 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-white/10 transition-all flex items-center gap-1"
                         title="Download enriched reconciliation CSV with all 8 accounting dimensions"
@@ -582,8 +644,8 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                   £{Number(approvalModalPayout.total_fees || 0).toLocaleString('en-GB', { minimumFractionDigits: 2 })}
                 </span>
               </div>
-              <div>
-                <span className="text-[10px] text-emerald-500 block font-sans">Net Payout</span>
+              <div title={`Stripe paid out £${Number(approvalModalPayout.amount || 0).toFixed(2)}`}>
+                <span className="text-[10px] text-emerald-500 block font-sans">Net Payout {approvalModalPayout.adds_up ? '✓ matches Stripe' : ''}</span>
                 <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400">
                   £{Number(approvalModalPayout.total_net || 0).toLocaleString('en-GB', { minimumFractionDigits: 2 })}
                 </span>
@@ -676,6 +738,11 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                 { id: 'ALL', label: 'All Transactions' },
                 { id: 'website', label: 'Website Only' },
                 { id: 'givebrite', label: 'GiveBrite Only' },
+                { id: 'subscription', label: 'Subscriptions' },
+                { id: 'payment_link', label: 'Payment links' },
+                { id: 'sign_pay', label: 'Sign Pay' },
+                { id: 'refund', label: 'Refunds' },
+                { id: 'failed_payment', label: 'Failed payments' },
                 { id: 'fee', label: 'System Fees' }
               ].map(st => (
                 <button
@@ -733,16 +800,19 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                   )}
 
                   {!itemsLoading && itemsData.items.map((it, idx) => (
-                    <tr key={idx} className="hover:bg-slate-100/50 dark:hover:bg-slate-800/40">
+                    <React.Fragment key={idx}>
+                    <tr className="hover:bg-slate-100/50 dark:hover:bg-slate-800/40">
                       <td className="p-3">
                         <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase ${
                           it.source_type === 'givebrite'
                             ? 'bg-indigo-500/20 text-indigo-400'
+                            : it.source_type === 'subscription'
+                            ? 'bg-purple-500/20 text-purple-400'
                             : it.source_type === 'website'
                             ? 'bg-emerald-500/20 text-emerald-400'
                             : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                          {it.source_type || 'Website'}
+                          {({ givebrite: 'GiveBrite', sign_pay: 'Sign Pay', payment_link: 'Payment link', failed_payment: 'Failed payment', subscription: 'Subscription', website: 'Website', fee: 'Stripe fee', refund: 'Refund' })[it.source_type] || it.source_type || 'Website'}
                         </span>
                       </td>
                       <td className="p-3 font-mono text-[11px] text-slate-500 dark:text-slate-400 whitespace-nowrap">
@@ -765,8 +835,15 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                       <td className="p-3 text-right font-mono font-bold text-emerald-600 dark:text-emerald-400">
                         £{Number(it.net || 0).toFixed(2)}
                       </td>
-                      <td className="p-3 font-mono font-bold text-[11px] text-cyan-600 dark:text-cyan-400 whitespace-nowrap">
-                        {it.code || 'Unassigned'}
+                      <td className="p-3 font-mono font-bold text-[11px] whitespace-nowrap">
+                        {(!it.code || it.code === 'Unassigned') ? (
+                          <button type="button" onClick={() => setClassifyingLine(classifyingLine?.balance_transaction_id === it.balance_transaction_id ? null : it)}
+                            className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 hover:bg-amber-500/25">Unassigned · classify</button>
+                        ) : (
+                          <span className="text-cyan-600 dark:text-cyan-400" title={it.classified_by === 'manual' ? 'Classified by hand' : it.classified_by ? `Matched by ${String(it.classified_by).replace(/_/g, ' ')}` : undefined}>
+                            {it.code}{it.classified_by === 'manual' && <span className="ml-1 text-[9px] text-slate-400">(manual)</span>}
+                          </span>
+                        )}
                       </td>
                       <td className="p-3 text-[11px] text-slate-700 dark:text-slate-300 font-medium whitespace-nowrap">
                         {it.heading || it.department || '—'}
@@ -775,7 +852,7 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                         {it.subheading || it.office || '—'}
                       </td>
                       <td className="p-3 font-mono text-[11px] text-indigo-600 dark:text-indigo-400 whitespace-nowrap">
-                        {it.fund_code || 'F1-EMR'}
+                        {it.fund_code || '—'}
                       </td>
                       <td className="p-3">
                         <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
@@ -783,10 +860,18 @@ export default function StripePayoutsPanel({ user, isSuperAdmin = true, activeCo
                             ? 'bg-emerald-500/10 text-emerald-500'
                             : 'bg-slate-500/10 text-slate-400'
                         }`}>
-                          {it.zakat_eligibility || 'Zakat'}
+                          {it.zakat_eligibility || '—'}
                         </span>
                       </td>
                     </tr>
+                    {classifyingLine?.balance_transaction_id === it.balance_transaction_id && (
+                      <tr><td colSpan="11" className="p-3">
+                        <ClassifyLineForm item={it} onCancel={() => setClassifyingLine(null)}
+                          company={company}
+                          onDone={() => { setClassifyingLine(null); fetchPayoutItems(itemsModalPayout.payout_id, itemsData.page); fetchPayouts(); showFeedback('success', 'Line classified and payout totals refreshed.'); }} />
+                      </td></tr>
+                    )}
+                    </React.Fragment>
                   ))}
                 </tbody>
               </table>

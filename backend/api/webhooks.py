@@ -791,11 +791,15 @@ def build_webhook_donation_record(payload: Dict[str, Any], target_cid: str = "re
 # ── API Route Endpoints ────────────────────────────────────────────────────────
 
 def _verify_webhook_secret(request: Request):
+    """Inbound GiveBrite webhooks are OFF: GiveBrite donations come from the API sync (platform-sync.service) and the
+    webhook was removed on GiveBrite's side (Oct 2026). These public routes would otherwise let anyone post donations.
+    To turn them back on, set GIVEBRITE_WEBHOOK_ENABLED=1 and GIVEBRITE_WEBHOOK_SECRET; a missing secret is refused."""
+    import hmac
+    if os.getenv("GIVEBRITE_WEBHOOK_ENABLED", "").strip() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="GiveBrite webhooks are disabled; donations sync via the API.")
     expected_secret = os.getenv("GIVEBRITE_WEBHOOK_SECRET", "").strip()
-    if not expected_secret:
-        return
-    provided = request.headers.get("x-webhook-secret") or request.query_params.get("secret")
-    if not provided or provided != expected_secret:
+    provided = request.headers.get("x-webhook-secret") or ""
+    if not expected_secret or not provided or not hmac.compare_digest(provided, expected_secret):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature/secret.")
 
 

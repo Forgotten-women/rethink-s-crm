@@ -61,3 +61,9 @@ data_cache/platform_health.json
 
 # database backups (contain donor data) - never commit
 data_cache/backups/
+
+# Platform session tokens (never commit)
+.*_token.json
+*_token.json
+.givebrite*token*.json
+.madinah*token*.json

@@ -70,13 +70,14 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     if (activeCompany === 'iqra') {
       return ['master', 'launchgood', 'givebright', 'madinah'].includes(saved) ? saved : 'launchgood';
     }
-    return ['master', 'launchgood', 'givebright', 'paysuite', 'website'].includes(saved) ? saved : 'launchgood';
+    return ['master', 'launchgood', 'givebright', 'paysuite', 'website', 'stripe'].includes(saved) ? saved : 'launchgood';
   });
 
   const [matrixData, setMatrixData] = useState({ total_campaigns: 0, classified_campaigns: 0, unassigned_campaigns: 0, rules: [] });
   const [codeMap, setCodeMap] = useState({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [syncingStripe, setSyncingStripe] = useState(false);
   const [saveNotification, setSaveNotification] = useState(null); // { type: 'success' | 'error' | 'info', title: string, message: string, timestamp: string }
 
   // Auto-dismiss success notification after 7 seconds
@@ -96,7 +97,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         handleSelectPlatform('launchgood');
       }
     } else if (activeCompany === 'rethink') {
-      if (!['master', 'launchgood', 'givebright', 'paysuite', 'website'].includes(platform)) {
+      if (!['master', 'launchgood', 'givebright', 'paysuite', 'website', 'stripe'].includes(platform)) {
         handleSelectPlatform('launchgood');
       }
     }
@@ -1021,6 +1022,53 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     }
   };
 
+  const handleSyncStripe = async () => {
+    if (isConsolidated) return;
+    setSyncingStripe(true);
+    setSaveNotification({
+      type: 'info',
+      title: 'Syncing Stripe Payment Links...',
+      message: 'Discovering active payment links from Stripe...',
+      timestamp: new Date().toLocaleTimeString()
+    });
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/classifications/stripe/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_role: user?.role || 'admin',
+          company_id: activeCompany
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data?.status === 'success') {
+        setSaveNotification({
+          type: 'success',
+          title: 'Stripe Links Synced',
+          message: data.message || 'Successfully synced Stripe payment links.',
+          timestamp: new Date().toLocaleTimeString()
+        });
+        loadMatrixData();
+      } else {
+        setSaveNotification({
+          type: 'error',
+          title: 'Stripe Sync Failed',
+          message: data?.detail || 'Failed to sync Stripe payment links.',
+          timestamp: new Date().toLocaleTimeString()
+        });
+      }
+    } catch (err) {
+      setSaveNotification({
+        type: 'error',
+        title: 'Stripe Sync Error',
+        message: err.message,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    } finally {
+      setSyncingStripe(false);
+    }
+  };
+
   const handleDeleteRule = async (rule) => {
     if (!isSuperAdmin) return;
     if (isConsolidated) {
@@ -1195,6 +1243,14 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       subtitle: 'text-slate-600 dark:text-slate-400 font-medium',
       activePill: 'bg-blue-600 text-white shadow-blue-500/30',
       countPill: 'border-blue-500/40 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/40'
+    },
+    stripe: {
+      container: 'bg-gradient-to-r from-indigo-500/15 via-violet-500/10 to-transparent border-indigo-500/30 text-indigo-900 dark:text-indigo-200',
+      iconBg: 'bg-indigo-600 text-white',
+      title: 'text-indigo-700 dark:text-indigo-300 font-extrabold',
+      subtitle: 'text-slate-600 dark:text-slate-400 font-medium',
+      activePill: 'bg-indigo-600 text-white shadow-indigo-500/30',
+      countPill: 'border-indigo-500/40 text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/40'
     }
   };
 
@@ -1376,6 +1432,19 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             )
           )}
 
+          {/* Sync from Stripe Button */}
+          {platform === 'stripe' && !isConsolidated && (
+            <button
+              onClick={handleSyncStripe}
+              disabled={syncingStripe}
+              className="px-3.5 py-2 text-xs font-extrabold rounded-xl text-white transition-all flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 shadow-md shadow-indigo-500/20 cursor-pointer disabled:opacity-50"
+              title="Discover new payment links and refresh active statuses from Stripe"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-white ${syncingStripe ? 'animate-spin' : ''}`} />
+              <span>{syncingStripe ? 'Syncing...' : 'Sync from Stripe'}</span>
+            </button>
+          )}
+
           {/* Export Dropdown */}
           <div className="flex items-center rounded-xl overflow-hidden border border-slate-200 dark:border-white/10 bg-slate-100 dark:bg-slate-800/60 shadow-sm">
             <button 
@@ -1530,6 +1599,27 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             )}
           </button>
         )}
+
+        {/* Stripe Links Tab (Rethink & Consolidated only) */}
+        {!isIqra && (
+          <button 
+            onClick={() => handleSelectPlatform('stripe')}
+            className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
+              platform === 'stripe'
+                ? 'bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-md shadow-indigo-500/30 border border-indigo-400 ring-2 ring-indigo-400/40'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
+            }`}
+          >
+            <CreditCard className={`w-4 h-4 ${platform === 'stripe' ? 'text-white' : 'text-indigo-600 dark:text-indigo-400'}`} />
+            <span className="font-bold">Stripe Links</span>
+            {platform === 'stripe' && (
+              <span className="flex h-2.5 w-2.5 relative ml-1">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
+              </span>
+            )}
+          </button>
+        )}
       </div>
 
       {/* 🎯 High-Contrast Active Matrix Banner Indicator */}
@@ -1541,6 +1631,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
              platform === 'givebright' ? <Gift className="w-5 h-5" /> :
              platform === 'madinah' ? <Sparkles className="w-5 h-5" /> :
              platform === 'paysuite' ? <CreditCard className="w-5 h-5" /> :
+             platform === 'stripe' ? <CreditCard className="w-5 h-5" /> :
              <Globe className="w-5 h-5" />}
           </span>
           <div>
@@ -1552,6 +1643,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                   platform === 'givebright' ? 'GiveBright Campaign & URL Master' :
                   platform === 'madinah' ? 'Madinah Campaign & URL Master' :
                   platform === 'paysuite' ? 'Paysuite Direct Debit Master' :
+                  platform === 'stripe' ? 'Stripe Payment Links Master' :
                   'Rethink Website Project Master'
                 }
               </span>
@@ -1566,6 +1658,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 ? 'Hierarchy: Campaign Name & URL ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
                 : platform === 'paysuite'
                 ? 'Hierarchy: Direct Debit Ref (Bank Ref) ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
+                : platform === 'stripe'
+                ? 'Hierarchy: Payment Link Name & ID ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
                 : platform === 'website'
                 ? 'Hierarchy: Project Name (Campaign) ➔ Appeal Name (Community) ➔ Location (Country)'
                 : 'Hierarchy: Campaign Name ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'}
@@ -1612,21 +1706,21 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className={`glass-panel p-4 border-l-4 ${platform === 'launchgood' ? 'border-teal-500 dark:border-cyan-400' : platform === 'givebright' ? 'border-purple-500 dark:border-purple-400' : platform === 'paysuite' ? 'border-amber-500 dark:border-amber-400' : 'border-blue-500 dark:border-blue-400'}`}>
+          <div className={`glass-panel p-4 border-l-4 ${platform === 'launchgood' ? 'border-teal-500 dark:border-cyan-400' : platform === 'givebright' ? 'border-purple-500 dark:border-purple-400' : platform === 'paysuite' ? 'border-amber-500 dark:border-amber-400' : platform === 'stripe' ? 'border-indigo-500 dark:border-indigo-400' : 'border-blue-500 dark:border-blue-400'}`}>
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
-              {platform === 'paysuite' ? 'Total Tracked Direct Debits' : 'Unique Tracked Campaigns'}
+              {platform === 'stripe' ? 'Unique Payment Links' : platform === 'paysuite' ? 'Total Tracked Direct Debits' : 'Unique Tracked Campaigns'}
             </div>
             <div className="text-2xl font-black text-slate-900 dark:text-white mt-1">{loading && !matrixData.rules?.length ? <span className="inline-block w-16 h-6 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" /> : uniqueCampaignsCount.toLocaleString()}</div>
           </div>
           <div className="glass-panel p-4 border-l-4 border-emerald-500 dark:border-emerald-400">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
-              {platform === 'paysuite' ? 'Fully Classified Debits' : 'Fully Classified Campaigns'}
+              {platform === 'stripe' ? 'Classified Links' : platform === 'paysuite' ? 'Fully Classified Debits' : 'Fully Classified Campaigns'}
             </div>
             <div className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{loading && !matrixData.rules?.length ? <span className="inline-block w-16 h-6 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" /> : classifiedCampaignsCount.toLocaleString()}</div>
           </div>
           <div className="glass-panel p-4 border-l-4 border-amber-500 dark:border-amber-400">
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
-              {platform === 'paysuite' ? 'Unassigned Debits' : 'Unassigned Campaigns'}
+              {platform === 'stripe' ? 'Unassigned Links' : platform === 'paysuite' ? 'Unassigned Debits' : 'Unassigned Campaigns'}
             </div>
             <div className="text-2xl font-black text-amber-600 dark:text-amber-400 mt-1">{loading && !matrixData.rules?.length ? <span className="inline-block w-16 h-6 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" /> : unassignedCampaignsCount.toLocaleString()}</div>
           </div>
@@ -1938,7 +2032,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
               <table className="crm-table w-full">
                 <thead>
                   <tr>
-                    <th className="min-w-[220px] text-left">{platform === 'paysuite' ? 'Direct Debit Ref (Bank Ref)' : 'Campaign Name'}</th>
+                    <th className="min-w-[220px] text-left">{platform === 'paysuite' ? 'Direct Debit Ref (Bank Ref)' : platform === 'stripe' ? 'Payment Link Name' : 'Campaign Name'}</th>
                     
                     {/* Paysuite: Donor Name and Email columns */}
                     {platform === 'paysuite' && (
@@ -1950,17 +2044,17 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
                     {/* Giving Level / Option Column */}
                     {platform !== 'paysuite' && (
-                      <th className="min-w-[180px] text-left">Giving Level / Option</th>
+                      <th className="min-w-[180px] text-left">{platform === 'stripe' ? 'Currency & Ref' : 'Giving Level / Option'}</th>
                     )}
 
-                    {/* LaunchGood & GiveBright: Campaign URL Column */}
+                    {/* LaunchGood, GiveBright & Stripe: Campaign URL Column */}
                     {platform !== 'paysuite' && (
-                      <th className="w-28 text-center">Campaign URL</th>
+                      <th className="w-28 text-center">{platform === 'stripe' ? 'Stripe URL' : 'Campaign URL'}</th>
                     )}
 
-                    {/* LaunchGood & Paysuite: Community Name column (Hidden for GiveBright & Madinah) */}
+                    {/* LaunchGood & Paysuite & Stripe: Community Name column (Hidden for GiveBright & Madinah) */}
                     {platform !== 'givebright' && platform !== 'madinah' && (
-                      <th className="min-w-[160px] text-left">{platform === 'paysuite' ? 'Platform Source' : 'Community Name'}</th>
+                      <th className="min-w-[160px] text-left">{platform === 'paysuite' ? 'Platform Source' : platform === 'stripe' ? 'Payment Link ID' : 'Community Name'}</th>
                     )}
                     
                     <th className="w-36 text-left">Code (Master Link)</th>

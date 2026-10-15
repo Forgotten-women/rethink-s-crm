@@ -1706,6 +1706,18 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                         """, master_code_rows)
 
                     # 2. Synchronize platform_campaign_mappings
+                    # Codes are saved upper-case; an existing row that differs only in case ("Unassigned" vs
+                    # "UNASSIGNED") is the same rule - rename it rather than add a second "variant" next to it.
+                    for (cname_lower, gl_lower), codes in cname_gl_to_codes.items():
+                        for c_low in codes:
+                            conn.execute("""UPDATE OR IGNORE platform_campaign_mappings SET code = ?
+                                            WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ?
+                                              AND LOWER(COALESCE(giving_level, '')) = ? AND LOWER(code) = ? AND code != ?""",
+                                         (c_low.upper(), comp, platform.lower(), cname_lower, gl_lower, c_low, c_low.upper()))
+                            conn.execute("""DELETE FROM platform_campaign_mappings
+                                            WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ?
+                                              AND LOWER(COALESCE(giving_level, '')) = ? AND LOWER(code) = ? AND code != ?""",
+                                         (comp, platform.lower(), cname_lower, gl_lower, c_low, c_low.upper()))
                     for (cname_lower, gl_lower), codes in cname_gl_to_codes.items():
                         placeholders = ','.join(['?'] * len(codes))
                         conn.execute(f"DELETE FROM platform_campaign_mappings WHERE company_id = ? AND platform = ? AND LOWER(campaign_name) = ? AND LOWER(COALESCE(giving_level, '')) = ? AND LOWER(code) NOT IN ({placeholders})", [comp, platform.lower(), cname_lower, gl_lower] + list(codes))

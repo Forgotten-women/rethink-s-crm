@@ -24,6 +24,7 @@ from core.data_processor import (
     invalidate_payouts_cache,
     sync_donors_to_classification_matrix,
     get_code_to_classification_map,
+    classify_donor_amount,
 )
 from core.fast_export import dataframe_to_fast_xlsx, dataframe_to_fast_csv
 from backend.api.auth import get_current_user
@@ -216,7 +217,7 @@ def update_single_donor_record(
     if new_code_val:
         c_code_clean = str(new_code_val).strip().lower()
         if c_code_clean not in ["unassigned", "nan", "none", "n/a", ""]:
-            c_map = get_code_to_classification_map()
+            c_map = get_code_to_classification_map(company_id=str(payload.company_id or "rethink").strip().lower())  # this charity's codes
             if c_code_clean in c_map:
                 c_info = c_map[c_code_clean]
                 for col in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Programme Fund", "Fund Code"]:
@@ -363,7 +364,7 @@ def bulk_edit_donors(
         c_idx = payload.target_columns.index("Code")
         new_c_val = str(payload.new_values[c_idx] or "").strip().lower()
         if new_c_val and new_c_val not in ["unassigned", "nan", "none", "n/a", ""]:
-            c_map = get_code_to_classification_map()
+            c_map = get_code_to_classification_map(company_id=str(payload.company_id or "rethink").strip().lower())  # this charity's codes
             if new_c_val in c_map:
                 c_info = c_map[new_c_val]
                 for tc in ["Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility", "Programme Fund", "Fund Code"]:
@@ -1323,8 +1324,27 @@ def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Qu
     # (company_id omitted/'all' already searches every charity, and the API guard only allows that
     # for accounts with access to all of them.)
 
+    manual = _manual_for_identity(comp or "all", donor_id_or_email, donor_txns)
     if donor_txns.empty:
-        raise HTTPException(status_code=404, detail=f"Donor '{donor_id_or_email}' not found.")
+        if not manual:
+            raise HTTPException(status_code=404, detail=f"Donor '{donor_id_or_email}' not found.")
+        m0 = manual[0]
+        manual_total = round(sum(float(m.get("total_donated") or 0.0) for m in manual), 2)
+        return {
+            "donor_id": m0["key"], "display_name": (m0.get("donor_name") or "").strip() or "Manual donor",
+            "email": m0.get("donor_email") or "N/A", "phone": m0.get("donor_phone") or "N/A",
+            "lifetime_tier": "Manual entry", "transaction_tier": "Manual entry",
+            "total_ltv": manual_total, "avg_donation": round(manual_total / len(manual), 2),
+            "total_donations_count": len(manual), "manual_total": manual_total, "manual_records": len(manual),
+            "platform": MANUAL_PLATFORM, "source": MANUAL_PLATFORM, "payment_frequency": "N/A", "payment_type": "N/A",
+            "gift_aid": "N/A", "marketing_consent": "N/A", "tax_receipt_requested": "N/A", "anonymous_public": "N/A",
+            "settlement_currency": "GBP", "billing_city": "N/A", "billing_state": "N/A", "billing_postcode": "N/A",
+            "billing_country": "N/A", "history": _manual_history_rows(manual, "Total Online Donations Net Amount in Settled Currency"),
+            "category_breakdown": [{"heading": "Sponsorship", "subheading": m.get("sponsorship_type") or "Sponsorship",
+                                    "total_amount": round(float(m.get("total_donated") or 0.0), 2), "count": 1,
+                                    "percentage": round(float(m.get("total_donated") or 0.0) / manual_total * 100, 1) if manual_total else 0.0}
+                                   for m in manual],
+        }
 
     col_amount = "Total Online Donations Net Amount in Settled Currency"
     if col_amount not in df.columns:
@@ -1384,8 +1404,14 @@ def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Qu
     timeline_cols = [c for c in [
         "Created Date (UTC)", "Campaign Name", "Heading", "Sub-Heading", 
         "Donation Currency (DC)", "Donation Amount (in Donation Currency)", 
-        col_amount, "Payment Frequency", "Platform", "Source"
+        col_amount, "Payment Frequency", "Platform", "Source",
+        # full detail for the donor panel
+        "Donation ID", "Code", "Department", "Office", "Country", "Programme Fund", "Fund Code", "Zakat Eligibility",
+        "Giving Level Title", "fundraiser_name", "Status", "Transaction Type", "Payment Type",
+        "Total Online Donation Gross Amount in Settled Currency", "Total Processing Fees Paid by CC In Settled Currency",
+        "Settlement Currency", "Gift Aid (yes or no)", "Zakat (yes or no)", "Anonymous or Public", "Comments",
     ] if c in donor_txns.columns]
+    timeline_cols = list(dict.fromkeys(timeline_cols))
 
     timeline_df = donor_txns[timeline_cols].copy()
     if "Created Date (UTC)" in timeline_df.columns:
@@ -1419,7 +1445,523 @@ def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Qu
 
     details["history"] = history
     details["category_breakdown"] = category_breakdown
+    if manual:  # also recorded by hand in the Sponsorship Tracker
+        details["manual_total"] = round(sum(float(m.get("total_donated") or 0.0) for m in manual), 2)
+        details["manual_records"] = len(manual)
+        details["total_donations_count"] = int(details.get("total_donations_count") or 0) + len(manual)
     return details
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Donor directory: one row per donor (not per donation), searchable / sortable / paged. Donations are grouped by
+# Donor ID (the same key the donor profile uses); generated placeholders ("anonymous", "name:nan nan") are left
+# out so unrelated anonymous gifts are never merged into one fake donor. Built once per charity and reused until
+# that charity's donations change.
+# ---------------------------------------------------------------------------------------------------------
+_DIRECTORY_CACHE: Dict[str, Any] = {}
+_DIRECTORY_AMOUNT = "Total Online Donations Net Amount in Settled Currency"
+MANUAL_PLATFORM = "Manual (Sponsorship Tracker)"
+
+
+def _manual_donor_records(comp: str) -> List[Dict[str, Any]]:
+    """Donors added by hand in the Sponsorship Tracker (read live; no copy is kept)."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        q = """SELECT id, company_id, donor_name, donor_email, donor_phone, sponsorship_type, total_donated, notes,
+                      created_at, classification FROM sponsorship_manual_donors"""
+        rows = conn.execute(q + (" WHERE LOWER(company_id) = ?" if comp != "all" else ""), (comp,) if comp != "all" else ()).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        r = dict(r)
+        email = (r.get("donor_email") or "").strip().lower()
+        r["key"] = email if "@" in email else f"manual:{r['id']}".lower()
+        out.append(r)
+    return out
+
+
+def _manual_for_identity(comp: str, identity: str, donor_txns: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    """Manual records for this donor: same email (as typed or as on their platform gifts) or a manual:<id> key."""
+    ident = str(identity or "").strip().lower()
+    if not ident:
+        return []
+    emails = {ident}
+    if donor_txns is not None and not donor_txns.empty and "Email" in donor_txns.columns:
+        emails |= set(donor_txns["Email"].dropna().astype(str).str.strip().str.lower())
+    return [m for m in _manual_donor_records(comp) if m["key"] in emails or ident == f"manual:{str(m['id']).lower()}"]
+
+
+def _manual_history_rows(records: List[Dict[str, Any]], col_amount: str) -> List[Dict[str, Any]]:
+    rows = []
+    for m in records:
+        rows.append({
+            "Created Date (UTC)": str(m.get("created_at") or "")[:10] or "N/A",
+            "Donation ID": m["id"], "Platform": MANUAL_PLATFORM, "Source": MANUAL_PLATFORM,
+            "Campaign Name": f"{m.get('sponsorship_type') or 'Sponsorship'} sponsorship (recorded manually)",
+            "Heading": "Sponsorship", "Sub-Heading": m.get("sponsorship_type") or "Sponsorship",
+            col_amount: round(float(m.get("total_donated") or 0.0), 2), "Settlement Currency": "GBP",
+            "Status": "recorded in tracker", "Comments": m.get("notes") or "",
+        })
+    return rows
+
+
+def _clean_text(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip()
+    return s.mask(s.str.lower().isin(["", "nan", "none", "null", "n/a", "<na>", "nat"]))
+
+
+SPONSORSHIP_TYPES = ("Orphan", "Hafiz", "Widow", "Ex-Prisoner")
+
+
+def _donor_directory_frame(comp: str) -> pd.DataFrame:
+    return _directory_data(comp)[0]
+
+
+def _directory_data(comp: str):
+    """(donor frame, donation index). The donor frame has one row per donor; the donation index has one row per
+    gift (plus manual tracker entries) with the fields segments filter on (date, cause, amount, platform, ...)."""
+    from core.cache import version_token
+    token = version_token(["donations", "classification", "tracker", "fundraisers"], comp)
+    hit = _DIRECTORY_CACHE.get(comp)
+    if hit and hit[0] == token:
+        return hit[1], hit[2]
+    df = load_data(company_id=comp if comp != "all" else None)
+    if df is None or df.empty or "Donor ID" not in df.columns:
+        frame = pd.DataFrame()
+        _DIRECTORY_CACHE[comp] = (token, frame, pd.DataFrame())
+        return frame, pd.DataFrame()
+    key = df["Donor ID"].astype(str).str.strip().str.lower()
+    # Only real placeholders: "name:nan nan" / "name:none" / "name:anonymous …" - never a real name such as
+    # "name:nancy refaat" that merely starts with the same letters.
+    usable = ~(key.isin(ANON_PLACEHOLDERS) | key.str.fullmatch(r"name:((nan|none|null|n/a)( (nan|none|null|n/a))?)?")
+               | key.str.match(r"name:anonymous\b"))
+
+    def col(c):
+        return _clean_text(df[c]) if c in df.columns else pd.Series(pd.NA, index=df.index, dtype=object)
+
+    first, last = col("First Name"), col("Last Name")
+    full = (first.fillna("") + " " + last.fillna("")).str.strip()
+    full = full.mask(full == "").fillna(col("Billing Name")).fillna(col("Display Name"))
+    phone = col("Phone Number")
+    for pc in ("Phone", "phone_number", "Contact Phone"):
+        phone = phone.fillna(col(pc))
+    freq = col("Payment Frequency").fillna("").str.lower()
+    # Sponsorship type of each gift - the same rules as the Sponsorship Tracker
+    try:
+        from backend.api.tracker import _sponsorship_masks
+        masks = _sponsorship_masks(df)
+    except Exception:
+        masks = {}
+    stype = pd.Series("", index=df.index, dtype=object)
+    for t in reversed(SPONSORSHIP_TYPES):
+        if t in masks:
+            stype = stype.mask(masks[t].fillna(False).astype(bool), t)
+    # SP (Sisters' Project): credited to an SP fundraiser (by name, assigned campaign name or tracked page), or the
+    # campaign / page itself is an SP page. Look-ups on unique values only, so it stays fast on 100k+ gifts.
+    sp = pd.Series(False, index=df.index)
+    try:
+        from backend.api.fundraisers import is_sp_text, resolve_page_group
+        conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+        try:
+            frs = conn.execute("SELECT id, name, page_group FROM fundraisers WHERE LOWER(company_id) = ?", (comp,)).fetchall()
+            assigned = conn.execute("""SELECT fundraiser_id, COALESCE(campaign_name, ''), COALESCE(match_type, 'campaign_name'),
+                                              COALESCE(match_value, '') FROM fundraiser_campaigns WHERE LOWER(company_id) = ?""", (comp,)).fetchall()
+        finally:
+            conn.close()
+        camps: Dict[str, List[str]] = {}
+        for fid, cn, mt, mv in assigned:
+            camps.setdefault(fid, []).extend([cn, mv])
+        sp_ids = {fid for fid, n, pg in frs if resolve_page_group(pg, n or "", camps.get(fid, [])) == "SP"}
+        sp_names = {str(n or "").strip().lower() for fid, n, pg in frs if fid in sp_ids}
+        sp_campaigns = {cn.strip().lower() for fid, cn, mt, mv in assigned if fid in sp_ids and mt == "campaign_name" and cn.strip()}
+        slug = lambda u: str(u or "").strip().lower().split("?")[0].rstrip("/").split("/")[-1]  # noqa: E731
+        sp_slugs = {slug(mv) for fid, cn, mt, mv in assigned if fid in sp_ids and mt != "campaign_name" and slug(mv)}
+
+        def flag(series: pd.Series, fn) -> pd.Series:
+            vals = series.fillna("").astype(str)
+            uniq = {v: bool(fn(v)) for v in vals.unique() if isinstance(v, str) and v and v.lower() not in ("nan", "none")}
+            return vals.map(uniq).fillna(False).astype(bool)
+
+        for c in ("fundraiser_name", "Fundraiser Name"):
+            if c in df.columns and sp_names:
+                sp |= flag(df[c], lambda v: v.strip().lower() in sp_names)
+        if "Campaign Name" in df.columns:
+            sp |= flag(df["Campaign Name"], lambda v: is_sp_text(v) or v.strip().lower() in sp_campaigns)
+        for c in ("Campaign URL", "campaign_url", "fundraiser_url", "Fundraiser URL", "Community URL", "community_url"):
+            if c in df.columns:
+                sp |= flag(df[c], lambda v: is_sp_text(v) or slug(v) in sp_slugs)
+    except Exception as e:
+        print(f"[donor directory] SP detection skipped: {e}")
+
+    w = pd.DataFrame({
+        "key": key, "name": full, "email": col("Email"), "phone": phone,
+        "city": col("Billing City"), "country": col("Billing Country"),
+        "amount": pd.to_numeric(df[_DIRECTORY_AMOUNT], errors="coerce").fillna(0.0) if _DIRECTORY_AMOUNT in df.columns else 0.0,
+        "date": pd.to_datetime(df["Created Date (UTC)"], errors="coerce", format="mixed") if "Created Date (UTC)" in df.columns else pd.NaT,
+        "platform": col("Platform"), "heading": col("Heading"), "subheading": col("Sub-Heading"), "code": col("Code"),
+        "campaign": col("Campaign Name"),
+        "gift_aid": col("Gift Aid (yes or no)").str.lower().isin(["yes", "true", "1", "y"]),
+        "consent": col("Marketing Consent"),
+        "recurring": freq.str.contains("recurr", na=False),
+        "stype": stype, "sp": sp.astype(bool),
+    })[usable]
+    unidentified_amount = float(pd.to_numeric(df.loc[~usable, _DIRECTORY_AMOUNT], errors="coerce").fillna(0).sum()) if _DIRECTORY_AMOUNT in df.columns else 0.0
+    unidentified_gifts = int((~usable).sum())
+    w = w.sort_values("date", kind="stable")
+    g = w.groupby("key", sort=False)
+    top_heading = (w.dropna(subset=["heading"]).groupby(["key", "heading"]).size()
+                   .reset_index(name="n").sort_values("n", ascending=False).drop_duplicates("key").set_index("key")["heading"])
+    platforms = _joined_values(w, "platform")
+    stypes = _joined_values(w[w["stype"] != ""], "stype")
+    frame = pd.DataFrame({
+        "name": g["name"].last(), "email": g["email"].last(), "phone": g["phone"].last(),
+        "city": g["city"].last(), "country": g["country"].last(),
+        "total": g["amount"].sum().round(2), "gifts": g["amount"].size(),
+        "first_gift": g["date"].min(), "last_gift": g["date"].max(),
+        "gift_aid": g["gift_aid"].any(), "marketing_consent": g["consent"].last(),
+        "recurring_gifts": g["recurring"].sum().astype(int), "sp": g["sp"].any(),
+    })
+    frame["platforms"] = platforms.reindex(frame.index)
+    frame["top_heading"] = top_heading.reindex(frame.index)
+    frame["sponsorship_types"] = stypes.reindex(frame.index)
+    frame["platform_total"] = frame["total"]
+    frame["manual_total"] = 0.0
+    frame["manual_records"] = 0
+    dx = w[["key", "date", "amount", "heading", "subheading", "code", "campaign", "platform", "recurring", "gift_aid",
+            "stype", "sp"]].copy()
+    manual_rows = []
+    # Manual donors from the Sponsorship Tracker: merged into the same person (by email) or listed on their own
+    by_email = {}
+    for idx, em in frame["email"].items():
+        if isinstance(em, str) and em.strip():
+            by_email.setdefault(em.strip().lower(), idx)
+    for m in _manual_donor_records(comp):
+        k, amt = m["key"], round(float(m.get("total_donated") or 0.0), 2)
+        k = k if k in frame.index else by_email.get(k, k)
+        made = pd.to_datetime(m.get("created_at"), errors="coerce")
+        mtype = str(m.get("sponsorship_type") or "").strip()
+        manual_rows.append({"key": k, "date": made, "amount": amt, "heading": "Sponsorship", "subheading": mtype or "Sponsorship",
+                            "code": None, "campaign": f"{mtype or 'Sponsorship'} sponsorship (manual)", "platform": MANUAL_PLATFORM,
+                            "recurring": False, "gift_aid": False, "stype": mtype if mtype in SPONSORSHIP_TYPES else "", "sp": False})
+        if k in frame.index:
+            frame.at[k, "manual_total"] += amt
+            frame.at[k, "manual_records"] += 1
+            frame.at[k, "total"] = round(frame.at[k, "total"] + amt, 2)
+            if MANUAL_PLATFORM not in str(frame.at[k, "platforms"] or ""):
+                frame.at[k, "platforms"] = ", ".join(p for p in [frame.at[k, "platforms"], MANUAL_PLATFORM] if isinstance(p, str) and p)
+            if mtype in SPONSORSHIP_TYPES and mtype not in str(frame.at[k, "sponsorship_types"] or ""):
+                frame.at[k, "sponsorship_types"] = ", ".join(sorted(t for t in [frame.at[k, "sponsorship_types"], mtype] if isinstance(t, str) and t))
+        else:
+            frame.loc[k] = {
+                "name": (m.get("donor_name") or "").strip() or None, "email": (m.get("donor_email") or "").strip() or None,
+                "phone": (m.get("donor_phone") or "").strip() or None, "city": None, "country": None,
+                "total": amt, "gifts": 0, "first_gift": made, "last_gift": made, "gift_aid": False, "marketing_consent": None,
+                "recurring_gifts": 0, "sp": False,
+                "platforms": MANUAL_PLATFORM, "top_heading": m.get("sponsorship_type") or "Sponsorship",
+                "sponsorship_types": mtype if mtype in SPONSORSHIP_TYPES else None,
+                "platform_total": 0.0, "manual_total": amt, "manual_records": 1,
+            }
+    if manual_rows:
+        dx = pd.concat([dx, pd.DataFrame(manual_rows)], ignore_index=True)
+    frame["avg_gift"] = (frame["platform_total"] / frame["gifts"].where(frame["gifts"] > 0)).round(2).fillna(0.0)
+    frame["recurring"] = frame["recurring_gifts"] > 0
+    frame["tier"] = frame["total"].map(classify_donor_amount)
+    # Sponsorship allocations each donor is part of (Sponsorship Tracker), by email
+    frame["allocations"] = 0
+    try:
+        conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+        try:
+            alloc = dict(conn.execute("""SELECT LOWER(TRIM(d.donor_email)), COUNT(DISTINCT d.allocation_id)
+                                         FROM sponsorship_allocation_donors d JOIN sponsorship_allocations a ON a.id = d.allocation_id
+                                         WHERE LOWER(a.company_id) = ? AND COALESCE(d.donor_email, '') LIKE '%@%'
+                                         GROUP BY 1""", (comp,)).fetchall())
+        finally:
+            conn.close()
+        em = frame["email"].fillna("").astype(str).str.strip().str.lower()
+        frame["allocations"] = em.map(alloc).fillna(0).astype(int)
+    except Exception as e:
+        print(f"[donor directory] allocation counts skipped: {e}")
+    frame = frame.reset_index().rename(columns={"index": "donor_id", "key": "donor_id"})
+    frame["search"] = (frame["donor_id"].fillna("") + " " + frame["name"].fillna("").str.lower() + " " +
+                       frame["email"].fillna("").str.lower() + " " + frame["phone"].fillna("").str.replace(r"[^0-9]", "", regex=True))
+    frame.attrs["unidentified"] = {"gifts": unidentified_gifts, "amount": round(unidentified_amount, 2)}
+    _DIRECTORY_CACHE[comp] = (token, frame, dx)
+    return frame, dx
+
+
+def _joined_values(w: pd.DataFrame, column: str) -> pd.Series:
+    """Per donor, the distinct values of a low-cardinality column joined with ', ' (alphabetical), vectorised."""
+    sub = w.dropna(subset=[column])
+    sub = sub[sub[column].astype(str).str.strip() != ""]
+    if sub.empty:
+        return pd.Series(dtype=object)
+    present = pd.crosstab(sub["key"], sub[column].astype(str)) > 0
+    out = pd.Series("", index=present.index, dtype=object)
+    for value in sorted(present.columns):
+        has = present[value]
+        out = out.where(~has, out.where(out == "", out + ", ") + value)
+    return out
+
+
+def _as_list(v) -> List[str]:
+    if v is None or v == "":
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [x.strip() for x in str(v).split(",") if x.strip()]
+
+
+def apply_segment(frame: pd.DataFrame, dx: pd.DataFrame, seg: Dict[str, Any]) -> pd.DataFrame:
+    """Donors matching a segment. Gift rules (date range, cause, sponsorship type, campaign, platform, amount,
+    recurring, Gift Aid, SP) pick the gifts that count - a donor matches if at least one gift passes ALL of them
+    (and, if set, their matching gifts reach min_matched_gifts / min_matched_total). Donor rules (tier, lifetime
+    total, gift count, average, recurring donor, allocations, contact, country, dates) then narrow the donors.
+    Lists mean "any of"; different rules combine with AND."""
+    seg = seg or {}
+    f = frame
+    gift_rules = ("date_from", "date_to", "headings", "subheadings", "codes", "campaign", "platforms", "sponsorship_types",
+                  "frequency", "gift_aid_gift", "sp_gift", "min_amount", "max_amount", "min_matched_gifts", "min_matched_total")
+    if any(seg.get(k) not in (None, "", [], "any") for k in gift_rules) and not dx.empty:
+        d = dx
+        if seg.get("date_from"):
+            d = d[d["date"] >= pd.to_datetime(seg["date_from"], errors="coerce")]
+        if seg.get("date_to"):
+            d = d[d["date"] < pd.to_datetime(seg["date_to"], errors="coerce") + pd.Timedelta(days=1)]
+        for k, c in (("headings", "heading"), ("subheadings", "subheading"), ("codes", "code"), ("platforms", "platform"),
+                     ("sponsorship_types", "stype")):
+            vals = [v.lower() for v in _as_list(seg.get(k))]
+            if vals:
+                d = d[d[c].fillna("").astype(str).str.strip().str.lower().isin(vals)]
+        if seg.get("campaign"):
+            d = d[d["campaign"].fillna("").str.lower().str.contains(re.escape(str(seg["campaign"]).lower()), na=False)]
+        if seg.get("frequency") in ("recurring", "one-off"):
+            d = d[d["recurring"] == (seg["frequency"] == "recurring")]
+        if seg.get("gift_aid_gift") in ("yes", "no"):
+            d = d[d["gift_aid"] == (seg["gift_aid_gift"] == "yes")]
+        if seg.get("sp_gift") in ("yes", "no"):
+            d = d[d["sp"] == (seg["sp_gift"] == "yes")]
+        if seg.get("min_amount") not in (None, ""):
+            d = d[d["amount"] >= float(seg["min_amount"])]
+        if seg.get("max_amount") not in (None, ""):
+            d = d[d["amount"] <= float(seg["max_amount"])]
+        agg = d.groupby("key")["amount"].agg(["size", "sum"])
+        if seg.get("min_matched_gifts") not in (None, ""):
+            agg = agg[agg["size"] >= int(seg["min_matched_gifts"])]
+        if seg.get("min_matched_total") not in (None, ""):
+            agg = agg[agg["sum"] >= float(seg["min_matched_total"])]
+        f = f[f["donor_id"].isin(agg.index)].copy()
+        f["matched_gifts"] = f["donor_id"].map(agg["size"]).fillna(0).astype(int)
+        f["matched_total"] = f["donor_id"].map(agg["sum"]).fillna(0).round(2)
+    tiers = _as_list(seg.get("tiers"))
+    if tiers:
+        f = f[f["tier"].isin(tiers)]
+    for k, c, op in (("min_total", "total", "ge"), ("max_total", "total", "le"), ("min_gifts", "gifts", "ge"),
+                     ("max_gifts", "gifts", "le"), ("min_avg", "avg_gift", "ge"), ("max_avg", "avg_gift", "le"),
+                     ("min_allocations", "allocations", "ge")):
+        if seg.get(k) not in (None, ""):
+            v = float(seg[k])
+            f = f[f[c] >= v] if op == "ge" else f[f[c] <= v]
+    yn = lambda k: seg.get(k) in ("yes", "no")  # noqa: E731
+    if yn("recurring"):
+        f = f[f["recurring"] == (seg["recurring"] == "yes")]
+    if yn("sp"):
+        f = f[f["sp"] == (seg["sp"] == "yes")]
+    if yn("gift_aid"):
+        f = f[f["gift_aid"] == (seg["gift_aid"] == "yes")]
+    if yn("has_email"):
+        has = f["email"].fillna("").astype(str).str.contains("@")
+        f = f[has == (seg["has_email"] == "yes")]
+    if yn("marketing_consent"):
+        ok = f["marketing_consent"].fillna("").astype(str).str.lower().isin(["yes", "true", "1", "y", "opted in"])
+        f = f[ok == (seg["marketing_consent"] == "yes")]
+    if yn("manual"):
+        f = f[(f["manual_records"] > 0) == (seg["manual"] == "yes")]
+    countries = [c.lower() for c in _as_list(seg.get("countries"))]
+    if countries:
+        f = f[f["country"].fillna("").str.lower().isin(countries)]
+    if seg.get("city"):
+        f = f[f["city"].fillna("").str.lower().str.contains(re.escape(str(seg["city"]).lower()), na=False)]
+    for k, c, lo in (("first_gift_from", "first_gift", True), ("first_gift_to", "first_gift", False),
+                     ("last_gift_from", "last_gift", True), ("last_gift_to", "last_gift", False)):
+        if seg.get(k):
+            t = pd.to_datetime(seg[k], errors="coerce")
+            f = f[f[c] >= t] if lo else f[f[c] < t + pd.Timedelta(days=1)]
+    if seg.get("search"):
+        q = str(seg["search"]).strip().lower()
+        digits = re.sub(r"[^0-9]", "", q)
+        m = f["search"].str.contains(re.escape(q), na=False)
+        if len(digits) >= 5:
+            m |= f["search"].str.contains(digits, na=False)
+        f = f[m]
+    return f
+
+
+@router.get("/segment-options")
+def get_segment_options(company_id: Optional[str] = Query("rethink")):
+    """Values the segment builder offers (causes, codes, platforms, countries, tiers, sponsorship types)."""
+    comp = str(company_id or "rethink").strip().lower()
+    frame, dx = _directory_data(comp)
+    if frame.empty:
+        return {"headings": [], "subheadings": [], "codes": [], "platforms": [], "countries": [], "tiers": [],
+                "sponsorship_types": list(SPONSORSHIP_TYPES)}
+
+    def counts(series, top=None):
+        vc = series.dropna().astype(str).str.strip()
+        vc = vc[(vc != "") & (~vc.str.lower().isin(["nan", "none", "unassigned", "n/a"]))].value_counts()
+        if top:
+            vc = vc.head(top)
+        return [{"value": k, "count": int(v)} for k, v in vc.items()]
+
+    sub = dx.dropna(subset=["subheading"])
+    sub = sub[sub["subheading"].astype(str).str.strip() != ""]
+    subs = (sub.groupby(["subheading", "heading"]).size().reset_index(name="n").sort_values("n", ascending=False))
+    return {
+        "headings": counts(dx["heading"]),
+        "subheadings": [{"value": r.subheading, "heading": r.heading, "count": int(r.n)} for r in subs.itertuples()],
+        "codes": counts(dx["code"], 400),
+        "platforms": counts(dx["platform"]),
+        "countries": counts(frame["country"], 80),
+        "tiers": ["Low End", "Medium Low", "Medium", "High", "Super High"],
+        "sponsorship_types": list(SPONSORSHIP_TYPES),
+    }
+
+
+@router.get("/directory")
+def get_donor_directory(
+    company_id: Optional[str] = Query("rethink"),
+    search: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    gift_aid: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    min_total: Optional[float] = Query(None),
+    last_gift_from: Optional[str] = Query(None),
+    last_gift_to: Optional[str] = Query(None),
+    tier: Optional[str] = Query(None),
+    recurring: Optional[str] = Query(None),
+    sp: Optional[str] = Query(None),
+    segment: Optional[str] = Query(None, description="JSON segment (see apply_segment)"),
+    sort_by: str = Query("total"),
+    sort_dir: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """One row per donor with lifetime totals; clicking a donor uses donor_id with /profile and /history."""
+    comp = str(company_id or "rethink").strip().lower()
+    frame, dx = _directory_data(comp)
+    if frame.empty:
+        return {"total_donors": 0, "page": 1, "page_size": page_size, "total_pages": 1, "summary": {}, "donors": []}
+    seg: Dict[str, Any] = {}
+    if segment:
+        try:
+            import json as _json
+            seg = _json.loads(segment) or {}
+        except ValueError:
+            raise HTTPException(status_code=400, detail="segment must be JSON")
+    if tier:
+        seg.setdefault("tiers", _as_list(tier))
+    if recurring in ("yes", "no"):
+        seg.setdefault("recurring", recurring)
+    if sp in ("yes", "no"):
+        seg.setdefault("sp", sp)
+    f = apply_segment(frame, dx, seg) if seg else frame
+    if search and search.strip():
+        q = search.strip().lower()
+        digits = re.sub(r"[^0-9]", "", q)
+        m = f["search"].str.contains(re.escape(q), na=False)
+        if len(digits) >= 5:
+            m |= f["search"].str.contains(digits, na=False)
+        f = f[m]
+    if platform and platform.lower() != "all":
+        f = f[f["platforms"].fillna("").str.lower().str.contains(re.escape(platform.lower()))]
+    if source == "manual":
+        f = f[f["manual_records"] > 0]
+    elif source == "platform":
+        f = f[f["gifts"] > 0]
+    if gift_aid in ("yes", "no"):
+        f = f[f["gift_aid"] == (gift_aid == "yes")]
+    if min_total is not None:
+        f = f[f["total"] >= float(min_total)]
+    if last_gift_from:
+        f = f[f["last_gift"] >= pd.to_datetime(last_gift_from, errors="coerce")]
+    if last_gift_to:
+        f = f[f["last_gift"] < pd.to_datetime(last_gift_to, errors="coerce") + pd.Timedelta(days=1)]
+    column = {"total": "total", "gifts": "gifts", "last_gift": "last_gift", "first_gift": "first_gift", "name": "name",
+              "avg_gift": "avg_gift", "recurring_gifts": "recurring_gifts", "allocations": "allocations",
+              "matched_total": "matched_total" if "matched_total" in f.columns else "total"}.get(sort_by, "total")
+    f = f.sort_values(column, ascending=(sort_dir == "asc"), na_position="last", kind="stable")
+    total = len(f)
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
+    rows = f.iloc[(page - 1) * page_size: page * page_size].drop(columns=["search"]).copy()
+    for c in ("first_gift", "last_gift"):
+        rows[c] = rows[c].dt.strftime("%Y-%m-%d")
+    rows = rows.astype(object).where(rows.notna(), None)
+    # Unfiltered view: include gifts that have no donor details, so the total equals the CRM's total raised.
+    unfiltered = f is frame or len(f) == len(frame)
+    unidentified = frame.attrs.get("unidentified", {"gifts": 0, "amount": 0.0}) if unfiltered else {"gifts": 0, "amount": 0.0}
+    return {
+        "total_donors": total, "page": page, "page_size": page_size, "total_pages": pages,
+        "summary": {"donors": total, "total_raised": round(float(f["platform_total"].sum()) + unidentified["amount"], 2),
+                    "manual_total": round(float(f["manual_total"].sum()), 2), "manual_donors": int((f["manual_records"] > 0).sum()),
+                    "gifts": int(f["gifts"].sum()) + unidentified["gifts"],
+                    "unidentified_gifts": unidentified["gifts"], "unidentified_amount": unidentified["amount"],
+                    "gift_aid_donors": int(f["gift_aid"].sum()),
+                    "average_per_donor": round(float(f["total"].mean()), 2) if total else 0.0,
+                    "average_gift": round(float(f["platform_total"].sum()) / max(int(f["gifts"].sum()), 1), 2),
+                    "recurring_donors": int(f["recurring"].sum()), "sp_donors": int(f["sp"].sum()),
+                    "tiers": {k: int(v) for k, v in f["tier"].value_counts().items()},
+                    "matched_total": round(float(f["matched_total"].sum()), 2) if "matched_total" in f.columns else None},
+        "donors": rows.to_dict(orient="records"),
+    }
+
+
+@router.get("/donation/{donation_id:path}")
+def get_donation_detail(donation_id: str, company_id: Optional[str] = Query(None)):
+    """Every field of one donation (or of one Sponsorship Tracker manual record), within the requested charity only."""
+    comp = str(company_id or "").strip().lower()
+    did = str(donation_id or "").strip()
+    if not did:
+        raise HTTPException(status_code=400, detail="Donation ID is required.")
+    df = load_data(company_id=comp if comp and comp != "all" else None)
+    rows = pd.DataFrame()
+    if df is not None and not df.empty and "Donation ID" in df.columns:
+        ids = df["Donation ID"].astype(str).str.strip()
+        rows = df.loc[ids == did]
+        if rows.empty and did.endswith(".0"):
+            rows = df.loc[ids == did[:-2]]
+    if rows.empty:
+        manual = [m for m in _manual_donor_records(comp or "all") if str(m["id"]) == did]
+        if not manual:
+            raise HTTPException(status_code=404, detail=f"Donation '{did}' not found.")
+        m = manual[0]
+        rec = _manual_history_rows([m], _DIRECTORY_AMOUNT)[0]
+        rec.update({"Display Name": m.get("donor_name") or "", "Email": m.get("donor_email") or "",
+                    "Phone Number": m.get("donor_phone") or "", "Classification": m.get("classification") or "",
+                    "company_id": m.get("company_id") or comp})
+        return {"donation": rec, "duplicates": 0, "manual": True}
+
+    def plain(v):
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            return None
+        if isinstance(v, pd.Timestamp):
+            return None if pd.isna(v) else v.isoformat()
+        if hasattr(v, "item"):
+            try:
+                v = v.item()
+            except (ValueError, AttributeError):
+                pass
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        text = str(v).strip()
+        return None if text.lower() in ("", "nan", "none", "null", "nat", "n/a") else v
+
+    rec = {str(k): plain(v) for k, v in rows.iloc[0].to_dict().items()}
+    rec = {k: v for k, v in rec.items() if v is not None}
+    return {"donation": rec, "duplicates": int(len(rows) - 1), "manual": False}
 
 
 @router.get("/history")
@@ -1427,9 +1969,14 @@ def get_donor_history_paginated(
     donor_id: str = Query(...),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
-    company_id: Optional[str] = Query(None)
+    company_id: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    heading: Optional[str] = Query(None),
+    subheading: Optional[str] = Query(None),
 ):
-    """Paginated transaction history for a donor to handle large transaction counts smoothly."""
+    """Paginated transaction history for a donor to handle large transaction counts smoothly.
+    Optional filters (applied before paging): date range, cause heading / sub-heading."""
     comp = str(company_id or "").strip().lower()
     df = load_data(company_id=comp if comp and comp != "all" else None)
     match_mask = _get_donor_matching_mask(df, donor_id) if not df.empty else pd.Series(False, index=df.index)
@@ -1439,8 +1986,13 @@ def get_donor_history_paginated(
     # (company_id omitted/'all' already searches every charity, and the API guard only allows that
     # for accounts with access to all of them.)
 
-    if donor_txns.empty:
+    manual = _manual_for_identity(comp or "all", donor_id, donor_txns)
+    if donor_txns.empty and not manual:
         return {"total_records": 0, "page": 1, "page_size": page_size, "total_pages": 1, "records": []}
+    if donor_txns.empty:
+        rows = sorted(_manual_history_rows(manual, "Total Online Donations Net Amount in Settled Currency"),
+                      key=lambda r: r["Created Date (UTC)"], reverse=True)
+        return {"total_records": len(rows), "page": 1, "page_size": page_size, "total_pages": 1, "records": rows[:page_size]}
 
     col_amount = "Total Online Donations Net Amount in Settled Currency"
     if col_amount not in df.columns:
@@ -1449,8 +2001,14 @@ def get_donor_history_paginated(
     timeline_cols = [c for c in [
         "Created Date (UTC)", "Campaign Name", "Heading", "Sub-Heading", 
         "Donation Currency (DC)", "Donation Amount (in Donation Currency)", 
-        col_amount, "Payment Frequency", "Platform", "Source"
+        col_amount, "Payment Frequency", "Platform", "Source",
+        # full detail for the donor panel
+        "Donation ID", "Code", "Department", "Office", "Country", "Programme Fund", "Fund Code", "Zakat Eligibility",
+        "Giving Level Title", "fundraiser_name", "Status", "Transaction Type", "Payment Type",
+        "Total Online Donation Gross Amount in Settled Currency", "Total Processing Fees Paid by CC In Settled Currency",
+        "Settlement Currency", "Gift Aid (yes or no)", "Zakat (yes or no)", "Anonymous or Public", "Comments",
     ] if c in donor_txns.columns]
+    timeline_cols = list(dict.fromkeys(timeline_cols))
 
     timeline_df = donor_txns[timeline_cols].copy()
     if "Created Date (UTC)" in timeline_df.columns:
@@ -1463,6 +2021,21 @@ def get_donor_history_paginated(
     timeline_df = timeline_df.fillna("N/A")
     if col_amount in timeline_df.columns:
         timeline_df[col_amount] = pd.to_numeric(timeline_df[col_amount], errors='coerce').fillna(0.0).round(2)
+    if manual:  # records added by hand in the Sponsorship Tracker sit alongside the platform donations
+        timeline_df = pd.concat([timeline_df, pd.DataFrame(_manual_history_rows(manual, col_amount))], ignore_index=True)
+        timeline_df = timeline_df.sort_values("Created Date (UTC)", ascending=False, kind="stable").fillna("N/A")
+    if date_from or date_to:
+        d = pd.to_datetime(timeline_df["Created Date (UTC)"], errors="coerce")
+        keep = d.notna()
+        if date_from:
+            keep &= d >= pd.to_datetime(date_from, errors="coerce")
+        if date_to:
+            keep &= d < pd.to_datetime(date_to, errors="coerce") + pd.Timedelta(days=1)
+        timeline_df = timeline_df[keep]
+    for val, colname in ((heading, "Heading"), (subheading, "Sub-Heading")):
+        if val and colname in timeline_df.columns:
+            timeline_df = timeline_df[timeline_df[colname].astype(str).str.strip().str.lower() == str(val).strip().lower()]
+    filtered_net = round(float(pd.to_numeric(timeline_df[col_amount], errors="coerce").fillna(0).sum()), 2) if col_amount in timeline_df.columns else 0.0
 
     total_records = len(timeline_df)
     total_pages = max(1, math.ceil(total_records / page_size))
@@ -1478,7 +2051,8 @@ def get_donor_history_paginated(
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,
-        "records": records
+        "records": records,
+        "filtered_net": filtered_net,
     }
 
 
@@ -1507,3 +2081,278 @@ def get_campaigns_list(company_id: Optional[str] = Query("rethink")):
             campaigns = sorted([str(c).strip() for c in df["Campaign Name"].dropna().unique() if str(c).strip()])
             return {"campaigns": campaigns}
         return {"campaigns": []}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Manual / offline donations and donor-level edits (permission: super admin or "can edit donors")
+# ---------------------------------------------------------------------------------------------------------------
+MANUAL_SOURCE = "Manual Entry"
+NET_COL = "Total Online Donations Net Amount in Settled Currency"
+GROSS_COL = "Total Online Donation Gross Amount in Settled Currency"
+FEES_COL = "Total Processing Fees Paid by CC In Settled Currency"
+
+
+def _require_editor(current_user: Dict[str, Any]) -> None:
+    if not (current_user.get("role") == "super_admin" or current_user.get("can_edit_donors")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Your account can't add or edit donor records (ask a super admin for 'Edit donors').")
+
+
+def _editable_company(company_id: Optional[str]) -> str:
+    comp = str(company_id or "").strip().lower()
+    if not comp or comp == "all":
+        raise HTTPException(status_code=400, detail="Choose a charity (not 'All') to add or edit records.")
+    return comp
+
+
+def _refresh_copy(comp: str, donation_ids: List[str]) -> None:
+    """SQLite is the source of truth: bring the dashboards' copy level for exactly these rows, now."""
+    try:
+        from core.donations_reconcile import reconcile
+        reconcile(deep=False, apply=True, require_confirmation=False, only_keys={(comp, str(d)) for d in donation_ids})
+    except Exception as e:
+        print(f"[manual donation] copy refresh deferred to the background reconciler: {e}")
+    try:
+        from backend.api.events import broadcast_event_sync
+        broadcast_event_sync("DONORS_UPDATED", {"source": "manual_edit", "company_id": comp, "count": len(donation_ids)})
+    except Exception:
+        pass
+
+
+class ManualDonationRequest(BaseModel):
+    company_id: str
+    first_name: str = ""
+    last_name: str = ""
+    email: str = ""
+    phone: str = ""
+    address: str = ""
+    city: str = ""
+    postcode: str = ""
+    country: str = ""
+    amount: float
+    currency: str = "GBP"
+    settled_amount_gbp: Optional[float] = None   # required when the gift wasn't in GBP
+    fee: float = 0.0
+    date: str                                    # YYYY-MM-DD
+    payment_type: str = "Cash"                   # Cash / Bank transfer / Cheque / Card terminal / Standing order / Other
+    frequency: str = "One-Time Payment"          # or "Recurring Payment"
+    campaign_name: str = ""
+    giving_level: str = ""
+    code: str = ""
+    gift_aid: bool = False
+    zakat: bool = False
+    anonymous: bool = False
+    marketing_consent: Optional[bool] = None
+    platform: str = "Offline / Manual"
+    fundraiser_name: str = ""
+    notes: str = ""
+    reference: str = ""                          # e.g. bank reference / receipt number
+
+
+@router.post("/donations")
+def create_manual_donation(payload: ManualDonationRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Adds one offline/manual donation to the CRM. It behaves like any other gift: Donors page, donor panel,
+    classifications (from its Code), fundraisers and - when the Code/campaign is a sponsorship (ORP, HUF, WID, SUR) -
+    the Sponsorship Tracker."""
+    import uuid as _uuid
+    _require_editor(current_user)
+    comp = _editable_company(payload.company_id)
+    if payload.amount is None or float(payload.amount) == 0:
+        raise HTTPException(status_code=400, detail="Enter the donation amount.")
+    when = pd.to_datetime(payload.date, errors="coerce")
+    if pd.isna(when):
+        raise HTTPException(status_code=400, detail="Enter a valid date (YYYY-MM-DD).")
+    currency = (payload.currency or "GBP").strip().upper()[:3]
+    settled = float(payload.amount) if currency == "GBP" else payload.settled_amount_gbp
+    if settled is None:
+        raise HTTPException(status_code=400, detail="For a non-GBP gift, enter the amount received in GBP.")
+    email = (payload.email or "").strip()
+    name = f"{payload.first_name} {payload.last_name}".strip()
+    if not email and not name:
+        raise HTTPException(status_code=400, detail="Enter the donor's name or email.")
+    code = (payload.code or "").strip().upper()
+    cls: Dict[str, Any] = {}
+    if code and code.lower() not in ("unassigned", "nan", "none", "n/a"):
+        cls = get_code_to_classification_map(company_id=comp).get(code.lower()) or {}
+        if not cls:
+            raise HTTPException(status_code=400, detail=f"'{code}' is not one of {comp}'s project codes.")
+    donor_id = email.lower() if "@" in email else f"name:{name.lower()}"
+    did = f"MAN-{_uuid.uuid4().hex[:10].upper()}"
+    fee = round(float(payload.fee or 0.0), 2)
+    net = round(float(settled) - fee, 2)
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    try:
+        table_cols = [r[1] for r in conn.execute("PRAGMA table_info(donations)")]
+        prior = conn.execute(f'SELECT COALESCE(SUM("{NET_COL}"), 0) FROM donations WHERE LOWER(company_id) = ? AND LOWER("Donor ID") = ?',
+                             (comp, donor_id)).fetchone()[0] or 0.0
+        ltv = round(float(prior) + net, 2)
+        rec = {
+            "Donation ID": did, "Created Date (UTC)": when.strftime("%Y-%m-%d"), "Created Time (UTC)": "00:00:00",
+            "Settled Date (UTC)": when.strftime("%Y-%m-%d"), "Created At": when.strftime("%Y-%m-%d 00:00:00"),
+            "_parsed_date": when.strftime("%Y-%m-%d"), "Status": "COMPLETED", "Transaction Type": "Donation",
+            "Offline or online donation": "offline", "First Name": payload.first_name.strip(), "Last Name": payload.last_name.strip(),
+            "Display Name": "Anonymous" if payload.anonymous else name, "Billing Name": name, "Email": email,
+            "Email (for tax receipt)": email, "Phone Number": payload.phone.strip(), "Billing Address": payload.address.strip(),
+            "Billing City": payload.city.strip(), "Billing Zip": payload.postcode.strip(), "Billing Country": payload.country.strip(),
+            "Marketing Consent": None if payload.marketing_consent is None else ("yes" if payload.marketing_consent else "no"),
+            "Gift Aid (yes or no)": "Yes" if payload.gift_aid else "No", "Zakat (yes or no)": "Yes" if payload.zakat else "No",
+            "Anonymous or Public": "Anonymous" if payload.anonymous else "Public",
+            "Donation Currency (DC)": currency, "Currency": currency, "Project Currency": currency, "Settlement Currency": "GBP",
+            "Donation Amount (in Donation Currency)": str(float(payload.amount)),
+            "Donation Amount in Project Currency (May be approx.)": str(float(payload.amount)), "Amount": float(payload.amount),
+            GROSS_COL: str(round(float(settled), 2)), FEES_COL: fee, NET_COL: net, "fee_amount": str(fee),
+            "Campaign Name": payload.campaign_name.strip(), "Giving Level Title": payload.giving_level.strip(),
+            "Has Giving Level": "Yes" if payload.giving_level.strip() else "No", "fundraiser_name": payload.fundraiser_name.strip(),
+            "Comments": payload.notes.strip(), "Payment Type": payload.payment_type.strip() or "Cash",
+            "Payment Frequency": payload.frequency or "One-Time Payment", "Platform": (payload.platform or "Offline / Manual").strip(),
+            "Source": MANUAL_SOURCE, "Customer Ref": payload.reference.strip(), "Donor ID": donor_id,
+            "Total LTV": ltv, "Lifetime Donor Classification": classify_donor_amount(ltv),
+            "Transaction Donor Classification": classify_donor_amount(net),
+            "Code": code or "Unassigned", "New Code": code or "Unassigned",
+            "Heading": cls.get("Heading") or cls.get("Department") or "", "Sub-Heading": cls.get("Sub-Heading") or cls.get("Office") or "",
+            "Department": cls.get("Department") or "", "Office": cls.get("Office") or "", "Portfolio": cls.get("Portfolio") or "",
+            "Country": cls.get("Country") or "", "Target Country": cls.get("Country") or "",
+            "Programme Fund": cls.get("Programme Fund") or "", "Fund Code": cls.get("Fund Code") or "",
+            "Zakat Eligibility": cls.get("Zakat Eligibility") or "", "Payout Settled": "No", "company_id": comp,
+            "Number of Donors": 1.0,
+        }
+        cols = [c for c in table_cols if c in rec]
+        with conn:
+            conn.execute(f'INSERT INTO donations ({", ".join(chr(34) + c + chr(34) for c in cols)}) VALUES ({", ".join("?" * len(cols))})',
+                         [rec[c] for c in cols])
+    finally:
+        conn.close()
+    _refresh_copy(comp, [did])
+    try:
+        from core.event_log import log_event
+        log_event("donation.manual_added", category="data", company_id=comp, actor=current_user.get("email"),
+                  donation_id=did, amount=net, code=code or "Unassigned",
+                  message=f"Manual donation {did} £{net:,.2f} added by {current_user.get('email')}")
+    except Exception:
+        pass
+    return {"success": True, "donation_id": did, "donor_id": donor_id, "net": net, "code": code or "Unassigned"}
+
+
+@router.delete("/donations/{donation_id}")
+def delete_manual_donation(donation_id: str, company_id: str = Query(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Removes a donation that was added by hand (platform gifts can only be edited, never deleted here)."""
+    _require_editor(current_user)
+    comp = _editable_company(company_id)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    try:
+        row = conn.execute('SELECT Source FROM donations WHERE LOWER(company_id) = ? AND "Donation ID" = ?', (comp, donation_id)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Donation not found for this charity.")
+        if (row[0] or "") != MANUAL_SOURCE:
+            raise HTTPException(status_code=400, detail="Only donations added by hand can be deleted. Platform donations can be edited instead.")
+        with conn:
+            conn.execute('DELETE FROM donations WHERE LOWER(company_id) = ? AND "Donation ID" = ? AND Source = ?', (comp, donation_id, MANUAL_SOURCE))
+    finally:
+        conn.close()
+    try:
+        from core.donations_reconcile import reconcile
+        reconcile(deep=False, apply=True, require_confirmation=False, only_keys=set())  # drops the row from the copy
+    except Exception as e:
+        print(f"[manual donation] copy refresh deferred: {e}")
+    try:
+        from core.event_log import log_event
+        log_event("donation.manual_deleted", category="data", company_id=comp, actor=current_user.get("email"),
+                  donation_id=donation_id, message=f"Manual donation {donation_id} deleted by {current_user.get('email')}")
+    except Exception:
+        pass
+    return {"success": True, "donation_id": donation_id}
+
+
+_DONOR_FIELDS = {
+    "first_name": "First Name", "last_name": "Last Name", "email": "Email", "phone": "Phone Number",
+    "address": "Billing Address", "city": "Billing City", "postcode": "Billing Zip", "country": "Billing Country",
+    "marketing_consent": "Marketing Consent", "anonymous": "Anonymous or Public",
+}
+
+
+class DonorUpdateRequest(BaseModel):
+    company_id: str
+    donor_id: str
+    fields: Dict[str, Any]
+
+
+@router.post("/update-donor")
+def update_donor(payload: DonorUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Edits a donor's details on every one of their gifts in this charity (and on their Sponsorship Tracker records)."""
+    _require_editor(current_user)
+    comp = _editable_company(payload.company_id)
+    key = str(payload.donor_id or "").strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="donor_id is required")
+    updates = {}
+    for k, v in (payload.fields or {}).items():
+        if k not in _DONOR_FIELDS:
+            raise HTTPException(status_code=400, detail=f"'{k}' can't be edited here.")
+        if k == "marketing_consent" and isinstance(v, bool):
+            v = "yes" if v else "no"
+        if k == "anonymous" and isinstance(v, bool):
+            v = "Anonymous" if v else "Public"
+        updates[_DONOR_FIELDS[k]] = "" if v is None else str(v).strip()
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+    new_email = updates.get("Email", "").lower()
+    if "Email" in updates and new_email and "@" not in new_email:
+        raise HTTPException(status_code=400, detail="That email address isn't valid.")
+
+    if key.startswith("manual:"):  # a Sponsorship Tracker manual donor with no CRM gifts
+        mid = key.split(":", 1)[1]
+        sets = {"donor_email": updates.get("Email"), "donor_phone": updates.get("Phone Number")}
+        if "First Name" in updates or "Last Name" in updates:
+            sets["donor_name"] = f"{updates.get('First Name', '')} {updates.get('Last Name', '')}".strip()
+        sets = {k: v for k, v in sets.items() if v is not None}
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        try:
+            with conn:
+                n = conn.execute(f"UPDATE sponsorship_manual_donors SET {', '.join(k + ' = ?' for k in sets)}, updated_at = CURRENT_TIMESTAMP "
+                                 "WHERE LOWER(id) = ? AND LOWER(company_id) = ?", (*sets.values(), mid, comp)).rowcount
+        finally:
+            conn.close()
+        if not n:
+            raise HTTPException(status_code=404, detail="Donor not found for this charity.")
+        return {"success": True, "updated_gifts": 0, "updated_manual_records": n}
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    try:
+        rows = conn.execute('SELECT "Donation ID", LOWER(COALESCE(Email, "")) FROM donations WHERE LOWER(company_id) = ? '
+                            'AND (LOWER("Donor ID") = ? OR LOWER(Email) = ?)', (comp, key, key)).fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Donor not found for this charity.")
+        ids = [r[0] for r in rows if r[0]]
+        sets = dict(updates)
+        if new_email and new_email != key:
+            sets["Donor ID"] = new_email
+            sets["Email (for tax receipt)"] = updates["Email"]
+        with conn:
+            conn.execute(f'UPDATE donations SET {", ".join(chr(34) + c + chr(34) + " = ?" for c in sets)} '
+                         'WHERE LOWER(company_id) = ? AND (LOWER("Donor ID") = ? OR LOWER(Email) = ?)',
+                         (*sets.values(), comp, key, key))
+            if new_email and new_email != key:
+                old_emails = {r[1] for r in rows if r[1]} | {key}
+                for old in old_emails:
+                    for t in ("sponsorship_allocations", "sponsorship_allocation_donors"):
+                        try:
+                            conn.execute(f"UPDATE {t} SET donor_email = ?, donor_id = ? WHERE company_id = ? AND (LOWER(donor_email) = ? OR LOWER(donor_id) = ?)",
+                                         (new_email, new_email, comp, old, old))
+                        except sqlite3.OperationalError:
+                            pass
+                    try:
+                        conn.execute("UPDATE sponsorship_manual_donors SET donor_email = ? WHERE LOWER(company_id) = ? AND LOWER(donor_email) = ?",
+                                     (updates["Email"], comp, old))
+                    except sqlite3.OperationalError:
+                        pass
+    finally:
+        conn.close()
+    _refresh_copy(comp, ids)
+    try:
+        from core.event_log import log_event
+        log_event("donor.updated", category="data", company_id=comp, actor=current_user.get("email"), donor_id=key,
+                  fields=sorted(updates), gifts=len(ids), message=f"Donor {key} updated on {len(ids)} gift(s) by {current_user.get('email')}")
+    except Exception:
+        pass
+    return {"success": True, "updated_gifts": len(ids), "donor_id": new_email or key}

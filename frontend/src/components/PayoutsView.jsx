@@ -169,6 +169,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
 
   // Dynamic Platform Counts per Tenant
   const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0, stripe: 0 });
+  const [stripeRefreshKey, setStripeRefreshKey] = useState(0);
 
   // State Refs to ensure zero stale-closure drift on async/event updates
   const selectedPlatformRef = useRef(selectedPlatform);
@@ -565,6 +566,22 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   const handleExportExcel = async () => {
     try {
       setExporting(true);
+      if (isStripe) {
+        const companyParam = `&company_id=${encodeURIComponent(activeCompany)}`;
+        const res = await fetch(`${API_BASE_URL}/api/payouts/stripe/export?currency=${currency}${companyParam}`);
+        if (!res.ok) throw new Error('Failed to generate Stripe export file');
+        
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `stripe_payouts_reconciliation_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        return;
+      }
       const batchParam = selectedBatch && selectedBatch !== 'ALL' ? `&batch=${encodeURIComponent(selectedBatch)}` : '';
       const statusParam = statusFilter && statusFilter !== 'ALL' ? `&status=${encodeURIComponent(statusFilter)}` : '';
       const searchParam = (debouncedSearch || search) ? `&search=${encodeURIComponent(debouncedSearch || search)}` : '';
@@ -694,7 +711,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Platform Selector Switcher (4 Options: LaunchGood, Paysuite, GiveBrite, Stripe) */}
+          {/* Platform Selector Switcher (LaunchGood, Paysuite, Stripe) */}
           <div className="flex items-center p-1 bg-slate-100 dark:bg-slate-800/90 rounded-2xl border border-slate-200 dark:border-white/10 shadow-inner">
             <button
               onClick={() => {
@@ -767,51 +784,55 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             </button>
           </div>
 
-          {!isStripe && (
-            <>
-              {/* Export Multi-Sheet Excel Button */}
-              <button
-                onClick={handleExportExcel}
-                disabled={exporting || loading}
-                className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
-                title={`Download multi-sheet Excel report (.xlsx) for ${isPaysuite ? 'Paysuite' : 'LaunchGood'}`}
-              >
-                {exporting ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <FileSpreadsheet className="w-3.5 h-3.5" />
-                )}
-                <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
-              </button>
+          {/* Export Multi-Sheet Excel Button */}
+          <button
+            onClick={handleExportExcel}
+            disabled={exporting || loading}
+            className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isStripe ? 'from-cyan-600 to-blue-600 shadow-cyan-500/20 hover:from-cyan-500 hover:to-blue-500' : isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
+            title={`Download multi-sheet Excel report (.xlsx) for ${isStripe ? 'Stripe' : isPaysuite ? 'Paysuite' : 'LaunchGood'}`}
+          >
+            {exporting ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+            )}
+            <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' && !isStripe ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
+          </button>
 
-              {/* Super Admin Purge Payout Button (Only for LaunchGood) */}
-              {isSuperAdmin && !isPaysuite && (
-                <button
-                  onClick={() => setShowPurgeModal(true)}
-                  className="px-3.5 py-2 text-xs font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/60 rounded-xl border border-rose-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
-                  title="Delete all LaunchGood payout settlement data from the system"
-                >
-                  <Trash2 className="w-3.5 h-3.5 text-rose-500" />
-                  <span>Purge</span>
-                </button>
-              )}
-
-              <button 
-                onClick={() => fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter)}
-                disabled={loading}
-                className="px-3.5 py-2 text-xs font-bold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-700/80 rounded-xl border border-slate-300 dark:border-white/10 transition-all flex items-center gap-2 cursor-pointer shadow-sm disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-emerald-500' : ''}`} />
-                <span>Refresh</span>
-              </button>
-            </>
+          {/* Super Admin Purge Payout Button (Only for LaunchGood) */}
+          {isSuperAdmin && !isPaysuite && !isStripe && (
+            <button
+              onClick={() => setShowPurgeModal(true)}
+              className="px-3.5 py-2 text-xs font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/60 rounded-xl border border-rose-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
+              title="Delete all LaunchGood payout settlement data from the system"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+              <span>Purge</span>
+            </button>
           )}
+
+          <button 
+            onClick={() => {
+              fetchPlatformCounts();
+              if (isStripe) {
+                setStripeRefreshKey(k => k + 1);
+              } else {
+                fetchPayoutData(debouncedSearch, selectedBatch, selectedPlatform, statusFilter);
+              }
+            }}
+            disabled={loading}
+            className="px-3.5 py-2 text-xs font-bold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-700/80 rounded-xl border border-slate-300 dark:border-white/10 transition-all flex items-center gap-2 cursor-pointer shadow-sm disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-cyan-500' : isStripe ? 'text-cyan-500' : isPaysuite ? 'text-amber-500' : 'text-emerald-500'}`} />
+            <span>Refresh</span>
+          </button>
         </div>
       </div>
 
       {/* RENDER STRIPE PAYOUTS SUITE WHEN STRIPE IS SELECTED */}
       {isStripe ? (
         <StripePayoutsPanel
+          key={stripeRefreshKey}
           user={user}
           isSuperAdmin={isSuperAdmin}
           activeCompany={activeCompany}
@@ -829,7 +850,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             <div>
               <div className="font-bold text-white text-xs">No Payout Settlements Uploaded for Iqra</div>
               <p className="text-slate-300 text-[11px] mt-0.5">
-                Iqra donor data is currently active for <b>GiveBrite</b> (14,092 records) and <b>Madinah</b> (16,700 records). Payout reconciliation batches will populate here once settlement reports for Iqra are uploaded.
+                Iqra donor data is currently active for <b>Madinah</b> (16,700 records). Payout reconciliation batches will populate here once settlement reports for Iqra are uploaded.
               </p>
             </div>
           </div>

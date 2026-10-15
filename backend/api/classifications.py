@@ -1378,6 +1378,9 @@ async def import_classification_file(
         elif platform_clean == "paysuite":
             existing = get_paysuite_classification_matrix(company_id=comp).fillna("Unassigned")
             merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name", "Community Name"], keep="last")
+        elif platform_clean == "stripe":
+            existing = get_stripe_classification_matrix(company_id=comp).fillna("Unassigned")
+            merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name", "Giving Level", "Code"], keep="last")
         else:
             existing = get_classification_matrix(company_id=comp).fillna("Unassigned")
             merged = pd.concat([existing, norm_df], ignore_index=True).drop_duplicates(subset=["Campaign Name", "Community Name"], keep="last")
@@ -1400,6 +1403,8 @@ async def import_classification_file(
     elif platform_clean == "paysuite":
         n_saved = save_paysuite_classification_matrix(merged, company_id=comp)
         sync_matrix_classifications_to_donors(merged, company_id=comp)
+    elif platform_clean == "stripe":
+        n_saved = save_stripe_classification_matrix(merged, company_id=comp)
     else:
         n_saved = save_classification_matrix(merged, company_id=comp)
         sync_matrix_classifications_to_donors(merged, company_id=comp)
