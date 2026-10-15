@@ -2438,6 +2438,37 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             else:
                 df["Settlement Currency"] = "GBP"
 
+        # Foreign-currency gifts (USD, CAD, ...): GiveBrite settles to the charity in GBP. Price them exactly like the
+        # live API sync (core.givebrite_ingestion.settle_gbp) instead of leaving the foreign amount in the GBP
+        # columns (USD 40 counted as £40) - and never as £0 when the gift has an amount.
+        try:
+            from core.givebrite_ingestion import settle_gbp
+            G_COL, N_COL = "Total Online Donation Gross Amount in Settled Currency", "Total Online Donations Net Amount in Settled Currency"
+            cur_s = (df["Donation Currency (DC)"] if "Donation Currency (DC)" in df.columns else pd.Series("GBP", index=df.index)).fillna("GBP").astype(str).str.strip().str.upper()
+            foreign = (cur_s != "GBP") & (cur_s != "") & (cur_s != "NAN")
+            if foreign.any():
+                orig = pd.to_numeric(df.get("Donation Amount (in Donation Currency)", pd.Series(index=df.index, dtype=float)), errors="coerce")
+                orig = orig.where(orig > 0, pd.to_numeric(df.get("Donation Amount in Project Currency (May be approx.)", pd.Series(index=df.index, dtype=float)), errors="coerce"))
+                camp = df["amount_campaign"] if "amount_campaign" in df.columns else pd.Series(None, index=df.index)
+                rate = df["exchange_rate"] if "exchange_rate" in df.columns else pd.Series(None, index=df.index)
+                fees = pd.to_numeric(df["fee_amount"], errors="coerce").fillna(0.0) if "fee_amount" in df.columns else pd.Series(0.0, index=df.index)
+                for col in (G_COL, N_COL, "Donation Amount (in Donation Currency)"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce").astype(float) if col in df.columns else float("nan")
+                for col in ("Project Currency", "Settlement Currency"):
+                    df[col] = df[col].astype(object) if col in df.columns else None
+                for idx in df.index[foreign]:
+                    gross = settle_gbp(orig.get(idx), cur_s.get(idx), camp.get(idx), rate.get(idx))
+                    if gross is None:
+                        continue  # no usable amount: leave the row as the file gave it (never a false £0)
+                    fee = float(fees.get(idx) or 0.0)
+                    df.at[idx, "Donation Amount (in Donation Currency)"] = orig.get(idx)
+                    df.at[idx, "Project Currency"] = cur_s.get(idx)
+                    df.at[idx, "Settlement Currency"] = "GBP"
+                    df.at[idx, G_COL] = gross
+                    df.at[idx, N_COL] = round(gross - fee, 2) if gross >= fee else gross
+        except Exception as fx_err:
+            print(f"[GiveBrite upload] currency conversion skipped: {fx_err}")
+
         if "subscription_id" in df.columns:
             df["Payment Frequency"] = df["subscription_id"].apply(
                 lambda s: "Recurring Payment" if pd.notna(s) and str(s).strip() not in ["", "nan", "None"] else "One-Time Payment"
@@ -3775,6 +3806,78 @@ def _ensure_two_tier_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# £ view of donations settled in another currency (e.g. Madinah pays out in USD).
+# The stored records stay exactly as settled (USD stays USD in SQLite and the parquet file). In memory, the three
+# settled-amount columns of non-GBP rows carry their £ equivalent (same benchmark rates as GiveBrite,
+# core.givebrite_ingestion.FX_BENCHMARKS) so every total, tier and dashboard adds up in pounds; the original settled
+# amounts sit in hidden "_settled_*" columns. ANY write of a frame carrying those columns (to_parquet / to_sql,
+# whichever code path) first puts the original settled amounts back - so the stored data can never change.
+# ---------------------------------------------------------------------------------------------------------------
+_GBP_VIEW_COLS = {
+    "Total Online Donations Net Amount in Settled Currency": "_settled_net",
+    "Total Online Donation Gross Amount in Settled Currency": "_settled_gross",
+    "Total Processing Fees Paid by CC In Settled Currency": "_settled_fees",
+}
+_GBP_RATE_COL = "_gbp_rate"
+
+
+def _apply_gbp_view(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "Settlement Currency" not in df.columns or _GBP_RATE_COL in df.columns:
+        return df
+    from core.givebrite_ingestion import FX_BENCHMARKS
+    cur = df["Settlement Currency"].fillna("").astype(str).str.strip().str.upper()
+    rate = cur.map(FX_BENCHMARKS)
+    foreign = cur.ne("GBP") & cur.ne("") & cur.ne("NAN") & cur.ne("NONE") & rate.notna()
+    df[_GBP_RATE_COL] = rate.where(foreign, 1.0).astype(float)
+    for col, keep in _GBP_VIEW_COLS.items():
+        if col not in df.columns:
+            continue
+        df[keep] = df[col]
+        if foreign.any():
+            vals = pd.to_numeric(df[col], errors="coerce")
+            converted = (vals * df[_GBP_RATE_COL]).round(2)
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].astype(float)
+                df.loc[foreign, col] = converted[foreign].values
+            else:  # stored as text: keep text, write the £ figure as text (blank stays blank)
+                df[col] = df[col].astype(object)
+                ok = foreign & converted.notna()
+                df.loc[ok, col] = converted[ok].map(lambda v: str(float(v))).values
+    return df
+
+
+def restore_settled_amounts(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy of df as stored: original settled amounts back, helper columns removed."""
+    if df is None or not isinstance(df, pd.DataFrame) or _GBP_RATE_COL not in df.columns:
+        return df
+    out = df.copy()
+    for col, keep in _GBP_VIEW_COLS.items():
+        if keep in out.columns:
+            if col in out.columns:
+                out[col] = out[keep]
+            out = out.drop(columns=[keep])
+    return out.drop(columns=[_GBP_RATE_COL])
+
+
+def _install_settled_write_guard():
+    if getattr(pd.DataFrame.to_parquet, "_settled_guard", False):
+        return
+    _orig_parquet, _orig_sql = pd.DataFrame.to_parquet, pd.DataFrame.to_sql
+
+    def to_parquet(self, *a, **k):
+        return _orig_parquet(restore_settled_amounts(self), *a, **k)
+
+    def to_sql(self, *a, **k):
+        return _orig_sql(restore_settled_amounts(self), *a, **k)
+
+    to_parquet._settled_guard = to_sql._settled_guard = True
+    pd.DataFrame.to_parquet, pd.DataFrame.to_sql = to_parquet, to_sql
+
+
+_install_settled_write_guard()
+
+
 def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> pd.DataFrame:
     """
     High-Performance Dataset Loader with In-Memory Singleton Caching.
@@ -3811,7 +3914,7 @@ def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> p
             try:
                 df = pd.read_parquet(PARQUET_PATH)
                 if not df.empty:
-                    df = _ensure_two_tier_columns(df)
+                    df = _apply_gbp_view(_ensure_two_tier_columns(df))
                     _CACHED_DF = df
                     _CACHE_MTIME = current_mtime
                     return _filter_cached_by_company(_CACHED_DF, company_id)
@@ -3831,7 +3934,7 @@ def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> p
                         _CACHE_MTIME = os.path.getmtime(PARQUET_PATH)
                 except Exception:
                     pass
-                _CACHED_DF = df
+                _CACHED_DF = _apply_gbp_view(df)
                 return _filter_cached_by_company(_CACHED_DF, company_id)
         except Exception as e:
             print(f"[CACHE NOTICE] SQLite read fallback: {e}")

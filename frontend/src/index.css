@@ -1,32 +1,31 @@
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 /* Default Dark Theme Variables */
 :root, .theme-dark {
-  --bg-canvas: #0B0F17;
-  --bg-card: rgba(15, 23, 42, 0.75);
-  --bg-card-inner: #0F172A;
-  --bg-card-hover: rgba(30, 41, 59, 0.9);
-  --border-glass: rgba(255, 255, 255, 0.1);
-  --accent-cyan: #38BDF8;
-  --accent-purple: #8B5CF6;
-  --accent-emerald: #10B981;
-  --accent-pink: #EC4899;
-  --accent-amber: #F59E0B;
-  --text-main: #F8FAFC;
-  --text-muted: #94A3B8;
-  --text-sub: #64748B;
-  --drawer-bg: #0F172A;
-  --table-header-bg: rgba(15, 23, 42, 0.95);
-  --input-bg: #0F172A;
-  --input-text: #F8FAFC;
-  --input-border: rgba(255, 255, 255, 0.15);
-  --badge-cyan-bg: rgba(56, 189, 248, 0.15);
-  --badge-cyan-border: rgba(56, 189, 248, 0.3);
-  --badge-purple-bg: rgba(139, 92, 246, 0.15);
-  --badge-purple-border: rgba(139, 92, 246, 0.3);
+  --bg-canvas: #0A0D14;
+  --bg-card: #11161F;
+  --bg-card-inner: #0D1119;
+  --bg-card-hover: #161C27;
+  --border-glass: rgba(148, 163, 184, 0.14);
+  --accent-cyan: #6A8EF8;
+  --accent-purple: #A688FA;
+  --accent-emerald: #34D399;
+  --accent-pink: #F472B6;
+  --accent-amber: #FBBF24;
+  --text-main: #E8ECF3;
+  --text-muted: #A5AFBF;
+  --text-sub: #707C8F;
+  --drawer-bg: #11161F;
+  --table-header-bg: #141A24;
+  --input-bg: #0D1119;
+  --input-text: #E8ECF3;
+  --input-border: rgba(148, 163, 184, 0.22);
+  --badge-cyan-bg: rgba(106, 142, 248, 0.15);
+  --badge-cyan-border: rgba(106, 142, 248, 0.3);
+  --badge-purple-bg: rgba(166, 136, 250, 0.15);
+  --badge-purple-border: rgba(166, 136, 250, 0.3);
   --badge-emerald-bg: rgba(16, 185, 129, 0.15);
   --badge-emerald-border: rgba(16, 185, 129, 0.3);
   --badge-pink-bg: rgba(236, 72, 153, 0.15);
@@ -37,28 +36,28 @@
 
 /* Polished Light Theme Variables */
 .theme-light {
-  --bg-canvas: #F8FAFC;
+  --bg-canvas: #F4F6FA;
   --bg-card: #FFFFFF;
-  --bg-card-inner: #F1F5F9;
-  --bg-card-hover: #E2E8F0;
-  --border-glass: #CBD5E1;
-  --accent-cyan: #0284C7;
-  --accent-purple: #7C3AED;
+  --bg-card-inner: #F5F7FA;
+  --bg-card-hover: #EEF1F6;
+  --border-glass: #E2E7EF;
+  --accent-cyan: #3555DD;
+  --accent-purple: #7849E2;
   --accent-emerald: #059669;
   --accent-pink: #DB2777;
   --accent-amber: #D97706;
-  --text-main: #0F172A;
-  --text-muted: #334155;
-  --text-sub: #64748B;
+  --text-main: #111827;
+  --text-muted: #4B5563;
+  --text-sub: #6B7280;
   --drawer-bg: #FFFFFF;
-  --table-header-bg: #E2E8F0;
-  --input-bg: #F1F5F9;
-  --input-text: #0F172A;
-  --input-border: #CBD5E1;
-  --badge-cyan-bg: rgba(2, 132, 199, 0.08);
-  --badge-cyan-border: rgba(2, 132, 199, 0.2);
-  --badge-purple-bg: rgba(124, 58, 237, 0.08);
-  --badge-purple-border: rgba(124, 58, 237, 0.2);
+  --table-header-bg: #F5F7FA;
+  --input-bg: #FFFFFF;
+  --input-text: #111827;
+  --input-border: #D8DEE8;
+  --badge-cyan-bg: rgba(53, 85, 221, 0.08);
+  --badge-cyan-border: rgba(53, 85, 221, 0.2);
+  --badge-purple-bg: rgba(120, 73, 226, 0.08);
+  --badge-purple-border: rgba(120, 73, 226, 0.2);
   --badge-emerald-bg: rgba(5, 150, 105, 0.08);
   --badge-emerald-border: rgba(5, 150, 105, 0.2);
   --badge-pink-bg: rgba(219, 39, 119, 0.08);
@@ -68,8 +67,13 @@
 }
 
 html {
-  font-size: 14px;
+  /* Base size for the whole app (text, spacing, controls all scale from it). 13px keeps screens compact on
+     laptops and on Windows displays scaled to 125%; very wide screens get 14px. */
+  font-size: 13px;
   -webkit-text-size-adjust: 100%;
+}
+@media (min-width: 1800px) {
+  html { font-size: 14px; }
 }
 
 * {
@@ -81,26 +85,27 @@ html {
 body {
   background-color: var(--bg-canvas);
   color: var(--text-main);
-  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-family: 'Inter Variable', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   min-height: 100vh;
   overflow-x: hidden;
-  font-size: 0.925rem;
-  line-height: 1.45;
-  transition: background-color 0.25s ease, color 0.25s ease;
+  font-size: 0.964rem;
+  line-height: 1.5;
 }
 
 .theme-dark body {
   background-image: 
-    radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.12) 0px, transparent 50%),
-    radial-gradient(at 100% 0%, rgba(139, 92, 246, 0.12) 0px, transparent 50%),
-    radial-gradient(at 50% 100%, rgba(16, 185, 129, 0.08) 0px, transparent 50%);
+    radial-gradient(at 0% 0%, rgba(74, 110, 240, 0.08) 0px, transparent 45%),
+    radial-gradient(at 100% 0%, rgba(140, 101, 241, 0.06) 0px, transparent 45%);
 }
 
 .theme-light body {
   background-image: 
-    radial-gradient(at 0% 0%, rgba(2, 132, 199, 0.05) 0px, transparent 50%),
-    radial-gradient(at 100% 0%, rgba(124, 58, 237, 0.05) 0px, transparent 50%),
-    radial-gradient(at 50% 100%, rgba(5, 150, 105, 0.04) 0px, transparent 50%);
+    radial-gradient(at 0% 0%, rgba(53, 85, 221, 0.04) 0px, transparent 45%),
+    radial-gradient(at 100% 0%, rgba(120, 73, 226, 0.03) 0px, transparent 45%);
 }
 
 /* Global Form Elements Support for Light & Dark Theme */
@@ -115,24 +120,21 @@ select option {
   color: var(--input-text);
 }
 
-/* Glassmorphism Panel */
+/* Card surface (was a blurred "glass" panel: the live blur on every card made the app feel slow) */
 .glass-panel {
   background: var(--bg-card);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border-glass);
-  border-radius: 16px;
-  box-shadow: 0 4px 20px 0 rgba(0, 0, 0, 0.06);
-  transition: all 0.25s ease;
+  border-radius: 12px;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.04), 0 1px 3px 0 rgba(15, 23, 42, 0.03);
+  transition: box-shadow 0.14s ease, border-color 0.14s ease;
 }
 
-.theme-light .glass-panel {
-  box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.08);
+.theme-dark .glass-panel {
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.35);
 }
 
 .glass-panel:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 10px 30px 0 rgba(0, 0, 0, 0.12);
+  border-color: color-mix(in srgb, var(--border-glass) 60%, var(--accent-cyan) 18%);
 }
 
 /* Accents */
@@ -509,3 +511,56 @@ textarea:focus-visible {
   border-width: 1px;
 }
 
+
+
+/* ===================================================================================================
+   Design system overrides (UI only). Keep components' logic untouched; these rules restyle globally.
+   =================================================================================================== */
+
+/* Numbers / IDs: same typeface as the UI with tabular, slashed-zero figures (was a monospace "code" look) */
+.font-mono, .tabular-nums {
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: 'tnum', 'zero', 'cv11';
+  letter-spacing: -0.005em;
+}
+
+/* Tiny labels were hard to read: lift the smallest hard-coded sizes a little */
+.text-\[8px\] { font-size: 9.5px !important; }
+.text-\[9px\] { font-size: 10px !important; }
+.text-\[10px\] { font-size: 10.75px !important; }
+.text-\[11px\] { font-size: 11.5px !important; }
+
+/* Headings: Inter reads better with a touch of negative tracking at large sizes */
+.text-xl, .text-2xl, .text-3xl, .text-4xl, .text-5xl { letter-spacing: -0.015em; }
+.uppercase.tracking-wider, .uppercase.tracking-widest { letter-spacing: 0.06em; }
+
+/* Speed: "transition-all" animated layout properties on ~300 elements - animate colours/shadows only, quickly */
+.transition-all {
+  transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform !important;
+  transition-duration: 140ms !important;
+}
+.transition-colors { transition-duration: 120ms !important; }
+
+/* Speed: background blur is expensive to repaint - keep a light blur only (overlays, sticky bars) */
+.backdrop-blur-xs, .backdrop-blur-sm { --tw-backdrop-blur: blur(2px) !important; }
+.backdrop-blur, .backdrop-blur-md, .backdrop-blur-lg, .backdrop-blur-xl, .backdrop-blur-2xl, .backdrop-blur-3xl {
+  --tw-backdrop-blur: blur(4px) !important;
+}
+
+/* Quicker panel / drawer entrances */
+.panel-pop { animation-duration: 0.16s !important; }
+.drawer-content { animation-duration: 0.2s !important; }
+.drawer-backdrop { animation-duration: 0.14s !important; }
+
+/* Focus ring: visible, on-brand, keyboard only */
+:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 2px; border-radius: 6px; }
+input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-cyan) 18%, transparent) !important; border-color: var(--accent-cyan) !important; outline: none; }
+
+/* Tables: calmer header, clearer rows */
+thead th { font-weight: 620; }
+tbody tr { transition: background-color 0.1s ease; }
+
+/* Respect "reduce motion" */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}

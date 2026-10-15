@@ -276,6 +276,19 @@ def _lookup_fundraiser_for_campaign(campaign_name: str, code: str = "", company_
     return None
 
 
+def _format_givebrite_url(url_or_slug: str, company_id: str = "rethink") -> str:
+    val = str(url_or_slug or "").strip()
+    if not val or val.lower() in ["nan", "none", "n/a", "null", "unassigned", "'", "''", "'''"]:
+        return ""
+    if val.startswith("http://") or val.startswith("https://"):
+        return val
+    slug = val.lstrip("/")
+    comp = str(company_id or "rethink").strip().lower()
+    if comp == "iqra":
+        return f"https://donate.iqracharity.org/{slug}"
+    return f"https://rethink-charity.givebrite.com/{slug}"
+
+
 def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", company_id: str = "rethink", giving_level: str = "") -> None:
     """
     Registers a campaign and optional giving_level variant into platform_campaign_mappings if not present.
@@ -285,6 +298,8 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
     cname_clean = str(campaign_name or "").strip()
     if not cname_clean or cname_clean.lower() in ["nan", "none", "n/a", ""]:
         return
+
+    clean_url = _format_givebrite_url(campaign_url, company_id=comp)
 
     gl_clean = str(giving_level or "").strip()
     if gl_clean.lower() in ["nan", "none", "n/a", "unassigned", "default", "general"]:
@@ -306,14 +321,14 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
 
         if default_row:
             camp_code = default_row[0]
-            if campaign_url and str(campaign_url).strip():
+            if clean_url:
                 cur.execute("""
                     UPDATE platform_campaign_mappings
                     SET campaign_url = ?
                     WHERE LOWER(COALESCE(company_id, 'rethink')) = ? 
                       AND platform IN ('givebright', 'givebrite') 
                       AND LOWER(campaign_name) = ?
-                """, (campaign_url.strip(), comp, cname_clean.lower()))
+                """, (clean_url, comp, cname_clean.lower()))
                 conn.commit()
         else:
             class_info = _lookup_givebrite_classification(cname_clean, company_id=comp)
@@ -322,7 +337,7 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
                 INSERT INTO platform_campaign_mappings (
                     platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, company_id
                 ) VALUES ('givebright', ?, '', ?, 'GiveBright', ?, 1, ?)
-            """, (cname_clean, camp_code, campaign_url.strip() if campaign_url else "", comp))
+            """, (cname_clean, camp_code, clean_url, comp))
             conn.commit()
             broadcast_event_sync("MATRIX_UPDATED", {"source": "givebrite_webhook", "company_id": comp, "campaign": cname_clean})
 
@@ -343,7 +358,7 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
                     INSERT INTO platform_campaign_mappings (
                         platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, company_id
                     ) VALUES ('givebright', ?, ?, ?, 'GiveBright', ?, 0, ?)
-                """, (cname_clean, gl_clean, var_code, campaign_url.strip() if campaign_url else "", comp))
+                """, (cname_clean, gl_clean, var_code, clean_url, comp))
                 conn.commit()
                 broadcast_event_sync("MATRIX_UPDATED", {"source": "givebrite_webhook", "company_id": comp, "campaign": cname_clean, "giving_level": gl_clean})
 

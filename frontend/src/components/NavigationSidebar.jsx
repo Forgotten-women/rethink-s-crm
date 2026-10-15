@@ -76,7 +76,7 @@ export default function NavigationSidebar({
     <div 
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
-      className={`h-full flex flex-col glass-panel border-r border-slate-200 dark:border-white/5 relative z-40 rounded-none rounded-r-2xl transition-all duration-300 ease-in-out ${showExpanded ? 'w-64 shadow-xl' : 'w-20'} flex-shrink-0`}
+      className={`h-full flex flex-col glass-panel border-r border-slate-200 dark:border-white/5 relative z-40 rounded-none rounded-r-2xl transition-all duration-300 ease-in-out ${showExpanded ? 'w-[236px] shadow-xl' : 'w-20'} flex-shrink-0`}
     >
       {/* Brand / Logo Area */}
       <div className="h-20 flex items-center px-4 md:px-5 border-b border-slate-100 dark:border-white/5 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 transition-colors duration-300">

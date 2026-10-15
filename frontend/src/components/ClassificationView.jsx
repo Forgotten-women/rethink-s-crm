@@ -1858,7 +1858,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
               <table className="crm-table w-full">
                 <thead>
                   <tr>
-                    <th className="w-36 text-left">Code (Master Link)</th>
+                    <th className="min-w-[168px] text-left">Code (Master Link)</th>
                     <th className="min-w-[150px] text-left">Special Treatment</th>
                     <th className="min-w-[130px] text-left">Programme Fund</th>
                     <th className="min-w-[110px] text-left">Fund Code</th>
@@ -2057,7 +2057,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                       <th className="min-w-[160px] text-left">{platform === 'paysuite' ? 'Platform Source' : platform === 'stripe' ? 'Payment Link ID' : 'Community Name'}</th>
                     )}
                     
-                    <th className="w-36 text-left">Code (Master Link)</th>
+                    <th className="min-w-[168px] text-left">Code (Master Link)</th>
                     <th className="min-w-[150px] text-left">Special Case</th>
                     <th className="min-w-[170px] text-left">Department</th>
                     <th className="min-w-[190px] text-left">Office</th>
@@ -2187,7 +2187,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     value={r['Campaign URL'] || ''}
                                     onChange={e => handleCellChange(r._row_id, 'Campaign URL', e.target.value)}
                                     placeholder="Paste URL..."
-                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-24 focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-[136px] focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
                                     title="Paste or edit campaign URL"
                                   />
                                 )}
@@ -2210,7 +2210,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                 value={r['Code'] || ''} 
                                 onChange={e => handleCellChange(r._row_id, 'Code', e.target.value)}
                                 placeholder="Type Code..."
-                                className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
+                                className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1.5 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full min-w-[152px] focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
                                 title="Changing Code automatically auto-fills Department, Office, Portfolio, Country, and Zakat! Type CODE [Special Case] to autofill both."
                               />
                             </td>
@@ -2271,7 +2271,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                 disabled={!isSuperAdmin}
                                 value={r['Country'] || ''} 
                                 onChange={e => handleCellChange(r._row_id, 'Country', e.target.value)}
-                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
+                                className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1.5 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full min-w-[150px] focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
                                 title={r['Country']}
                               />
                             </td>
@@ -2585,7 +2585,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                         value={rule['Campaign URL'] || ''}
                                         onChange={e => handleCellChange(rule._row_id, 'Campaign URL', e.target.value)}
                                         placeholder="Paste URL..."
-                                        className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-24 focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
+                                        className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-800 dark:text-slate-300 w-[136px] focus:outline-none focus:border-cyan-500 disabled:opacity-60 font-mono"
                                         title="Paste or edit campaign URL"
                                       />
                                     )}
@@ -2608,7 +2608,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     value={rule['Code'] || ''} 
                                     onChange={e => handleCellChange(rule._row_id, 'Code', e.target.value)}
                                     placeholder="Type Code..."
-                                    className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
+                                    className="bg-white dark:bg-slate-900/90 border border-cyan-400 dark:border-cyan-500/40 rounded-lg px-2.5 py-1 text-xs font-mono text-cyan-800 dark:text-cyan-300 font-extrabold w-full min-w-[152px] focus:outline-none focus:border-cyan-500 disabled:opacity-60 uppercase shadow-sm"
                                   />
                                 </td>
 
@@ -2666,7 +2666,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     disabled={!isSuperAdmin}
                                     value={rule['Country'] || ''} 
                                     onChange={e => handleCellChange(rule._row_id, 'Country', e.target.value)}
-                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
+                                    className="bg-white dark:bg-slate-900/90 border border-slate-300 dark:border-white/10 rounded-lg px-2.5 py-1 text-xs text-emerald-800 dark:text-emerald-300 font-semibold w-full min-w-[150px] focus:outline-none focus:border-emerald-500 dark:focus:border-emerald-400 disabled:opacity-60 shadow-sm"
                                   />
                                 </td>
 

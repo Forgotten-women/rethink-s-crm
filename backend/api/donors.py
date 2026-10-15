@@ -1959,9 +1959,23 @@ def get_donation_detail(donation_id: str, company_id: Optional[str] = Query(None
         text = str(v).strip()
         return None if text.lower() in ("", "nan", "none", "null", "nat", "n/a") else v
 
-    rec = {str(k): plain(v) for k, v in rows.iloc[0].to_dict().items()}
+    row0 = rows.iloc[0].to_dict()
+    # Amounts exactly as settled (e.g. USD for Madinah) - plus their £ equivalent, which is what totals use
+    rate = row0.get("_gbp_rate")
+    gbp = None
+    if rate is not None and not pd.isna(rate) and float(rate) != 1.0:
+        num = lambda v: None if plain(v) is None else round(float(pd.to_numeric(v, errors="coerce")), 2)  # noqa: E731
+        gbp = {"rate": float(rate), "gross": num(row0.get("Total Online Donation Gross Amount in Settled Currency")),
+               "fees": num(row0.get("Total Processing Fees Paid by CC In Settled Currency")),
+               "net": num(row0.get("Total Online Donations Net Amount in Settled Currency"))}
+    for col, keep in (("Total Online Donations Net Amount in Settled Currency", "_settled_net"),
+                      ("Total Online Donation Gross Amount in Settled Currency", "_settled_gross"),
+                      ("Total Processing Fees Paid by CC In Settled Currency", "_settled_fees")):
+        if keep in row0:
+            row0[col] = row0[keep]
+    rec = {str(k): plain(v) for k, v in row0.items() if not str(k).startswith("_settled") and k != "_gbp_rate"}
     rec = {k: v for k, v in rec.items() if v is not None}
-    return {"donation": rec, "duplicates": int(len(rows) - 1), "manual": False}
+    return {"donation": rec, "duplicates": int(len(rows) - 1), "manual": False, "gbp_equivalent": gbp}
 
 
 @router.get("/history")

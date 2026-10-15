@@ -68,6 +68,33 @@ FX_BENCHMARKS: Dict[str, float] = {
 }
 
 
+def _positive(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def settle_gbp(amount, currency, amount_campaign=None, exchange_rate=None) -> Optional[float]:
+    """GBP settled gross for one GiveBrite gift - the ONE rule used by the live sync, CSV uploads and backfills.
+    Order: GiveBrite's own GBP figure (amount_campaign, only if > 0) -> the gift's exchange rate -> benchmark rate.
+    Returns None when the gift has no usable amount, so callers never write a false £0."""
+    camp = _positive(amount_campaign)
+    if camp is not None:
+        return round(camp, 2)
+    amt = _positive(amount)
+    if amt is None:
+        return None
+    cur = str(currency or "GBP").strip().upper() or "GBP"
+    if cur == "GBP":
+        return round(amt, 2)
+    rate = _positive(exchange_rate)
+    if rate is not None and rate != 1.0:
+        return round(amt * rate, 2)
+    return round(amt * FX_BENCHMARKS.get(cur, 1.0), 2)
+
+
 def parse_givebrite_date(created_at_str: Optional[str]) -> Tuple[str, str, str]:
     """
     Parses GiveBrite ISO-8601 UTC string (e.g. '2026-10-06T07:39:03.735Z')
@@ -500,11 +527,8 @@ def build_donation_record(
     settlement_currency = "GBP"
     camp_amt = det.get("amount_campaign", doc.get("amount_campaign"))
     settled_gross = None
-    if camp_amt is not None and str(camp_amt).strip() != "":
-        try:
-            settled_gross = round(float(camp_amt), 2)
-        except (ValueError, TypeError):
-            pass
+    if _positive(camp_amt) is not None:  # GiveBrite's GBP figure; 0 / blank means "not given", never £0
+        settled_gross = round(float(camp_amt), 2)
 
     ex_obj = det.get("exchange") if isinstance(det.get("exchange"), dict) else (doc.get("exchange") if isinstance(doc.get("exchange"), dict) else {})
     ex_rate = None

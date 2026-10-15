@@ -103,6 +103,7 @@ function Field({ label, value }) {
 export default function DonationDetailModal({ donationId, companyId, initial, onClose, onChanged }) {
   const [data, setData] = useState(initial || null);
   const [manual, setManual] = useState(false);
+  const [gbpEq, setGbpEq] = useState(null);
   const [duplicates, setDuplicates] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -121,7 +122,7 @@ export default function DonationDetailModal({ donationId, companyId, initial, on
     const qs = companyId ? `?company_id=${encodeURIComponent(companyId)}` : '';
     fetch(`${API_BASE_URL}/api/donors/donation/${encodeURIComponent(donationId)}${qs}`)
       .then(async r => { if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `Error ${r.status}`); return r.json(); })
-      .then(j => { if (!alive) return; setData(j.donation); setManual(!!j.manual); setDuplicates(j.duplicates || 0); })
+      .then(j => { if (!alive) return; setData(j.donation); setManual(!!j.manual); setDuplicates(j.duplicates || 0); setGbpEq(j.gbp_equivalent || null); })
       .catch(e => { if (alive) setError(e.message); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
@@ -276,9 +277,9 @@ export default function DonationDetailModal({ donationId, companyId, initial, on
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {[
               ['Donated', fmtMoney(donated, donCur), donCur !== settleCur ? `in ${donCur}` : 'donor paid', Wallet],
-              ['Gross settled', fmtMoney(gross, settleCur), `in ${settleCur}`, Tag],
+              ['Gross settled', fmtMoney(gross, settleCur), gbpEq?.gross != null ? `in ${settleCur} · ≈ ${fmtMoney(gbpEq.gross, 'GBP')}` : `in ${settleCur}`, Tag],
               ['Fees', fmtMoney(fees, settleCur), num(gross) && num(fees) !== null ? `${((num(fees) / num(gross)) * 100).toFixed(1)}% of gross` : 'processing', CreditCard],
-              ['Net received', fmtMoney(net, settleCur), 'after fees', Receipt],
+              ['Net received', fmtMoney(net, settleCur), gbpEq?.net != null ? `≈ ${fmtMoney(gbpEq.net, 'GBP')} in totals` : 'after fees', Receipt],
             ].map(([label, value, sub, Icon], i) => (
               <div key={label} className={`rounded-xl border p-3 ${i === 3 ? 'bg-cyan-500/10 border-cyan-500/30' : ''}`} style={i === 3 ? undefined : { borderColor: 'var(--border-glass)' }}>
                 <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--text-sub)' }}><Icon className="w-3 h-3" />{label}</div>
