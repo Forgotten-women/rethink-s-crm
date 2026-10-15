@@ -85,9 +85,18 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_app_event_logs_ts ON app_event_logs(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_app_event_logs_cat ON app_event_logs(category, ts)")
-    conn.execute("DELETE FROM app_event_logs WHERE ts < ?", (
-        (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=_LOCAL_RETENTION_DAYS)).isoformat(),))
     _table_ready = True
+    global _last_prune_time
+    if '_last_prune_time' not in globals():
+        _last_prune_time = 0
+    now_ts = time.time()
+    if now_ts - _last_prune_time > 21600:  # prune once every 6 hours
+        try:
+            conn.execute("DELETE FROM app_event_logs WHERE ts < ?", (
+                (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=_LOCAL_RETENTION_DAYS)).isoformat(),))
+            _last_prune_time = now_ts
+        except Exception:
+            pass
 
 
 def log_event(event: str, category: str = "app", level: str = "info", message: str = "",
@@ -102,7 +111,8 @@ def log_event(event: str, category: str = "app", level: str = "info", message: s
             "service": _SERVICE, "host": _HOST, **(data if isinstance(data, dict) else {}),
         }
         try:
-            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=5.0)
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+            conn.execute("PRAGMA busy_timeout = 30000;")
             try:
                 _ensure_table(conn)
                 conn.execute(
@@ -212,7 +222,8 @@ def query_local(category: Optional[str] = None, level: Optional[str] = None, com
         where.append("ts >= ?"); params.append(since)
     if until:
         where.append("ts <= ?"); params.append(until)
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout = 30000;")
     try:
         _ensure_table(conn)
         clause = " AND ".join(where)

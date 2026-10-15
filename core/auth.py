@@ -106,6 +106,7 @@ def init_user_db():
         return
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout = 30000;")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

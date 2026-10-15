@@ -1510,13 +1510,22 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
     df_raw.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
 
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
+    conn.execute("PRAGMA busy_timeout = 60000;")
     try:
+        df_raw[comp_mask].to_sql("_donations_staging", con=conn, if_exists="replace", index=False, chunksize=10000)
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM donations WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
-        df_raw[comp_mask].to_sql("donations", con=conn, if_exists="append", index=False, chunksize=5000)
+        conn.execute("INSERT INTO donations SELECT * FROM _donations_staging")
+        conn.execute("DROP TABLE IF EXISTS _donations_staging")
         conn.commit()
     except Exception as e:
         print(f"[Donations sync to DB notice]: {e}")
+        try:
+            conn.rollback()
+            conn.execute("DROP TABLE IF EXISTS _donations_staging")
+        except Exception:
+            pass
     finally:
         conn.close()
 
@@ -1568,13 +1577,23 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                     pdf = sanitize_df_dtypes_for_parquet(pdf)
                     atomic_write_parquet(pdf, PAYOUTS_PARQUET_PATH)
                     try:
-                        conn_p = sqlite3.connect(LOCAL_DB_PATH, timeout=20.0)
+                        conn_p = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
+                        conn_p.execute("PRAGMA busy_timeout = 60000;")
+                        pdf[p_comp_mask].to_sql("_payouts_staging", con=conn_p, if_exists="replace", index=False, chunksize=10000)
+                        conn_p.execute("BEGIN IMMEDIATE")
                         conn_p.execute("DELETE FROM payout_settlements WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
-                        pdf[p_comp_mask].to_sql("payout_settlements", con=conn_p, if_exists="append", index=False, chunksize=5000)
+                        conn_p.execute("INSERT INTO payout_settlements SELECT * FROM _payouts_staging")
+                        conn_p.execute("DROP TABLE IF EXISTS _payouts_staging")
                         conn_p.commit()
                         conn_p.close()
                     except Exception as e:
                         print(f"[Payout DB update notice]: {e}")
+                        try:
+                            conn_p.rollback()
+                            conn_p.execute("DROP TABLE IF EXISTS _payouts_staging")
+                            conn_p.close()
+                        except Exception:
+                            pass
     except Exception as e:
         print(f"[Payout settlement sync notice]: {e}")
 

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ChevronDown, Filter, Gift, Users, X, Search, Check } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
@@ -30,32 +31,62 @@ const YES_NO = [['', 'Any'], ['yes', 'Yes'], ['no', 'No']];
 function MultiSelect({ label, options, value = [], onChange, placeholder = 'Any', renderSub }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
-  const ref = useRef(null);
+  const [pos, setPos] = useState(null);
+  const btnRef = useRef(null);
+  const popRef = useRef(null);
+  // The list is rendered at the top level of the page (portal) so no panel can cover it; it follows its button.
+  const place = () => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const width = Math.max(r.width, 300);
+    const height = 340;
+    const below = window.innerHeight - r.bottom;
+    const up = below < height + 12 && r.top > below;
+    setPos({ left: Math.max(8, Math.min(r.left, window.innerWidth - width - 8)), width,
+      top: up ? undefined : r.bottom + 4, bottom: up ? window.innerHeight - r.top + 4 : undefined });
+  };
   useEffect(() => {
-    const close = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    if (!open) return undefined;
+    place();
+    const close = (e) => {
+      if (btnRef.current?.contains(e.target) || popRef.current?.contains(e.target)) return;
+      setOpen(false);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); setOpen(false); } };
     document.addEventListener('mousedown', close);
-    return () => document.removeEventListener('mousedown', close);
-  }, []);
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
   const shown = useMemo(() => {
     const ql = q.trim().toLowerCase();
     return (options || []).filter(o => !ql || String(o.value).toLowerCase().includes(ql) || String(o.sub || '').toLowerCase().includes(ql)).slice(0, 300);
   }, [options, q]);
   const toggle = (v) => onChange(value.includes(v) ? value.filter(x => x !== v) : [...value, v]);
   return (
-    <label className="flex flex-col gap-1 min-w-0 relative" ref={ref}>
+    <div className="flex flex-col gap-1 min-w-0">
       <span className="text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>{label}</span>
-      <button type="button" onClick={() => setOpen(o => !o)} className="px-2.5 py-1.5 text-xs rounded-lg flex items-center justify-between gap-2 text-left" style={inputStyle}>
+      <button type="button" ref={btnRef} onClick={() => setOpen(o => !o)} aria-haspopup="listbox" aria-expanded={open}
+        className="px-2.5 py-1.5 text-xs rounded-lg flex items-center justify-between gap-2 text-left" style={inputStyle}>
         <span className="truncate">{value.length ? (value.length <= 2 ? value.join(', ') : `${value.length} selected`) : placeholder}</span>
-        <ChevronDown className="w-3.5 h-3.5 shrink-0 opacity-60" />
+        <ChevronDown className={`w-3.5 h-3.5 shrink-0 opacity-60 transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
-      {open && (
-        <div className="absolute z-[90] top-full mt-1 left-0 w-[min(22rem,90vw)] rounded-xl shadow-2xl border p-2 flex flex-col gap-1.5"
-          style={{ backgroundColor: 'var(--bg-card, var(--bg-main))', borderColor: 'var(--border-glass)' }}>
+      {open && pos && createPortal(
+        <div ref={popRef} role="listbox" aria-label={label}
+          className="fixed z-[1000] rounded-xl shadow-2xl border p-2 flex flex-col gap-1.5"
+          style={{ left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, maxHeight: 340,
+            backgroundColor: 'var(--bg-card, var(--bg-main))', borderColor: 'var(--border-glass)' }}>
           <span className="relative">
             <Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
-            <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Search" className="w-full pl-7 pr-2 py-1.5 text-xs rounded-lg focus:outline-none" style={inputStyle} />
+            <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder={`Search ${label.toLowerCase()}`} className="w-full pl-7 pr-2 py-1.5 text-xs rounded-lg focus:outline-none" style={inputStyle} />
           </span>
-          <div className="max-h-64 overflow-y-auto flex flex-col">
+          <div className="flex-1 min-h-0 overflow-y-auto flex flex-col">
             {shown.length === 0 && <span className="text-xs p-2" style={{ color: 'var(--text-muted)' }}>Nothing matches</span>}
             {shown.map(o => (
               <button type="button" key={o.value} onClick={() => toggle(o.value)}
@@ -71,10 +102,14 @@ function MultiSelect({ label, options, value = [], onChange, placeholder = 'Any'
               </button>
             ))}
           </div>
-          {value.length > 0 && <button type="button" onClick={() => onChange([])} className="text-[11px] text-cyan-600 self-start px-1">Clear</button>}
-        </div>
+          <div className="flex items-center justify-between px-1">
+            {value.length > 0 ? <button type="button" onClick={() => onChange([])} className="text-[11px] text-cyan-600">Clear</button> : <span />}
+            <button type="button" onClick={() => setOpen(false)} className="text-[11px] font-semibold text-cyan-600">Done</button>
+          </div>
+        </div>,
+        document.body,
       )}
-    </label>
+    </div>
   );
 }
 

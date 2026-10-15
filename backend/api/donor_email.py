@@ -75,6 +75,22 @@ def _user(request: Request) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------ recipients & personalisation
+def _clean(v):
+    """JSON-safe value: NaN / NaT / pandas NA become None, numpy numbers become plain numbers."""
+    try:
+        import pandas as pd
+        if v is None or (not isinstance(v, (list, dict, str)) and pd.isna(v)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except (ValueError, AttributeError):
+            pass
+    return v
+
+
 def _resolve_recipients(comp: str, segment: Optional[Dict[str, Any]], donor_ids: Optional[List[str]],
                         extra: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Segment matches + hand-picked donors + typed addresses, one row per email address (first wins)."""
@@ -94,10 +110,10 @@ def _resolve_recipients(comp: str, segment: Optional[Dict[str, Any]], donor_ids:
             if "@" not in em or em.lower() in seen:
                 continue
             seen.add(em.lower())
-            out.append({"donor_id": r.get("donor_id"), "email": em, "name": r.get("name") or "",
-                        "total": r.get("total"), "gifts": r.get("gifts"), "tier": r.get("tier"),
-                        "last_gift": str(r.get("last_gift") or "")[:10], "matched_total": r.get("matched_total"),
-                        "sponsorship_types": r.get("sponsorship_types")})
+            out.append({"donor_id": _clean(r.get("donor_id")), "email": em, "name": _clean(r.get("name")) or "",
+                        "total": _clean(r.get("total")), "gifts": _clean(r.get("gifts")), "tier": _clean(r.get("tier")),
+                        "last_gift": str(_clean(r.get("last_gift")) or "")[:10], "matched_total": _clean(r.get("matched_total")),
+                        "sponsorship_types": _clean(r.get("sponsorship_types"))})
     for e in extra or []:
         em = str((e or {}).get("email") or "").strip()
         if "@" in em and em.lower() not in seen:
@@ -115,10 +131,11 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
         hit = frame[(frame["donor_id"].str.lower() == key) | (frame["email"].fillna("").str.lower() == str(recipient.get("email") or "").lower())]
         if not hit.empty:
             row = hit.iloc[0].to_dict()
+    row = {k: _clean(v) for k, v in row.items()}
     name = (row.get("name") or recipient.get("name") or "").strip() or "Friend"
     gifts = dx[dx["key"] == row.get("donor_id")].sort_values("date") if row and not dx.empty else None
     last = gifts.iloc[-1] if gifts is not None and len(gifts) else None
-    money = lambda v: f"{float(v or 0):,.2f}"  # noqa: E731
+    money = lambda v: f"{float(_clean(v) or 0):,.2f}"  # noqa: E731
     v = {
         "first_name": name.split(" ")[0], "donor_name": name, "email": recipient.get("email") or "",
         "recipient_email": recipient.get("email") or "",

@@ -537,37 +537,61 @@ class PlatformSyncService:
             except Exception as bf_ex:
                 logger.error(f"Initial backfill ({cid}) notice: {bf_ex}")
 
-        # 2. Latest Real-Time Donations Stream -> Direct CRM Ingestion (SQLite + Parquet)
-        url_gb_donations = f"{GIVEBRITE_API_BASE}/donations?charity_id={charity_id}&page=1&limit=50&sort_value=-1&sort_title=created_at"
-        try:
-            r = self.session.get(url_gb_donations, headers=headers, timeout=12)
-            if r.status_code == 401:
-                logger.warning(f"[GiveBrite {cid}] Received HTTP 401. Performing immediate token renewal...")
-                auth_header = self.get_givebrite_token(company_id=cid, force_refresh=True)
-                headers["Authorization"] = auth_header
+        # 2. Latest Real-Time Donations Stream with Rolling Catch-Up (up to 10 pages)
+        total_ingested = 0
+        total_skipped = 0
+        total_docs_seen = 0
+        page = 1
+        max_sync_pages = 10
+
+        while page <= max_sync_pages:
+            url_gb_donations = f"{GIVEBRITE_API_BASE}/donations?charity_id={charity_id}&page={page}&limit=50&sort_value=-1&sort_title=created_at"
+            try:
                 r = self.session.get(url_gb_donations, headers=headers, timeout=12)
+                if r.status_code == 401:
+                    logger.warning(f"[GiveBrite {cid}] Received HTTP 401 on page {page}. Performing immediate token renewal...")
+                    auth_header = self.get_givebrite_token(company_id=cid, force_refresh=True)
+                    headers["Authorization"] = auth_header
+                    r = self.session.get(url_gb_donations, headers=headers, timeout=12)
 
-            if r.status_code == 200:
-                data = r.json()
-                docs = data.get("docs", [])
-                result["total_donations_count"] = data.get("total", 0)
+                if r.status_code == 200:
+                    data = r.json()
+                    docs = data.get("docs", [])
+                    if page == 1:
+                        result["total_donations_count"] = data.get("total", 0)
 
-                # Direct persistence to SQLite and Parquet (strictly company_id=cid)
-                ingest_res = ingest_givebrite_donations(docs, headers=headers, company_id=cid)
-                result["donations_ingested"] = ingest_res.get("inserted", 0)
-                result["donations_skipped"] = ingest_res.get("skipped", 0)
-                if ingest_res.get("inserted", 0) > 0:
-                    logger.info(f"[GiveBrite {cid} Ingestion] Successfully persisted {ingest_res['inserted']} new donations into CRM DB & Parquet.")
-                self._record_cycle(f"givebrite_{cid}", True, 200, None, result["donations_ingested"], len(docs))
-                if cid == "iqra":
-                    self._record_cycle("givebrite", True, 200, None, result["donations_ingested"], len(docs))
-            else:
-                logger.warning(f"Givebrite ({cid}) donations HTTP {r.status_code}")
-                self._record_cycle(f"givebrite_{cid}", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
-                if cid == "iqra":
-                    self._record_cycle("givebrite", False, r.status_code, f"Donations API HTTP {r.status_code}: {r.text[:150]}")
-        except Exception as ex:
-            logger.error(f"Givebrite ({cid}) donations error: {ex}")
+                    if not docs:
+                        break
+
+                    total_docs_seen += len(docs)
+                    ingest_res = ingest_givebrite_donations(docs, headers=headers, company_id=cid)
+                    ins = ingest_res.get("inserted", 0)
+                    skp = ingest_res.get("skipped", 0)
+                    total_ingested += ins
+                    total_skipped += skp
+
+                    # If page has 0 new insertions and all docs already exist, we are fully caught up
+                    if ins == 0:
+                        break
+
+                    if not data.get("hasNextPage"):
+                        break
+
+                    page += 1
+                else:
+                    logger.warning(f"Givebrite ({cid}) donations HTTP {r.status_code} on page {page}")
+                    break
+            except Exception as ex:
+                logger.error(f"Givebrite ({cid}) donations error on page {page}: {ex}")
+                break
+
+        result["donations_ingested"] = total_ingested
+        result["donations_skipped"] = total_skipped
+        if total_ingested > 0:
+            logger.info(f"[GiveBrite {cid} Ingestion] Successfully persisted {total_ingested} new donations into CRM DB & Parquet across {page} pages.")
+        self._record_cycle(f"givebrite_{cid}", True, 200, None, total_ingested, total_docs_seen)
+        if cid == "iqra":
+            self._record_cycle("givebrite", True, 200, None, total_ingested, total_docs_seen)
             self._record_cycle(f"givebrite_{cid}", False, None, f"Donations fetch error: {ex}")
             if cid == "iqra":
                 self._record_cycle("givebrite", False, None, f"Donations fetch error: {ex}")

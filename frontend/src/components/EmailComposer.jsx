@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Mail, Users, Search, Send, ListChecks, Eye, Plus, ChevronLeft, ChevronRight, Clock } from 'lucide-react';
 import { API_BASE_URL } from '../config';
@@ -49,9 +49,15 @@ export default function EmailComposer({ company, initialSegment = {}, initialDon
   const [progress, setProgress] = useState(null);
   const [campaignName, setCampaignName] = useState('');
   const [asCampaign, setAsCampaign] = useState(startAsCampaign);
+  const listRef = useRef(null);
+  useEffect(() => { if (recipients && listRef.current) listRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, [recipients]);
 
   useEffect(() => {
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      if (document.querySelector('[role="listbox"]')) return; // Escape closes the open filter list first, not this window
+      e.stopPropagation(); onClose();
+    };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
   }, [onClose]);
@@ -175,7 +181,7 @@ export default function EmailComposer({ company, initialSegment = {}, initialDon
           <button type="button" onClick={onClose} aria-label="Close" className="w-8 h-8 rounded-full flex items-center justify-center" style={{ color: 'var(--text-sub)' }}><X className="w-4 h-4" /></button>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 flex flex-col gap-4 text-sm">
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-4 text-sm">
           {step === 1 && (
             <>
               <SegmentBuilder company={company} value={segment} onChange={setSegment} defaultOpen />
@@ -218,7 +224,7 @@ export default function EmailComposer({ company, initialSegment = {}, initialDon
                 </div>
               </div>
               {recipients && (
-                <div className="glass-panel overflow-hidden">
+                <div ref={listRef} className="glass-panel overflow-hidden">
                   <div className="px-3 py-2 flex items-center justify-between gap-2 flex-wrap border-b" style={{ borderColor: 'var(--border-glass)' }}>
                     <span className="text-xs" style={{ color: 'var(--text-main)' }}>
                       <b>{selected.size}</b> of {recipients.count} selected{recipients.excluded_recently_emailed ? ` · ${recipients.excluded_recently_emailed} skipped (emailed recently)` : ''}
@@ -229,7 +235,8 @@ export default function EmailComposer({ company, initialSegment = {}, initialDon
                       <button type="button" onClick={() => setSelected(new Set())} className="text-xs text-sky-600">None</button>
                     </span>
                   </div>
-                  <div className="max-h-72 overflow-y-auto">
+                  {recipients.count === 0 && <div className="px-3 py-6 text-center text-xs" style={{ color: 'var(--text-muted)' }}>Nobody with an email address matches these filters.</div>}
+                  <div className="max-h-[50vh] overflow-y-auto">
                     <table className="w-full text-xs">
                       <thead className="sticky top-0" style={{ backgroundColor: 'var(--bg-card, var(--bg-main))', color: 'var(--text-sub)' }}>
                         <tr>{['', 'Name', 'Email', 'Tier', 'Lifetime', 'Matching', 'Last gift', 'Sponsorships'].map(h => <th key={h} className="px-2 py-1.5 text-left font-bold">{h}</th>)}</tr>
