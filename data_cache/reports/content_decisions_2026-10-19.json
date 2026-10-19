@@ -1,0 +1,1370 @@
+{
+ "A": [
+  {
+   "campaign": "\"Feed a Family in East Africa – Just £35 Provides a Full Food Pack for 5 People.\"",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "“Feed A Family In East Africa – Just £35 Provides A Full Food Pack For 5 People.”",
+   "url": "https://donate.iqracharity.org/feed-a-family-in-east-africa-just-35-provides-a-full-food-pack-for-5-people",
+   "name_score": 1.0,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "MATCH (chosen)"
+  },
+  {
+   "campaign": "Deliver Urgent Food, Water, Shelter, And Life-Saving Aid To Families In Crisis.",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Diversify your Donation",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "🍽️ “We Survive On Potatoes & Onions…” — Your Qurbani Can Change That",
+   "url": "https://donate.iqracharity.org/meat-for-food-insecure-families",
+   "name_score": 0.31,
+   "words_on_page": 0.0,
+   "levels_match": 0.5,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Diversify your Donation",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "Lauren's Qurbani In Shaam 26",
+   "url": "https://donate.iqracharity.org/laurensqurbani26",
+   "name_score": 0.2,
+   "words_on_page": 0.0,
+   "levels_match": 0.5,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Diversify your Donation",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Emergency Aid",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Feed Syrian & Gazan Families",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Feed a Family in East Africa",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Iftaar Campaign",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Orphan and Widows Sponsorship",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Orphans",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "STEM SCHOOL",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "Super Village School",
+   "url": "https://donate.iqracharity.org/super-village-school",
+   "name_score": 0.58,
+   "words_on_page": 0.5,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "STEM SCHOOL",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Shield Them From the Cold",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Unassigned",
+   "platform": "givebright",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Greater Shaam Project Continues",
+   "platform": "givebright",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "RAMADAN 2026: IFTAR500 IS BACK!",
+   "platform": "givebright",
+   "charity": "rethink",
+   "candidate": "Qurbani 2026",
+   "url": "https://campaigns.givebrite.com/qurbani2026",
+   "name_score": 0.39,
+   "words_on_page": 0.25,
+   "levels_match": 1.0,
+   "numbers_ok": false,
+   "decision": "no"
+  },
+  {
+   "campaign": "RAMADAN 2026: IFTAR500 IS BACK!",
+   "platform": "givebright",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Winter Warmth",
+   "platform": "givebright",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Emergency Aid For Gaza/ Zak Sidat",
+   "platform": "launchgood",
+   "charity": "iqra",
+   "candidate": "Iqra@7G for The Liberated Lands!",
+   "url": "https://www.launchgood.com/v4/campaign/iqra_for_the_liberated_lands",
+   "name_score": 0.35,
+   "words_on_page": 0.0,
+   "levels_match": 1.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Emergency Aid For Gaza/ Zak Sidat",
+   "platform": "launchgood",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Abū Ismā'īl x2 – 22/313",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "AbÅ« IsmÄفÄ«l x2 – 22/313",
+   "url": "https://www.launchgood.com/v4/campaign/ab_isml__22313",
+   "name_score": 0.88,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Abū Ismā'īl x2 – 22/313",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Umm Ismaeel – 7/313",
+   "url": "https://www.launchgood.com/v4/campaign/umm_ismaeel__7313",
+   "name_score": 0.63,
+   "words_on_page": 0.17,
+   "levels_match": null,
+   "numbers_ok": false,
+   "decision": "no"
+  },
+  {
+   "campaign": "Abū Ismā'īl x2 – 22/313",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Abu Rumaysa – 23/313",
+   "url": "https://www.launchgood.com/v4/campaign/abu_rumaysa__23313",
+   "name_score": 0.62,
+   "words_on_page": 0.33,
+   "levels_match": null,
+   "numbers_ok": false,
+   "decision": "no"
+  },
+  {
+   "campaign": "Abū Ismā'īl x2 – 22/313",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Abdul Ahad – 20/313",
+   "url": "https://www.launchgood.com/v4/campaign/rising_on_explorer__19313",
+   "name_score": 0.58,
+   "words_on_page": 0.17,
+   "levels_match": null,
+   "numbers_ok": false,
+   "decision": "no"
+  },
+  {
+   "campaign": "Abū Ismā'īl x2 – 22/313",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Diversify your Donation",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Eīd Clothes & Toys 4 Children in Shām",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "EÄ«d Clothes & Toys 4 Children in ShÄفm",
+   "url": "https://www.launchgood.com/v4/campaign/eidclothes",
+   "name_score": 0.97,
+   "words_on_page": 0.8,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "MATCH (chosen)"
+  },
+  {
+   "campaign": "Eīd Clothes & Toys 4 Children in Shām",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Help the families and children of war in Syria",
+   "url": "https://www.launchgood.com/v4/campaign/help_the_families_and_children_of_war_in_syria",
+   "name_score": 0.58,
+   "words_on_page": 0.2,
+   "levels_match": null,
+   "numbers_ok": false,
+   "decision": "no"
+  },
+  {
+   "campaign": "Eīd Clothes & Toys 4 Children in Shām",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Feed the fasting in Shaam",
+   "url": "https://www.launchgood.com/v4/campaign/feed_the_fasting_in_shaam",
+   "name_score": 0.57,
+   "words_on_page": 0.2,
+   "levels_match": null,
+   "numbers_ok": false,
+   "decision": "no"
+  },
+  {
+   "campaign": "Food Support Fund",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Orphan Sponsorship",
+   "url": "https://www.launchgood.com/v4/campaign/orphan_38",
+   "name_score": 0.8,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Orphan Sponsorship",
+   "url": "https://www.launchgood.com/v4/campaign/sp_ummaadil_1",
+   "name_score": 0.8,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Widows Sponsorship",
+   "url": "https://www.launchgood.com/v4/campaign/widows_sponsorship",
+   "name_score": 0.76,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Asad – Hifdh Sponsorships",
+   "url": "https://www.launchgood.com/v4/campaign/asad__hifdh_sponsorships",
+   "name_score": 0.72,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Asad – Widows Sponsorship",
+   "url": "https://www.launchgood.com/v4/campaign/asad__widows_sponsorship",
+   "name_score": 0.72,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Syria Hifdh Sponsorship",
+   "url": "https://www.launchgood.com/v4/campaign/hifdh_1",
+   "name_score": 0.7,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Hafiz Sponsorship",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Iftars Programme",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Mohammad Omars School Project",
+   "url": "https://www.launchgood.com/v4/campaign/mohammad_omars_school_project",
+   "name_score": 0.75,
+   "words_on_page": 0.67,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "RISE OF THE ASHBAL: MASJID & SCHOOL PROJECT",
+   "url": "https://www.launchgood.com/v4/campaign/ashbal-masjid",
+   "name_score": 0.72,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Nazneens School Project",
+   "url": "https://www.launchgood.com/v4/campaign/nazneens_school_project",
+   "name_score": 0.72,
+   "words_on_page": 0.67,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Sama & Ayaans Shaam School Project",
+   "url": "https://www.launchgood.com/v4/campaign/sama__ayaans_shaam_school_project",
+   "name_score": 0.7,
+   "words_on_page": 0.67,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Sophinas School Project",
+   "url": "https://www.launchgood.com/v4/campaign/sophinas_school_project",
+   "name_score": 0.68,
+   "words_on_page": 0.67,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Haris Masjid project",
+   "url": "https://www.launchgood.com/v4/campaign/harris_masjid_project",
+   "name_score": 0.64,
+   "words_on_page": 0.67,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Masjid & School Project",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Most Needed",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Syrias Most Needy",
+   "url": "https://www.launchgood.com/v4/campaign/syrias_most_needy",
+   "name_score": 0.67,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Most Needed",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Muslims In Need",
+   "url": "https://www.launchgood.com/v4/campaign/muslims_in_need_6",
+   "name_score": 0.56,
+   "words_on_page": 0.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Most Needed",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Iftar 4 Orphans & Widows",
+   "url": "https://www.launchgood.com/v4/campaign/iftar_4_orphans__widows",
+   "name_score": 0.8,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Solar Panels 4 Widows",
+   "url": "https://www.launchgood.com/v4/campaign/solar_panels_4_widows",
+   "name_score": 0.69,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Ahmed – Widow & Orphan",
+   "url": "https://www.launchgood.com/v4/campaign/ahmed__widow__orphan",
+   "name_score": 0.67,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Empower Widows & Orphan",
+   "url": "https://www.launchgood.com/v4/campaign/empower_widows__orphan",
+   "name_score": 0.67,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "House for Widows & Orphans",
+   "url": "https://www.launchgood.com/v4/campaign/house_for_widows__orphans",
+   "name_score": 0.67,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Nahida – Widows & Orphans",
+   "url": "https://www.launchgood.com/v4/campaign/nahida__widows__orphans",
+   "name_score": 0.67,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Orphan & Widow",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "STEM School",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Team South London",
+   "url": "https://www.launchgood.com/v4/campaign/team_south_london",
+   "name_score": 0.57,
+   "words_on_page": 0.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "STEM School",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "£10 School Pack",
+   "url": "https://www.launchgood.com/v4/campaign/10_school_pack",
+   "name_score": 0.56,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "STEM School",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Help Syrians and gazans",
+   "url": "https://www.launchgood.com/v4/campaign/help_syrians_and_gazans",
+   "name_score": 0.69,
+   "words_on_page": 0.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Syeda & Maisha",
+   "url": "https://www.launchgood.com/v4/campaign/syeda__maisha",
+   "name_score": 0.67,
+   "words_on_page": 0.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Sofia4Syria&Gaza",
+   "url": "https://www.launchgood.com/v4/campaign/al_garden_of_knowledge_for_syria",
+   "name_score": 0.65,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Syed4Syria&Gaza 2024",
+   "url": "https://www.launchgood.com/v4/campaign/syed4syriagaza_2024",
+   "name_score": 0.63,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Farida4Syria&Gaza",
+   "url": "https://www.launchgood.com/v4/campaign/farida4syriagaza",
+   "name_score": 0.63,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "Save Gaza!",
+   "url": "https://www.launchgood.com/v4/campaign/save_gaza_24",
+   "name_score": 0.61,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Sudan & Gaza",
+   "platform": "launchgood",
+   "charity": "rethink",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Al-Shaam & Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam &Gaza Helping Hands",
+   "url": "https://www.madinah.com/alshaam-gaza-helping-hands",
+   "name_score": 1.0,
+   "words_on_page": 1.0,
+   "levels_match": 0.2,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Al-Shaam & Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam and Gaza Challenge",
+   "url": "https://www.madinah.com/bilaadasshaam&gaza-challenge",
+   "name_score": 0.75,
+   "words_on_page": 0.5,
+   "levels_match": 0.2,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Al-Shaam & Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam &Gaza Fund",
+   "url": "https://www.madinah.com/alshaam-gaza-fund",
+   "name_score": 0.74,
+   "words_on_page": 0.75,
+   "levels_match": 0.2,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Al-Shaam & Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "M&M - Helping the Needy",
+   "url": "https://www.madinah.com/m&m",
+   "name_score": 0.69,
+   "words_on_page": 0.25,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Al-Shaam & Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam &Gaza",
+   "url": "https://www.madinah.com/toxaidworker-alshaam-gaza-campaign",
+   "name_score": 0.68,
+   "words_on_page": 0.5,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Al-Shaam & Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Bilaad AsShaam &Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam &Gaza Helping Hands",
+   "url": "https://www.madinah.com/alshaam-gaza-helping-hands",
+   "name_score": 1.0,
+   "words_on_page": 1.0,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "MATCH (chosen)"
+  },
+  {
+   "campaign": "Bilaad AsShaam &Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam and Gaza Challenge",
+   "url": "https://www.madinah.com/bilaadasshaam&gaza-challenge",
+   "name_score": 0.75,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bilaad AsShaam &Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam &Gaza Fund",
+   "url": "https://www.madinah.com/alshaam-gaza-fund",
+   "name_score": 0.74,
+   "words_on_page": 0.75,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bilaad AsShaam &Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "M&M - Helping the Needy",
+   "url": "https://www.madinah.com/m&m",
+   "name_score": 0.69,
+   "words_on_page": 0.25,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bilaad AsShaam &Gaza Helping Hands",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bilaad AsShaam &Gaza",
+   "url": "https://www.madinah.com/toxaidworker-alshaam-gaza-campaign",
+   "name_score": 0.68,
+   "words_on_page": 0.5,
+   "levels_match": null,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Bouncer’s Gaza Gym in Bilaad AsShaam Fundraiser",
+   "url": "https://www.madinah.com/bouncers-gaza-gym-fundraiser",
+   "name_score": 0.83,
+   "words_on_page": 1.0,
+   "levels_match": 0.33,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Nuha’s Bilaad AsShaam &Gaza Fundraiser",
+   "url": "https://www.madinah.com/nuhas-alshaam-gaza-fundraiser",
+   "name_score": 0.61,
+   "words_on_page": 0.5,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Umair and Suhaib's Fundraiser",
+   "url": "https://www.madinah.com/umair-and-suhaibs-fundraiser",
+   "name_score": 0.61,
+   "words_on_page": 0.25,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Elise's Super Village Bilaad AsShaam Fundraiser",
+   "url": "https://www.madinah.com/elise4alshaam",
+   "name_score": 0.58,
+   "words_on_page": 0.25,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Abu Hajar's Winter Fundraiser",
+   "url": "https://www.madinah.com/AbuHajar's-Winter",
+   "name_score": 0.57,
+   "words_on_page": 0.25,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Sanni’s Bilaad AsShaam & Gaza Fundraiser",
+   "url": "https://www.madinah.com/sannis-gaza-fundraiser",
+   "name_score": 0.57,
+   "words_on_page": 0.5,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Bouncers Gaza Gym Fundraiser",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "GAZA Emergency Appeal",
+   "url": "https://www.madinah.com/gaza-emergency-appeal-4",
+   "name_score": 1.0,
+   "words_on_page": 1.0,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "GAZA Emergency Appeal",
+   "url": "https://www.madinah.com/gaza-emergency-appeal-2",
+   "name_score": 1.0,
+   "words_on_page": 1.0,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "LAMAR’S Bilaad AsShaam &Gaza emergency appeal",
+   "url": "https://www.madinah.com/lamars-alshaamgaza-emergency-appeal",
+   "name_score": 0.7,
+   "words_on_page": 1.0,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "GAZA Blankets Appeal",
+   "url": "https://www.madinah.com/BlanketsAppeal",
+   "name_score": 0.65,
+   "words_on_page": 0.67,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Nazima's Emergency Aid For Gaza",
+   "url": "https://www.madinah.com/nazimasemergencyaidforgaza",
+   "name_score": 0.62,
+   "words_on_page": 0.67,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "Naziya's Emergency Aid For Gaza",
+   "url": "https://www.madinah.com/Naziya'sEmergencyAidForGaza",
+   "name_score": 0.62,
+   "words_on_page": 0.67,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "GAZA Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Lamar's Al-Shaam & Gaza Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "LAMAR’S Bilaad AsShaam &Gaza emergency appeal",
+   "url": "https://www.madinah.com/lamars-alshaamgaza-emergency-appeal",
+   "name_score": 1.0,
+   "words_on_page": 1.0,
+   "levels_match": 0.17,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Lamar's Al-Shaam & Gaza Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "GAZA Emergency Appeal",
+   "url": "https://www.madinah.com/gaza-emergency-appeal-4",
+   "name_score": 0.7,
+   "words_on_page": 0.6,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Lamar's Al-Shaam & Gaza Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "GAZA Emergency Appeal",
+   "url": "https://www.madinah.com/gaza-emergency-appeal-2",
+   "name_score": 0.7,
+   "words_on_page": 0.6,
+   "levels_match": 0.0,
+   "numbers_ok": true,
+   "decision": "no"
+  },
+  {
+   "campaign": "Lamar's Al-Shaam & Gaza Emergency Appeal",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Lauren's Super Village",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Numan Family Masjid in Shaam",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Ruhi 4 Al-Shaam",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Servant of Allah 2",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Shawkat 4 Al-Shaam",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Straya 4 Sham",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Super Village School",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "The Greater Shaam Project 2",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "The Super Village School with Misbah",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Winter Camp",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  },
+  {
+   "campaign": "Yaman's Umrah of Victory🕋",
+   "platform": "madinah",
+   "charity": "iqra",
+   "candidate": "",
+   "url": "",
+   "decision": "NO MATCH - stays on name matching"
+  }
+ ],
+ "B": [
+  {
+   "platform": "givebright",
+   "charity": "iqra",
+   "campaign": "One With Gaza",
+   "giving_level": "",
+   "page": "One With Gaza",
+   "scores": "GAZ-SOC-EMR-GEN=2.8; GAZ-SOC-EMR-MEA=1.8; GAZ-SOC-EMR-BFO=1.8; GAZ-INF-MIS-WAT=1.8",
+   "decision": "GAZ-SOC-EMR-GEN"
+  },
+  {
+   "platform": "givebright",
+   "charity": "iqra",
+   "campaign": "Qurbani in Bilaad Al Sham 2026",
+   "giving_level": "",
+   "page": "Qurbani In Bilaad Al Sham 2026",
+   "scores": "SHM-SOC-GEN-GEN=2.8; SHM-SOC-RES-WAL=1.8",
+   "decision": "SHM-SOC-GEN-GEN"
+  },
+  {
+   "platform": "givebright",
+   "charity": "iqra",
+   "campaign": "Relief for Nadia, Fatimah & Hussein",
+   "giving_level": "",
+   "page": "Relief For Nadia, Fatimah & Hussein",
+   "scores": "SHM-SOC-GEN-GEN=1.0; SHM-SOC-AID-SPC=0.0; SHM-SOC-AID-FOD=0.0",
+   "decision": "SHM-SOC-GEN-GEN"
+  },
+  {
+   "platform": "givebright",
+   "charity": "iqra",
+   "campaign": "🌙The Best 10 Days | HOPE WIDOWS VILLAGE & ABNAA AS SHAAM SCHOOL🏡",
+   "giving_level": "",
+   "page": "🌙The Best 10 Days | Hope Widows Village & Abnaa As Shaam School🏡",
+   "scores": "SHM-EDU-SCH-AAT=5.8; SHM-SOC-GEN-GEN=1.8",
+   "decision": "SHM-EDU-SCH-AAT"
+  },
+  {
+   "platform": "givebright",
+   "charity": "rethink",
+   "campaign": "Greater Shaam Project Continues",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-GEN-GEN=2.8; SHM-INF-GMC-GEN=2.8; SHM-SOC-AID-ZKT=1.8; SHM-SOC-AID-SPC=1.8; SHM-SOC-AID-MNE=1.8; SHM-INF-VIL-HOU=1.8; SHM-EDU-SPN-WID=1.8; GAZ-SOC-EMR-WAT=-1.5",
+   "decision": "UNDECIDED"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Amaani's Emergency Aid For Gaza",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "GAZ-SOC-EMR-GEN=3.0; GAZ-SOC-EMR-BFO=2.0",
+   "decision": "GAZ-SOC-EMR-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Asia's quest: Educate, Elevate empowering future generations, Sadqa Jaariya",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-EDU-SCH-GEN=1.0; SHM-INF-VIL-SCH=0.0; SHM-INF-MIS-WWQ=0.0",
+   "decision": "SHM-EDU-SCH-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Bilad As Sham, Now more than ever!",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-GEN-GEN=2.8; SHM-SOC-AID-GEN=2.8; SHM-SOC-AID-WIN=1.8; SHM-SOC-AID-MNE=1.8; SHM-SOC-AID-FBX=1.8",
+   "decision": "UNDECIDED"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Emergency Aid For Gaza/ Zak Sidat",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "GAZ-SOC-EMR-GEN=3.0; GAZ-SOC-EMR-MEA=2.0; GAZ-SOC-EMR-BDI=2.0",
+   "decision": "GAZ-SOC-EMR-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Empower Shaam with Knowledge",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-INF-VIL-SCH=1.8; SHM-EDU-SPN-EDU=1.8",
+   "decision": "UNDECIDED"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Fawziya's Emergency Aid For Gaza",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "GAZ-SOC-EMR-GEN=3.0; GAZ-SOC-EMR-BFO=2.0",
+   "decision": "GAZ-SOC-EMR-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Hamza's Greater Shaam Project",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-GEN-GEN=2.8; SHM-INF-MAS-GEN=2.8; SHM-EDU-SCH-GEN=2.8; SHM-SOC-AID-MNE=1.8; SHM-EDU-SPN-SUR=1.8; SHM-EDU-SPN-ORP=1.8; SHM-EDU-SPN-HUF=1.8; GAZ-SOC-EMR-GEN=-0.5",
+   "decision": "UNDECIDED"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Handoo Children's Super Village Fundraiser",
+   "giving_level": "Deluxe Homes Pot – £80",
+   "page": "(not readable)",
+   "scores": "SHM-INF-MIS-HOM=3.0; SHM-INF-VIL-GEN=2.0",
+   "decision": "SHM-INF-MIS-HOM"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Handoo Children's Super Village Fundraiser",
+   "giving_level": "Donate for 1 Deluxe Home for a refugee Family – £3,500",
+   "page": "(not readable)",
+   "scores": "SHM-INF-MIS-HOM=3.0; SHM-INF-VIL-GEN=2.0",
+   "decision": "SHM-INF-MIS-HOM"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Handoo Children's Super Village Fundraiser",
+   "giving_level": "Shop 4 Life – Setup a refugee in business and allow them to decide their future – £3,250",
+   "page": "(not readable)",
+   "scores": "SHM-INF-VIL-SHP=5.0; SHM-INF-VIL-GEN=2.0",
+   "decision": "SHM-INF-VIL-SHP"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Handoo Children's Super Village Fundraiser",
+   "giving_level": "Shops Project – Giving a means to earn – £80",
+   "page": "(not readable)",
+   "scores": "SHM-INF-VIL-SHP=5.0; SHM-INF-VIL-GEN=2.0",
+   "decision": "SHM-INF-VIL-SHP"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Khattab's Revive Shaam Campaign",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-GEN-GEN=2.8; SHM-SOC-AID-GEN=2.8; SHM-SOC-AID-WIN=1.8; SHM-SOC-AID-T2H=1.8; SHM-SOC-AID-MNE=1.8; SHM-SOC-AID-FOD=1.8",
+   "decision": "UNDECIDED"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Lauren's Qurbani in Shaam & Afghanistan",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-AID-QAA=3.8; SHM-SOC-AID-MNE=1.8; AFG-SOC-AID-QAA=0.8",
+   "decision": "SHM-SOC-AID-QAA"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "M&M – Helping the Needy",
+   "giving_level": "",
+   "page": "M&M - Helping the Needy",
+   "scores": "SHM-SOC-AID-MNE=2.0; TUR-SOC-AID-SPC=0.0",
+   "decision": "SHM-SOC-AID-MNE"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Naziya's Emergency Aid For Gaza",
+   "giving_level": "",
+   "page": "Naziya's Emergency Aid For Gaza",
+   "scores": "GAZ-SOC-EMR-GEN=3.0; GAZ-SOC-EMR-BFO=2.0",
+   "decision": "GAZ-SOC-EMR-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Plant a Legacy: Donate for the Walnut Waqf Project",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-INF-MIS-WWQ=4.0; SHM-INF-VIL-SCH=0.0; SHM-EDU-SCH-GEN=0.0",
+   "decision": "SHM-INF-MIS-WWQ"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Samra's Appeal-Walnut Waqf Project",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-INF-MIS-WWQ=4.0; SHM-INF-VIL-SCH=0.0; SHM-EDU-SCH-GEN=0.0",
+   "decision": "SHM-INF-MIS-WWQ"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "SERVANTS OF THE MERCIFUL WALNUT WAQF PROJECT: EMPOWER SHAAM WITH KNOWLEDGE!",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-INF-MIS-WWQ=5.8; SHM-INF-VIL-SCH=1.8; SHM-EDU-SCH-GEN=1.8",
+   "decision": "SHM-INF-MIS-WWQ"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "SHE SPENT 25 YEARS TEACHING. LET HER LEGACY CONTINUE.",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-INF-GIN-GEN=1.0; SHM-SOC-AID-ZKT=0.0",
+   "decision": "SHM-INF-GIN-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Special Cases from a Refugee Camp",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-AID-SPC=4.0; SHM-SOC-AID-MNE=4.0; SHM-SOC-AID-FOD=0.0",
+   "decision": "UNDECIDED"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "The Greater Shaam Project With Lauren Booth",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-SOC-GEN-GEN=2.8; SHM-INF-MIS-HOM=1.8",
+   "decision": "SHM-SOC-GEN-GEN"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "THE WALNUT WAQF PROJECT: EMPOWER SHAAM WITH KNOWLEDGE!",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-INF-MIS-WWQ=5.8; SHM-INF-VIL-SCH=1.8; SHM-EDU-SCH-GEN=1.8",
+   "decision": "SHM-INF-MIS-WWQ"
+  },
+  {
+   "platform": "madinah",
+   "charity": "iqra",
+   "campaign": "Tox's Empower Shaam with Knowledge",
+   "giving_level": "",
+   "page": "(not readable)",
+   "scores": "SHM-EDU-SCH-GEN=2.8; SHM-EDU-SPN-EDU=1.8",
+   "decision": "SHM-EDU-SCH-GEN"
+  }
+ ]
+}

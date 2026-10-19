@@ -1,0 +1,312 @@
+[
+ [
+  "givebright",
+  "iqra",
+  "One With Gaza",
+  "",
+  [
+   "GAZ-INF-MIS-WAT",
+   "GAZ-SOC-EMR-BFO",
+   "GAZ-SOC-EMR-GEN",
+   "GAZ-SOC-EMR-MEA"
+  ]
+ ],
+ [
+  "givebright",
+  "iqra",
+  "Qurbani in Bilaad Al Sham 2026",
+  "",
+  [
+   "SHM-SOC-GEN-GEN",
+   "SHM-SOC-RES-WAL"
+  ]
+ ],
+ [
+  "givebright",
+  "iqra",
+  "Relief for Nadia, Fatimah & Hussein",
+  "",
+  [
+   "SHM-SOC-AID-FOD",
+   "SHM-SOC-AID-SPC",
+   "SHM-SOC-GEN-GEN"
+  ]
+ ],
+ [
+  "givebright",
+  "iqra",
+  "🌙The Best 10 Days | HOPE WIDOWS VILLAGE & ABNAA AS SHAAM SCHOOL🏡",
+  "",
+  [
+   "SHM-EDU-SCH-AAT",
+   "SHM-SOC-GEN-GEN"
+  ]
+ ],
+ [
+  "givebright",
+  "rethink",
+  "Greater Shaam Project Continues",
+  "",
+  [
+   "GAZ-SOC-EMR-WAT",
+   "SHM-EDU-SPN-WID",
+   "SHM-INF-GMC-GEN",
+   "SHM-INF-VIL-HOU",
+   "SHM-SOC-AID-MNE",
+   "SHM-SOC-AID-SPC",
+   "SHM-SOC-AID-ZKT",
+   "SHM-SOC-GEN-GEN"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Amaani's Emergency Aid For Gaza",
+  "",
+  [
+   "GAZ-SOC-EMR-GEN",
+   "GAZ-SOC-EMR-BFO"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Asia's quest: Educate, Elevate empowering future generations, Sadqa Jaariya",
+  "",
+  [
+   "SHM-INF-MIS-WWQ",
+   "SHM-EDU-SCH-GEN",
+   "SHM-INF-VIL-SCH"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Bilad As Sham, Now more than ever!",
+  "",
+  [
+   "SHM-SOC-GEN-GEN",
+   "SHM-SOC-AID-FBX",
+   "SHM-SOC-AID-GEN",
+   "SHM-SOC-AID-MNE",
+   "SHM-SOC-AID-WIN"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Emergency Aid For Gaza/ Zak Sidat",
+  "",
+  [
+   "GAZ-SOC-EMR-GEN",
+   "GAZ-SOC-EMR-BDI",
+   "GAZ-SOC-EMR-MEA"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Empower Shaam with Knowledge",
+  "",
+  [
+   "SHM-EDU-SPN-EDU",
+   "SHM-INF-VIL-SCH"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Fawziya's Emergency Aid For Gaza",
+  "",
+  [
+   "GAZ-SOC-EMR-GEN",
+   "GAZ-SOC-EMR-BFO"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Hamza's Greater Shaam Project",
+  "",
+  [
+   "SHM-SOC-GEN-GEN",
+   "GAZ-SOC-EMR-GEN",
+   "SHM-EDU-SCH-GEN",
+   "SHM-EDU-SPN-HUF",
+   "SHM-EDU-SPN-ORP",
+   "SHM-EDU-SPN-SUR",
+   "SHM-INF-MAS-GEN",
+   "SHM-SOC-AID-MNE"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Handoo Children's Super Village Fundraiser",
+  "Deluxe Homes Pot – £80",
+  [
+   "SHM-INF-VIL-GEN",
+   "SHM-INF-MIS-HOM"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Handoo Children's Super Village Fundraiser",
+  "Donate for 1 Deluxe Home for a refugee Family – £3,500",
+  [
+   "SHM-INF-VIL-GEN",
+   "SHM-INF-MIS-HOM"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Handoo Children's Super Village Fundraiser",
+  "Shop 4 Life – Setup a refugee in business and allow them to decide their future – £3,250",
+  [
+   "SHM-INF-VIL-GEN",
+   "SHM-INF-VIL-SHP"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Handoo Children's Super Village Fundraiser",
+  "Shops Project – Giving a means to earn – £80",
+  [
+   "SHM-INF-VIL-GEN",
+   "SHM-INF-VIL-SHP"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Khattab's Revive Shaam Campaign",
+  "",
+  [
+   "SHM-SOC-AID-T2H",
+   "SHM-SOC-AID-FOD",
+   "SHM-SOC-AID-GEN",
+   "SHM-SOC-AID-MNE",
+   "SHM-SOC-AID-WIN",
+   "SHM-SOC-GEN-GEN"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Lauren's Qurbani in Shaam & Afghanistan",
+  "",
+  [
+   "SHM-SOC-AID-QAA",
+   "AFG-SOC-AID-QAA",
+   "SHM-SOC-AID-MNE"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "M&M – Helping the Needy",
+  "",
+  [
+   "TUR-SOC-AID-SPC",
+   "SHM-SOC-AID-MNE"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Naziya's Emergency Aid For Gaza",
+  "",
+  [
+   "GAZ-SOC-EMR-GEN",
+   "GAZ-SOC-EMR-BFO"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Plant a Legacy: Donate for the Walnut Waqf Project",
+  "",
+  [
+   "SHM-INF-MIS-WWQ",
+   "SHM-EDU-SCH-GEN",
+   "SHM-INF-VIL-SCH"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Samra's Appeal-Walnut Waqf Project",
+  "",
+  [
+   "SHM-INF-MIS-WWQ",
+   "SHM-EDU-SCH-GEN",
+   "SHM-INF-VIL-SCH"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "SERVANTS OF THE MERCIFUL WALNUT WAQF PROJECT: EMPOWER SHAAM WITH KNOWLEDGE!",
+  "",
+  [
+   "SHM-INF-MIS-WWQ",
+   "SHM-EDU-SCH-GEN",
+   "SHM-INF-VIL-SCH"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "SHE SPENT 25 YEARS TEACHING. LET HER LEGACY CONTINUE.",
+  "",
+  [
+   "SHM-SOC-AID-ZKT",
+   "SHM-INF-GIN-GEN"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Special Cases from a Refugee Camp",
+  "",
+  [
+   "SHM-SOC-AID-SPC",
+   "SHM-SOC-AID-FOD",
+   "SHM-SOC-AID-MNE"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "The Greater Shaam Project With Lauren Booth",
+  "",
+  [
+   "SHM-SOC-GEN-GEN",
+   "SHM-INF-MIS-HOM"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "THE WALNUT WAQF PROJECT: EMPOWER SHAAM WITH KNOWLEDGE!",
+  "",
+  [
+   "SHM-INF-MIS-WWQ",
+   "SHM-EDU-SCH-GEN",
+   "SHM-INF-VIL-SCH"
+  ]
+ ],
+ [
+  "madinah",
+  "iqra",
+  "Tox's Empower Shaam with Knowledge",
+  "",
+  [
+   "SHM-EDU-SCH-GEN",
+   "SHM-EDU-SPN-EDU"
+  ]
+ ]
+]

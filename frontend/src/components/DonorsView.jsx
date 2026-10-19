@@ -3,7 +3,6 @@ import { Users, Search, ChevronLeft, ChevronRight, ArrowUp, ArrowDown, Gift, X, 
 import { API_BASE_URL } from '../config';
 import SegmentBuilder, { cleanSegment } from './SegmentBuilder';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
-import EmailComposer from './EmailComposer';
 
 const gbp = (v) => `£${Number(v || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const PLATFORMS = ['all', 'GiveBright', 'LaunchGood', 'Madinah', 'Rethink Website', 'Paysuite', 'Offline / Manual'];
@@ -20,7 +19,7 @@ const GIFT_RULES = ['date_from', 'date_to', 'headings', 'subheadings', 'codes', 
  * One row per donor (not per donation). Clicking a donor opens the donor panel with every donation they made.
  * Quick filters + "More filters" (the shared segment builder); the same filters can be emailed straight away.
  */
-export default function DonorsView({ activeCompany, onSelectDonor, user }) {
+export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenEmail }) {
   const [search, setSearch] = useState('');
   const [searchApplied, setSearchApplied] = useState('');
   const [platform, setPlatform] = useState('all');
@@ -40,7 +39,6 @@ export default function DonorsView({ activeCompany, onSelectDonor, user }) {
   const [error, setError] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
   const [adding, setAdding] = useState(false);
-  const [emailing, setEmailing] = useState(false);
   const [notice, setNotice] = useState('');
   const canEdit = canEditRecords(user) && activeCompany !== 'all';
   const segJson = useMemo(() => JSON.stringify(cleanSegment(segment)), [segment]);
@@ -119,11 +117,6 @@ export default function DonorsView({ activeCompany, onSelectDonor, user }) {
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>Each person once, with everything they have given. Click a donor to see all of their donations.</p>
         </div>
         <div className="flex gap-2">
-          {activeCompany !== 'all' && (
-            <button type="button" onClick={() => setEmailing(true)} className="px-3 py-2 text-xs rounded-lg font-bold border flex items-center gap-1.5" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}>
-              <Mail className="w-4 h-4 text-sky-500" /> Email {filtersActive ? 'these donors' : 'donors'}
-            </button>
-          )}
           {canEdit && (
             <button type="button" onClick={() => setAdding(true)} className="px-3 py-2 text-xs rounded-lg font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5">
               <PlusCircle className="w-4 h-4" /> Add donation
@@ -283,7 +276,6 @@ export default function DonorsView({ activeCompany, onSelectDonor, user }) {
         )}
       </div>
       {adding && <AddDonationModal company={activeCompany} onClose={() => setAdding(false)} onCreated={(d) => { setNotice(`Donation ${d.donation_id} added (£${d.net.toFixed(2)}, ${d.code}).`); setRefreshTick(t => t + 1); }} />}
-      {emailing && <EmailComposer company={activeCompany} initialSegment={fullSegment()} onClose={() => setEmailing(false)} />}
     </div>
   );
 }

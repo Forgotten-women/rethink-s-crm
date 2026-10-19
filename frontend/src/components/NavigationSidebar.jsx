@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users } from 'lucide-react';
+import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import { useUnsubscribeAlerts, UnsubscribeToast } from './email/unsubscribeAlerts';
 
 const resolveLogoUrl = (url) => {
   if (!url) return null;
@@ -16,6 +17,7 @@ const tabs = [
   { id: 'ltv', label: 'Lifetime LTV', icon: Crown },
   { id: 'explorer', label: 'Data Explorer', icon: Table },
   { id: 'donors', label: 'Donors', icon: Users },
+  { id: 'email', label: 'Email', icon: Mail },
   { id: 'fundraisers', label: 'Fundraisers', icon: HeartHandshake },
   { id: 'payouts', label: 'Payout Reconciliation', icon: DollarSign },
   { id: 'tracker', label: 'Sponsorship Tracker', icon: Target },
@@ -35,6 +37,7 @@ export default function NavigationSidebar({
 }) {
   const [isHovered, setIsHovered] = useState(false);
   const showExpanded = isHovered;
+  const unsub = useUnsubscribeAlerts(activeCompany);
 
   const colors = [
     { id: 'cyan', bg: 'bg-cyan-500' },
@@ -129,13 +132,23 @@ export default function NavigationSidebar({
                 }
               `}
             >
-              <Icon className={`w-5 h-5 ${isActive ? '' : 'opacity-70'} shrink-0`} /> 
-              {showExpanded && <span className="truncate">{t.label}</span>}
+              <span className="relative shrink-0">
+                <Icon className={`w-5 h-5 ${isActive ? '' : 'opacity-70'}`} />
+                {t.id === 'email' && unsub.unseen > 0 && !showExpanded && (
+                  <span className="absolute -top-1.5 -right-2 min-w-[1rem] h-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-bold leading-4 text-center">{unsub.unseen}</span>
+                )}
+              </span>
+              {showExpanded && <span className="truncate flex-1">{t.label}</span>}
+              {showExpanded && t.id === 'email' && unsub.unseen > 0 && (
+                <span className="px-1.5 rounded-full bg-amber-500 text-white text-[10px] font-bold" title="New unsubscribes">{unsub.unseen} unsubscribed</span>
+              )}
             </button>
           );
         })}
       </div>
       
+      <UnsubscribeToast toast={unsub.toast} onClose={unsub.clearToast} onOpen={() => setActiveTab('email')} />
+
       {/* Footer / Version Area */}
       <div className={`p-4 border-t border-slate-100 dark:border-white/5 transition-all duration-300 flex ${showExpanded ? 'justify-between' : 'justify-center'} items-center`}>
         {showExpanded ? (

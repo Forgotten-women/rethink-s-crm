@@ -12,6 +12,7 @@ import {
 import { API_BASE_URL } from '../config';
 import FundraiserFormModal from './FundraiserFormModal';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
+import DonationDetailModal from './DonationDetailModal';
 
 export default function FundraiserView({ user, accentColor = 'cyan', activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
@@ -78,6 +79,10 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const [ramadanPeriods, setRamadanPeriods] = useState([]);
   const [ramadanChoice, setRamadanChoice] = useState('');
   const [txFilter, setTxFilter] = useState('');
+  const [txPage, setTxPage] = useState(1);
+  const [txPageSize, setTxPageSize] = useState(100);
+  const [txLoading, setTxLoading] = useState(false);
+  const [openDonation, setOpenDonation] = useState(null);
   const [ramadanOpen, setRamadanOpen] = useState(false);
   const [ramadanYear, setRamadanYear] = useState(null);
   const ramadanRef = useRef(null);
@@ -302,6 +307,9 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
     params.append('company_id', activeCompany);
     if (sDate) params.append('start_date', sDate);
     if (eDate) params.append('end_date', eDate);
+    params.append('tx_page', '1');
+    params.append('tx_page_size', String(txPageSize));
+    setTxPage(1); setTxFilter('');
 
     fetch(`${API_BASE_URL}/api/fundraisers/${fid}?${params.toString()}`)
       .then(res => res.json())
@@ -320,6 +328,31 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
         setLoadingDrilldown(false);
       });
   };
+
+  // One page of the fundraiser's donations (searched on the server) without reloading the rest of the panel
+  const loadTxPage = (page, search = txFilter, size = txPageSize) => {
+    if (!selectedFundraiserId) return;
+    setTxLoading(true);
+    const params = new URLSearchParams({ company_id: activeCompany, tx_page: String(page), tx_page_size: String(size) });
+    if (drilldownStartDate) params.append('start_date', drilldownStartDate);
+    if (drilldownEndDate) params.append('end_date', drilldownEndDate);
+    if (search.trim()) params.append('tx_search', search.trim());
+    fetch(`${API_BASE_URL}/api/fundraisers/${selectedFundraiserId}?${params.toString()}`)
+      .then(res => res.json())
+      .then(data => {
+        setTxPage(page);
+        setDrilldownData(d => (d ? { ...d, recent_transactions: data.recent_transactions || [], transactions_total: data.transactions_total,
+          transactions_all: data.transactions_all, tx_pages: data.tx_pages } : d));
+      })
+      .catch(err => console.error('Error loading donations page:', err))
+      .finally(() => setTxLoading(false));
+  };
+  const txSearchFirst = useRef(true);
+  useEffect(() => {
+    if (txSearchFirst.current) { txSearchFirst.current = false; return undefined; }
+    const t = setTimeout(() => loadTxPage(1, txFilter), 350);
+    return () => clearTimeout(t);
+  }, [txFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     loadFundraisers();
@@ -2051,7 +2084,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                   <div>
                     <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
                       <h4 className="text-xs font-extrabold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
-                        <Clock className="w-3.5 h-3.5 text-cyan-500" /> Donations ({(drilldownData?.transactions_total ?? drilldownData?.recent_transactions?.length ?? 0).toLocaleString()}{drilldownData?.transactions_total > (drilldownData?.recent_transactions?.length || 0) ? `, newest ${drilldownData.recent_transactions.length.toLocaleString()} shown` : ''})
+                        <Clock className="w-3.5 h-3.5 text-cyan-500" /> Donations ({(drilldownData?.transactions_total ?? 0).toLocaleString()}{txFilter.trim() && drilldownData?.transactions_all ? ` of ${drilldownData.transactions_all.toLocaleString()}` : ''}) <span className="normal-case font-normal">· click a donation for its details</span>
                       </h4>
                       <span className="relative">
                         <Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -2069,12 +2102,13 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                           </tr>
                         </thead>
                         <tbody className="divide-y" style={{ borderColor: 'var(--border-glass)' }}>
-                          {(drilldownData?.recent_transactions || []).filter(tx => {
-                            const q = txFilter.trim().toLowerCase();
-                            return !q || [tx.donor_name, tx.email, tx.campaign_name, tx.code, tx.heading, tx.sub_heading, tx.giving_level, tx.donation_id, tx.tracked_page]
-                              .some(v => String(v || '').toLowerCase().includes(q));
-                          }).map((tx, i) => (
-                            <tr key={`${tx.donation_id}-${i}`} className="hover:bg-slate-200/40 dark:hover:bg-slate-800/40 transition-colors">
+                          {(drilldownData?.recent_transactions || []).length === 0 && (
+                            <tr><td colSpan={15} className="py-6 text-center text-xs" style={{ color: 'var(--text-muted)' }}>{txLoading ? 'Loading…' : 'No donations match.'}</td></tr>
+                          )}
+                          {(drilldownData?.recent_transactions || []).map((tx, i) => (
+                            <tr key={`${tx.donation_id}-${i}`} onClick={() => tx.donation_id && setOpenDonation(tx)}
+                              title={tx.donation_id ? 'Click for full donation details' : undefined}
+                              className={`hover:bg-cyan-500/10 transition-colors ${tx.donation_id ? 'cursor-pointer' : ''} ${txLoading ? 'opacity-50' : ''}`}>
                               <td className="py-1.5 px-2.5 whitespace-nowrap font-mono text-[11px]" style={{ color: 'var(--text-sub)' }}>{tx.date}</td>
                               <td className="py-1.5 px-2.5 font-bold whitespace-nowrap" style={{ color: 'var(--text-main)' }}>{tx.donor_name}</td>
                               <td className="py-1.5 px-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{tx.email}</td>
@@ -2095,12 +2129,33 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                         </tbody>
                       </table>
                     </div>
+                    <div className="flex items-center justify-between gap-2 flex-wrap px-1 pt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+                      <span>
+                        {(drilldownData?.transactions_total || 0) > 0
+                          ? `${((txPage - 1) * txPageSize + 1).toLocaleString()}–${Math.min(txPage * txPageSize, drilldownData.transactions_total).toLocaleString()} of ${drilldownData.transactions_total.toLocaleString()}`
+                          : ''}
+                      </span>
+                      <span className="flex items-center gap-2">
+                        <select value={txPageSize} onChange={e => { const n = Number(e.target.value); setTxPageSize(n); loadTxPage(1, txFilter, n); }}
+                          className="px-2 py-1 text-xs rounded-lg" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }}>
+                          {[50, 100, 200, 500].map(n => <option key={n} value={n}>{n} per page</option>)}
+                        </select>
+                        <button type="button" disabled={txPage <= 1 || txLoading} onClick={() => loadTxPage(txPage - 1)} className="p-1 rounded disabled:opacity-30" aria-label="Previous page"><ChevronLeft className="w-4 h-4" /></button>
+                        Page {txPage} of {drilldownData?.tx_pages || 1}
+                        <button type="button" disabled={txPage >= (drilldownData?.tx_pages || 1) || txLoading} onClick={() => loadTxPage(txPage + 1)} className="p-1 rounded disabled:opacity-30" aria-label="Next page"><ChevronRight className="w-4 h-4" /></button>
+                      </span>
+                    </div>
                   </div>
                 </>
               )}
             </div>
           </div>
         </div>
+      )}
+
+      {openDonation && (
+        <DonationDetailModal donationId={String(openDonation.donation_id)} companyId={activeCompany} onClose={() => setOpenDonation(null)}
+          onChanged={() => loadTxPage(txPage)} />
       )}
 
       {addingDonationFor && (

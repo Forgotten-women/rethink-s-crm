@@ -442,6 +442,42 @@ def calculate_benchmark_goal(raised_amount: float) -> float:
         return math.ceil(raised_amount / 25000.0) * 25000.0
 
 
+def _page_names_claimed_by_links(cur, comp: str, candidate_lower_names: set) -> set:
+    """Platform page names (donations' fundraiser_name) whose page is already assigned to a fundraiser by link.
+    Discovery matches by name only, so without this a page-titled fundraiser that was renamed to the person
+    would be re-created (empty) every time the Fundraisers page opens."""
+    if not candidate_lower_names or comp == "all":
+        return set()
+    from core.page_links import normalise_platform, page_key, parse_page_link
+    assigned = {r[0] for r in cur.execute(
+        "SELECT match_key FROM fundraiser_campaigns WHERE company_id = ? AND COALESCE(match_key, '') != ''", (comp,))}
+    if not assigned:
+        return set()
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(donations)")}
+    sources = [(c, k) for c, k in (("Fundraiser URL", "fundraiser"), ("fundraiser_url", "fundraiser"), ("Community URL", "community"),
+                                   ("team_url", "community"), ("Campaign URL", "campaign"), ("campaign_url", "campaign")) if c in cols]
+    if not sources:
+        return set()
+    select = ", ".join(f'"{c}"' for c, _k in sources)
+    claimed = set()
+    rows = cur.execute(f"""SELECT DISTINCT LOWER(TRIM(fundraiser_name)), Platform, {select} FROM donations
+                           WHERE company_id = ? AND fundraiser_name IS NOT NULL AND TRIM(fundraiser_name) != ''""", (comp,)).fetchall()
+    for row in rows:
+        lname = row[0]
+        if lname not in candidate_lower_names or lname in claimed:
+            continue
+        plat = normalise_platform(row[1])
+        for (col, kind), raw in zip(sources, row[2:]):
+            parsed = parse_page_link(str(raw or ""), plat) if raw else None
+            if not parsed:
+                continue
+            k = kind if kind != "campaign" else parsed[0]
+            if page_key(k, plat, parsed[2]) in assigned or page_key(k, "*", parsed[2]) in assigned:
+                claimed.add(lname)
+                break
+    return claimed
+
+
 def sync_discovered_fundraisers_internal(company_id: str = "rethink") -> int:
     """
     Scans the live donations dataset for unique fundraiser_name values not yet present
@@ -492,8 +528,11 @@ def sync_discovered_fundraisers_internal(company_id: str = "rethink") -> int:
         return 0
         
     new_fundraisers = []
-    
+    claimed_names = _page_names_claimed_by_links(cur, comp, {r[1] for r in don_fundraisers if r[1] not in existing_lower_names})
+
     for fname, lname, total_raised, total_dons, earliest_gift, latest_gift in don_fundraisers:
+        if lname in claimed_names:
+            continue  # the page is assigned to a fundraiser by its link (e.g. renamed to the person) - not a new one
         if lname not in existing_lower_names and fname:
             fid = f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, f'{comp}_{lname}').hex[:16]}"
             raised = float(total_raised or 0.0)
@@ -1289,7 +1328,10 @@ def get_fundraiser_detail(
     fundraiser_id: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    company_id: Optional[str] = Query("rethink")
+    company_id: Optional[str] = Query("rethink"),
+    tx_page: int = Query(1, ge=1),
+    tx_page_size: int = Query(100, ge=10, le=500),
+    tx_search: Optional[str] = Query(None),
 ):
     """
     Returns deep drilldown for a single fundraiser:
@@ -1333,6 +1375,7 @@ def get_fundraiser_detail(
     first_gift_all_time = latest_gift_all_time = first_gift_period = latest_gift_period = None
     net_received_all_time = 0.0
     transactions_total = 0
+    transactions_all = 0
     attr_aid = None
     is_filtered = bool(start_date or end_date)
 
@@ -1501,8 +1544,20 @@ def get_fundraiser_detail(
                                        "Donation ID", "Heading", "Sub-Heading", "Giving Level Title", "Gift Aid (yes or no)", "Status", "fundraiser_name",
                                        "Donation Currency (DC)", "Donation Amount (in Donation Currency)", "_page", "_net_received", "Donor ID"] if c in period_sub.columns]
             sort_cand = "_calc_date" if "_calc_date" in period_sub.columns else ("_parsed_date" if "_parsed_date" in period_sub.columns else "Created Date (UTC)")
-            transactions_total = int(len(period_sub))
-            tx_sample = period_sub[sample_cols].sort_values(sort_cand, ascending=False).head(TRANSACTIONS_LIMIT).to_dict('records')
+            # Paged (and searched) on the server: every donation is reachable, not only the newest 2,000
+            tx_frame = period_sub
+            transactions_all = int(len(period_sub))
+            q = (tx_search or "").strip().lower()
+            if q:
+                hay = pd.Series("", index=tx_frame.index)
+                for c in ("Donor Name", "First Name", "Last Name", "Email", "Campaign Name", "Code", "Heading", "Sub-Heading",
+                          "Giving Level Title", "Donation ID", "_page", "Platform"):
+                    if c in tx_frame.columns:
+                        hay = hay + " " + tx_frame[c].astype(str).str.lower()
+                tx_frame = tx_frame[hay.str.contains(q, regex=False, na=False)]
+            transactions_total = int(len(tx_frame))
+            start = (tx_page - 1) * tx_page_size
+            tx_sample = tx_frame[sample_cols].sort_values(sort_cand, ascending=False).iloc[start:start + tx_page_size].to_dict('records')
             for t in tx_sample:
                 fn = str(t.get("First Name") or "").strip() if pd.notna(t.get("First Name")) else ""
                 ln = str(t.get("Last Name") or "").strip() if pd.notna(t.get("Last Name")) else ""
@@ -1581,6 +1636,10 @@ def get_fundraiser_detail(
         "monthly_timeline": timeline_sorted,
         "recent_transactions": recent_transactions,
         "transactions_total": transactions_total,
+        "transactions_all": transactions_all,
+        "tx_page": tx_page,
+        "tx_page_size": tx_page_size,
+        "tx_pages": max(1, -(-transactions_total // tx_page_size)),
         "tracked_pages": tracked_pages,
     }
 

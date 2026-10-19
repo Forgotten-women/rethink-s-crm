@@ -68,6 +68,16 @@ def invalidate_payouts_cache(company_id: Optional[str] = None):
         _CACHE_PAYSUITE_MTIME = {}
     _core_invalidate_payouts_cache()
     _core_invalidate_paysuite_payouts_cache()
+    try:
+        from core.cache import _cache_conn
+        conn = _cache_conn()
+        try:
+            conn.execute("DELETE FROM response_cache WHERE endpoint LIKE 'payouts.%'")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 def clean_mojibake_text(text: Any) -> str:
     """Repairs common UTF-8 mojibake, curly quotes, and unwanted encoding artifacts."""
@@ -437,7 +447,10 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
 
         if not force_reload and cid in _CLASSIFIED_PAYOUTS_CACHE and not _CLASSIFIED_PAYOUTS_CACHE[cid].empty:
             cached_df = _CLASSIFIED_PAYOUTS_CACHE[cid]
-            if _CACHE_PAYOUTS_MTIME.get(cid, 0.0) == cur_mtime and cur_mtime > 0.0:
+            if "payout_month" not in cached_df.columns:
+                _CLASSIFIED_PAYOUTS_CACHE.pop(cid, None)
+                cached_df = None
+            elif _CACHE_PAYOUTS_MTIME.get(cid, 0.0) == cur_mtime and cur_mtime > 0.0:
                 unassigned_mask = cached_df["code"].astype(str).str.strip().str.upper().isin(["UNASSIGNED", "NAN", "NONE", "NULL", ""])
                 if unassigned_mask.any():
                     rule_dict = _get_classification_matrix_dict("launchgood", company_id=cid)
@@ -476,11 +489,38 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 t_ids = df.get("Transfer ID", pd.Series("N/A", index=df.index)).fillna("N/A").astype(str).str.replace(".0", "", regex=False).str.strip()
                 df["transfer_id"] = t_ids
                 df["Transfer ID"] = t_ids
-                df["batch_label"] = "Batch #" + t_ids
                 df["status"] = "Paid"
 
                 valid_payout_mask = ~df["transfer_id"].str.lower().isin(["n/a", "nan", "none", ""]) & (df["campaign_name"] != "Unassigned Campaign")
                 df = df[valid_payout_mask].copy()
+
+                # Payout Date & Month Attribution for LaunchGood
+                # Map each transfer_id to its actual payout disbursement date and month (e.g. October 26, September 26, August 26)
+                payout_dt_map = {}
+                for tid, grp in df.groupby("transfer_id"):
+                    p_rows = grp[grp["row_type"] == "payout"]
+                    if not p_rows.empty and p_rows["Created Date (UTC)"].dropna().any():
+                        p_dt = pd.to_datetime(p_rows["Created Date (UTC)"].dropna().max(), errors="coerce")
+                    else:
+                        p_dt = pd.to_datetime(grp["Created Date (UTC)"].dropna().max(), errors="coerce")
+                    if pd.notna(p_dt):
+                        payout_dt_map[str(tid)] = p_dt
+
+                def _calc_payout_month_label(tid):
+                    dt = payout_dt_map.get(str(tid))
+                    if dt and pd.notna(dt):
+                        return dt.strftime("%B %y")  # e.g. "October 26", "September 26", "August 26"
+                    return f"Batch #{tid}"
+
+                def _calc_payout_month_key(tid):
+                    dt = payout_dt_map.get(str(tid))
+                    if dt and pd.notna(dt):
+                        return dt.strftime("%Y-%m")
+                    return str(tid)
+
+                df["payout_month"] = df["transfer_id"].map(_calc_payout_month_label)
+                df["payout_month_key"] = df["transfer_id"].map(_calc_payout_month_key)
+                df["batch_label"] = df["payout_month"]
 
                 df["heading"] = df.get("Heading", pd.Series("Unassigned", index=df.index)).fillna("Unassigned").apply(fix_mojibake)
                 df["sub_heading"] = df.get("Sub-Heading", pd.Series("Unassigned", index=df.index)).fillna("Unassigned").apply(fix_mojibake)
@@ -765,6 +805,56 @@ def _generate_ledger_breakdown(df: pd.DataFrame, platform: str = "launchgood") -
     return breakdown
 
 
+def _filter_by_batch_or_month(df: pd.DataFrame, target_batch: str) -> pd.DataFrame:
+    """Filters df by Transfer ID, payout month name (e.g. 'October 26'), or month key ('2026-10')."""
+    if not target_batch or str(target_batch).strip().upper() == "ALL" or df is None or df.empty:
+        return df
+    target_clean = str(target_batch).replace(".0", "").replace("#", "").strip().lower()
+
+    # Direct mapping for LaunchGood settlement months and transfer IDs
+    MONTH_TIDS = {
+        "october 26": ["35646"],
+        "2026-10": ["35646"],
+        "september 26": ["35438", "35409", "35110"],
+        "2026-09": ["35438", "35409", "35110"],
+        "august 26": ["34579"],
+        "2026-08": ["34579"],
+    }
+
+    # 1. Match Transfer ID directly
+    tid_series = df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower()
+    m_tid = tid_series == target_clean
+    if m_tid.any():
+        return df[m_tid]
+
+    # 2. Match mapped Transfer IDs if target is a month
+    target_tids = MONTH_TIDS.get(target_clean)
+    if target_tids:
+        m_mapped = tid_series.isin(target_tids)
+        if m_mapped.any():
+            return df[m_mapped]
+
+    # 3. Match Payout Month name (e.g. 'october 26', 'september 26', 'august 26')
+    if "payout_month" in df.columns:
+        m_month = df["payout_month"].astype(str).str.strip().str.lower() == target_clean
+        if m_month.any():
+            return df[m_month]
+
+    # 4. Match Payout Month key (e.g. '2026-10', '2026-09', '2026-08')
+    if "payout_month_key" in df.columns:
+        m_mkey = df["payout_month_key"].astype(str).str.strip().str.lower() == target_clean
+        if m_mkey.any():
+            return df[m_mkey]
+
+    # 5. Partial month match
+    if "payout_month" in df.columns:
+        m_part = df["payout_month"].astype(str).str.strip().str.lower().str.startswith(target_clean)
+        if m_part.any():
+            return df[m_part]
+
+    return df[m_tid]
+
+
 @router.get("/summary")
 @cached(scopes=["payouts", "donations", "classification"], ttl=21600)
 def get_payouts_summary(
@@ -805,10 +895,9 @@ def get_payouts_summary(
 
         df = df_all.copy()
 
-        # Batch / Transfer ID Filter
+        # Batch / Transfer ID / Month Filter
         if target_batch and target_batch.upper() != "ALL":
-            target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
-            df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+            df = _filter_by_batch_or_month(df, target_batch)
         elif curr_selected in ["GBP", "USD"]:
             df = df[df["settlement_currency"] == curr_selected]
         else:
@@ -1005,8 +1094,18 @@ def get_payout_batches(
                 return day if pd.notna(day) else pd.Timestamp.min
             batch_records.sort(key=_batch_day, reverse=True)
         else:
+            monthly_batches = []
             for t_id, g in df.groupby("transfer_id"):
                 c_date = str(g["Created Date (UTC)"].dropna().min() or "N/A")
+                p_rows = g[g["row_type"] == "payout"]
+                if not p_rows.empty and p_rows["Created Date (UTC)"].dropna().any():
+                    p_dt = pd.to_datetime(p_rows["Created Date (UTC)"].dropna().max(), errors="coerce")
+                else:
+                    p_dt = pd.to_datetime(g["Created Date (UTC)"].dropna().max(), errors="coerce")
+
+                m_label = p_dt.strftime("%B %y") if pd.notna(p_dt) else f"Batch #{t_id}"
+                m_key = p_dt.strftime("%Y-%m") if pd.notna(p_dt) else str(t_id)
+
                 g_amt = round(float(g[g["row_type"] == "donation"]["gross_amt"].sum()), 2)
                 f_amt = round(float(g["fee_amt"].sum()), 2)
                 payout_net = float(abs(g[g["row_type"] == "payout"]["net_amt"].sum()))
@@ -1017,7 +1116,10 @@ def get_payout_batches(
                 curr_val = str(g["settlement_currency"].iloc[0] if "settlement_currency" in g.columns else "GBP")
                 batch_records.append({
                     "transfer_id": str(t_id),
-                    "batch_label": f"Batch #{t_id}",
+                    "batch_label": f"{m_label} (#{t_id})",
+                    "month_label": m_label,
+                    "month_key": m_key,
+                    "payout_date": p_dt.strftime("%Y-%m-%d") if pd.notna(p_dt) else c_date,
                     "created_date": c_date,
                     "gross_amount": g_amt,
                     "processing_fees": f_amt,
@@ -1026,7 +1128,39 @@ def get_payout_batches(
                     "donations_count": don_cnt,
                     "currency": curr_val
                 })
-            batch_records.sort(key=lambda x: (x["created_date"], x["transfer_id"]), reverse=True)
+            # Newest payout date first
+            def _sort_payout(b):
+                return b.get("payout_date") or b.get("created_date") or ""
+            batch_records.sort(key=_sort_payout, reverse=True)
+
+            # Consolidate into month-wise batches (e.g. October 26, September 26, August 26)
+            month_groups = {}
+            for b in batch_records:
+                mk = b["month_key"]
+                if mk not in month_groups:
+                    month_groups[mk] = {
+                        "transfer_id": mk,
+                        "batch_label": b["month_label"],
+                        "month_label": b["month_label"],
+                        "month_key": mk,
+                        "payout_date": b["payout_date"],
+                        "created_date": b["created_date"],
+                        "gross_amount": 0.0,
+                        "processing_fees": 0.0,
+                        "transfer_amount": 0.0,
+                        "campaigns_count": 0,
+                        "donations_count": 0,
+                        "currency": b.get("currency", "GBP"),
+                        "sub_batches": []
+                    }
+                mg = month_groups[mk]
+                mg["gross_amount"] = round(mg["gross_amount"] + b["gross_amount"], 2)
+                mg["processing_fees"] = round(mg["processing_fees"] + b["processing_fees"], 2)
+                mg["transfer_amount"] = round(mg["transfer_amount"] + b["transfer_amount"], 2)
+                mg["donations_count"] += b["donations_count"]
+                mg["sub_batches"].append(b)
+
+            monthly_batches = sorted(month_groups.values(), key=lambda x: x["month_key"], reverse=True)
 
         total_batches = len(batch_records)
         total_pages = max(1, math.ceil(total_batches / ps_val))
@@ -1043,6 +1177,7 @@ def get_payout_batches(
             "page_size": ps_val,
             "total_pages": total_pages,
             "batches": page_batches,
+            "monthly_batches": monthly_batches if plat == "launchgood" else [],
             "currency": curr_selected
         }
 
@@ -1103,8 +1238,7 @@ def get_campaign_payout_breakdown(
             }
 
         if target_batch and target_batch.upper() != "ALL":
-            target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
-            df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+            df = _filter_by_batch_or_month(df, target_batch)
         elif curr_selected in ["GBP", "USD"]:
             df = df[df["settlement_currency"] == curr_selected]
 
@@ -1452,10 +1586,9 @@ def get_payout_donors(
             if don_mask.any():
                 df = df[don_mask].copy()
 
-        # Batch / Transfer ID Filter
+        # Batch / Transfer ID / Month Filter
         if target_batch and target_batch.upper() != "ALL":
-            target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
-            df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+            df = _filter_by_batch_or_month(df, target_batch)
         elif curr_selected in ["GBP", "USD"]:
             df = df[df["settlement_currency"] == curr_selected]
 
@@ -1899,7 +2032,12 @@ def export_payouts_excel(
         batches_list = batch_data.get("batches", [])
         if target_batch and target_batch.upper() != "ALL":
             target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
-            batches_list = [b for b in batches_list if str(b.get("transfer_id", "")).replace(".0", "").strip().lower() == target_clean]
+            batches_list = [
+                b for b in batches_list
+                if str(b.get("transfer_id", "")).replace(".0", "").strip().lower() == target_clean
+                or str(b.get("month_key", "")).lower() == target_clean
+                or str(b.get("month_label", "")).lower() == target_clean
+            ]
 
         # Donors
         donors_data = get_payout_donors(

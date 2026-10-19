@@ -172,6 +172,20 @@ def canonicalize_special_case(sc_str) -> str:
 _URL_PLACEHOLDERS = {"", "unassigned", "nan", "none", "null", "n/a", "na", "-"}
 
 
+_MADINAH_ADMIN_RE = re.compile(r"^https?://(?:www\.)?madinah\.com/(?:preview|campaign/edit)/?\?(?:.*&)?id=([^&#]+)", re.I)
+
+
+def public_campaign_url(u: str) -> str:
+    """Madinah's exports put dashboard links in Campaign URL (madinah.com/preview?id=X, /campaign/edit/?id=X) that only
+    open for someone signed in to Madinah; the public page is madinah.com/X."""
+    m = _MADINAH_ADMIN_RE.match(str(u or "").strip())
+    if m:
+        from urllib.parse import unquote
+        slug = unquote(m.group(1)).strip()
+        return f"https://www.madinah.com/{slug}" if slug and "/" not in slug and " " not in slug else ""
+    return u
+
+
 def clean_campaign_url(value: Any) -> str:
     """A campaign link, or "" when the value is not one.
 
@@ -189,10 +203,10 @@ def clean_campaign_url(value: Any) -> str:
     if u.lower() in _URL_PLACEHOLDERS or " " in u:
         return ""
     if u.lower().startswith(("http://", "https://")):
-        return u
+        return public_campaign_url(u)
     host = u.split("/", 1)[0].lower()
     if "/" in u and "." in host and host.replace(".", "").replace("-", "").isalnum():
-        return "https://" + u
+        return public_campaign_url("https://" + u)
     return ""
 
 
@@ -505,6 +519,11 @@ def init_classification_db():
                     UNIQUE (platform, company_id, campaign_name, giving_level, code)
                 );
             """)
+            for _col in ("campaign_ref", "giving_level_ref"):  # classification by platform campaign / giving level ID
+                try:
+                    cur.execute(f"ALTER TABLE platform_campaign_mappings ADD COLUMN {_col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
 
             cur.execute("PRAGMA table_info(platform_campaign_mappings)")
             map_cols = [r[1] for r in cur.fetchall()]
@@ -587,7 +606,9 @@ def init_classification_db():
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
-                    COALESCE(m.donor_email, '') AS donor_email
+                    COALESCE(m.donor_email, '') AS donor_email,
+                    m.campaign_ref AS campaign_ref,
+                    m.giving_level_ref AS giving_level_ref
                 FROM platform_campaign_mappings m
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -620,7 +641,9 @@ def init_classification_db():
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
-                    COALESCE(m.donor_email, '') AS donor_email
+                    COALESCE(m.donor_email, '') AS donor_email,
+                    m.campaign_ref AS campaign_ref,
+                    m.giving_level_ref AS giving_level_ref
                 FROM platform_campaign_mappings m
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -751,7 +774,9 @@ def init_classification_db():
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
-                    COALESCE(m.donor_email, '') AS donor_email
+                    COALESCE(m.donor_email, '') AS donor_email,
+                    m.campaign_ref AS campaign_ref,
+                    m.giving_level_ref AS giving_level_ref
                 FROM platform_campaign_mappings m
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -1419,6 +1444,10 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
     comp_mask = (df_raw["company_id"].astype(str).str.lower() == comp)
     if not comp_mask.any():
         return 0
+    # Snapshot of the classification columns, to write back only the rows this save actually changes
+    _CLS_COLS = [c for c in ["Code", "Department", "Office", "Portfolio", "Heading", "Sub-Heading", "Country", "Zakat Eligibility",
+                             "Programme Fund", "Fund Code", "Special Case", "Campaign URL", "Community Name"] if c in df_raw.columns]
+    _cls_before = df_raw.loc[comp_mask, _CLS_COLS].astype(str).copy()
 
     def _norm_campaign_title(name_val):
         if not name_val:
@@ -1579,24 +1608,24 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
     df_raw.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
 
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
-    conn.execute("PRAGMA busy_timeout = 60000;")
-    try:
-        df_raw[comp_mask].to_sql("_donations_staging", con=conn, if_exists="replace", index=False, chunksize=10000)
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM donations WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
-        conn.execute("INSERT INTO donations SELECT * FROM _donations_staging")
-        conn.execute("DROP TABLE IF EXISTS _donations_staging")
-        conn.commit()
-    except Exception as e:
-        print(f"[Donations sync to DB notice]: {e}")
+    # SQLite (the source of truth): UPDATE only the rows whose classification changed, keyed by Donation ID + charity.
+    # It used to DELETE every donation of the charity and re-insert this in-memory copy; on 19 Oct 2026 that left
+    # 37,317 Iqra donations deleted (restored from backup). Nothing is ever deleted here now.
+    _after = df_raw.loc[comp_mask, _CLS_COLS].astype(str)
+    _changed_idx = _after.index[(_after != _cls_before.reindex(_after.index)).any(axis=1)]
+    if len(_changed_idx) and "Donation ID" in df_raw.columns:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
+        conn.execute("PRAGMA busy_timeout = 60000;")
         try:
-            conn.rollback()
-            conn.execute("DROP TABLE IF EXISTS _donations_staging")
-        except Exception:
-            pass
-    finally:
-        conn.close()
+            sets = ", ".join(f'"{c}" = ?' for c in _CLS_COLS)
+            rows = [tuple(None if (v is None or (isinstance(v, float) and pd.isna(v))) else v for v in df_raw.loc[i, _CLS_COLS])
+                    + (str(df_raw.at[i, "Donation ID"]), comp) for i in _changed_idx]
+            with conn:
+                conn.executemany(f'UPDATE donations SET {sets} WHERE "Donation ID" = ? AND LOWER(COALESCE(company_id, \'rethink\')) = ?', rows)
+        except Exception as e:
+            print(f"[Donations sync to DB notice]: {e}")
+        finally:
+            conn.close()
 
     # Also update payouts_cache.parquet & payout_settlements table in SQLite
     try:
@@ -1794,6 +1823,18 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                         """, master_code_rows)
 
                     # 2. Synchronize platform_campaign_mappings
+                    # Keep each rule's campaign / giving-level ID: changing a code deletes the old-code row and inserts a
+                    # new one, which would otherwise lose them (classification is by ID first).
+                    try:
+                        _ref_snapshot = {}
+                        for _n, _g, _r, _lr in conn.execute("""SELECT LOWER(campaign_name), LOWER(COALESCE(giving_level, '')), campaign_ref,
+                                                                      giving_level_ref FROM platform_campaign_mappings
+                                                               WHERE company_id = ? AND platform = ? AND campaign_ref IS NOT NULL""",
+                                                            (comp, platform.lower())):
+                            _ref_snapshot.setdefault((_n, _g), (_r, _lr))
+                            _ref_snapshot.setdefault((_n, "*"), (_r, None))
+                    except sqlite3.OperationalError:
+                        _ref_snapshot = {}
                     # Codes are saved upper-case; an existing row that differs only in case ("Unassigned" vs
                     # "UNASSIGNED") is the same rule - rename it rather than add a second "variant" next to it.
                     for (cname_lower, gl_lower), codes in cname_gl_to_codes.items():
@@ -1834,6 +1875,19 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                             special_case = CASE WHEN excluded.special_case != '' THEN excluded.special_case ELSE platform_campaign_mappings.special_case END,
                             updated_at = CURRENT_TIMESTAMP;
                     """, mapping_rows)
+
+                    if _ref_snapshot:
+                        for _id, _n, _g in conn.execute("""SELECT id, LOWER(campaign_name), LOWER(COALESCE(giving_level, ''))
+                                                           FROM platform_campaign_mappings WHERE company_id = ? AND platform = ?
+                                                           AND campaign_ref IS NULL""", (comp, platform.lower())).fetchall():
+                            hit = _ref_snapshot.get((_n, _g)) or _ref_snapshot.get((_n, "*"))
+                            if hit:
+                                lref = hit[1] if (_n, _g) in _ref_snapshot else None
+                                if lref is None and _g:  # a new giving level: GiveBrite impact id when known, else its title
+                                    from core.classification_ids import _catalogue as _cid_cat, nkey as _cid_key
+                                    lref = _cid_cat(conn, platform.lower(), comp)["level"].get((hit[0], _cid_key(_g))) or f"title:{_cid_key(_g)}"
+                                conn.execute("UPDATE platform_campaign_mappings SET campaign_ref = ?, giving_level_ref = COALESCE(giving_level_ref, ?) WHERE id = ?",
+                                             (hit[0], lref, _id))
 
                     # Propagate non-empty special_case to matching campaigns / base campaign titles in platform_campaign_mappings
                     spec_updates = {}
@@ -2075,12 +2129,35 @@ def save_stripe_classification_matrix(matrix_df, company_id: str = "rethink"):
     return save_platform_matrix_rules("stripe", matrix_df, company_id=company_id)
 
 
+def _id_rule_values(df, platform: str, company_id: str, db_matrix, db_fields):
+    """Classification by platform campaign / giving-level ID (core/classification_ids.py): {db_field: Series} of the
+    ID rule's values (None where no ID rule, blanks/Unassigned -> None so the name matching still fills them),
+    plus "_matched". Empty dict on any problem - name matching then works exactly as before."""
+    try:
+        from core.classification_ids import map_fields
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        try:
+            out = map_fields(df, platform, company_id, db_matrix, list(db_fields), conn)
+        finally:
+            conn.close()
+        for f in db_fields:
+            s = out.get(f)
+            if s is not None:
+                out[f] = s.where(~s.astype(str).str.strip().str.lower().isin(["", "nan", "none", "unassigned", "n/a"]), None)
+        return out
+    except Exception as e:
+        print(f"[classification by ID] notice, using names only: {e}")
+        return {}
+
 def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
     """Pre-compute all derived columns (Donor ID, LTV, Classification, Payment Frequency) and apply classifications."""
     if df is None or df.empty:
         return df
 
     target_cid = str(company_id or "rethink").strip().lower()
+    for _col in ("Campaign URL", "campaign_url"):  # Madinah dashboard preview/edit links -> the public campaign page
+        if _col in df.columns:
+            df[_col] = df[_col].map(lambda v: public_campaign_url(v) if isinstance(v, str) else v)
 
     already_multi_platform = "Platform" in df.columns and df["Platform"].dropna().nunique() > 1
 
@@ -2610,14 +2687,19 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             cname_series = df["Campaign Name"].astype(str).str.strip().str.lower()
             gl_series = df["Giving Level Title"].fillna("").astype(str).str.strip().str.lower() if "Giving Level Title" in df.columns else pd.Series("", index=df.index)
 
-            for f in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
+            _gb_fields = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
+            id_vals = _id_rule_values(df, "givebright", target_cid, db_matrix, [f.lower().replace("-", "_").replace(" ", "_") for f in _gb_fields])
+            for f in _gb_fields:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
                 mapped_gl = [rule_dict_gl.get((c, g), {}).get(db_f) if g else None for c, g in zip(cname_series, gl_series)]
                 mapped_camp = cname_series.map(lambda c: rule_dict_camp.get(c, {}).get(db_f))
                 mapped_vals = pd.Series(mapped_gl, index=df.index).combine_first(mapped_camp)
+                if db_f in id_vals:  # by campaign / giving-level ID first, names fill the rest
+                    mapped_vals = id_vals[db_f].combine_first(mapped_vals)
                 valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
                 if valid_mask.any():
                     df.loc[valid_mask, f] = mapped_vals[valid_mask]
+            _id_matched_names = set(df.loc[id_vals["_matched"], "Campaign Name"].astype(str).str.strip().str.lower()) if "_matched" in id_vals else set()
 
             # Seed new GiveBright campaigns into platform_campaign_mappings database with giving level support
             c_curl_map = {}
@@ -2637,6 +2719,8 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                     continue
 
                 curl = c_curl_map.get(cn_l, "")
+                if cn_l in _id_matched_names:
+                    continue  # its campaign ID already has rules (e.g. a renamed campaign): no duplicate "Unassigned" rule
                 if gl_l and gl_l not in ["nan", "none", "n/a", ""]:
                     if (cn_l, gl_l) not in rule_dict_gl:
                         new_rules.append((target_cid, "givebright", cn, gl, "Unassigned", curl, 0))
@@ -2725,12 +2809,18 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             cname_series = df["Campaign Name"].astype(str).str.strip()
             cname_lower = cname_series.str.lower()
 
-            for f in ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]:
+            _md_fields = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
+            id_vals = _id_rule_values(df, "madinah", target_cid, db_matrix if "db_matrix" in dir() else None,
+                                      [f.lower().replace("-", "_").replace(" ", "_") for f in _md_fields])
+            for f in _md_fields:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
                 mapped_vals = cname_lower.map(lambda c: rule_dict.get(c, {}).get(db_f))
+                if db_f in id_vals:  # by campaign / giving-level ID first, names fill the rest
+                    mapped_vals = id_vals[db_f].combine_first(mapped_vals)
                 valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
                 if valid_mask.any():
                     df.loc[valid_mask, f] = mapped_vals[valid_mask]
+            _id_matched_names = set(df.loc[id_vals["_matched"], "Campaign Name"].astype(str).str.strip().str.lower()) if "_matched" in id_vals else set()
 
             # Seed new Madinah campaigns into platform_campaign_mappings in 1 vectorized pass
             unique_cnames = df[["Campaign Name"]].drop_duplicates(subset=["Campaign Name"])
@@ -2738,7 +2828,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             for _, r in unique_cnames.iterrows():
                 cn = str(r["Campaign Name"]).strip()
                 cn_l = cn.lower()
-                if cn and cn_l not in ["nan", "none", "n/a", ""] and cn_l not in rule_dict:
+                if cn and cn_l not in ["nan", "none", "n/a", ""] and cn_l not in rule_dict and cn_l not in _id_matched_names:
                     curl = str(r.get("Campaign URL") or "").strip() if "Campaign URL" in r else ""
                     new_rules.append((target_cid, "madinah", cn, "Unassigned", curl, 1))
 
@@ -3007,11 +3097,15 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             cname_series = df["Campaign Name"].astype(str).str.strip().str.lower()
             gl_series = df["Giving Level Title"].fillna("").astype(str).str.strip().str.lower() if "Giving Level Title" in df.columns else pd.Series("", index=df.index)
 
+            _id_plat = {"campaign_classifications": "launchgood", "givebright_classifications": "givebright", "madinah_classifications": "madinah"}.get(tbl_name)
+            id_vals = _id_rule_values(df, _id_plat, target_cid, db_matrix, [f.lower().replace("-", "_").replace(" ", "_") for f in target_cols]) if _id_plat else {}
             for f in target_cols:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
                 mapped_gl = [rule_dict_gl.get((c, g), {}).get(db_f) if g else None for c, g in zip(cname_series, gl_series)]
                 mapped_camp = cname_series.map(lambda c: rule_dict_camp.get(c, {}).get(db_f))
                 mapped_vals = pd.Series(mapped_gl, index=df.index).combine_first(mapped_camp)
+                if db_f in id_vals:  # by campaign / giving-level ID first, names fill the rest
+                    mapped_vals = id_vals[db_f].combine_first(mapped_vals)
 
                 valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
                 curr_unassigned = df[f].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])

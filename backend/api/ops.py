@@ -11,8 +11,9 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
+import re
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from backend.api.auth import require_super_admin
@@ -20,6 +21,7 @@ from config.settings import LOCAL_DB_PATH, GIVEBRITE_CHARITY_IDS
 from core.event_log import log_event, query_axiom, query_local, shipping_status
 
 router = APIRouter(prefix="/api/ops", tags=["Ops Console"], dependencies=[Depends(require_super_admin)])
+sync_router = APIRouter(prefix="/api/ops/sync-helper", tags=["Ops Sync Helper"])
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TOKEN_FILES = {
@@ -27,6 +29,8 @@ TOKEN_FILES = {
     "givebrite_iqra": os.path.join(BASE_DIR, ".givebrite_token.json"),
     "givebrite_rethink": os.path.join(BASE_DIR, ".givebrite_rethink_token.json"),
     "madinah": os.path.join(BASE_DIR, ".madinah_token.json"),
+    "launchgood_rethink": os.path.join(BASE_DIR, "config", "launchgood_tokens_rethink.json"),
+    "launchgood_iqra": os.path.join(BASE_DIR, "config", "launchgood_tokens_iqra.json"),
 }
 HEALTH_FILE = os.path.join(BASE_DIR, "data_cache", "platform_health.json")
 SYNC_FILE = os.path.join(BASE_DIR, "data_cache", "platform_sync_data.json")
@@ -36,6 +40,14 @@ MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _jwt_claims(token: str) -> Dict[str, Any]:
+    try:
+        part = (token or "").replace("Bearer ", "").strip().split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))) or {}
+    except Exception:
+        return {}
 
 
 def _jwt_exp(token: str) -> Optional[datetime.datetime]:
@@ -69,13 +81,20 @@ def _age_minutes(iso: Optional[str]) -> Optional[float]:
 
 def _token_info(platform: str) -> Dict[str, Any]:
     data = _read_json(TOKEN_FILES[platform])
-    info: Dict[str, Any] = {"present": bool(data.get("accessToken")), "retrieved_at": data.get("retrievedAt"),
-                            "captured_by": data.get("capturedBy")}
+    has_cookies = bool(data.get("rawCookie") or data.get("cookies") or data.get("authCookies"))
+    info: Dict[str, Any] = {
+        "present": bool(data.get("accessToken") or data.get("bearerToken")),
+        "retrieved_at": data.get("retrievedAt") or data.get("savedAt"),
+        "captured_by": data.get("capturedBy"),
+        "has_refresh": bool(data.get("refreshToken")),
+    }
     for key, label in (("accessToken", "access"), ("refreshToken", "refresh")):
-        if data.get(key):
-            exp = _jwt_exp(data[key])
+        token_val = data.get(key) or (data.get("bearerToken") if key == "accessToken" else None)
+        if token_val:
+            exp = _jwt_exp(token_val)
+            left_m = round((exp - _now()).total_seconds() / 60, 1) if exp else None
             info[f"{label}_expires_at"] = exp.isoformat() if exp else None
-            info[f"{label}_minutes_left"] = round((exp - _now()).total_seconds() / 60, 1) if exp else None
+            info[f"{label}_minutes_left"] = left_m
     return info
 
 
@@ -94,6 +113,21 @@ def _live_check(platform: str, token: Optional[str] = None) -> Dict[str, Any]:
                 "http_status": 200 if info else 500,
                 "detail": f"Access PaySuite DDCMS v3 answered normally (Client: {client.client_code})" if info else "Empty response"
             }
+        except Exception as e:
+            return {"ok": False, "detail": str(e)[:200]}
+
+    if platform in ("launchgood_rethink", "launchgood_iqra"):
+        cid = "rethink" if "rethink" in platform else "iqra"
+        try:
+            from core.launchgood_client import LaunchGoodClient
+            client = LaunchGoodClient(company_id=cid)
+            if not client.is_configured():
+                return {"ok": False, "detail": f"LaunchGood session not configured for {cid.title()}"}
+            user_info = client.get_current_user()
+            if not _lg_signed_in(user_info):
+                return {"ok": False, "http_status": 401, "detail": "LaunchGood answered as a signed-out guest - the saved session has expired"}
+            name = (user_info.get("result") or {}).get("name") or "Connected"
+            return {"ok": True, "http_status": 200, "detail": f"LaunchGood API answered normally ({name})"}
         except Exception as e:
             return {"ok": False, "detail": str(e)[:200]}
 
@@ -128,6 +162,16 @@ def _service_state(name: str) -> Dict[str, Any]:
         return {"name": name, "active": active, "since": since}
     except Exception as e:
         return {"name": name, "active": "unknown", "detail": str(e)[:120]}
+
+
+def _lg_signed_in(user_info: Dict[str, Any]) -> bool:
+    """LaunchGood answers /user/currentUser with 200 even when signed out - then the result holds only site settings
+    (application, environment, currencies...) and no user. Only a result with the user's own fields is signed in."""
+    res = (user_info or {}).get("result") or {}
+    return isinstance(res, dict) and any(k in res for k in ("id", "userId", "user_id", "email", "user", "firstName", "first_name", "name", "accounts"))
+
+
+LG_CAPTURE_HINT = "paste LaunchGood's `refreshToken` (browser > F12 > Application > Local storage) in Ops > Sessions, or run `node scripts/capture_platform_session.js {platform}` on your PC"
 
 
 def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[str, Any]:
@@ -188,7 +232,7 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
 
         out = {
             "platform": "paysuite",
-            "name": "Access PaySuite (Direct Debit)",
+            "name": "Access PaySuite (Rethink)",
             "state": state,
             "issues": issues,
             "token": {"present": configured, "captured_by": "API Key (.env)"},
@@ -199,6 +243,172 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
             if not out["live_check"]["ok"]:
                 out["state"] = "down"
                 out["issues"].append(f"Live API check failed ({out['live_check'].get('http_status', 'error')})")
+        return out
+
+    if platform in ("stripe", "stripe_rethink"):
+        from core.stripe_accounts import is_connected, stripe_key
+        configured = is_connected("rethink")
+        issues: List[str] = []
+        state = "ok" if configured else "down"
+        if not configured:
+            issues.append("RETHINK_STRIPE_SECRET_KEY missing in .env")
+
+        last_sync = None
+        # The ledger poll's own health record (runs every minute); the payout report time is shown separately
+        sync_data = dict((health.get("stripe") or {}) if isinstance(health, dict) else {})
+        try:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=2.0)
+            row = conn.execute("""
+                SELECT MAX(created_at) FROM stripe_payout_reports WHERE LOWER(COALESCE(company_id, 'rethink')) = 'rethink'
+            """).fetchone()
+            if row and row[0]:
+                last_sync = row[0]
+                sync_data["last_payout_reconciled_at"] = last_sync
+
+            unassigned_count = conn.execute("""
+                SELECT COUNT(*) FROM platform_campaign_mappings 
+                WHERE platform = 'stripe' AND LOWER(COALESCE(company_id, 'rethink')) = 'rethink'
+                  AND UPPER(TRIM(COALESCE(code, ''))) IN ('', 'UNASSIGNED', 'NONE', 'NAN')
+            """).fetchone()[0]
+            if unassigned_count > 0:
+                issues.append(f"{unassigned_count} Stripe link(s) need classification")
+            conn.close()
+        except Exception:
+            pass
+
+        out = {
+            "platform": "stripe_rethink",
+            "name": "Stripe (Rethink)",
+            "state": state,
+            "issues": issues,
+            "token": {"present": configured, "captured_by": "API Key (.env)"},
+            "sync": sync_data
+        }
+        if live and configured:
+            try:
+                import stripe
+                stripe.api_key = stripe_key("rethink")
+                stripe.Balance.retrieve()
+                out["live_check"] = {"ok": True, "detail": "Stripe API reachable, credentials valid"}
+            except Exception as e:
+                out["live_check"] = {"ok": False, "detail": str(e)[:120]}
+                out["state"] = "down"
+                out["issues"].append(f"Live Stripe check failed: {str(e)[:80]}")
+        return out
+
+    if platform in ("launchgood_rethink", "launchgood_iqra"):
+        cid = "rethink" if "rethink" in platform else "iqra"
+        from core.launchgood_accounts import get_session, is_connected, get_account_id
+        session = get_session(cid)
+        configured = is_connected(cid)
+        account_id = get_account_id(cid)
+        issues: List[str] = []
+        token_info = {"present": configured}
+        
+        hint = LG_CAPTURE_HINT.format(platform=platform)
+        if not configured:
+            if cid == "iqra":
+                state = "not_configured"
+                issues.append(f"Not set up: Iqra's LaunchGood donations come from uploaded files. To sync them automatically, {hint}.")
+            else:
+                state = "down"
+                issues.append(f"No LaunchGood session saved - {hint}.")
+        else:
+            from core.launchgood_session import session_state
+            st = session_state(cid)
+            token_info["captured_at"] = (session or {}).get("savedAt")
+            token_info["renewed_at"] = st.get("renewed_at")
+            token_info["has_refresh"] = bool(st["has_refresh"]) and not st.get("renew_failed")
+            a_left = st.get("access_left_s")
+            token_info["access_minutes_left"] = round(a_left / 60, 1) if a_left is not None else None
+            refresh_ok = token_info["has_refresh"] and (st.get("refresh_left_s") is None or st["refresh_left_s"] > 0)
+            r_left = st.get("refresh_left_s")
+            if token_info["has_refresh"] and r_left:
+                token_info["refresh_expires_at"] = (_now() + datetime.timedelta(seconds=r_left)).isoformat()
+                if 0 < r_left < 25 * 86400:  # each renewal issues a fresh 30-day token: < 25 days left means renewals stopped
+                    issues.append(f"LaunchGood renewals have stopped - the saved sign-in ends in {int(r_left // 86400)} days {int(r_left % 86400 // 3600)} h. Check the error below, or paste a fresh refreshToken.")
+            if a_left is not None and a_left > 0:
+                state = "ok"
+                token_info["status_text"] = "Active (renews itself)" if refresh_ok else f"{int(a_left // 60)} min left"
+                if not refresh_ok:
+                    issues.append(f"This session can't renew itself, so it stops in {int(a_left // 60)} min. For a lasting connection, {hint}.")
+            elif refresh_ok:
+                state = "warning"
+                token_info["status_text"] = "Renewing"
+                issues.append("The 15-minute access token ran out; the sync service renews it on its next cycle (within a minute).")
+            else:
+                state = "down"
+                token_info["status_text"] = "Signed out"
+                when = ""
+                exp = _jwt_exp((session or {}).get("bearerToken") or "")
+                if exp:
+                    when = f" since {exp.strftime('%d %b %H:%M')} UTC"
+                why = " (LaunchGood refused the renewal)" if st.get("renew_failed") else ""
+                issues.append(f"Signed out of LaunchGood{when}{why} - donations aren't syncing. To reconnect, {hint}.")
+
+        last_sync = None
+        sync_data = {}
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=1.0)
+            row = conn.execute("""
+                SELECT MAX("Created Date (UTC)"), MAX("Created Time (UTC)")
+                FROM donations 
+                WHERE company_id = ? 
+                  AND (Platform = 'LaunchGood' OR Source LIKE '%LaunchGood%')
+                  AND "Created Date (UTC)" LIKE '20%'
+            """, (cid,)).fetchone()
+            if row and row[0] and "nan" not in str(row[0]).lower():
+                d_val = str(row[0]).strip()
+                t_val = str(row[1] or "00:00:00").strip()
+                sync_data["last_ingested_at"] = f"{d_val}T{t_val}Z"
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        h = health.get(platform, {}) if isinstance(health, dict) else {}
+        if isinstance(h, dict) and h:
+            for k, v in h.items():
+                if v is not None:
+                    if k == "last_ingested_at" and (not v or str(v).lower() in ("nan", "none", "")):
+                        continue
+                    sync_data[k] = v
+            if h.get("last_ok_at"):
+                last_sync = h["last_ok_at"]
+                sync_data["last_ok_at"] = h["last_ok_at"]
+            elif h.get("last_sync_at"):
+                last_sync = h["last_sync_at"]
+                sync_data["last_sync_at"] = h["last_sync_at"]
+            if configured and state == "ok" and h.get("consecutive_failures", 0) >= 3:
+                state = "warning"
+                issues.append(f"Donation sync failed {h['consecutive_failures']} times in a row: {h.get('last_error') or ''}".strip())
+
+        out = {
+            "platform": platform,
+            "name": f"LaunchGood ({cid.title()})",
+            "state": state,
+            "issues": issues,
+            "token": token_info,
+            "sync": sync_data
+        }
+        if live and configured:
+            try:
+                from core.launchgood_client import LaunchGoodClient
+                client = LaunchGoodClient(company_id=cid)
+                user_info = client.get_current_user()
+                if not _lg_signed_in(user_info):
+                    raise RuntimeError("LaunchGood answered as a signed-out guest (session expired)")
+                name = (user_info.get("result") or {}).get("name") or "Connected"
+                out["live_check"] = {"ok": True, "detail": f"LaunchGood API connected ({name})"}
+            except Exception as e:
+                out["live_check"] = {"ok": False, "detail": str(e)[:120]}
+                out["state"] = "down"
+                out["issues"].append(f"Live API check failed: {str(e)[:80]}")
         return out
 
     h = health.get(platform, {}) if isinstance(health, dict) else {}
@@ -240,21 +450,29 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
         try:
             cid = "rethink" if "rethink" in platform else "iqra"
             src = "givebrite" if "givebrite" in platform else "madinah"
-            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=2.0)
+            conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=1.0)
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
+                SELECT MAX("Created Date (UTC)"), MAX("Created Time (UTC)")
                 FROM donations
-                WHERE company_id = ? AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
+                WHERE company_id = ? AND Source LIKE ?
             """, (cid, f"%{src}%"))
             row = cursor.fetchone()
             if row and row[0] and "nan" not in str(row[0]).lower():
-                sync_data["last_ingested_at"] = row[0]
+                d_val = str(row[0]).strip()
+                t_val = str(row[1] or "00:00:00").strip()
+                sync_data["last_ingested_at"] = f"{d_val}T{t_val}Z"
             conn.close()
         except Exception:
             pass
 
-    out = {"platform": platform, "state": state, "issues": issues, "token": token, "sync": sync_data}
+    platform_names = {
+        "givebrite_iqra": "GiveBrite (Iqra)",
+        "givebrite_rethink": "GiveBrite (Rethink)",
+        "madinah": "Madinah (Iqra)",
+    }
+    p_name = platform_names.get(platform, platform)
+    out = {"platform": platform, "name": p_name, "state": state, "issues": issues, "token": token, "sync": sync_data}
     if live:
         out["live_check"] = _live_check(platform)
         if not out["live_check"]["ok"]:
@@ -267,8 +485,18 @@ def _outlook_status() -> List[Dict[str, Any]]:
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute("SELECT company_id, connected_email, refresh_token, token_expiry, subscription_expiration "
-                            "FROM sponsorship_outlook_auth").fetchall()
+        from backend.api.mailbox import _gmail_row, provider
+        rows = [dict(r) for r in conn.execute("SELECT company_id, connected_email, refresh_token, token_expiry, subscription_expiration "
+                                              "FROM sponsorship_outlook_auth").fetchall()]
+        have = {r["company_id"] for r in rows}
+        rows += [{"company_id": c, "connected_email": None, "refresh_token": None, "subscription_expiration": None}
+                 for c in ("rethink", "iqra") if c not in have]
+        for r in rows:  # a charity on Gmail: show its Gmail mailbox instead
+            r["provider"] = provider(r["company_id"])
+            if r["provider"] == "gmail":
+                g = _gmail_row(r["company_id"])
+                r.update(connected_email=g["connected_email"] if g else None, refresh_token=g["refresh_token"] if g else None,
+                         subscription_expiration=None, last_error=g["last_error"] if g else None)
         out = []
         for r in rows:
             last_send = conn.execute(
@@ -276,7 +504,8 @@ def _outlook_status() -> List[Dict[str, Any]]:
                 "AND event IN ('email.sent', 'email.failed') ORDER BY ts DESC LIMIT 1", (r["company_id"],)).fetchone() \
                 if conn.execute("SELECT name FROM sqlite_master WHERE name = 'app_event_logs'").fetchone() else None
             out.append({
-                "company_id": r["company_id"], "connected": bool(r["refresh_token"]),
+                "company_id": r["company_id"], "provider": r["provider"], "connected": bool(r["refresh_token"]),
+                "last_error": r.get("last_error"),
                 "mailbox": r["connected_email"], "subscription_expires": r["subscription_expiration"],
                 "last_send": dict(last_send) if last_send else None,
                 "state": "ok" if r["refresh_token"] else "down",
@@ -290,7 +519,7 @@ def _outlook_status() -> List[Dict[str, Any]]:
 def ops_status(live: bool = Query(False)):
     health = _read_json(HEALTH_FILE)
     sync = _read_json(SYNC_FILE)
-    platforms = [_platform_status(p, health, live) for p in ("givebrite_iqra", "givebrite_rethink", "madinah", "paysuite")]
+    platforms = [_platform_status(p, health, live) for p in ("givebrite_iqra", "givebrite_rethink", "madinah", "paysuite", "stripe_rethink", "launchgood_rethink", "launchgood_iqra")]
     services = [_service_state("platform-sync.service")]
     for s in services:
         if s["active"] != "active":
@@ -298,8 +527,9 @@ def ops_status(live: bool = Query(False)):
                 p["state"] = "down"
                 p["issues"].insert(0, "platform-sync service is not running")
     errors_24h = query_local(level="error", since=(_now() - datetime.timedelta(hours=24)).isoformat(), limit=1)["total"]
-    overall = "down" if any(p["state"] == "down" for p in platforms) else (
-        "warning" if any(p["state"] == "warning" for p in platforms) else "ok")
+    active_platforms = [p for p in platforms if p.get("state") != "not_configured"]
+    overall = "down" if any(p["state"] == "down" for p in active_platforms) else (
+        "warning" if any(p["state"] == "warning" for p in active_platforms) else "ok")
     return {
         "checked_at": _now().isoformat(),
         "overall": overall,
@@ -352,13 +582,75 @@ def ops_logs(category: Optional[str] = None, level: Optional[str] = None, compan
 
 
 class SessionUpload(BaseModel):
-    accessToken: str
+    accessToken: Optional[str] = ""  # LaunchGood: may be left empty when a refresh token is given
     refreshToken: Optional[str] = None
     account: Optional[str] = None
     source: Optional[str] = "manual-capture"
+    rawCookie: Optional[str] = None
+    # LaunchGood: the browser's cookies for *.launchgood.com (including httpOnly ones from the sign-in site),
+    # [{name, value, domain}] - what a future automatic renewal needs
+    cookies: Optional[List[Dict[str, Any]]] = None
 
 
-SESSION_PLATFORMS = ["givebrite_iqra", "givebrite_rethink", "madinah"]
+def _launchgood_candidate(existing: Dict[str, Any], access: str, payload: "SessionUpload") -> Dict[str, Any]:
+    """A captured LaunchGood session in the format core/launchgood_client reads (bearerToken + browser headers +
+    cookie header). The old Authorization/Cookie headers are dropped - keeping them sent the expired token."""
+    headers = {k: v for k, v in (existing.get("headers") or {}).items() if k.lower() not in ("authorization", "cookie")}
+    headers["authorization"] = access
+    # a new sign-in replaces the old session entirely: its refresh token and renewal notes no longer apply
+    cand = {k: v for k, v in existing.items() if k not in ("headers", "bearerToken", "rawCookie", "refreshToken",
+                                                           "renewedAt", "renewFailedAt", "renewFailedDetail")}
+    cand.update({"bearerToken": access, "accessToken": access, "headers": headers, "savedAt": _now().strftime("%Y-%m-%dT%H:%M:%SZ")})
+    jar = [c for c in (payload.cookies or []) if isinstance(c, dict) and c.get("name") and "launchgood.com" in str(c.get("domain") or "")]
+    if payload.rawCookie and payload.rawCookie.strip():
+        raw = payload.rawCookie.strip()
+        headers["cookie"] = raw
+        cand["rawCookie"] = raw
+    elif jar:
+        site = [c for c in jar if not str(c.get("domain") or "").lstrip(".").startswith("auth.")]
+        raw = "; ".join(f"{c['name']}={c.get('value', '')}" for c in site)
+        headers["cookie"] = raw
+        cand["rawCookie"] = raw
+        cand["authCookies"] = [{"name": c["name"], "value": c.get("value", ""), "domain": c.get("domain")}
+                               for c in jar if str(c.get("domain") or "").lstrip(".").startswith("auth.")]
+    elif existing.get("rawCookie"):
+        cand["rawCookie"] = existing["rawCookie"]
+        headers["cookie"] = existing["rawCookie"]
+        cand["rawCookie"] = existing["rawCookie"]
+    if payload.refreshToken:
+        cand["refreshToken"] = payload.refreshToken.replace("Bearer ", "").strip()
+    # the site cookie "token" carries the access JWT too: an old one there would contradict the new header
+    raw = cand.get("rawCookie") or ""
+    if "token=" in raw:
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+        raw = "; ".join(f"token={access.replace('Bearer ', '')}" if p.split("=", 1)[0] == "token" else p for p in parts)
+        cand["rawCookie"] = raw
+        headers["cookie"] = raw
+    return cand
+
+
+def _launchgood_check(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Verifies a candidate LaunchGood session itself (not the saved one): signed in, not a guest."""
+    headers = dict(candidate.get("headers") or {})
+    headers.setdefault("Accept", "application/json, text/plain, */*")
+    headers.setdefault("Origin", "https://www.launchgood.com")
+    headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    try:
+        r = requests.post("https://www.launchgood.com/api/user/currentUser", headers=headers, json={}, timeout=20)
+    except requests.RequestException as e:
+        return {"ok": False, "detail": str(e)[:160]}
+    if r.status_code != 200:
+        return {"ok": False, "http_status": r.status_code, "detail": r.text[:160]}
+    try:
+        info = r.json()
+    except ValueError:
+        return {"ok": False, "http_status": 200, "detail": "Unexpected reply"}
+    if not _lg_signed_in(info):
+        return {"ok": False, "http_status": 401, "detail": "LaunchGood treated this session as signed out"}
+    return {"ok": True, "http_status": 200}
+
+
+SESSION_PLATFORMS = ["givebrite_iqra", "givebrite_rethink", "madinah", "launchgood_rethink", "launchgood_iqra"]
 
 
 @router.get("/platform-sessions")
@@ -374,7 +666,61 @@ def upload_session(platform: str, payload: SessionUpload, user: dict = Depends(r
         platform = "givebrite_iqra"
     if platform not in TOKEN_FILES:
         raise HTTPException(status_code=404, detail="Unknown platform")
-    access = payload.accessToken.strip()
+    access = (payload.accessToken or "").strip()
+    if platform.startswith("launchgood"):
+        # Whatever was pasted (one token, both, a JSON blob, a whole localStorage dump): pick out LaunchGood's JWTs
+        # and tell them apart by their "type" claim. An access token alone lasts 15 minutes - saving it is what kept
+        # signing the CRM out - so without a refresh token the paste is refused with directions.
+        blob = " ".join(x for x in (payload.accessToken, payload.refreshToken) if x)
+        found_access, found_refresh = None, None
+        for tok in re.findall(r"eyJ[\w-]+\.[\w-]+\.[\w-]+", blob):
+            claims = _jwt_claims(tok)
+            if "launchgood" not in str(claims.get("iss", "")):
+                continue
+            kind = str(claims.get("type") or "").lower()
+            if kind == "refresh" or (kind != "access" and "refresh" in str(claims.get("jti", ""))):
+                found_refresh = tok
+            elif kind == "access":
+                found_access = tok
+        if found_refresh:
+            payload.refreshToken = found_refresh
+        elif payload.refreshToken and _jwt_claims(payload.refreshToken).get("type") == "access":
+            payload.refreshToken = None  # an access token pasted into the refresh box
+        if not (payload.refreshToken and payload.refreshToken.strip()):
+            raise HTTPException(status_code=400, detail=(
+                "That's LaunchGood's 15-minute access token - on its own the CRM is signed out again within 15 minutes. "
+                "Paste the refreshToken instead: on launchgood.com press F12 > Console, run  copy(localStorage.refreshToken)  "
+                "and paste here." if found_access or access else "Paste LaunchGood's refreshToken (see the steps above)."))
+        access = found_access or access
+    if platform.startswith("launchgood") and payload.refreshToken and payload.refreshToken.strip():
+        # LaunchGood's access token only lives 15 minutes: with the refresh token (browser > Local Storage >
+        # "refreshToken") we get a fresh one now, and the sync service keeps renewing it from then on
+        from core.launchgood_session import renew_with_refresh_token
+        try:
+            new_access, new_refresh = renew_with_refresh_token(payload.refreshToken, (_read_json(TOKEN_FILES[platform]).get("headers") or {}))
+        except (ValueError, requests.RequestException) as e:
+            if "firewall" in str(e) or isinstance(e, requests.RequestException):
+                # Cloudflare is only holding the request for a while: keep the refresh token (it is still valid) and
+                # let the sync service finish the renewal on its next cycles - no need to paste it again
+                existing = _read_json(TOKEN_FILES[platform])
+                rt = payload.refreshToken.replace("Bearer ", "").strip()
+                pending = {k: v for k, v in existing.items() if k not in ("refreshToken", "renewedAt", "renewFailedAt", "renewFailedDetail")}
+                pending.update({"refreshToken": rt, "savedAt": _now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "capturedBy": f"{user.get('email')} via {payload.source} (renewal pending)"})
+                fd_path = f"{TOKEN_FILES[platform]}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+                fd = os.open(fd_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(pending, f, indent=2)
+                os.replace(fd_path, TOKEN_FILES[platform])
+                log_event("session.uploaded", category="session", actor=user.get("email"), platform=platform, has_refresh=True,
+                          source=payload.source, message=f"{platform} refresh token saved; renewal pending (LaunchGood firewall)")
+                return {"status": "pending", "platform": platform, "has_refresh": True, "verified": False,
+                        "message": "Saved. LaunchGood's firewall is holding requests for a moment, so the CRM will finish connecting by itself within a few minutes - no need to paste again."}
+            raise HTTPException(status_code=400, detail=f"{e}. Copy the refreshToken again from a browser where you're signed in to LaunchGood.")
+        access = new_access
+        payload.refreshToken = new_refresh or payload.refreshToken.replace("Bearer ", "").strip()
+    if not access:
+        raise HTTPException(status_code=400, detail="Paste the access token" + (" or the refresh token" if platform.startswith("launchgood") else "") + ".")
     access = access if access.startswith("Bearer ") else f"Bearer {access}"
     exp = _jwt_exp(access)
     if not exp or exp <= _now():
@@ -387,6 +733,24 @@ def upload_session(platform: str, payload: SessionUpload, user: dict = Depends(r
     # Verify before overwriting the working session.
     path = TOKEN_FILES[platform]
     existing = _read_json(path)
+    if platform.startswith("launchgood"):
+        candidate = _launchgood_candidate(existing, access, payload)
+        candidate["capturedBy"] = f"{user.get('email')} via {payload.source}"
+        check = _launchgood_check(candidate)
+        if not check["ok"]:
+            log_event("session.upload_rejected", category="session", level="warning", actor=user.get("email"),
+                      platform=platform, http_status=check.get("http_status"), detail=check.get("detail"))
+            raise HTTPException(status_code=400, detail=f"{platform} rejected that session ({check.get('http_status')}): {check.get('detail')}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd_path = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+        fd = os.open(fd_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(candidate, f, indent=2)
+        os.replace(fd_path, path)
+        log_event("session.uploaded", category="session", actor=user.get("email"), platform=platform, expires_at=exp.isoformat(),
+                  has_refresh=bool(candidate.get("refreshToken") or candidate.get("authCookies")), source=payload.source)
+        return {"status": "success", "platform": platform, "access_expires_at": exp.isoformat(), "verified": True,
+                "auth_cookies": [c["name"] for c in candidate.get("authCookies") or []], "has_refresh": bool(candidate.get("refreshToken"))}
     candidate = dict(existing)
     candidate.update({"accessToken": access, "retrievedAt": _now().isoformat(),
                       "capturedBy": f"{user.get('email')} via {payload.source}"})
@@ -429,3 +793,91 @@ def ops_cache_clear(user: dict = Depends(require_super_admin)):
     log_event("cache.cleared", category="performance", level="warning", actor=user.get("email"),
               message="Response cache cleared from the ops console")
     return {"status": "success"}
+
+
+# ---------------------------------------------------------------------------
+# 1-Click Browser Bookmarklet & Direct CSV Sync Helper Routes
+# ---------------------------------------------------------------------------
+class BookmarkletPayload(BaseModel):
+    accessToken: str
+    rawCookie: Optional[str] = None
+    refreshToken: Optional[str] = None
+    syncKey: Optional[str] = None
+    source: Optional[str] = "bookmarklet-1click"
+
+
+@sync_router.post("/{platform}")
+def sync_helper_upload(platform: str, payload: BookmarkletPayload, request: Request):
+    """Receives active session tokens pushed by the 1-click LaunchGood browser bookmarklet."""
+    expected_key = os.environ.get("LAUNCHGOOD_SYNC_KEY", "lg_sync_rethink_2026_crm")
+    auth_header = request.headers.get("Authorization", "")
+    is_valid_key = bool(payload.syncKey and payload.syncKey.strip() == expected_key)
+
+    if not is_valid_key and not auth_header:
+        raise HTTPException(status_code=401, detail="Invalid sync key or missing authentication")
+
+    platform = platform.lower()
+    if platform not in TOKEN_FILES:
+        raise HTTPException(status_code=404, detail="Unknown platform")
+
+    access = (payload.accessToken or "").strip()
+    access = access if access.startswith("Bearer ") else f"Bearer {access}"
+    exp = _jwt_exp(access)
+    if not exp or exp <= _now():
+        raise HTTPException(status_code=400, detail="Provided token is not a valid or unexpired JWT")
+
+    path = TOKEN_FILES[platform]
+    existing = _read_json(path)
+    # Reuse candidate builder so headers & cookies are formatted consistently
+    dummy_upload = SessionUpload(
+        accessToken=access,
+        refreshToken=payload.refreshToken,
+        rawCookie=payload.rawCookie,
+        source=payload.source
+    )
+    candidate = _launchgood_candidate(existing, access, dummy_upload)
+    candidate["capturedBy"] = f"1-Click Bookmarklet via {payload.source}"
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd_path = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+    fd = os.open(fd_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(candidate, f, indent=2)
+    os.replace(fd_path, path)
+
+    cid = "rethink" if "rethink" in platform else "iqra"
+    try:
+        from core.cache import invalidate_data_cache
+        invalidate_data_cache(cid)
+    except Exception:
+        pass
+
+    log_event("session.bookmarklet_synced", category="session", level="info",
+              platform=platform, expires_at=exp.isoformat(), source=payload.source)
+    return {
+        "ok": True,
+        "status": "success",
+        "platform": platform,
+        "access_expires_at": exp.isoformat(),
+        "message": "LaunchGood session synced successfully to CRM"
+    }
+
+
+@sync_router.post("/csv/{company_id}")
+async def sync_helper_csv(company_id: str, request: Request):
+    """Directly ingests LaunchGood donor export CSV downloaded by browser."""
+    expected_key = os.environ.get("LAUNCHGOOD_SYNC_KEY", "lg_sync_rethink_2026_crm")
+    key_hdr = request.headers.get("X-Sync-Key") or request.query_params.get("sync_key")
+    auth_hdr = request.headers.get("Authorization", "")
+    if key_hdr != expected_key and not auth_hdr:
+        raise HTTPException(status_code=401, detail="Invalid sync key")
+
+    body = await request.body()
+    csv_text = body.decode("utf-8", errors="replace")
+    if not csv_text.strip():
+        raise HTTPException(status_code=400, detail="Empty CSV body")
+
+    from core.launchgood_sync import ingest_launchgood_csv_text
+    res = ingest_launchgood_csv_text(csv_text, company_id)
+    return res
+

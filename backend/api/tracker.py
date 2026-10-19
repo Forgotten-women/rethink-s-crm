@@ -7,6 +7,7 @@ import threading
 import json
 import uuid
 import sqlite3
+import html
 import datetime
 import logging
 import requests
@@ -226,6 +227,12 @@ def _ensure_tracker_tables_migrated():
                 INSERT OR IGNORE INTO sponsorship_alert_settings (company_id, threshold_days, staff_emails, digest_frequency)
                 VALUES (?, 30, '', 'weekly')
             """, (cid,))
+        # Which overdue records the automatic digest lists (the Overdue Alerts filters, saved)
+        if "digest_filters" not in {r[1] for r in cur.execute("PRAGMA table_info(sponsorship_alert_settings)")}:
+            try:
+                cur.execute("ALTER TABLE sponsorship_alert_settings ADD COLUMN digest_filters TEXT")
+            except sqlite3.OperationalError:
+                pass  # added by the other worker
 
         # 6. sponsorship_alert_dismissals table (for false positives / dismissals)
         cur.execute("""
@@ -497,13 +504,111 @@ class TemplateUpdateRequest(BaseModel):
     subject: str
     body_html: str
     company_id: Optional[str] = "rethink"
+    builder_json: Optional[Any] = None  # the email builder's document (blocks); body_html is rendered from it
+
+
+def _ensure_template_builder_columns(conn) -> None:
+    for col in ("builder_json", "legacy_html"):
+        try:
+            conn.execute(f"ALTER TABLE sponsorship_email_templates ADD COLUMN {col} TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # already there (or another worker just added it)
 
 class UpdateAlertSettingsRequest(BaseModel):
     company_id: Optional[str] = "rethink"
     threshold_days: int = 30
     staff_emails: Optional[str] = ""
-    digest_frequency: Optional[str] = "weekly"
+    digest_frequency: Optional[str] = "weekly"  # daily | weekly | monthly | off
+    digest_filters: Optional[Dict[str, Any]] = None  # None = keep the saved ones, {} = everyone
     user_role: Optional[str] = "admin"
+
+
+DIGEST_FILTER_KEYS = ("sponsorship_type", "target_status", "classification", "severity", "search", "earned_from", "earned_to",
+                      "last_gift_from", "last_gift_to", "max_days", "min_slots", "min_amount", "max_amount")
+
+
+def _clean_digest_filters(f: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {k: v for k, v in (f or {}).items() if k in DIGEST_FILTER_KEYS and v not in (None, "") and str(v).lower() != "all"}
+
+
+def _last_digest_slot(freq: str, now: datetime.datetime) -> Optional[datetime.datetime]:
+    """Most recent scheduled send time (UTC) at or before now: daily 08:00, Mondays 08:00, the 1st at 08:00."""
+    slot = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if freq == "daily":
+        return slot if slot <= now else slot - datetime.timedelta(days=1)
+    if freq == "weekly":
+        slot -= datetime.timedelta(days=slot.weekday())
+        return slot if slot <= now else slot - datetime.timedelta(days=7)
+    if freq == "monthly":
+        slot = slot.replace(day=1)
+        if slot > now:
+            prev = (slot - datetime.timedelta(days=1)).replace(day=1)
+            slot = prev
+        return slot
+    return None
+
+
+def _next_digest_at(freq: str, now: datetime.datetime) -> Optional[str]:
+    last = _last_digest_slot(freq, now)
+    if not last:
+        return None
+    if freq == "daily":
+        nxt = last + datetime.timedelta(days=1)
+    elif freq == "weekly":
+        nxt = last + datetime.timedelta(days=7)
+    else:
+        nxt = (last.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+    return nxt.isoformat(timespec="minutes") + "Z"
+
+
+def run_scheduled_overdue_digests() -> Dict[str, Any]:
+    """Background: send each charity's overdue digest when its schedule is due, with its saved filters, from its own
+    mailbox. Only the first scheduled time AFTER the settings were saved counts, so saving never sends at once."""
+    now = datetime.datetime.utcnow()
+    out: Dict[str, Any] = {}
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM sponsorship_alert_settings")]
+    finally:
+        conn.close()
+    for r in rows:
+        comp = str(r.get("company_id") or "").lower()
+        freq = str(r.get("digest_frequency") or "weekly").lower()
+        if freq not in ("daily", "weekly", "monthly") or not str(r.get("staff_emails") or "").strip():
+            continue
+        slot = _last_digest_slot(freq, now)
+        since = str(r.get("last_digest_sent_at") or r.get("updated_at") or "")[:19].replace("T", " ")
+        try:
+            since_dt = datetime.datetime.strptime(since, "%Y-%m-%d %H:%M:%S") if since else None
+        except ValueError:
+            since_dt = None
+        if not slot or (since_dt and since_dt >= slot) or (now - slot) > datetime.timedelta(hours=20):
+            continue  # not due, already sent for this slot, or the slot is long gone (don't send a stale one late)
+        from backend.api.mailbox import is_connected as _mailbox_connected
+        if not _mailbox_connected(comp):
+            out[comp] = "mailbox not connected"
+            continue
+        try:
+            f = json.loads(r.get("digest_filters") or "{}") or {}
+        except ValueError:
+            f = {}
+        try:
+            res = send_overdue_digest(SendOverdueDigestRequest(company_id=comp, saved_filters=True, **_digest_request_filters(f)))
+            out[comp] = res.get("status")
+            log_event("email.overdue_digest_scheduled", category="email", company_id=comp, frequency=freq,
+                      status=res.get("status"), message=f"Scheduled {freq} overdue digest for {comp}: {res.get('status')}")
+        except Exception as e:
+            out[comp] = f"error: {e}"
+    return out
+
+
+def _digest_request_filters(f: Dict[str, Any]) -> Dict[str, Any]:
+    f = _clean_digest_filters(f)
+    top = {k: f[k] for k in ("sponsorship_type", "target_status", "classification", "severity", "search") if k in f}
+    top["filters"] = {k: v for k, v in f.items() if k not in top}
+    return top
 
 class SendOverdueDigestRequest(BaseModel):
     company_id: Optional[str] = "rethink"
@@ -511,6 +616,14 @@ class SendOverdueDigestRequest(BaseModel):
     recipient_emails: Optional[str] = None
     dry_run: Optional[bool] = False
     user_role: Optional[str] = "admin"
+    # the Overdue Alerts screen's filters: the digest lists exactly what the team sees on screen
+    sponsorship_type: Optional[str] = None
+    target_status: Optional[str] = None
+    classification: Optional[str] = None
+    severity: Optional[str] = None
+    search: Optional[str] = None
+    filters: Optional[Dict[str, Any]] = None  # earned_from/to, last_gift_from/to, max_days, min_slots, min_amount, max_amount
+    saved_filters: Optional[bool] = False  # use the filters saved for the automatic digest instead of the ones sent
 
 class DismissOverdueRequest(BaseModel):
     company_id: Optional[str] = "rethink"
@@ -3854,6 +3967,10 @@ def _get_valid_graph_token(company_id: str) -> str:
 def get_outlook_status(company_id: Optional[str] = Query("rethink")):
     """Returns Microsoft 365 / Outlook connection status, connected email, and subscription state."""
     comp = (company_id or "rethink").strip().lower()
+    from backend.api.mailbox import _owner, provider, is_connected, sender_address
+    if provider(_owner(comp)) == "gmail":  # this charity sends with Gmail: same shape, so every screen's "connected" check works
+        return {"provider": "gmail", "connected": is_connected(_owner(comp)), "connected_email": sender_address(_owner(comp)),
+                "client_id_set": True, "tenant_id": None, "subscription_active": False, "subscription_expiration": None}
     auth = _get_outlook_auth_row(comp)
     if not auth:
         return {
@@ -4169,9 +4286,14 @@ def preview_email(payload: EmailPreviewRequest):
     """Renders exactly what one donor would receive (same code path as sending)."""
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
-        return render_email_for_donor(conn.cursor(), payload.allocation_id, payload.allocation_donor_id,
-                                      payload.template_type or "profile_intro", payload.company_id,
-                                      payload.subject_template, payload.body_template)
+        out = render_email_for_donor(conn.cursor(), payload.allocation_id, payload.allocation_donor_id,
+                                     payload.template_type or "profile_intro", payload.company_id,
+                                     payload.subject_template, payload.body_template)
+        if isinstance(out, dict) and out.get("body_html") and out.get("recipient_email"):
+            from backend.api.unsubscribe import add_footer, is_unsubscribed  # the Unsubscribe button, as sent
+            out["body_html"] = add_footer(out["body_html"], out.get("company_id") or payload.company_id, out["recipient_email"])
+            out["unsubscribed"] = is_unsubscribed(out.get("company_id") or payload.company_id, out["recipient_email"])
+        return out
     finally:
         conn.close()
 
@@ -4185,7 +4307,8 @@ def _public_base_url(request: Request) -> str:
     return base_url
 
 
-def _prepare_outgoing_html(raw_body: str, tracking_pixel_url: str) -> str:
+def _prepare_outgoing_html(raw_body: str, tracking_pixel_url: str, company_id: Optional[str] = None,
+                           recipient_email: Optional[str] = None, tracking_id: Optional[str] = None) -> str:
     pixel = (f'<div style="display:none;max-height:0px;overflow:hidden;"><img src="{tracking_pixel_url}" width="1" height="1" '
              f'style="display:none;width:1px;height:1px;border:0;outline:none;" alt="" /></div>')
     body = re.sub(r'src=["\']data:image/[^;]+;base64,[^"\']+["\']', f'src="{_RETHINK_EMAIL_LOGO_URI}"', (raw_body or "").strip())
@@ -4193,6 +4316,9 @@ def _prepare_outgoing_html(raw_body: str, tracking_pixel_url: str) -> str:
         body = re.sub(r'(<img[^>]*alt="Sisters\' Project"[^>]*src=")[^"]*(")', r'\1' + _SP_LOGO_URI + r'\2', body)
     if "alt=\"IQRA\"" in body:
         body = re.sub(r'(<img[^>]*alt="IQRA"[^>]*src=")[^"]*(")', r'\1' + _IQRA_EMAIL_LOGO_URI + r'\2', body)
+    if company_id and recipient_email:  # the Unsubscribe button (backend/api/unsubscribe.py)
+        from backend.api.unsubscribe import add_footer
+        body = add_footer(body, company_id, recipient_email, tracking_id)
     return body.replace("</body>", f"{pixel}</body>") if "</body>" in body else f"{body}{pixel}"
 
 
@@ -4213,26 +4339,23 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
                   placeholders=rendered["unresolved_placeholders"], **log_ctx)
         return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed",
                 "detail": "Unknown placeholders: " + ", ".join(rendered["unresolved_placeholders"])}
-    access_token = _get_valid_graph_token(comp)
-    auth = _get_outlook_auth_row(comp)
-    sender_email = auth["connected_email"] if auth and auth["connected_email"] else "me"
+    from backend.api.unsubscribe import is_unsubscribed
+    if is_unsubscribed(comp, to_email):
+        log_event("email.skipped", level="warning", message=f"{to_email} has unsubscribed - not emailed", **log_ctx)
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "skipped",
+                "detail": "Unsubscribed from emails"}
+    from backend.api.mailbox import is_connected, provider, send_email
+    if not is_connected(comp):
+        raise HTTPException(status_code=400, detail=f"{comp.title()}'s {'Gmail' if provider(comp) == 'gmail' else 'Microsoft 365'} mailbox isn't connected - connect it in Email > Mailbox.")
     tracking_id = str(uuid.uuid4())
-    html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}")
-    res = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers={
-        "Authorization": f"Bearer {access_token}", "Content-Type": "application/json"
-    }, json={
-        "message": {
-            "subject": rendered["subject"].strip(),
-            "body": {"contentType": "HTML", "content": html},
-            "toRecipients": [{"emailAddress": {"address": to_email, "name": rendered["recipient_name"]}}],
-        },
-        "saveToSentItems": "true",
-    }, timeout=15)
-    if res.status_code not in (200, 202):
-        log_event("email.failed", level="error", message=f"Graph sendMail HTTP {res.status_code} to {to_email}",
-                  http_status=res.status_code, detail=res.text[:300], mailbox=sender_email, **log_ctx)
-        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed",
-                "detail": f"Microsoft Graph sendMail error: {res.text[:300]}"}
+    html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}",
+                                  comp, to_email, tracking_id)
+    sent = send_email(comp, [(to_email, rendered["recipient_name"])], rendered["subject"].strip(), html)
+    sender_email = sent.get("sender") or "me"
+    if not sent["ok"]:
+        log_event("email.failed", level="error", message=f"Send failed ({sent.get('http_status')}) to {to_email}",
+                  http_status=sent.get("http_status"), detail=sent["detail"][:300], mailbox=sender_email, **log_ctx)
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed", "detail": sent["detail"][:300]}
 
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
@@ -4241,9 +4364,10 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
             INSERT INTO sponsorship_communications (
                 allocation_id, allocation_donor_id, template_type, company_id, direction, message_id, thread_id,
                 subject, body, sender_email, recipient_email, tracking_id, delivery_status, open_count, sent_at
-            ) VALUES (?, ?, ?, ?, 'outbound', ?, '', ?, ?, ?, ?, ?, 'delivered', 0, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, 'outbound', ?, ?, ?, ?, ?, ?, ?, 'delivered', 0, CURRENT_TIMESTAMP)
         """, (allocation_id, rendered["allocation_donor_id"], rendered["template_type"], comp,
-              f"graph_{int(time.time()*1000)}_{rendered['allocation_donor_id']}", rendered["subject"].strip(),
+              sent.get("message_id") or f"graph_{int(time.time()*1000)}_{rendered['allocation_donor_id']}",
+              sent.get("thread_id") or "", rendered["subject"].strip(),
               rendered["body_html"], sender_email, to_email, tracking_id))
         comm_id = cur.lastrowid
         cur.execute("""
@@ -4466,9 +4590,10 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
     theme_owner = _owner_company(payload.company_id) if payload.company_id else comp
     if theme_owner != comp:
         raise HTTPException(status_code=400, detail=f"Theme '{payload.company_id}' cannot be used for a {comp} sponsorship.")
-    access_token = _get_valid_graph_token(comp)
-    auth = _get_outlook_auth_row(comp)
-    sender_email = auth["connected_email"] if auth and auth["connected_email"] else "me"
+    from backend.api.mailbox import is_connected, sender_address, send_email
+    if not is_connected(comp):
+        raise HTTPException(status_code=400, detail=f"{comp.title()}'s mailbox isn't connected - connect it in Email > Mailbox.")
+    sender_email = sender_address(comp) or "me"
 
     recipients_raw = payload.recipient_email.replace(";", ",").split(",")
     to_recipients_list = []
@@ -4514,34 +4639,21 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
     if "alt=\"IQRA\"" in raw_body:
         raw_body = re.sub(r'(<img[^>]*alt="IQRA"[^>]*src=")[^"]*(")', r'\1' + _IQRA_EMAIL_LOGO_URI + r'\2', raw_body)
 
+    if len(to_recipients_list) == 1:  # the Unsubscribe button (one person per link)
+        from backend.api.unsubscribe import add_footer
+        raw_body = add_footer(raw_body, comp, to_recipients_list[0]["emailAddress"]["address"], tracking_id)
     if "</body>" in raw_body:
         email_body_with_pixel = raw_body.replace("</body>", f"{tracking_pixel_html}</body>")
     else:
         email_body_with_pixel = f"{raw_body}{tracking_pixel_html}"
 
-    send_payload = {
-        "message": {
-            "subject": payload.subject.strip(),
-            "body": {
-                "contentType": "HTML",
-                "content": email_body_with_pixel
-            },
-            "toRecipients": to_recipients_list
-        },
-        "saveToSentItems": "true"
-    }
-
-    send_url = "https://graph.microsoft.com/v1.0/me/sendMail"
-    res = requests.post(send_url, headers={
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }, json=send_payload, timeout=15)
-
-    if res.status_code not in (200, 202):
+    sent = send_email(comp, [(r["emailAddress"]["address"], r["emailAddress"].get("name")) for r in to_recipients_list],
+                      payload.subject.strip(), email_body_with_pixel)
+    if not sent["ok"]:
         log_event("email.failed", category="email", level="error", company_id=comp, allocation_id=payload.allocation_id,
-                  recipient=payload.recipient_email, http_status=res.status_code, detail=res.text[:300],
-                  message=f"Graph sendMail HTTP {res.status_code} (legacy single send)")
-        raise HTTPException(status_code=400, detail=f"Microsoft Graph sendMail Error: {res.text}")
+                  recipient=payload.recipient_email, http_status=sent.get("http_status"), detail=sent["detail"][:300],
+                  message=f"Send failed ({sent.get('http_status')}) (legacy single send)")
+        raise HTTPException(status_code=400, detail=sent["detail"])
     log_event("email.sent", category="email", company_id=comp, allocation_id=payload.allocation_id,
               recipient=payload.recipient_email, template=payload.template_type, subject=payload.subject,
               mailbox=sender_email, tracking_id=tracking_id, message=f"Sent (legacy single send) to {payload.recipient_email}")
@@ -4559,8 +4671,8 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
         """, (
             payload.allocation_id,
             comp,
-            f"graph_{int(time.time()*1000)}",
-            "",
+            sent.get("message_id") or f"graph_{int(time.time()*1000)}",
+            sent.get("thread_id") or "",
             payload.subject.strip(),
             payload.body_html.strip(),
             sender_email,
@@ -4713,6 +4825,9 @@ def renew_outlook_subscription(company_id: Optional[str] = Query("rethink"), cur
 def test_send_outlook_message(payload: OutlookTestEmailRequest, request: Request, current_user = Depends(require_super_admin)):
     """Dispatches a test verification email via Microsoft Graph API. Super Admin only."""
     comp = (payload.company_id or "rethink").strip().lower()
+    from backend.api.mailbox import TestSend, mailbox_test_send, provider
+    if provider(comp) == "gmail":
+        return mailbox_test_send(TestSend(company_id=comp, recipient_email=payload.recipient_email or ""), current_user)
     access_token = _get_valid_graph_token(comp)
     auth = _get_outlook_auth_row(comp)
     sender_email = auth["connected_email"] if auth and auth["connected_email"] else "office@rethinkcharity.org.uk"
@@ -4932,6 +5047,44 @@ def _backfill_conversation_ids(company_id: str) -> Dict[str, Any]:
     return {"status": "ok", "pending": len(pending), "matched": matched}
 
 
+def _record_direct_reply(cur, company_id: str, msg_id: str, conv_id: str, subject: str, body_preview: str,
+                         sender_email: str, received_at: Optional[str]) -> bool:
+    """A reply to an email sent from the Email section / Donors (crm_email_messages) rather than a sponsorship
+    email: recorded in crm_email_replies so the donor's thread is complete. It belongs to the direct email when
+    that is the latest thing we sent this person before the reply and the reply isn't in a sponsorship
+    conversation. Returns True when newly recorded, "recorded" when it already was, False when it isn't one."""
+    sender = (sender_email or "").strip().lower()
+    if not sender or not msg_id:
+        return False
+    try:
+        if cur.execute("SELECT 1 FROM crm_email_replies WHERE company_id = ? AND message_id = ?", (company_id, msg_id)).fetchone():
+            return "recorded"
+        when = str(received_at or "").replace("T", " ").replace("Z", "")[:19] or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        if conv_id and cur.execute("""SELECT 1 FROM sponsorship_communications WHERE company_id = ? AND direction = 'outbound'
+                                      AND thread_id = ? LIMIT 1""", (company_id, conv_id)).fetchone():
+            return False  # a reply in a sponsorship email's conversation
+        direct = cur.execute("""SELECT id, REPLACE(sent_at, 'T', ' ') FROM crm_email_messages
+                                WHERE company_id = ? AND LOWER(recipient_email) = ? AND status = 'sent'
+                                  AND REPLACE(sent_at, 'T', ' ') <= ? ORDER BY sent_at DESC LIMIT 1""",
+                             (company_id, sender, when)).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    if not direct:
+        return False
+    spons = cur.execute("""SELECT MAX(REPLACE(sent_at, 'T', ' ')) FROM sponsorship_communications WHERE company_id = ?
+                           AND direction = 'outbound' AND LOWER(TRIM(recipient_email)) = ? AND REPLACE(sent_at, 'T', ' ') <= ?""",
+                        (company_id, sender, when)).fetchone()[0]
+    if spons and spons > direct[1]:
+        return False  # the latest email they got was a sponsorship one
+    cur.execute("""INSERT OR IGNORE INTO crm_email_replies (company_id, message_id, conversation_id, reply_to_id, sender_email,
+                                                       subject, body_preview, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (company_id, msg_id, conv_id, direct[0], sender, subject, body_preview, when))
+    cur.execute("UPDATE crm_email_messages SET replied_at = COALESCE(replied_at, ?) WHERE id = ?", (when, direct[0]))
+    log_event("email.reply_received", category="email", company_id=company_id, sender=sender, subject=subject,
+              message=f"Reply from {sender} (direct email)")
+    return True
+
+
 def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subject: str, body_preview: str,
                           sender_email: str, recipient_email: str, received_at: Optional[str]) -> bool:
     """Logs one inbound reply (once per message id) and marks only the outbound email that donor
@@ -4939,6 +5092,9 @@ def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subje
     if cur.execute("SELECT 1 FROM sponsorship_communications WHERE message_id = ? AND company_id = ?",
                    (msg_id, company_id)).fetchone():
         return False
+    direct = _record_direct_reply(cur, company_id, msg_id, conv_id, subject, body_preview, sender_email, received_at)
+    if direct:
+        return direct is True
     alloc_id, alloc_donor_id = _match_reply_sender(cur, company_id, sender_email, conv_id, received_at)
     if not alloc_id:
         return False
@@ -5032,6 +5188,14 @@ def run_mailbox_maintenance() -> Dict[str, Any]:
         companies = []
     finally:
         conn.close()
+    from backend.api.mailbox import gmail_companies, provider, sync_gmail_replies
+    companies = [c for c in companies if provider(c) == "outlook"]
+    for comp in gmail_companies():  # Gmail mailboxes: no webhook - pull new replies (read-only)
+        try:
+            r = sync_gmail_replies(comp)
+            out[comp] = {"provider": "gmail", "replies": r.get("status"), **({"new_replies": r["synced_new_replies"]} if r.get("synced_new_replies") else {})}
+        except Exception as e:
+            out[comp] = {"provider": "gmail", "replies": f"error: {e}"}
     for comp in companies:
         result = {}
         for name, fn in (("subscription", lambda: ensure_outlook_subscription(comp)),
@@ -5050,9 +5214,10 @@ def run_mailbox_maintenance() -> Dict[str, Any]:
 
 @router.post("/outlook/sync-replies")
 def trigger_sync_replies(company_id: Optional[str] = Query("rethink"), current_user = Depends(get_current_user)):
-    """On-demand sync of recent donor replies from Microsoft 365 Inbox."""
+    """On-demand sync of recent donor replies from the charity's mailbox (Microsoft 365 or Gmail)."""
     comp = (company_id or "rethink").strip().lower()
-    return sync_inbound_outlook_replies(comp)
+    from backend.api.mailbox import sync_replies
+    return sync_replies(comp)
 # ==========================================
 # 9. TEMPLATES & COMMUNICATIONS HISTORY
 # ==========================================
@@ -5742,6 +5907,7 @@ def get_email_templates(company_id: Optional[str] = Query("rethink"), charity_th
     try:
         cur = conn.cursor()
         
+        _ensure_template_builder_columns(conn)
         # 1. Purge legacy Forgotten Women templates completely
         cur.execute("""
             DELETE FROM sponsorship_email_templates 
@@ -5787,7 +5953,7 @@ def get_email_templates(company_id: Optional[str] = Query("rethink"), charity_th
         # 3. Query templates
         if selected_theme and selected_theme in allowed_themes:
             cur.execute("""
-                SELECT id, company_id, template_type, subject, body_html 
+                SELECT id, company_id, template_type, subject, body_html, builder_json
                 FROM sponsorship_email_templates 
                 WHERE LOWER(company_id) = ?
                 ORDER BY id ASC
@@ -5795,7 +5961,7 @@ def get_email_templates(company_id: Optional[str] = Query("rethink"), charity_th
         else:
             placeholders = ",".join("?" for _ in allowed_themes)
             cur.execute(f"""
-                SELECT id, company_id, template_type, subject, body_html 
+                SELECT id, company_id, template_type, subject, body_html, builder_json
                 FROM sponsorship_email_templates 
                 WHERE LOWER(company_id) IN ({placeholders})
                 ORDER BY CASE LOWER(company_id) WHEN ? THEN 0 ELSE 1 END, id ASC
@@ -5804,6 +5970,10 @@ def get_email_templates(company_id: Optional[str] = Query("rethink"), charity_th
         rows = []
         for r in cur.fetchall():
             d = dict(r)
+            try:
+                d["builder_json"] = json.loads(d["builder_json"]) if d.get("builder_json") else None
+            except (TypeError, ValueError):
+                d["builder_json"] = None
             cid = str(d.get("company_id", "")).lower()
             if cid == "sp_rethink":
                 d["charity_theme"] = "sp"
@@ -5854,14 +6024,25 @@ def update_email_template(payload: TemplateUpdateRequest):
     comp = (payload.company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
+        _ensure_template_builder_columns(conn)
         cur = conn.cursor()
+        builder = payload.builder_json
+        if builder is not None and not isinstance(builder, str):
+            builder = json.dumps(builder, separators=(",", ":"))
+        if builder and len(builder) > 2_000_000:
+            raise HTTPException(status_code=400, detail="This template is too large to save.")
+        # the first time a template is saved from the builder, keep its original HTML (legacy_html) to roll back to
         cur.execute("""
-            INSERT INTO sponsorship_email_templates (company_id, template_type, subject, body_html)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO sponsorship_email_templates (company_id, template_type, subject, body_html, builder_json)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(company_id, template_type) DO UPDATE SET
+                legacy_html = COALESCE(sponsorship_email_templates.legacy_html,
+                                       CASE WHEN sponsorship_email_templates.builder_json IS NULL AND excluded.builder_json IS NOT NULL
+                                            THEN sponsorship_email_templates.body_html END),
                 subject = excluded.subject,
-                body_html = excluded.body_html
-        """, (comp, payload.template_type.strip(), payload.subject.strip(), payload.body_html.strip()))
+                body_html = excluded.body_html,
+                builder_json = excluded.builder_json
+        """, (comp, payload.template_type.strip(), payload.subject.strip(), payload.body_html.strip(), builder))
         conn.commit()
         log_event("template.saved", category="template", company_id=_owner_company(comp), theme=comp,
                   template=payload.template_type, subject=payload.subject,
@@ -6380,6 +6561,40 @@ def get_overdue_summary(
     }
 
 
+def _overdue_extra_filters(rows: List[Dict[str, Any]], amount_key: str, earned_from=None, earned_to=None, last_gift_from=None,
+                           last_gift_to=None, max_days=None, min_slots=None, min_amount=None, max_amount=None) -> List[Dict[str, Any]]:
+    """Overdue alerts: when the slot was earned (eligible_since), last gift date, waiting at most N days, minimum
+    unallocated slots and amount range. Dates compare as YYYY-MM-DD text."""
+    def val(x):
+        x = _unwrap_param(x, None)
+        return None if x in (None, "") else x
+    ef, et, lf, lt = (str(val(v))[:10] if val(v) else None for v in (earned_from, earned_to, last_gift_from, last_gift_to))
+    md, ms, mn, mx = (val(v) for v in (max_days, min_slots, min_amount, max_amount))
+    out = []
+    for r in rows:
+        earned = str(r.get("eligible_since") or r.get("oldest_donation_date") or "")[:10]
+        last = str(r.get("latest_donation_date") or "")[:10]
+        amount = float(r.get(amount_key) or 0)
+        if ef and (not earned or earned < ef):
+            continue
+        if et and (not earned or earned > et):
+            continue
+        if lf and (not last or last < lf):
+            continue
+        if lt and (not last or last > lt):
+            continue
+        if md is not None and int(r.get("waiting_days") or 0) > int(md):
+            continue
+        if ms is not None and int(r.get("remaining_slots") or 0) < int(ms):
+            continue
+        if mn is not None and amount < float(mn):
+            continue
+        if mx is not None and amount > float(mx):
+            continue
+        out.append(r)
+    return out
+
+
 @router.get("/overdue-donors")
 def get_overdue_donors(
     company_id: Optional[str] = Query("rethink"),
@@ -6392,7 +6607,15 @@ def get_overdue_donors(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=50000),
     all_records: Optional[bool] = Query(False),
-    force_refresh: Optional[bool] = Query(False)
+    force_refresh: Optional[bool] = Query(False),
+    earned_from: Optional[str] = Query(None, description="slot earned on/after (YYYY-MM-DD)"),
+    earned_to: Optional[str] = Query(None),
+    last_gift_from: Optional[str] = Query(None),
+    last_gift_to: Optional[str] = Query(None),
+    max_days: Optional[int] = Query(None, description="waiting at most this many days"),
+    min_slots: Optional[int] = Query(None),
+    min_amount: Optional[float] = Query(None),
+    max_amount: Optional[float] = Query(None),
 ):
     comp = _unwrap_param(company_id, "rethink").strip().lower()
     raw_days = _unwrap_param(min_days, 30)
@@ -6422,6 +6645,8 @@ def get_overdue_donors(
 
     if sev and sev.lower() != "all":
         all_donors = [d for d in all_donors if d.get("severity") == sev.lower().strip()]
+    all_donors = _overdue_extra_filters(all_donors, "total_donated", earned_from, earned_to, last_gift_from, last_gift_to,
+                                        max_days, min_slots, min_amount, max_amount)
 
     total = len(all_donors)
     if all_rec:
@@ -6461,7 +6686,15 @@ def get_overdue_campaigns(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=50000),
     all_records: Optional[bool] = Query(False),
-    force_refresh: Optional[bool] = Query(False)
+    force_refresh: Optional[bool] = Query(False),
+    earned_from: Optional[str] = Query(None, description="slot earned on/after (YYYY-MM-DD)"),
+    earned_to: Optional[str] = Query(None),
+    last_gift_from: Optional[str] = Query(None),
+    last_gift_to: Optional[str] = Query(None),
+    max_days: Optional[int] = Query(None, description="waiting at most this many days"),
+    min_slots: Optional[int] = Query(None),
+    min_amount: Optional[float] = Query(None),
+    max_amount: Optional[float] = Query(None),
 ):
     comp = _unwrap_param(company_id, "rethink").strip().lower()
     raw_days = _unwrap_param(min_days, 30)
@@ -6491,6 +6724,8 @@ def get_overdue_campaigns(
 
     if sev and sev.lower() != "all":
         all_campaigns = [c for c in all_campaigns if c.get("severity") == sev.lower().strip()]
+    all_campaigns = _overdue_extra_filters(all_campaigns, "total_raised", earned_from, earned_to, last_gift_from, last_gift_to,
+                                           max_days, min_slots, min_amount, max_amount)
 
     total = len(all_campaigns)
     if all_rec:
@@ -6593,7 +6828,7 @@ def get_overdue_settings(company_id: Optional[str] = Query("rethink")):
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
-        cur.execute("SELECT company_id, threshold_days, staff_emails, digest_frequency, last_digest_sent_at FROM sponsorship_alert_settings WHERE company_id = ?", (comp,))
+        cur.execute("SELECT company_id, threshold_days, staff_emails, digest_frequency, last_digest_sent_at, digest_filters FROM sponsorship_alert_settings WHERE company_id = ?", (comp,))
         row = cur.fetchone()
         if not row:
             return {
@@ -6601,9 +6836,21 @@ def get_overdue_settings(company_id: Optional[str] = Query("rethink")):
                 "threshold_days": 30,
                 "staff_emails": "",
                 "digest_frequency": "weekly",
-                "last_digest_sent_at": None
+                "last_digest_sent_at": None,
+                "digest_filters": {},
+                "next_digest_at": None,
             }
-        return dict(row)
+        out = dict(row)
+        try:
+            out["digest_filters"] = _clean_digest_filters(json.loads(out.get("digest_filters") or "{}"))
+        except ValueError:
+            out["digest_filters"] = {}
+        out["staff_emails"] = out.get("staff_emails") or ""
+        freq = str(out.get("digest_frequency") or "weekly").lower()
+        out["next_digest_at"] = _next_digest_at(freq, datetime.datetime.utcnow()) if out["staff_emails"].strip() else None
+        from backend.api.mailbox import is_connected as _mailbox_connected
+        out["mailbox_connected"] = _mailbox_connected(comp)
+        return out
     finally:
         conn.close()
 
@@ -6614,6 +6861,9 @@ def update_overdue_settings(payload: UpdateAlertSettingsRequest):
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
+        freq = (payload.digest_frequency or "weekly").strip().lower()
+        if freq not in ("daily", "weekly", "monthly", "off"):
+            raise HTTPException(status_code=400, detail="Digest frequency must be daily, weekly, monthly or off.")
         cur.execute("""
             INSERT INTO sponsorship_alert_settings (company_id, threshold_days, staff_emails, digest_frequency, updated_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -6622,7 +6872,10 @@ def update_overdue_settings(payload: UpdateAlertSettingsRequest):
                 staff_emails = excluded.staff_emails,
                 digest_frequency = excluded.digest_frequency,
                 updated_at = CURRENT_TIMESTAMP
-        """, (comp, payload.threshold_days, payload.staff_emails.strip(), payload.digest_frequency.strip()))
+        """, (comp, payload.threshold_days, (payload.staff_emails or "").strip(), freq))
+        if payload.digest_filters is not None:
+            cur.execute("UPDATE sponsorship_alert_settings SET digest_filters = ? WHERE company_id = ?",
+                        (json.dumps(_clean_digest_filters(payload.digest_filters)), comp))
         conn.commit()
         return {"status": "success", "message": f"Successfully updated alert settings for {comp.upper()}!"}
     finally:
@@ -6636,7 +6889,7 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
-        cur.execute("SELECT threshold_days, staff_emails FROM sponsorship_alert_settings WHERE company_id = ?", (comp,))
+        cur.execute("SELECT threshold_days, staff_emails, digest_filters FROM sponsorship_alert_settings WHERE company_id = ?", (comp,))
         set_row = cur.fetchone()
     finally:
         conn.close()
@@ -6651,8 +6904,34 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
             detail="No recipient emails configured. Please provide staff recipient email(s) in settings or in request."
         )
 
-    donors = _get_all_overdue_donors_data(company_id=comp, min_days=threshold)
-    campaigns = _get_all_overdue_campaigns_data(company_id=comp, min_days=threshold)
+    if payload.saved_filters:  # the automatic digest's own saved filters (also "Send Digest Now" / preview in its settings)
+        try:
+            saved = json.loads((set_row["digest_filters"] if set_row and "digest_filters" in set_row.keys() else None) or "{}") or {}
+        except ValueError:
+            saved = {}
+        payload = (payload.model_copy if hasattr(payload, "model_copy") else payload.copy)(update=_digest_request_filters(saved))
+    sel = dict(sponsorship_type=payload.sponsorship_type or "all", target_status=payload.target_status or "all",
+               classification=payload.classification if payload.classification and payload.classification != "all" else None,
+               search=(payload.search or "").strip() or None)
+    donors = _get_all_overdue_donors_data(company_id=comp, min_days=threshold, **sel)
+    campaigns = _get_all_overdue_campaigns_data(company_id=comp, min_days=threshold, **sel)
+    sev = (payload.severity or "all").strip().lower()
+    if sev != "all":
+        donors = [d for d in donors if d.get("severity") == sev]
+        campaigns = [c for c in campaigns if c.get("severity") == sev]
+    extra = {k: v for k, v in (payload.filters or {}).items()
+             if k in ("earned_from", "earned_to", "last_gift_from", "last_gift_to", "max_days", "min_slots", "min_amount", "max_amount")
+             and v not in (None, "")}
+    donors = _overdue_extra_filters(donors, "total_donated", **extra)
+    campaigns = _overdue_extra_filters(campaigns, "total_raised", **extra)
+    labels = {"earned_from": "slot earned from", "earned_to": "slot earned to", "last_gift_from": "last gift from",
+              "last_gift_to": "last gift to", "max_days": "waiting at most (days)", "min_slots": "unallocated slots ≥",
+              "min_amount": "amount ≥ £", "max_amount": "amount ≤ £"}
+    applied = [f"{k.replace('_', ' ')}: {v}" for k, v in (("program", sel["sponsorship_type"]), ("target", sel["target_status"]),
+                                                          ("source", sel["classification"]), ("severity", sev), ("search", sel["search"]))
+               if v and str(v).lower() != "all"] + [f"{labels[k]} {v}" for k, v in extra.items()]
+    filters_html = (f'<p style="margin: 6px 0 0 0; font-size: 12px; opacity: 0.9;">Filtered: {html.escape(" · ".join(applied))}</p>'
+                    if applied else "")
 
     total_donors = len(donors)
     total_campaigns = len(campaigns)
@@ -6711,6 +6990,7 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
             <div style="background: {brand_color}; padding: 24px 28px; color: #ffffff;">
                 <h2 style="margin: 0 0 6px 0; font-size: 20px; font-weight: 700;">⚠️ Sponsorship SLA Alert: Overdue Beneficiary Allocations</h2>
                 <p style="margin: 0; font-size: 13px; opacity: 0.9;">{brand_title} • Generated on {now_str} • Threshold: {threshold}+ Days</p>
+                {filters_html}
             </div>
 
             <!-- Content Area -->
@@ -6808,57 +7088,37 @@ def send_overdue_digest(payload: SendOverdueDigestRequest):
             "html_preview": body_html
         }
 
-    # Attempt Live Email Sending via Outlook Graph API if available
+    # Send from the charity's own mailbox (Gmail or Microsoft 365)
     email_sent = False
     error_msg = None
     try:
-        graph_access_token = _get_valid_graph_token(comp)
+        from backend.api.mailbox import send_email
+        sent = send_email(comp, [(r, None) for r in recipients],
+                          f"⚠️ [{brand_title}] Sponsorship SLA Alert: {total_donors} Donors Overdue Allocation ({threshold}+ Days)", body_html)
+        email_sent = bool(sent["ok"])
+        if not email_sent:
+            error_msg = sent["detail"]
     except HTTPException as e:
-        graph_access_token = None
         error_msg = e.detail
+    except Exception as e:
+        error_msg = str(e)
 
-    if graph_access_token:
-        try:
-            to_recipients_list = [{"emailAddress": {"address": r}} for r in recipients]
-            send_payload = {
-                "message": {
-                    "subject": f"⚠️ [{brand_title}] Sponsorship SLA Alert: {total_donors} Donors Overdue Allocation ({threshold}+ Days)",
-                    "body": {
-                        "contentType": "HTML",
-                        "content": body_html
-                    },
-                    "toRecipients": to_recipients_list
-                },
-                "saveToSentItems": "true"
-            }
-            send_res = requests.post(
-                "https://graph.microsoft.com/v1.0/me/sendMail",
-                headers={
-                    "Authorization": f"Bearer {graph_access_token}",
-                    "Content-Type": "application/json"
-                },
-                json=send_payload,
-                timeout=15
-            )
-            if send_res.status_code in (200, 202):
-                email_sent = True
-            else:
-                error_msg = f"Graph API error: {send_res.text}"
-        except Exception as e:
-            error_msg = str(e)
-
-    # Update last_digest_sent_at in database
-    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    # Update last_digest_sent_at in database. The email has already gone out by now, so a busy database must not
+    # turn it into an error (the sender would retry and the team would get the digest twice).
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE sponsorship_alert_settings
-            SET last_digest_sent_at = CURRENT_TIMESTAMP
-            WHERE company_id = ?
-        """, (comp,))
-        conn.commit()
-    finally:
-        conn.close()
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE sponsorship_alert_settings
+                SET last_digest_sent_at = CURRENT_TIMESTAMP
+                WHERE company_id = ?
+            """, (comp,))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Overdue digest ({comp}) sent={email_sent} but last_digest_sent_at not saved: {e}")
 
     return {
         "status": "success" if email_sent else ("warning" if not graph_access_token else "error"),
@@ -6943,7 +7203,13 @@ def _clean(v) -> str:
 
 def _consent_for_row(row: pd.Series) -> Optional[str]:
     """Marketing consent per platform rules: GiveBrite 'optin' (CSV/webhook), Madinah hidden donor = No /
-    shown = Yes (inferred), otherwise the 'Marketing Consent' column. None when unknown."""
+    shown = Yes (inferred), otherwise the 'Marketing Consent' column. None when unknown.
+    Someone who pressed Unsubscribe in one of our emails is always No."""
+    em = _clean(row.get("Email")).lower()
+    if em:
+        from backend.api.unsubscribe import is_unsubscribed
+        if is_unsubscribed(_clean(row.get("company_id")).lower() or "rethink", em):
+            return "No"
     platform = _clean(row.get("Platform")).lower()
     optin = _clean(row.get("optin")).lower()
     if platform in ("givebright", "givebrite") and optin in ("true", "false"):

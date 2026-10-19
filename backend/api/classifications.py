@@ -401,11 +401,20 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
                 from core.data_processor import sanitize_df_dtypes_for_parquet
                 df_raw = sanitize_df_dtypes_for_parquet(df_raw)
                 df_raw.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
+                # SQLite: update this code's donations in place (it used to delete every donation of the charity and
+                # re-insert the in-memory copy - unsafe; see core/data_processor.sync_matrix_classifications_to_donors)
+                vals = {"Department": dept, "Office": off, "Portfolio": port, "Heading": dept, "Sub-Heading": off, "Country": cntry,
+                        "Zakat Eligibility": zkt, "Programme Fund": prog_fund, "Fund Code": f_code}
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
-                conn.execute("DELETE FROM donations WHERE LOWER(COALESCE(company_id, 'rethink')) = ?", (comp,))
-                df_raw[comp_mask].to_sql("donations", con=conn, if_exists="append", index=False, chunksize=5000)
-                conn.commit()
-                conn.close()
+                try:
+                    have = {r[1] for r in conn.execute("PRAGMA table_info(donations)")}
+                    vals = {k: v for k, v in vals.items() if k in have}
+                    with conn:
+                        conn.execute(f"""UPDATE donations SET {", ".join(f'"{k}" = ?' for k in vals)}
+                                         WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND UPPER(TRIM(Code)) = ?""",
+                                     (*vals.values(), comp, clean_code))
+                finally:
+                    conn.close()
     except Exception as e:
         print(f"Error cascading master code to donations: {e}")
 
@@ -1231,6 +1240,7 @@ def delete_single_rule(payload: DeleteRuleRequest):
     cname = sanitize_text(payload.campaign_name.strip())
     gl_name = sanitize_text((payload.giving_level or "").strip())
     code = sanitize_text(payload.code.strip()) if payload.code else None
+    platform = str(getattr(payload, "platform", "") or "").strip().lower()
     plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
 
     with _DB_LOCK:
@@ -1239,9 +1249,9 @@ def delete_single_rule(payload: DeleteRuleRequest):
             with conn:
                 del_sql = "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ?"
                 del_params = [comp, plat_db, cname.lower()]
-                if gl_name:
-                    del_sql += " AND LOWER(COALESCE(giving_level, '')) = ?"
-                    del_params.append(gl_name.lower())
+                # Only the row asked for: a campaign's default (no giving level) rule must not take its giving levels with it
+                del_sql += " AND LOWER(COALESCE(giving_level, '')) = ?"
+                del_params.append(gl_name.lower())
                 if code and code.lower() not in ["", "none", "nan", "unassigned"]:
                     del_sql += " AND LOWER(code) = ?"
                     del_params.append(code.lower())

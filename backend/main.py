@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, stripe_payouts, stream, tracker, webhooks, donor_email
+from backend.api import admin, auth, cache_versions, classifications, donors, events, expenses, filters, fundraisers, ltv, metrics, overview, ops, payouts, stripe_payouts, stream, tracker, webhooks, donor_email, unsubscribe, mailbox
 
 app = FastAPI(
     title="Crowdfunding Analytics & Enterprise CRM API",
@@ -87,6 +87,7 @@ async def audit_log_middleware(request, call_next):
 from fastapi import Depends as _Depends
 _GUARDED = [_Depends(auth.api_access_guard)]
 app.include_router(ops.router)
+app.include_router(ops.sync_router)
 app.include_router(cache_versions.router, dependencies=_GUARDED)
 app.include_router(auth.router)
 app.include_router(metrics.router, dependencies=_GUARDED)
@@ -105,6 +106,9 @@ app.include_router(payouts.router, dependencies=_GUARDED)
 app.include_router(stripe_payouts.router, dependencies=_GUARDED)
 app.include_router(fundraisers.router, dependencies=_GUARDED)
 app.include_router(webhooks.router)
+app.include_router(unsubscribe.public_router)  # the Unsubscribe button in emails: public, HMAC-signed links
+app.include_router(unsubscribe.router, dependencies=_GUARDED)
+app.include_router(mailbox.router, dependencies=_GUARDED)  # which mailbox each charity sends from + Gmail
 
 # Mount logos directory for branded email assets
 logos_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache", "logos")
@@ -183,6 +187,7 @@ async def startup_event():
 
     # 4c. Outlook: renew reply webhooks, learn sent-email threads, pull replies (every 5 minutes)
     asyncio.get_running_loop().create_task(_mailbox_maintenance_loop())
+    asyncio.get_running_loop().create_task(_overdue_digest_loop())
 
     # 4d. Nightly database backup (02:30 UTC): verified snapshot, local copies + Supabase Storage when configured
     asyncio.get_running_loop().create_task(_nightly_backup_loop())
@@ -232,6 +237,26 @@ async def _donations_reconcile_loop():
         await asyncio.sleep(60)
 
 
+async def _overdue_digest_loop():
+    """Automatic overdue digests (Sponsorship Tracker > Overdue Alerts settings): checked every 10 minutes by one
+    worker; each charity's digest goes out at its scheduled time with its saved filters."""
+    import asyncio
+    from core.cache import try_exclusive
+    from backend.api.tracker import run_scheduled_overdue_digests
+    await asyncio.sleep(150)
+    lock = try_exclusive("overdue_digest")
+    if lock is None:
+        return
+    while True:
+        try:
+            result = await asyncio.to_thread(run_scheduled_overdue_digests)
+            if result:
+                print(f"[Overdue Digest] {result}")
+        except Exception as dg_err:
+            print(f"[Overdue Digest Notice]: {dg_err}")
+        await asyncio.sleep(600)
+
+
 async def _mailbox_maintenance_loop():
     import asyncio
     from core.cache import try_exclusive
@@ -247,7 +272,7 @@ async def _mailbox_maintenance_loop():
                 print(f"[Mailbox Maintenance] {result}")
         except Exception as mb_err:
             print(f"[Mailbox Maintenance Notice]: {mb_err}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)  # replies show in a donor's thread within about a minute
 
 
 async def _nightly_backup_loop():

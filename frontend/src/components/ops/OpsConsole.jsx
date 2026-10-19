@@ -2,15 +2,22 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   X, Activity, ScrollText, KeyRound, RefreshCw, Loader2, CheckCircle2,
   AlertTriangle, XCircle, ChevronDown, ChevronRight, Radio, Upload,
-  Database, Trash2, Copy, Check, Terminal
+  Database, Trash2, Copy, Check, Terminal, Bookmark, Zap, ExternalLink
 } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 
 const STATE_STYLE = {
   ok: { cls: 'text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900', Icon: CheckCircle2, label: 'Working' },
   warning: { cls: 'text-amber-700 bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900', Icon: AlertTriangle, label: 'Needs attention' },
-  down: { cls: 'text-rose-700 bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-900', Icon: XCircle, label: 'Not working' }
+  down: { cls: 'text-rose-700 bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-900', Icon: XCircle, label: 'Not working' },
+  not_configured: { cls: 'text-slate-600 bg-slate-100 dark:bg-slate-800 dark:text-slate-300 border-slate-200 dark:border-slate-700', Icon: AlertTriangle, label: 'Not set up' }
 };
+const ISSUE_CLS = { down: 'text-rose-700 dark:text-rose-300', warning: 'text-amber-700 dark:text-amber-300', ok: 'text-amber-700 dark:text-amber-300', not_configured: 'text-slate-600 dark:text-slate-300' };
+// `command` in an issue becomes a copyable code chip
+const IssueText = ({ text }) => String(text).split(/(`[^`]+`)/).map((part, i) => (part.startsWith('`') && part.endsWith('`')
+  ? <code key={i} className="px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 font-mono text-[10.5px] break-all select-all">{part.slice(1, -1)}</code>
+  : <span key={i}>{part}</span>));
+const OLD_ISSUE_MS = 24 * 60 * 60 * 1000;
 
 const LEVEL_CLS = {
   info: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
@@ -146,7 +153,7 @@ function CodeBlock({ json, title = 'JSON Payload' }) {
 
 function StateBadge({ state }) {
   const s = STATE_STYLE[state] || STATE_STYLE.warning;
-  return <span className={`px-2.5 py-0.5 rounded-full border text-[11px] font-bold inline-flex items-center gap-1 ${s.cls}`}><s.Icon className="w-3 h-3" />{s.label}</span>;
+  return <span className={`px-2.5 py-0.5 rounded-full border text-[11px] font-bold inline-flex items-center gap-1 shrink-0 whitespace-nowrap ${s.cls}`}><s.Icon className="w-3 h-3" />{s.label}</span>;
 }
 
 function StatusTab() {
@@ -178,45 +185,86 @@ function StatusTab() {
       {error && <div className="p-3 rounded-xl bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300 border border-rose-200 dark:border-rose-900">{error}</div>}
       {data && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+          {/* At most 4 per row: the console is a fixed-width window, so viewport breakpoints for 7 columns squeezed the cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
             {data.platforms.map(p => {
-              const label = p.platform === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
+              const label = p.name || (
+                            p.platform === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
                             (p.platform === 'givebrite_iqra' || p.platform === 'givebrite') ? 'GiveBrite (Iqra)' :
-                            p.platform === 'paysuite' ? 'Access PaySuite (Direct Debit)' :
-                            'Madinah (Iqra)';
+                            p.platform === 'paysuite' ? 'Access PaySuite (Rethink)' :
+                            p.platform === 'stripe_rethink' ? 'Stripe (Rethink)' :
+                            p.platform === 'launchgood_rethink' ? 'LaunchGood (Rethink)' :
+                            p.platform === 'launchgood_iqra' ? 'LaunchGood (Iqra)' :
+                            p.platform === 'madinah' ? 'Madinah (Iqra)' :
+                            (p.platform || 'Unknown Platform'));
               return (
-              <div key={p.platform} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 flex flex-col gap-2.5 shadow-2xs">
-                <div className="flex items-center justify-between">
-                  <span className="font-bold text-sm text-slate-900 dark:text-slate-100">{label}</span>
+              <div key={p.platform} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 flex flex-col gap-2.5 shadow-2xs min-w-0">
+                <div className="flex items-start justify-between gap-2">
+                  <span className="font-bold text-sm leading-snug text-slate-900 dark:text-slate-100 min-w-0 truncate" title={label}>{label}</span>
                   <StateBadge state={p.state} />
                 </div>
                 {p.issues.length > 0 && (
-                  <ul className="list-disc pl-4 text-rose-700 dark:text-rose-300 flex flex-col gap-0.5 text-xs">{p.issues.map((i, n) => <li key={n}>{i}</li>)}</ul>
+                  <ul className={`list-disc pl-4 flex flex-col gap-1 text-xs leading-relaxed ${ISSUE_CLS[p.state] || ISSUE_CLS.down}`}>{p.issues.map((i, n) => <li key={n}><IssueText text={i} /></li>)}</ul>
                 )}
-                <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-slate-600 dark:text-slate-300 text-xs">
-                  <span>Last successful sync</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ok_at || p.sync?.last_sync_at)}</span>
-                  <span>Failures in a row</span><span className="font-semibold text-slate-900 dark:text-slate-100">{p.sync?.consecutive_failures ?? 0}</span>
-                  <span>Last API status</span><span className="font-semibold text-slate-900 dark:text-slate-100">{p.sync?.last_http_status ?? '—'}</span>
-                  <span>{p.platform === 'paysuite' ? 'Auth Mode' : 'Access token'}</span>
-                  <span className="font-semibold text-slate-900 dark:text-slate-100">
-                    {p.platform === 'paysuite' ? (p.token?.present ? 'API Key (Active)' : 'Missing Key') : (p.token.present ? fmtLeft(p.token.access_minutes_left) : 'missing')}
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1.5 text-slate-600 dark:text-slate-300 text-xs items-center">
+                  <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Last successful sync</span>
+                  <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtAge(p.sync?.last_ok_at || p.sync?.last_sync_at)}</span>
+                  
+                  <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Failures in a row</span>
+                  <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{p.sync?.consecutive_failures ?? 0}</span>
+                  
+                  <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Last API status</span>
+                  <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{p.sync?.last_http_status ?? '—'}</span>
+                  
+                  <span className="truncate pr-1 text-slate-500 dark:text-slate-400">{['paysuite', 'stripe_rethink'].includes(p.platform) ? 'Auth Mode' : 'Access token'}</span>
+                  <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">
+                    {['paysuite', 'stripe_rethink'].includes(p.platform) ? (p.token?.present ? 'API Key (Active)' : 'Missing Key') : (p.token?.present ? (p.token.status_text || (p.token.has_refresh && (p.token.access_minutes_left == null || p.token.access_minutes_left <= 0) ? 'Active' : fmtLeft(p.token.access_minutes_left))) : 'missing')}
                   </span>
-                  {p.platform === 'madinah' && (<><span>Refresh token</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtLeft(p.token.refresh_minutes_left)}</span></>)}
-                  {p.platform !== 'paysuite' && (
+                  {p.platform === 'madinah' && (
                     <>
-                      <span>Session renewed</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_token_refresh_at || p.token.retrieved_at)}</span>
-                      <span>Last new donation</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_ingested_at)}</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Refresh token</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtLeft(p.token.refresh_minutes_left)}</span>
+                    </>
+                  )}
+                  {!['paysuite', 'stripe_rethink'].includes(p.platform) && !p.platform?.startsWith('launchgood') && (
+                    <>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Session renewed</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtAge(p.sync?.last_token_refresh_at || p.token.retrieved_at)}</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Last new donation</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtAge(p.sync?.last_ingested_at)}</span>
                     </>
                   )}
                   {p.platform === 'paysuite' && (
                     <>
-                      <span>Schedule</span><span className="font-semibold text-slate-900 dark:text-slate-100">Hourly (last 30 days)</span>
-                      <span>Last sync</span><span className="font-semibold text-slate-900 dark:text-slate-100">{fmtAge(p.sync?.last_sync_at)}</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Schedule</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">Hourly (30 days)</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Last sync</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtAge(p.sync?.last_sync_at)}</span>
+                    </>
+                  )}
+                  {p.platform === 'stripe_rethink' && (
+                    <>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Integration</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">Direct API (.env)</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Last reconciled</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtAge(p.sync?.last_payout_reconciled_at)}</span>
+                    </>
+                  )}
+                  {p.platform?.startsWith('launchgood') && (
+                    <>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Integration</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">API Gateway v4</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Session captured</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{p.token?.captured_at ? fmtAge(p.token.captured_at) : '—'}</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Auto-renewal</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{p.token?.has_refresh ? (p.platform?.startsWith('launchgood') ? 'automatic (rolling)' : (p.token.refresh_expires_at ? `until ${new Date(p.token.refresh_expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}` : 'yes')) : 'needs refreshToken'}</span>
+                      <span className="truncate pr-1 text-slate-500 dark:text-slate-400">Last new donation</span>
+                      <span className="font-semibold text-slate-900 dark:text-slate-100 text-right whitespace-nowrap">{fmtAge(p.sync?.last_ingested_at)}</span>
                     </>
                   )}
                 </div>
-                {p.sync?.last_error && (
-                  <div className="text-[11px]">
+                {p.sync?.last_error && !(p.sync?.consecutive_failures === 0 && Date.now() - new Date(p.sync.last_error_at).getTime() > OLD_ISSUE_MS) && (
+                  <div className="text-[11px] line-clamp-3 break-words" title={p.sync.last_error}>
                     {p.sync?.consecutive_failures === 0 ? (
                       <span className="text-slate-400 dark:text-slate-500">
                         Resolved · Last transient issue ({fmtAge(p.sync.last_error_at)}): {p.sync.last_error}
@@ -248,14 +296,15 @@ function StatusTab() {
               <div className="text-slate-500 mt-2 text-[11px]">Heartbeat {fmtAge(data.sync_heartbeat)}</div>
             </div>
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 shadow-2xs">
-              <div className="font-bold mb-2 text-slate-900 dark:text-slate-100">Outlook mailboxes</div>
+              <div className="font-bold mb-2 text-slate-900 dark:text-slate-100">Mailboxes</div>
               {data.outlook.map(o => (
                 <div key={o.company_id} className="flex flex-col mb-2">
                   <span className="flex justify-between">
-                    <span className="capitalize font-semibold text-slate-800 dark:text-slate-200">{o.company_id}</span>
+                    <span className="capitalize font-semibold text-slate-800 dark:text-slate-200">{o.company_id} <span className="font-normal text-slate-500">· {o.provider === 'gmail' ? 'Gmail' : 'Microsoft 365'}</span></span>
                     <span className={o.connected ? 'text-emerald-600 font-bold' : 'text-rose-600 font-bold'}>{o.connected ? 'connected' : 'not connected'}</span>
                   </span>
                   <span className="text-slate-500 truncate text-[11px]">{o.mailbox || '—'}{o.last_send ? ` · last ${o.last_send.event === 'email.sent' ? 'sent' : 'FAILED'} ${fmtAge(o.last_send.ts)}` : ''}</span>
+                  {o.last_error && <span className="text-rose-600 text-[11px]">{o.last_error}</span>}
                 </div>
               ))}
             </div>
@@ -393,19 +442,43 @@ function SessionsTab() {
   const [form, setForm] = useState({ platform: 'madinah', accessToken: '', refreshToken: '' });
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
+  const [copiedBookmarklet, setCopiedBookmarklet] = useState(false);
   const load = () => getJson('/api/ops/platform-sessions').then(setSessions).catch(e => setMsg({ type: 'error', text: e.message }));
   useEffect(() => { load(); }, []);
 
+  const bookmarkletCode = `javascript:(function(){const CRM='${window.location.origin}';const KEY='lg_sync_rethink_2026_crm';if(!location.hostname.includes('launchgood.com')){alert('Please open launchgood.com first before clicking this bookmarklet!');return;}let b=document.getElementById('lg-sync-box');if(!b){b=document.createElement('div');b.id='lg-sync-box';b.style.cssText='position:fixed;top:18px;right:18px;z-index:9999999;padding:13px 18px;background:#0f172a;color:#f8fafc;border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,0.4);font-family:system-ui,-apple-system,sans-serif;font-size:13px;display:flex;align-items:center;gap:10px;border:1px solid #334155;';document.body.appendChild(b);}b.innerHTML='🔄 Connecting LaunchGood session to CRM...';function getTok(){let m=(document.cookie||'').match(/(?:^|;\\s*)token=([^;]+)/);if(m)return m[1];try{for(let i=0;i<localStorage.length;i++){let v=localStorage.getItem(localStorage.key(i));if(typeof v==='string'&&/^(Bearer\\s+)?eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$/.test(v.trim()))return v.trim();}}catch(e){}return'';}function sync(){const t=getTok();if(!t){b.innerHTML='⚠️ Not signed in to LaunchGood. Please log in first.';setTimeout(()=>b.remove(),5000);return;}fetch(CRM+'/api/ops/sync-helper/launchgood_rethink',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({accessToken:t,rawCookie:document.cookie||'',source:'bookmarklet-1click',syncKey:KEY})}).then(r=>r.json()).then(res=>{if(res.ok){b.innerHTML='🟢 <b style=\"color:#34d399;\">LaunchGood Synced!</b> Auto-sync active (every 5m).';b.style.background='#064e3b';b.style.borderColor='#059669';if(!window.__lgInt){window.__lgInt=setInterval(sync,300000);}setTimeout(()=>{b.style.opacity='0.6';},4000);}else{b.innerHTML='⚠️ Notice: '+(res.detail||'Check connection');setTimeout(()=>b.remove(),6000);}}).catch(e=>{b.innerHTML='❌ Error: '+e.message;setTimeout(()=>b.remove(),6000);});}sync();})();`;
+
   const upload = async () => {
-    if (!form.accessToken.trim()) return;
+    let token = form.accessToken.trim();
+    let rawCookie = (form.rawCookie || '').trim();
+    let refreshToken = (form.refreshToken || '').trim();
+
+    // Smart auto-parse if user pasted full JSON from browser network tab or tokens file
+    if (token.startsWith('{') && token.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(token);
+        token = parsed.bearerToken || parsed.accessToken || (parsed.headers?.authorization || parsed.headers?.Authorization) || token;
+        if (!rawCookie) {
+          rawCookie = parsed.rawCookie || parsed.headers?.cookie || parsed.headers?.Cookie || '';
+        }
+        if (!refreshToken) {
+          refreshToken = parsed.refreshToken || '';
+        }
+      } catch {}
+    }
+
+    const isLg = form.platform?.startsWith('launchgood');
+    if (!token && !(isLg && refreshToken)) return;
     setBusy(true); setMsg(null);
     try {
       const r = await getJson(`/api/ops/platform-sessions/${form.platform}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accessToken: form.accessToken, refreshToken: form.refreshToken || null, source: 'ops-console-paste' })
+        body: JSON.stringify({ accessToken: token, rawCookie: rawCookie || null, refreshToken: refreshToken || null, source: 'ops-console-paste' })
       });
-      setMsg({ type: 'ok', text: `Verified and saved. Access token valid until ${new Date(r.access_expires_at).toLocaleString()}.` });
-      setForm(f => ({ ...f, accessToken: '', refreshToken: '' }));
+      setMsg({ type: 'ok', text: r.status === 'pending' ? r.message : r.has_refresh
+        ? 'Verified and saved. The session now renews itself automatically - no need to sign in again unless LaunchGood signs you out.'
+        : `Verified and saved. Access token valid until ${new Date(r.access_expires_at).toLocaleString()}.` });
+      setForm(f => ({ ...f, accessToken: '', refreshToken: '', rawCookie: '' }));
       load();
     } catch (e) { setMsg({ type: 'error', text: e.message }); } finally { setBusy(false); }
   };
@@ -413,16 +486,20 @@ function SessionsTab() {
   const captureCommands = [
     { platform: 'madinah (iqra)', cmd: 'node scripts/capture_platform_session.js madinah', targetCls: 'text-cyan-400 font-bold' },
     { platform: 'givebrite (iqra)', cmd: 'node scripts/capture_platform_session.js iqra', targetCls: 'text-emerald-400 font-bold' },
-    { platform: 'givebrite (rethink)', cmd: 'node scripts/capture_platform_session.js rethink', targetCls: 'text-purple-400 font-bold' }
+    { platform: 'givebrite (rethink)', cmd: 'node scripts/capture_platform_session.js rethink', targetCls: 'text-purple-400 font-bold' },
+    { platform: 'launchgood (rethink)', cmd: 'node scripts/capture_platform_session.js launchgood_rethink', targetCls: 'text-emerald-500 font-bold' },
+    { platform: 'launchgood (iqra)', cmd: 'node scripts/capture_platform_session.js launchgood_iqra', targetCls: 'text-teal-400 font-bold' }
   ];
 
   return (
     <div className="flex flex-col gap-4">
       {/* Session overview cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
         {sessions && Object.entries(sessions).map(([p, s]) => {
           const sessionLabel = p === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
                                (p === 'givebrite_iqra' || p === 'givebrite') ? 'GiveBrite (Iqra)' :
+                               p === 'launchgood_rethink' ? 'LaunchGood (Rethink)' :
+                               p === 'launchgood_iqra' ? 'LaunchGood (Iqra)' :
                                'Madinah (Iqra)';
           return (
           <div key={p} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 grid grid-cols-2 gap-x-3 gap-y-1.5 shadow-2xs text-xs">
@@ -437,7 +514,7 @@ function SessionsTab() {
             </div>
             <span className="text-slate-500 dark:text-slate-400 font-medium">Access token</span>
             <span className={`font-semibold ${s.access_minutes_left > 120 ? 'text-emerald-600 dark:text-emerald-400' : s.access_minutes_left > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-slate-700 dark:text-slate-300'}`}>
-              {s.present ? fmtLeft(s.access_minutes_left) : 'missing'}
+              {s.present ? (s.status_text || (s.has_refresh && (s.access_minutes_left == null || s.access_minutes_left <= 0) ? 'Active' : fmtLeft(s.access_minutes_left))) : 'missing'}
             </span>
             {s.refresh_minutes_left !== undefined && (
               <>
@@ -465,16 +542,78 @@ function SessionsTab() {
         <TerminalBox commands={captureCommands} />
       </div>
 
+      {/* 1-Click LaunchGood Bookmarklet Sync (Recommended) */}
+      <div className="p-4 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50/60 dark:bg-emerald-950/20 flex flex-col gap-3 shadow-2xs">
+        <div className="flex items-center justify-between">
+          <div className="font-bold text-sm text-emerald-950 dark:text-emerald-100 flex items-center gap-2">
+            <Zap className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+            1-Click LaunchGood Sync Bookmarklet (Recommended)
+          </div>
+          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-300 uppercase tracking-wide">
+            Zero DevTools / Zero Typing
+          </span>
+        </div>
+        <p className="text-slate-700 dark:text-slate-300 text-xs leading-relaxed">
+          Because LaunchGood uses 15-minute expiring tokens, you no longer need to copy/paste tokens manually. Drag the button below to your browser’s bookmarks bar. Whenever you are on LaunchGood, click it once — it syncs your active session and keeps it alive in the background every 5 minutes.
+        </p>
+
+        <div className="flex flex-wrap items-center gap-3 pt-1">
+          <a
+            href={bookmarkletCode}
+            onClick={(e) => {
+              alert('Drag this button directly to your browser\'s Bookmarks bar! Then click it whenever you are on launchgood.com.');
+              e.preventDefault();
+            }}
+            className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white font-bold text-xs shadow-md shadow-emerald-600/25 flex items-center gap-2 cursor-grab select-none transition-all"
+            title="Drag to your Bookmarks toolbar"
+          >
+            <Bookmark className="w-4 h-4" />
+            <span>🚀 Drag to Bookmarks: Sync LaunchGood</span>
+          </a>
+
+          <button
+            type="button"
+            onClick={() => {
+              navigator.clipboard.writeText(bookmarkletCode);
+              setCopiedBookmarklet(true);
+              setTimeout(() => setCopiedBookmarklet(false), 2500);
+            }}
+            className="px-3.5 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+          >
+            {copiedBookmarklet ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copiedBookmarklet ? 'Copied code!' : 'Copy bookmarklet code'}</span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-1 text-[11px] text-slate-600 dark:text-slate-400">
+          <div className="flex items-start gap-1.5 p-2 rounded-lg bg-white/70 dark:bg-slate-900/60 border border-emerald-100 dark:border-emerald-900/50">
+            <span className="font-bold text-emerald-600 dark:text-emerald-400">1.</span>
+            <span>Drag the <b>🚀 Sync LaunchGood</b> button into your browser’s bookmarks bar.</span>
+          </div>
+          <div className="flex items-start gap-1.5 p-2 rounded-lg bg-white/70 dark:bg-slate-900/60 border border-emerald-100 dark:border-emerald-900/50">
+            <span className="font-bold text-emerald-600 dark:text-emerald-400">2.</span>
+            <span>Go to <a href="https://www.launchgood.com" target="_blank" rel="noreferrer" className="text-emerald-600 dark:text-emerald-400 underline font-semibold">launchgood.com</a> and sign in.</span>
+          </div>
+          <div className="flex items-start gap-1.5 p-2 rounded-lg bg-white/70 dark:bg-slate-900/60 border border-emerald-100 dark:border-emerald-900/50">
+            <span className="font-bold text-emerald-600 dark:text-emerald-400">3.</span>
+            <span>Click the bookmark! A green badge confirms connection and auto-renews every 5m.</span>
+          </div>
+        </div>
+      </div>
+
       {/* Manual token paste */}
       <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 flex flex-col gap-3 shadow-2xs">
         <div className="font-bold text-sm text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
           <Upload className="w-4 h-4 text-blue-500" />
           Or paste tokens manually
         </div>
-        <div className="flex gap-2">
-          {['givebrite_iqra', 'givebrite_rethink', 'madinah'].map(p => {
+        <div className="flex flex-wrap gap-2">
+          {['givebrite_iqra', 'givebrite_rethink', 'madinah', 'launchgood_rethink', 'launchgood_iqra'].map(p => {
             const btnLabel = p === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
-                             p === 'givebrite_iqra' ? 'GiveBrite (Iqra)' : 'Madinah (Iqra)';
+                             p === 'givebrite_iqra' ? 'GiveBrite (Iqra)' :
+                             p === 'launchgood_rethink' ? 'LaunchGood (Rethink)' :
+                             p === 'launchgood_iqra' ? 'LaunchGood (Iqra)' :
+                             'Madinah (Iqra)';
             return (
               <button
                 key={p}
@@ -491,15 +630,15 @@ function SessionsTab() {
             );
           })}
         </div>
-        <div className="flex flex-col gap-1.5">
+        <div className={`flex flex-col gap-1.5 ${form.platform?.startsWith('launchgood') ? 'hidden' : ''}`}>
           <label className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
-            Access token (Bearer string)
+            {form.platform?.startsWith('launchgood') ? 'Access token (optional when you paste the refresh token)' : 'Access token (Bearer string or full JSON)'}
           </label>
           <textarea
             value={form.accessToken}
             onChange={e => setForm(f => ({ ...f, accessToken: e.target.value }))}
             rows={3}
-            placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+            placeholder={form.platform?.startsWith('launchgood') ? 'Bearer eyJhbGci... or paste full JSON with headers/cookies' : 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'}
             className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 font-mono text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all"
           />
         </div>
@@ -517,12 +656,31 @@ function SessionsTab() {
             />
           </div>
         )}
+        {form.platform?.startsWith('launchgood') && (
+          <div className="flex flex-col gap-1.5 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50/60 dark:bg-emerald-950/20 p-3">
+            <label className="text-[11px] font-bold text-emerald-900 dark:text-emerald-200">
+              Refresh token - the one that stops LaunchGood signing out (the access token alone lasts only 15 minutes)
+            </label>
+            <ol className="text-[11px] text-emerald-900/80 dark:text-emerald-200/80 list-decimal pl-4 space-y-0.5">
+              <li>Open <b>launchgood.com</b> in Chrome or Edge, signed in to {form.platform === 'launchgood_iqra' ? "Iqra's" : "Rethink's"} account.</li>
+              <li>Press <b>F12</b>, open the <b>Console</b> tab, type <code className="select-all px-1 rounded bg-white dark:bg-slate-800 !text-slate-900 dark:!text-slate-100">copy(localStorage.refreshToken)</code> and press Enter (if Chrome asks, type <i>allow pasting</i> first).</li>
+              <li>Paste here (Ctrl+V) and press <b>Verify &amp; save</b>. The CRM then renews the session by itself - no more sign-ins until LaunchGood ends it (shown on the card as “Auto-renewal until …”).</li>
+            </ol>
+            <textarea
+              value={form.refreshToken}
+              onChange={e => setForm(f => ({ ...f, refreshToken: e.target.value }))}
+              rows={3}
+              placeholder="eyJhbGciOi... (value of refreshToken)"
+              className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 font-mono text-xs focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all"
+            />
+          </div>
+        )}
         <button
           type="button"
-          disabled={busy || !form.accessToken.trim()}
+          disabled={busy || !(form.accessToken.trim() || (form.platform?.startsWith('launchgood') && (form.refreshToken || '').trim()))}
           onClick={upload}
           className={`self-start px-4 py-2 rounded-xl font-bold text-xs flex items-center gap-2 transition-all ${
-            !form.accessToken.trim() || busy
+            !(form.accessToken.trim() || (form.platform?.startsWith('launchgood') && (form.refreshToken || '').trim())) || busy
               ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 cursor-not-allowed border border-slate-300/40 dark:border-slate-700/40'
               : 'bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white shadow-md shadow-blue-500/25 cursor-pointer'
           }`}
@@ -637,7 +795,7 @@ export default function OpsConsole({ onClose, initialTab = 'status' }) {
   return (
     <div className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150" onClick={onClose}>
       <div
-        className="w-full max-w-6xl max-h-[92vh] overflow-y-auto rounded-2xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-2xl text-xs text-slate-800 dark:text-slate-200"
+        className="w-full max-w-7xl max-h-[92vh] overflow-y-auto overflow-x-hidden rounded-2xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-2xl text-xs text-slate-800 dark:text-slate-200"
         onClick={e => e.stopPropagation()}
       >
         {/* Solid opaque sticky header — completely blocks background bleed-through when scrolling */}

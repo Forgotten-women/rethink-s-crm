@@ -1597,6 +1597,23 @@ def _directory_data(comp: str):
     except Exception as e:
         print(f"[donor directory] SP detection skipped: {e}")
 
+    # Zakat paid on the gift: platforms record it in different columns
+    zakat = col("Zakat (yes or no)").fillna("").str.lower().isin(["yes", "true", "1", "y"])
+    zakat |= col("is_zakat").fillna("").str.lower().isin(["true", "1", "yes"])
+    zakat |= col("Zakat Status").fillna("").str.strip().str.lower().eq("zakat")
+    # Fundraiser each gift is credited to (same attribution as the Fundraisers page) and the pages it was made through
+    try:
+        from backend.api.fundraisers import attribute_donations
+        fundraiser = attribute_donations(df, comp)[0].where(lambda x: x.notna() & (x.astype(str).str.strip() != ""), None)
+    except Exception as e:
+        print(f"[donor directory] fundraiser attribution skipped: {e}")
+        fundraiser = pd.Series(None, index=df.index, dtype=object)
+    try:
+        from core.page_links import donation_link_keys
+        link_keys = donation_link_keys(df)
+    except Exception as e:
+        print(f"[donor directory] page links skipped: {e}")
+        link_keys = pd.DataFrame(index=df.index)
     w = pd.DataFrame({
         "key": key, "name": full, "email": col("Email"), "phone": phone,
         "city": col("Billing City"), "country": col("Billing Country"),
@@ -1608,6 +1625,10 @@ def _directory_data(comp: str):
         "consent": col("Marketing Consent"),
         "recurring": freq.str.contains("recurr", na=False),
         "stype": stype, "sp": sp.astype(bool),
+        "zakat": zakat.astype(bool), "fundraiser": fundraiser,
+        "donation_id": col("Donation ID"), "giving_level": col("Giving Level Title"),
+        **{c: link_keys[c] if c in link_keys.columns else None
+           for c in ("campaign_key", "campaign_slug_key", "community_key", "community_slug_key", "fundraiser_key", "fundraiser_slug_key")},
     })[usable]
     unidentified_amount = float(pd.to_numeric(df.loc[~usable, _DIRECTORY_AMOUNT], errors="coerce").fillna(0).sum()) if _DIRECTORY_AMOUNT in df.columns else 0.0
     unidentified_gifts = int((~usable).sum())
@@ -1632,7 +1653,8 @@ def _directory_data(comp: str):
     frame["manual_total"] = 0.0
     frame["manual_records"] = 0
     dx = w[["key", "date", "amount", "heading", "subheading", "code", "campaign", "platform", "recurring", "gift_aid",
-            "stype", "sp"]].copy()
+            "stype", "sp", "zakat", "fundraiser", "donation_id", "giving_level",
+            "campaign_key", "campaign_slug_key", "community_key", "community_slug_key", "fundraiser_key", "fundraiser_slug_key"]].copy()
     manual_rows = []
     # Manual donors from the Sponsorship Tracker: merged into the same person (by email) or listed on their own
     by_email = {}
@@ -1646,7 +1668,8 @@ def _directory_data(comp: str):
         mtype = str(m.get("sponsorship_type") or "").strip()
         manual_rows.append({"key": k, "date": made, "amount": amt, "heading": "Sponsorship", "subheading": mtype or "Sponsorship",
                             "code": None, "campaign": f"{mtype or 'Sponsorship'} sponsorship (manual)", "platform": MANUAL_PLATFORM,
-                            "recurring": False, "gift_aid": False, "stype": mtype if mtype in SPONSORSHIP_TYPES else "", "sp": False})
+                            "recurring": False, "gift_aid": False, "stype": mtype if mtype in SPONSORSHIP_TYPES else "", "sp": False,
+                            "zakat": False, "fundraiser": None, "donation_id": None, "giving_level": None})
         if k in frame.index:
             frame.at[k, "manual_total"] += amt
             frame.at[k, "manual_records"] += 1
@@ -1672,25 +1695,83 @@ def _directory_data(comp: str):
     frame["tier"] = frame["total"].map(classify_donor_amount)
     # Sponsorship allocations each donor is part of (Sponsorship Tracker), by email
     frame["allocations"] = 0
+    frame["sponsorship_statuses"] = ""
+    frame["sponsored_types"] = ""
     try:
         conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
         try:
-            alloc = dict(conn.execute("""SELECT LOWER(TRIM(d.donor_email)), COUNT(DISTINCT d.allocation_id)
+            alloc_rows = conn.execute("""SELECT LOWER(TRIM(d.donor_email)), a.id, a.start_date, a.end_date,
+                                                COALESCE(b.sponsorship_type, '')
                                          FROM sponsorship_allocation_donors d JOIN sponsorship_allocations a ON a.id = d.allocation_id
-                                         WHERE LOWER(a.company_id) = ? AND COALESCE(d.donor_email, '') LIKE '%@%'
-                                         GROUP BY 1""", (comp,)).fetchall())
+                                         LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                                         WHERE LOWER(a.company_id) = ? AND COALESCE(d.donor_email, '') LIKE '%@%'""", (comp,)).fetchall()
         finally:
             conn.close()
+        alloc_ids: Dict[str, set] = {}
+        statuses: Dict[str, set] = {}
+        sponsored: Dict[str, set] = {}
+        for em_, aid, start, end, stype_ in alloc_rows:
+            alloc_ids.setdefault(em_, set()).add(aid)
+            statuses.setdefault(em_, set()).add(sponsorship_cycle_status(start, end))
+            if stype_:
+                sponsored.setdefault(em_, set()).add(str(stype_).strip())
         em = frame["email"].fillna("").astype(str).str.strip().str.lower()
-        frame["allocations"] = em.map(alloc).fillna(0).astype(int)
+        frame["allocations"] = em.map({k: len(v) for k, v in alloc_ids.items()}).fillna(0).astype(int)
+        frame["sponsorship_statuses"] = em.map({k: ",".join(sorted(v)) for k, v in statuses.items()}).fillna("")
+        frame["sponsored_types"] = em.map({k: ",".join(sorted(v)) for k, v in sponsored.items()}).fillna("")
     except Exception as e:
         print(f"[donor directory] allocation counts skipped: {e}")
     frame = frame.reset_index().rename(columns={"index": "donor_id", "key": "donor_id"})
     frame["search"] = (frame["donor_id"].fillna("") + " " + frame["name"].fillna("").str.lower() + " " +
                        frame["email"].fillna("").str.lower() + " " + frame["phone"].fillna("").str.replace(r"[^0-9]", "", regex=True))
     frame.attrs["unidentified"] = {"gifts": unidentified_gifts, "amount": round(unidentified_amount, 2)}
+    try:
+        from core.page_links import learn_host_platforms
+        dx.attrs["host_platforms"] = learn_host_platforms(df)
+    except Exception:
+        dx.attrs["host_platforms"] = {}
     _DIRECTORY_CACHE[comp] = (token, frame, dx)
     return frame, dx
+
+
+SPONSORSHIP_STATUSES = ("active", "due", "grace", "lapsed")
+
+
+def sponsorship_cycle_status(start_date: Optional[str], end_date: Optional[str]) -> str:
+    """active / due (renewal within 30 days) / grace (up to 30 days past the end) / lapsed - the Sponsorship
+    Tracker's rule (tracker.get_allocations): the end date, or one year after the start when it has none."""
+    import datetime as _dt
+    today = _dt.date.today()
+    end = None
+    try:
+        end = _dt.datetime.strptime(str(end_date or "")[:10], "%Y-%m-%d").date()
+    except ValueError:
+        try:
+            end = _dt.datetime.strptime(str(start_date or "")[:10], "%Y-%m-%d").date() + _dt.timedelta(days=365)
+        except ValueError:
+            return "active"
+    days = (end - today).days
+    return "active" if days > 30 else "due" if days >= 0 else "grace" if days >= -30 else "lapsed"
+
+
+def _page_link_mask(dx: pd.DataFrame, url: str, link_type: str, host_platforms: Optional[Dict[str, str]] = None) -> pd.Series:
+    """Gifts made through one page link. link_type: campaign / community / fundraiser, or auto (what the link
+    itself says). The same normalised keys as the Fundraisers page (core.page_links)."""
+    from core.page_links import page_key, parse_page_link
+    parsed = parse_page_link(url, host_platforms=host_platforms or {})
+    if not parsed:
+        raise HTTPException(status_code=400, detail="That doesn't look like a page link.")
+    kind, platform, page = parsed
+    if link_type in ("campaign", "community", "fundraiser"):
+        kind = link_type
+    full, anyp = page_key(kind, platform, page), page_key(kind, "*", page)
+    mask = pd.Series(False, index=dx.index)
+    for col in ("campaign", "community", "fundraiser"):
+        for c, target in ((f"{col}_key", full), (f"{col}_slug_key", anyp)):
+            if c in dx.columns:
+                mask |= dx[c].astype(object).eq(target)
+    return mask
+
 
 
 def _joined_values(w: pd.DataFrame, column: str) -> pd.Series:
@@ -1715,6 +1796,52 @@ def _as_list(v) -> List[str]:
     return [x.strip() for x in str(v).split(",") if x.strip()]
 
 
+GIFT_RULES = ("date_from", "date_to", "headings", "subheadings", "codes", "campaign", "platforms", "sponsorship_types",
+              "frequency", "gift_aid_gift", "sp_gift", "zakat_gift", "fundraisers", "page_url", "giving_levels",
+              "min_amount", "max_amount", "min_matched_gifts", "min_matched_total")
+
+
+def has_gift_rules(seg: Optional[Dict[str, Any]]) -> bool:
+    return any((seg or {}).get(k) not in (None, "", [], "any") for k in GIFT_RULES)
+
+
+def filter_gifts(dx: pd.DataFrame, seg: Dict[str, Any], host_platforms: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+    """The gifts that count for a segment (its gift rules only)."""
+    d = dx
+    if seg.get("date_from"):
+        d = d[d["date"] >= pd.to_datetime(seg["date_from"], errors="coerce")]
+    if seg.get("date_to"):
+        d = d[d["date"] < pd.to_datetime(seg["date_to"], errors="coerce") + pd.Timedelta(days=1)]
+    for k, c in (("headings", "heading"), ("subheadings", "subheading"), ("codes", "code"), ("platforms", "platform"),
+                 ("sponsorship_types", "stype")):
+        vals = [v.lower() for v in _as_list(seg.get(k))]
+        if vals:
+            d = d[d[c].fillna("").astype(str).str.strip().str.lower().isin(vals)]
+    if seg.get("campaign"):
+        d = d[d["campaign"].fillna("").str.lower().str.contains(re.escape(str(seg["campaign"]).lower()), na=False)]
+    if seg.get("frequency") in ("recurring", "one-off"):
+        d = d[d["recurring"] == (seg["frequency"] == "recurring")]
+    if seg.get("gift_aid_gift") in ("yes", "no"):
+        d = d[d["gift_aid"] == (seg["gift_aid_gift"] == "yes")]
+    if seg.get("sp_gift") in ("yes", "no"):
+        d = d[d["sp"] == (seg["sp_gift"] == "yes")]
+    if seg.get("zakat_gift") in ("yes", "no") and "zakat" in d.columns:
+        d = d[d["zakat"].fillna(False).astype(bool) == (seg["zakat_gift"] == "yes")]
+    fundraisers = [v.strip().lower() for v in _as_list(seg.get("fundraisers"))]
+    if fundraisers and "fundraiser" in d.columns:
+        d = d[d["fundraiser"].fillna("").astype(str).str.strip().str.lower().isin(fundraisers)]
+    levels = [v.strip().lower() for v in _as_list(seg.get("giving_levels"))]
+    if levels and "giving_level" in d.columns:
+        d = d[d["giving_level"].fillna("").astype(str).str.strip().str.lower().isin(levels)]
+    if seg.get("page_url"):
+        d = d[_page_link_mask(d, str(seg["page_url"]).strip(), str(seg.get("page_type") or "auto"), host_platforms)]
+    if seg.get("min_amount") not in (None, ""):
+        d = d[d["amount"] >= float(seg["min_amount"])]
+    if seg.get("max_amount") not in (None, ""):
+        d = d[d["amount"] <= float(seg["max_amount"])]
+    return d
+
+
 def apply_segment(frame: pd.DataFrame, dx: pd.DataFrame, seg: Dict[str, Any]) -> pd.DataFrame:
     """Donors matching a segment. Gift rules (date range, cause, sponsorship type, campaign, platform, amount,
     recurring, Gift Aid, SP) pick the gifts that count - a donor matches if at least one gift passes ALL of them
@@ -1723,31 +1850,9 @@ def apply_segment(frame: pd.DataFrame, dx: pd.DataFrame, seg: Dict[str, Any]) ->
     Lists mean "any of"; different rules combine with AND."""
     seg = seg or {}
     f = frame
-    gift_rules = ("date_from", "date_to", "headings", "subheadings", "codes", "campaign", "platforms", "sponsorship_types",
-                  "frequency", "gift_aid_gift", "sp_gift", "min_amount", "max_amount", "min_matched_gifts", "min_matched_total")
-    if any(seg.get(k) not in (None, "", [], "any") for k in gift_rules) and not dx.empty:
-        d = dx
-        if seg.get("date_from"):
-            d = d[d["date"] >= pd.to_datetime(seg["date_from"], errors="coerce")]
-        if seg.get("date_to"):
-            d = d[d["date"] < pd.to_datetime(seg["date_to"], errors="coerce") + pd.Timedelta(days=1)]
-        for k, c in (("headings", "heading"), ("subheadings", "subheading"), ("codes", "code"), ("platforms", "platform"),
-                     ("sponsorship_types", "stype")):
-            vals = [v.lower() for v in _as_list(seg.get(k))]
-            if vals:
-                d = d[d[c].fillna("").astype(str).str.strip().str.lower().isin(vals)]
-        if seg.get("campaign"):
-            d = d[d["campaign"].fillna("").str.lower().str.contains(re.escape(str(seg["campaign"]).lower()), na=False)]
-        if seg.get("frequency") in ("recurring", "one-off"):
-            d = d[d["recurring"] == (seg["frequency"] == "recurring")]
-        if seg.get("gift_aid_gift") in ("yes", "no"):
-            d = d[d["gift_aid"] == (seg["gift_aid_gift"] == "yes")]
-        if seg.get("sp_gift") in ("yes", "no"):
-            d = d[d["sp"] == (seg["sp_gift"] == "yes")]
-        if seg.get("min_amount") not in (None, ""):
-            d = d[d["amount"] >= float(seg["min_amount"])]
-        if seg.get("max_amount") not in (None, ""):
-            d = d[d["amount"] <= float(seg["max_amount"])]
+    host_platforms = dict(dx.attrs.get("host_platforms") or {}) if hasattr(dx, "attrs") else {}
+    if has_gift_rules(seg) and not dx.empty:
+        d = filter_gifts(dx, seg, host_platforms)
         agg = d.groupby("key")["amount"].agg(["size", "sum"])
         if seg.get("min_matched_gifts") not in (None, ""):
             agg = agg[agg["size"] >= int(seg["min_matched_gifts"])]
@@ -1756,6 +1861,12 @@ def apply_segment(frame: pd.DataFrame, dx: pd.DataFrame, seg: Dict[str, Any]) ->
         f = f[f["donor_id"].isin(agg.index)].copy()
         f["matched_gifts"] = f["donor_id"].map(agg["size"]).fillna(0).astype(int)
         f["matched_total"] = f["donor_id"].map(agg["sum"]).fillna(0).round(2)
+        # What each person's matching gifts were for: one row per person, their donations summarised
+        d = d[d["key"].isin(agg.index)]
+        causes = _joined_values(d.assign(_c=d["subheading"].fillna(d["heading"])).rename(columns={"_c": "cause_label"}), "cause_label")
+        f["matched_causes"] = f["donor_id"].map(causes).fillna("")
+        f["matched_sponsorships"] = f["donor_id"].map(_joined_values(d[d["stype"].fillna("") != ""], "stype")).fillna("")
+        f["matched_last"] = f["donor_id"].map(d.groupby("key")["date"].max()).astype(str).str[:10].replace({"NaT": ""})
     tiers = _as_list(seg.get("tiers"))
     if tiers:
         f = f[f["tier"].isin(tiers)]
@@ -1775,6 +1886,17 @@ def apply_segment(frame: pd.DataFrame, dx: pd.DataFrame, seg: Dict[str, Any]) ->
     if yn("has_email"):
         has = f["email"].fillna("").astype(str).str.contains("@")
         f = f[has == (seg["has_email"] == "yes")]
+    if yn("has_phone"):
+        has = f["phone"].fillna("").astype(str).str.replace(r"[^0-9]", "", regex=True).str.len() >= 7
+        f = f[has == (seg["has_phone"] == "yes")]
+    sponsored = [v.lower() for v in _as_list(seg.get("sponsored_types"))]
+    if sponsored and "sponsored_types" in f.columns:
+        have = f["sponsored_types"].fillna("").astype(str).str.lower()
+        f = f[have.map(lambda s: any(x in s.split(",") for x in sponsored))]
+    statuses = [v.lower() for v in _as_list(seg.get("sponsorship_statuses"))]
+    if statuses and "sponsorship_statuses" in f.columns:
+        have = f["sponsorship_statuses"].fillna("").astype(str)
+        f = f[have.map(lambda s: any(x in s.split(",") for x in statuses))]
     if yn("marketing_consent"):
         ok = f["marketing_consent"].fillna("").astype(str).str.lower().isin(["yes", "true", "1", "y", "opted in"])
         f = f[ok == (seg["marketing_consent"] == "yes")]
@@ -1827,7 +1949,25 @@ def get_segment_options(company_id: Optional[str] = Query("rethink")):
         "countries": counts(frame["country"], 80),
         "tiers": ["Low End", "Medium Low", "Medium", "High", "Super High"],
         "sponsorship_types": list(SPONSORSHIP_TYPES),
+        "sponsorship_statuses": list(SPONSORSHIP_STATUSES),
+        "fundraisers": _fundraiser_options(comp, dx),
+        "giving_levels": counts(dx["giving_level"], 300) if "giving_level" in dx.columns else [],
     }
+
+
+def _fundraiser_options(comp: str, dx: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Fundraisers of this charity with the number of gifts credited to each (Fundraisers page attribution)."""
+    if dx is None or dx.empty or "fundraiser" not in dx.columns:
+        return []
+    counts = dx["fundraiser"].dropna().astype(str).str.strip().str.lower().value_counts()
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    try:
+        names = {str(n).strip().lower(): str(n).strip() for (n,) in
+                 conn.execute("SELECT name FROM fundraisers WHERE LOWER(company_id) = ? AND COALESCE(name, '') != ''", (comp,))}
+    finally:
+        conn.close()
+    out = [{"value": names.get(k, k), "count": int(n)} for k, n in counts.items() if k]
+    return sorted(out, key=lambda o: -o["count"])
 
 
 @router.get("/directory")
@@ -2299,8 +2439,14 @@ def update_donor(payload: DonorUpdateRequest, current_user: Dict[str, Any] = Dep
     key = str(payload.donor_id or "").strip().lower()
     if not key:
         raise HTTPException(status_code=400, detail="donor_id is required")
+    fields = dict(payload.fields or {})
+    note = str(fields.pop("notes", "") or "").strip()
+    if note:
+        _add_donor_note(comp, key, note, current_user.get("email"))
+        if not any(str(v or "").strip() for v in fields.values()):
+            return {"success": True, "updated_gifts": 0, "donor_id": key, "note_added": True}
     updates = {}
-    for k, v in (payload.fields or {}).items():
+    for k, v in fields.items():
         if k not in _DONOR_FIELDS:
             raise HTTPException(status_code=400, detail=f"'{k}' can't be edited here.")
         if k == "marketing_consent" and isinstance(v, bool):
@@ -2363,6 +2509,8 @@ def update_donor(payload: DonorUpdateRequest, current_user: Dict[str, Any] = Dep
     finally:
         conn.close()
     _refresh_copy(comp, ids)
+    if new_email and new_email != key:
+        _move_donor_notes(comp, key, new_email)
     try:
         from core.event_log import log_event
         log_event("donor.updated", category="data", company_id=comp, actor=current_user.get("email"), donor_id=key,
@@ -2370,3 +2518,86 @@ def update_donor(payload: DonorUpdateRequest, current_user: Dict[str, Any] = Dep
     except Exception:
         pass
     return {"success": True, "updated_gifts": len(ids), "donor_id": new_email or key}
+
+
+
+# ------------------------------------------------------------------ donor notes
+def _notes_db():
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
+    conn.execute("""CREATE TABLE IF NOT EXISTS donor_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, company_id TEXT NOT NULL, donor_id TEXT NOT NULL, note TEXT NOT NULL,
+        created_by TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_donor_notes_donor ON donor_notes(company_id, donor_id)")
+    return conn
+
+
+def _add_donor_note(comp: str, donor_id: str, note: str, author: Optional[str]) -> int:
+    if len(note) > 5000:
+        raise HTTPException(status_code=400, detail="Keep a note under 5,000 characters.")
+    conn = _notes_db()
+    try:
+        with conn:
+            cur = conn.execute("INSERT INTO donor_notes (company_id, donor_id, note, created_by) VALUES (?, ?, ?, ?)",
+                               (comp, donor_id.strip().lower(), note, author or ""))
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def _move_donor_notes(comp: str, old_id: str, new_id: str) -> None:
+    """A donor's ID follows their email; their notes go with it."""
+    conn = _notes_db()
+    try:
+        with conn:
+            conn.execute("UPDATE donor_notes SET donor_id = ? WHERE company_id = ? AND donor_id = ?",
+                         (new_id.strip().lower(), comp, old_id.strip().lower()))
+    finally:
+        conn.close()
+
+
+class DonorNoteRequest(BaseModel):
+    company_id: str
+    donor_id: str
+    note: str
+
+
+@router.get("/notes")
+def list_donor_notes(company_id: str = Query(...), donor_id: str = Query(...)):
+    comp = str(company_id or "").strip().lower()
+    if not comp or comp == "all":
+        return {"notes": []}
+    conn = _notes_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute("""SELECT id, note, created_by, created_at, updated_at FROM donor_notes
+                                                WHERE company_id = ? AND donor_id = ? ORDER BY id DESC""",
+                                             (comp, str(donor_id or "").strip().lower()))]
+    finally:
+        conn.close()
+    return {"notes": rows}
+
+
+@router.post("/notes")
+def add_donor_note(payload: DonorNoteRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    _require_editor(current_user)
+    comp = _editable_company(payload.company_id)
+    note = (payload.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Write something first.")
+    nid = _add_donor_note(comp, payload.donor_id, note, current_user.get("email"))
+    return {"id": nid}
+
+
+@router.delete("/notes/{note_id}")
+def delete_donor_note(note_id: int, company_id: str = Query(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+    _require_editor(current_user)
+    comp = _editable_company(company_id)
+    conn = _notes_db()
+    try:
+        with conn:
+            n = conn.execute("DELETE FROM donor_notes WHERE id = ? AND company_id = ?", (note_id, comp)).rowcount
+    finally:
+        conn.close()
+    if not n:
+        raise HTTPException(status_code=404, detail="Note not found for this charity.")
+    return {"deleted": note_id}

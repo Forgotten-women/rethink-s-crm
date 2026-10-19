@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from config.settings import LOCAL_DB_PATH
+from backend.api.unsubscribe import is_unsubscribed
 from backend.api.tracker import (
     THEME_OWNER_COMPANY, _PLACEHOLDER_RE, _get_outlook_auth_row, _get_template, _get_valid_graph_token,
     _prepare_outgoing_html, _render_text, _resolve_theme, tracker_access_guard,
@@ -52,6 +53,20 @@ def init_tables() -> None:
             UNIQUE(campaign_id, recipient_email))""")
         if "message_body" not in {r[1] for r in conn.execute("PRAGMA table_info(crm_email_campaigns)")}:
             conn.execute("ALTER TABLE crm_email_campaigns ADD COLUMN message_body TEXT")
+        msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(crm_email_messages)")}
+        for col, typ in (("extra_json", "TEXT"), ("replied_at", "TEXT"), ("kind", "TEXT")):
+            if col not in msg_cols:
+                try:
+                    conn.execute(f"ALTER TABLE crm_email_messages ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass  # the other worker added it at the same moment
+        # Replies to emails sent from here (Donors / campaigns / single emails); sponsorship replies live in
+        # sponsorship_communications. Filled by the tracker's reply sync (tracker._record_inbound_reply).
+        conn.execute("""CREATE TABLE IF NOT EXISTS crm_email_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, company_id TEXT NOT NULL, message_id TEXT, conversation_id TEXT,
+            reply_to_id INTEGER, sender_email TEXT, subject TEXT, body_preview TEXT, received_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(company_id, message_id))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_email_replies_sender ON crm_email_replies(company_id, sender_email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_email_messages_company ON crm_email_messages(company_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_email_messages_email ON crm_email_messages(company_id, recipient_email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_email_messages_tracking ON crm_email_messages(tracking_id)")
@@ -111,8 +126,16 @@ def _resolve_recipients(comp: str, segment: Optional[Dict[str, Any]], donor_ids:
                 continue
             seen.add(em.lower())
             out.append({"donor_id": _clean(r.get("donor_id")), "email": em, "name": _clean(r.get("name")) or "",
+                        "phone": _clean(r.get("phone")) or "",
                         "total": _clean(r.get("total")), "gifts": _clean(r.get("gifts")), "tier": _clean(r.get("tier")),
-                        "last_gift": str(_clean(r.get("last_gift")) or "")[:10], "matched_total": _clean(r.get("matched_total")),
+                        "last_gift": str(_clean(r.get("last_gift")) or "")[:10],
+                        # one row per person; what their matching donations were (donation-based search)
+                        "matched_gifts": _clean(r.get("matched_gifts")), "matched_total": _clean(r.get("matched_total")),
+                        "matched_causes": _clean(r.get("matched_causes")) or "",
+                        "matched_sponsorships": _clean(r.get("matched_sponsorships")) or "",
+                        "matched_last": _clean(r.get("matched_last")) or "",
+                        "allocations": _clean(r.get("allocations")) or 0,
+                        "sponsorship_statuses": _clean(r.get("sponsorship_statuses")) or "",
                         "sponsorship_types": _clean(r.get("sponsorship_types"))})
     for e in extra or []:
         em = str((e or {}).get("email") or "").strip()
@@ -132,7 +155,9 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
         if not hit.empty:
             row = hit.iloc[0].to_dict()
     row = {k: _clean(v) for k, v in row.items()}
-    name = (row.get("name") or recipient.get("name") or "").strip() or "Friend"
+    # the name the sender sees for this person (donor panel / recipient list) wins over another spelling on
+    # their donations, so the email doesn't say "Dear H" under a header that says "Zakaryya"
+    name = (str(recipient.get("name") or "").strip() or str(row.get("name") or "").strip()) or "Friend"
     gifts = dx[dx["key"] == row.get("donor_id")].sort_values("date") if row and not dx.empty else None
     last = gifts.iloc[-1] if gifts is not None and len(gifts) else None
     money = lambda v: f"{float(_clean(v) or 0):,.2f}"  # noqa: E731
@@ -146,25 +171,19 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
         "last_gift_cause": str((last["subheading"] or last["heading"] or "")) if last is not None else "",
         "top_cause": str(row.get("top_heading") or ""), "sponsorship_types": str(row.get("sponsorship_types") or ""),
         "subject": subject_template or "", "message_body": (message_body or "").strip() or DEFAULT_MESSAGE,
+        # the donations that matched the filters this email was sent for (one email per person, all of them)
+        "matching_gifts_count": str(int(_clean(recipient.get("matched_gifts")) or 0)) if recipient.get("matched_gifts") is not None else "",
+        "matching_total": money(recipient.get("matched_total")) if recipient.get("matched_total") is not None else "",
+        "matching_causes": str(recipient.get("matched_causes") or ""),
+        "matching_sponsorships": str(recipient.get("matched_sponsorships") or ""),
     }
-    # Sponsorship placeholders from the donor's latest allocation (if any)
+    # Sponsorship placeholders: ALL of the donor's sponsorships in one email. One sponsorship fills the fields as
+    # before; several are combined ("Ahmed, Fatima and Bilal") and listed in {sponsorships_list}.
     em = str(recipient.get("email") or "").strip().lower()
     if em:
-        conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
-        conn.row_factory = sqlite3.Row
-        try:
-            a = conn.execute("""SELECT a.*, b.name AS beneficiary_name, b.sponsorship_type AS b_type, b.location AS b_location,
-                                       b.profile_link AS b_profile, b.video_link AS b_video, b.project_code AS b_code, b.donor_folder_link AS b_folder
-                                FROM sponsorship_allocation_donors d JOIN sponsorship_allocations a ON a.id = d.allocation_id
-                                LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
-                                WHERE LOWER(a.company_id) = ? AND LOWER(TRIM(d.donor_email)) = ?
-                                ORDER BY COALESCE(a.start_date, '') DESC LIMIT 1""", (comp, em)).fetchone()
-        except sqlite3.OperationalError:
-            a = None
-        finally:
-            conn.close()
-        if a:
-            a = dict(a)
+        allocs = donor_sponsorships(comp, em)
+        if allocs:
+            a = allocs[0]  # latest - its links / dates fill the single-value fields
             v.update({
                 "beneficiary_name": a.get("beneficiary_name") or "", "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
                 "location": a.get("b_location") or "", "project_code": a.get("b_code") or "",
@@ -175,7 +194,69 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
                 "renewal_deadline": a.get("end_date") or "",
                 "sponsorship_year": (a.get("start_date") or "")[:4],
             })
+            combined = _combined_sponsorship_vars(allocs)
+            if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
+                combined = {k: combined[k] for k in ("beneficiary_names", "sponsorships_count", "sponsorships_list")}
+            v.update(combined)
     return v
+
+
+def donor_sponsorships(comp: str, email: str) -> List[Dict[str, Any]]:
+    """Every sponsorship (allocation) this address is a donor on, latest first, with its beneficiary and status."""
+    from backend.api.donors import sponsorship_cycle_status
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT DISTINCT a.*, b.name AS beneficiary_name, b.sponsorship_type AS b_type, b.location AS b_location,
+                   b.profile_link AS b_profile, b.video_link AS b_video, b.project_code AS b_code, b.donor_folder_link AS b_folder
+            FROM sponsorship_allocation_donors d JOIN sponsorship_allocations a ON a.id = d.allocation_id
+            LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+            WHERE LOWER(a.company_id) = ? AND LOWER(TRIM(d.donor_email)) = ?
+            ORDER BY COALESCE(a.start_date, '') DESC, a.id DESC""", (comp, (email or "").strip().lower()))]
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    seen, out = set(), []
+    for r in rows:
+        if r["id"] in seen:
+            continue
+        seen.add(r["id"])
+        r["cycle_status"] = sponsorship_cycle_status(r.get("start_date"), r.get("end_date"))
+        out.append(r)
+    return out
+
+
+def _join_names(names: List[str]) -> str:
+    names = [n for n in dict.fromkeys(n.strip() for n in names if n and n.strip())]
+    return names[0] if len(names) == 1 else (", ".join(names[:-1]) + " and " + names[-1]) if names else ""
+
+
+def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
+    import html as _html
+    items = []
+    for a in allocs:
+        name = a.get("beneficiary_name") or a.get("campaign_name") or "Sponsorship"
+        bits = [b for b in (a.get("b_type") or a.get("sponsorship_type"), a.get("b_location")) if b]
+        link = a.get("b_profile") or a.get("profile_link") or ""
+        line = f"<b>{_html.escape(name)}</b>" + (f" - {_html.escape(', '.join(bits))}" if bits else "")
+        if a.get("end_date"):
+            line += f" (renewal {_html.escape(str(a['end_date'])[:10])})"
+        if link:
+            line += f' - <a href="{_html.escape(link, quote=True)}">profile</a>'
+        items.append(f"<li>{line}</li>")
+    return {
+        "beneficiary_name": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
+        "beneficiary_names": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
+        "sponsorship_type": _join_names([a.get("b_type") or a.get("sponsorship_type") or "" for a in allocs]),
+        "location": _join_names([a.get("b_location") or "" for a in allocs]),
+        "sponsorships_count": str(len(allocs)),
+        "sponsorships_list": f"<ul>{''.join(items)}</ul>",
+        "profile_link": allocs[0].get("b_profile") or allocs[0].get("profile_link") or "",
+        "video_link": allocs[0].get("b_video") or "",
+        "renewal_deadline": min((str(a.get("end_date"))[:10] for a in allocs if a.get("end_date")), default=""),
+    }
 
 
 def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str], body_tpl: Optional[str],
@@ -197,28 +278,35 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
             "body_html": _render_text(body_tpl, variables), "unresolved_placeholders": unresolved}
 
 
+MATCH_FIELDS = ("matched_gifts", "matched_total", "matched_causes", "matched_sponsorships")
+
+
 def _deliver(comp: str, theme: str, template_type: str, rendered: Dict[str, Any], base_url: str,
-             campaign_id: Optional[int], donor_id: Optional[str], message_id: Optional[int] = None) -> Dict[str, Any]:
+             campaign_id: Optional[int], donor_id: Optional[str], message_id: Optional[int] = None,
+             kind: Optional[str] = None) -> Dict[str, Any]:
     to = (rendered["recipient_email"] or "").strip()
     result = {"recipient_email": to, "status": "sent", "detail": ""}
     if "@" not in to:
         result.update(status="skipped", detail="No email address")
     elif rendered["unresolved_placeholders"]:
         result.update(status="skipped", detail="Template needs: " + ", ".join(rendered["unresolved_placeholders"]))
+    elif is_unsubscribed(comp, to):
+        result.update(status="skipped", detail="Unsubscribed from emails")
     tracking_id, sender = None, None
     if result["status"] == "sent":
-        access_token = _get_valid_graph_token(comp)  # this charity's own mailbox only
-        auth = _get_outlook_auth_row(comp)
-        sender = auth["connected_email"] if auth and auth["connected_email"] else "me"
+        from backend.api.mailbox import is_connected, provider, send_email  # this charity's own mailbox (Gmail or Microsoft 365)
+        if not is_connected(comp):  # stop the whole send, as before, rather than failing every person
+            raise HTTPException(status_code=400, detail=f"{comp.title()}'s {'Gmail' if provider(comp) == 'gmail' else 'Microsoft 365'} mailbox isn't connected - connect it in Email > Mailbox.")
         tracking_id = str(uuid.uuid4())
-        html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}")
-        res = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers={
-            "Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json={
-            "message": {"subject": rendered["subject"].strip(), "body": {"contentType": "HTML", "content": html},
-                        "toRecipients": [{"emailAddress": {"address": to, "name": rendered["recipient_name"]}}]},
-            "saveToSentItems": "true"}, timeout=15)
-        if res.status_code not in (200, 202):
-            result.update(status="failed", detail=f"Mail server error {res.status_code}")
+        html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}",
+                                      comp, to, tracking_id)
+        try:
+            res = send_email(comp, [(to, rendered["recipient_name"])], rendered["subject"].strip(), html)
+        except HTTPException as e:
+            res = {"ok": False, "detail": str(e.detail)}
+        sender = res.get("sender")
+        if not res["ok"]:
+            result.update(status="failed", detail=res["detail"][:300])
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
     try:
         with conn:
@@ -229,9 +317,10 @@ def _deliver(comp: str, theme: str, template_type: str, rendered: Dict[str, Any]
                                        sender_email = ?, sent_at = ? WHERE id = ? AND company_id = ?""", (*vals, message_id, comp))
             else:
                 conn.execute("""INSERT INTO crm_email_messages (company_id, campaign_id, donor_id, recipient_email, recipient_name,
-                                    template_type, theme, subject, body_html, status, detail, tracking_id, sender_email, sent_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                             (comp, campaign_id, donor_id, to, rendered["recipient_name"], template_type, theme, *vals))
+                                    template_type, theme, subject, body_html, status, detail, tracking_id, sender_email, sent_at, kind)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             (comp, campaign_id, donor_id, to, rendered["recipient_name"], template_type, theme, *vals,
+                              kind or ("campaign" if campaign_id else "bulk")))
     finally:
         conn.close()
     try:
@@ -297,7 +386,11 @@ class PreviewRequest(BaseModel):
 def preview(req: PreviewRequest):
     comp = _company(req.company_id)
     theme = _resolve_theme(comp, req.theme)
-    return _render(comp, theme, req.template_type, req.subject_template, req.body_template, req.recipient, req.message_body)
+    out = _render(comp, theme, req.template_type, req.subject_template, req.body_template, req.recipient, req.message_body)
+    from backend.api.unsubscribe import add_footer  # show the Unsubscribe button exactly as it will be sent
+    out["body_html"] = add_footer(out.get("body_html") or "", comp, out.get("recipient_email") or "")
+    out["unsubscribed"] = is_unsubscribed(comp, out.get("recipient_email") or "")
+    return out
 
 
 class SendRequest(BaseModel):
@@ -309,6 +402,7 @@ class SendRequest(BaseModel):
     message_body: Optional[str] = None
     recipients: List[Dict[str, Any]]
     dry_run: bool = False
+    kind: str = "bulk"  # "single" when written to one person from their donor panel
 
 
 @router.post("/send")
@@ -328,7 +422,8 @@ def send(req: SendRequest, request: Request):
                         "detail": "" if ok else ("No email address" if "@" not in rendered["recipient_email"]
                                                  else "Template needs: " + ", ".join(rendered["unresolved_placeholders"]))})
             continue
-        out.append(_deliver(comp, theme, req.template_type, rendered, base_url, None, r.get("donor_id")))
+        out.append(_deliver(comp, theme, req.template_type, rendered, base_url, None, r.get("donor_id"),
+                            kind="single" if req.kind == "single" else "bulk"))
     summary = {s: sum(1 for x in out if x["status"] == s) for s in ("sent", "ok", "skipped", "failed")}
     return {"results": out, "summary": summary, "dry_run": req.dry_run}
 
@@ -346,6 +441,7 @@ class CampaignRequest(BaseModel):
     message_body: Optional[str] = None
     exclude_emailed_days: Optional[int] = None
     exclude_other_pending: bool = True
+    matched: Optional[List[Dict[str, Any]]] = None
 
 
 @router.post("/campaigns")
@@ -376,6 +472,8 @@ def create_campaign(req: CampaignRequest, request: Request):
     rows = [r for r in rows if r["email"].lower() not in skip]
     if not rows:
         raise HTTPException(status_code=400, detail="Nobody to email: the segment has no one with an email address (after exclusions).")
+    # the screen sends the chosen people with what matched for each (the queue keeps it for {matching_...})
+    matched = {str(m.get("email") or "").lower(): m for m in (req.matched or [])}
     user = _user(request)
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
     try:
@@ -387,8 +485,10 @@ def create_campaign(req: CampaignRequest, request: Request):
                                 req.template_type, theme, req.subject_template, req.body_template, req.message_body, user.get("email")))
             cid = cur.lastrowid
             conn.executemany("""INSERT OR IGNORE INTO crm_email_messages (company_id, campaign_id, donor_id, recipient_email, recipient_name,
-                                    template_type, theme, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
-                             [(comp, cid, r["donor_id"], r["email"], r["name"], req.template_type, theme) for r in rows])
+                                    template_type, theme, status, extra_json, kind) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'campaign')""",
+                             [(comp, cid, r["donor_id"], r["email"], r["name"], req.template_type, theme,
+                               json.dumps({k: matched.get(r["email"].lower(), {}).get(k, r.get(k)) for k in MATCH_FIELDS}))
+                              for r in rows])
     finally:
         conn.close()
     return {"campaign_id": cid, "queued": len(rows), "excluded": len(skip & {r['email'].lower() for r in rows})}
@@ -459,7 +559,7 @@ def send_campaign_batch(campaign_id: int, req: CampaignSendRequest, request: Req
         c = _campaign(conn, comp, campaign_id)
         if c["status"] not in ("queued", "sending"):
             raise HTTPException(status_code=400, detail=f"This campaign is {c['status']}.")
-        pending = [dict(r) for r in conn.execute("""SELECT id, donor_id, recipient_email, recipient_name FROM crm_email_messages
+        pending = [dict(r) for r in conn.execute("""SELECT id, donor_id, recipient_email, recipient_name, extra_json FROM crm_email_messages
                        WHERE campaign_id = ? AND company_id = ? AND status = 'pending' ORDER BY id LIMIT ?""",
                                                  (campaign_id, comp, max(1, min(int(req.limit), SEND_BATCH_LIMIT))))]
         if not req.dry_run:
@@ -470,14 +570,18 @@ def send_campaign_batch(campaign_id: int, req: CampaignSendRequest, request: Req
     base_url = str(request.base_url).rstrip("/")
     out = []
     for m in pending:
+        try:
+            extra = json.loads(m.get("extra_json") or "{}") or {}
+        except ValueError:
+            extra = {}
         rendered = _render(comp, c["theme"], c["template_type"], c["subject"], c["body_html"],
-                           {"donor_id": m["donor_id"], "email": m["recipient_email"], "name": m["recipient_name"]}, c.get("message_body"))
+                           {**extra, "donor_id": m["donor_id"], "email": m["recipient_email"], "name": m["recipient_name"]}, c.get("message_body"))
         if req.dry_run:
             ok = not rendered["unresolved_placeholders"]
             out.append({"recipient_email": m["recipient_email"], "status": "ok" if ok else "skipped",
                         "detail": "" if ok else "Template needs: " + ", ".join(rendered["unresolved_placeholders"])})
             continue
-        out.append(_deliver(comp, c["theme"], c["template_type"], rendered, base_url, campaign_id, m["donor_id"], m["id"]))
+        out.append(_deliver(comp, c["theme"], c["template_type"], rendered, base_url, campaign_id, m["donor_id"], m["id"], kind="campaign"))
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
     try:
         left = conn.execute("SELECT COUNT(*) FROM crm_email_messages WHERE campaign_id = ? AND status = 'pending'", (campaign_id,)).fetchone()[0]
@@ -538,3 +642,225 @@ def donor_email_history(company_id: str = Query(...), email: str = Query(...)):
     finally:
         conn.close()
     return {"emails": rows}
+
+
+class RecipientGiftsRequest(BaseModel):
+    company_id: str
+    donor_id: str
+    segment: Optional[Dict[str, Any]] = None
+
+
+@router.post("/recipient-gifts")
+def recipient_gifts(req: RecipientGiftsRequest):
+    """One person's donations that match the segment (all of them when it has no gift rules) and their
+    sponsorships - shown when a row of the recipient list is opened."""
+    from backend.api.donors import _directory_data, filter_gifts, has_gift_rules
+    comp = _company(req.company_id)
+    frame, dx = _directory_data(comp)
+    key = str(req.donor_id or "").strip().lower()
+    row = frame[frame["donor_id"].str.lower() == key] if frame is not None and not frame.empty else frame
+    if row is None or row.empty:
+        raise HTTPException(status_code=404, detail="Donor not found for this charity.")
+    person = row.iloc[0]
+    gifts = dx[dx["key"] == person["donor_id"]]
+    if has_gift_rules(req.segment):
+        gifts = filter_gifts(gifts, req.segment or {}, dx.attrs.get("host_platforms") or {})
+    gifts = gifts.sort_values("date", ascending=False)
+    cols = ["date", "amount", "campaign", "heading", "subheading", "stype", "platform", "fundraiser", "giving_level",
+            "donation_id", "zakat", "gift_aid", "recurring"]
+    out = []
+    for g in gifts[[c for c in cols if c in gifts.columns]].head(300).to_dict(orient="records"):
+        g = {k: _clean(v) for k, v in g.items()}
+        g["date"] = str(g.get("date") or "")[:10]
+        out.append(g)
+    allocs = donor_sponsorships(comp, str(person.get("email") or "")) if "@" in str(person.get("email") or "") else []
+    return {"donor_id": person["donor_id"], "count": int(len(gifts)), "total": round(float(gifts["amount"].sum()), 2),
+            "gifts": out,
+            "sponsorships": [{"allocation_id": a["id"], "beneficiary": a.get("beneficiary_name") or a.get("campaign_name"),
+                              "type": a.get("b_type") or a.get("sponsorship_type"), "location": a.get("b_location"),
+                              "start_date": a.get("start_date"), "end_date": a.get("end_date"), "status": a["cycle_status"]}
+                             for a in allocs]}
+
+
+@router.get("/thread")
+def donor_email_thread(company_id: str = Query(...), email: str = Query(...)):
+    """Everything this charity has emailed one address and every reply, oldest first: single and bulk emails,
+    campaign emails, Sponsorship Tracker emails and the donor's replies to any of them."""
+    comp = _company(company_id)
+    em = (email or "").strip().lower()
+    if "@" not in em:
+        raise HTTPException(status_code=400, detail="An email address is needed.")
+    items: List[Dict[str, Any]] = []
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        for r in conn.execute("""SELECT m.id, m.subject, m.body_html, m.status, m.detail, m.sent_at, m.created_at, m.opened_at,
+                                        m.open_count, m.replied_at, m.template_type, m.kind, m.sender_email, c.name AS campaign
+                                 FROM crm_email_messages m LEFT JOIN crm_email_campaigns c ON c.id = m.campaign_id
+                                 WHERE m.company_id = ? AND LOWER(m.recipient_email) = ? AND m.status != 'pending'""", (comp, em)):
+            r = dict(r)
+            items.append({"id": f"crm-{r['id']}", "direction": "out", "at": r["sent_at"] or r["created_at"],
+                          "source": f"Campaign: {r['campaign']}" if r["campaign"] else ("Email" if r["kind"] == "single" else "Bulk email"),
+                          "subject": r["subject"], "body_html": r["body_html"], "status": r["status"], "detail": r["detail"],
+                          "opened_at": r["opened_at"], "open_count": r["open_count"] or 0, "replied_at": r["replied_at"],
+                          "template_type": r["template_type"], "from": r["sender_email"]})
+        for r in conn.execute("""SELECT id, subject, body_preview, received_at, sender_email, reply_to_id FROM crm_email_replies
+                                 WHERE company_id = ? AND LOWER(sender_email) = ?""", (comp, em)):
+            r = dict(r)
+            items.append({"id": f"crmr-{r['id']}", "direction": "in", "at": r["received_at"], "source": "Reply",
+                          "subject": r["subject"], "body_text": r["body_preview"], "reply_to": f"crm-{r['reply_to_id']}" if r["reply_to_id"] else None,
+                          "from": r["sender_email"]})
+        try:
+            for r in conn.execute("""SELECT c.id, c.direction, c.subject, c.body, c.sent_at, c.delivery_status, c.opened_at, c.open_count,
+                                            c.replied_at, c.template_type, c.sender_email, c.recipient_email, c.thread_id, b.name AS beneficiary
+                                     FROM sponsorship_communications c
+                                     LEFT JOIN sponsorship_allocations a ON a.id = c.allocation_id
+                                     LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                                     WHERE LOWER(c.company_id) = ? AND (
+                                        (c.direction = 'outbound' AND LOWER(c.recipient_email) LIKE ?) OR
+                                        (c.direction = 'inbound' AND LOWER(TRIM(c.sender_email)) = ?))""", (comp, f"%{em}%", em)):
+                r = dict(r)
+                out = r["direction"] == "outbound"
+                to_list = [x.strip() for x in str(r.get("recipient_email") or "").lower().replace(";", ",").split(",")]
+                if out and em not in to_list:  # LIKE also matches "xa@b.com" for "a@b.com"
+                    continue
+                items.append({"id": f"sp-{r['id']}", "direction": "out" if out else "in", "at": r["sent_at"],
+                              "source": f"Sponsorship{': ' + r['beneficiary'] if r['beneficiary'] else ''}" if out else "Reply",
+                              "subject": r["subject"], ("body_html" if out else "body_text"): r["body"],
+                              "status": (r["delivery_status"] or "sent") if out else None,
+                              "opened_at": r["opened_at"], "open_count": r["open_count"] or 0, "replied_at": r["replied_at"],
+                              "template_type": r["template_type"], "conversation": r["thread_id"], "from": r["sender_email"]})
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        conn.close()
+
+    def when(i):
+        return str(i.get("at") or "").replace("T", " ")[:19]
+    items.sort(key=when)
+    for i in items:
+        i["at"] = when(i)
+    # everything that actually went out (sponsorship emails also show as opened / delivered / replied)
+    sent = [i for i in items if i["direction"] == "out" and i.get("status") not in ("skipped", "failed", "pending")]
+    return {"email": em, "items": items,
+            "summary": {"sent": len(sent), "opened": sum(1 for i in sent if (i.get("open_count") or 0) > 0),
+                        "replies": sum(1 for i in items if i["direction"] == "in"),
+                        "last_contact": items[-1]["at"] if items else None}}
+
+
+@router.get("/activity")
+def email_activity(company_id: str = Query(...), direction: Optional[str] = Query(None), search: Optional[str] = Query(None),
+                   limit: int = Query(200, ge=1, le=1000)):
+    """Latest emails sent and replies received by this charity, from every part of the CRM (Email section, campaigns,
+    Sponsorship Tracker), newest first - the Email section's activity feed."""
+    comp = _company(company_id)
+    q = f"%{(search or '').strip().lower()}%"
+    rows: List[Dict[str, Any]] = []
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        if direction in (None, "", "out"):
+            rows += [dict(r, direction="out") for r in conn.execute("""
+                SELECT 'crm-' || m.id AS id, m.recipient_email AS email, m.recipient_name AS name, m.subject, m.status,
+                       REPLACE(COALESCE(m.sent_at, m.created_at), 'T', ' ') AS at, m.open_count, m.replied_at,
+                       CASE WHEN c.name IS NOT NULL THEN 'Campaign: ' || c.name WHEN m.kind = 'single' THEN 'Email' ELSE 'Bulk email' END AS source
+                FROM crm_email_messages m LEFT JOIN crm_email_campaigns c ON c.id = m.campaign_id
+                WHERE m.company_id = ? AND m.status != 'pending'
+                  AND (LOWER(m.recipient_email) LIKE ? OR LOWER(COALESCE(m.recipient_name, '')) LIKE ? OR LOWER(COALESCE(m.subject, '')) LIKE ?)
+                ORDER BY at DESC LIMIT ?""", (comp, q, q, q, limit))]
+            try:
+                rows += [dict(r, direction="out") for r in conn.execute("""
+                    SELECT 'sp-' || c.id AS id, c.recipient_email AS email, d.donor_name AS name, c.subject,
+                           COALESCE(c.delivery_status, 'sent') AS status, REPLACE(c.sent_at, 'T', ' ') AS at, c.open_count, c.replied_at,
+                           'Sponsorship' || COALESCE(': ' || b.name, '') AS source
+                    FROM sponsorship_communications c
+                    LEFT JOIN sponsorship_allocation_donors d ON d.id = c.allocation_donor_id
+                    LEFT JOIN sponsorship_allocations a ON a.id = c.allocation_id
+                    LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                    WHERE LOWER(c.company_id) = ? AND c.direction = 'outbound'
+                      AND (LOWER(COALESCE(c.recipient_email, '')) LIKE ? OR LOWER(COALESCE(d.donor_name, '')) LIKE ? OR LOWER(COALESCE(c.subject, '')) LIKE ?)
+                    ORDER BY at DESC LIMIT ?""", (comp, q, q, q, limit))]
+            except sqlite3.OperationalError:
+                pass
+        if direction in (None, "", "in"):
+            rows += [dict(r, direction="in", status="reply") for r in conn.execute("""
+                SELECT 'crmr-' || id AS id, sender_email AS email, NULL AS name, subject, REPLACE(received_at, 'T', ' ') AS at,
+                       body_preview, 'Reply' AS source FROM crm_email_replies
+                WHERE company_id = ? AND (LOWER(sender_email) LIKE ? OR LOWER(COALESCE(subject, '')) LIKE ?)
+                ORDER BY at DESC LIMIT ?""", (comp, q, q, limit))]
+            try:
+                rows += [dict(r, direction="in", status="reply") for r in conn.execute("""
+                    SELECT 'sp-' || id AS id, sender_email AS email, NULL AS name, subject, REPLACE(sent_at, 'T', ' ') AS at,
+                           body AS body_preview, 'Reply (sponsorship)' AS source FROM sponsorship_communications
+                    WHERE LOWER(company_id) = ? AND direction = 'inbound' AND (LOWER(COALESCE(sender_email, '')) LIKE ? OR LOWER(COALESCE(subject, '')) LIKE ?)
+                    ORDER BY at DESC LIMIT ?""", (comp, q, q, limit))]
+            except sqlite3.OperationalError:
+                pass
+    finally:
+        conn.close()
+    rows.sort(key=lambda r: str(r.get("at") or ""), reverse=True)
+    for r in rows:
+        r["at"] = str(r.get("at") or "")[:19]
+        if r.get("body_preview"):
+            r["body_preview"] = str(r["body_preview"])[:300]
+    return {"items": rows[:limit]}
+
+
+SPONSORSHIP_PLACEHOLDERS = {"beneficiary_name", "beneficiary_names", "sponsorship_type", "location", "project_code", "profile_link",
+                            "video_link", "report_link", "donor_folder_link", "folder_link", "renewal_deadline", "sponsorship_year",
+                            "sponsorships_list", "sponsorships_count", "campaign_name", "community_name"}
+LINK_PLACEHOLDERS = {"profile_link", "video_link", "report_link", "donor_folder_link", "folder_link"}
+
+
+def _issue_text(missing: List[str], has_sponsorship: bool) -> str:
+    """Why an email can't be sent, in words the sender can act on."""
+    spons = [m for m in missing if m.lower() in SPONSORSHIP_PLACEHOLDERS]
+    other = [m for m in missing if m.lower() not in SPONSORSHIP_PLACEHOLDERS]
+    parts = []
+    if spons and not has_sponsorship:
+        parts.append("not on any sponsorship in the Sponsorship Tracker, so " + ", ".join(f"{{{m}}}" for m in spons) + " can't be filled")
+    elif spons:
+        links = [m for m in spons if m.lower() in LINK_PLACEHOLDERS]
+        rest = [m for m in spons if m.lower() not in LINK_PLACEHOLDERS]
+        if links:
+            parts.append("their beneficiary has no " + ", ".join(f"{{{m}}}" for m in links) + " (add it on the beneficiary in the Tracker)")
+        if rest:
+            parts.append("their sponsorship has no " + ", ".join(f"{{{m}}}" for m in rest))
+    if other:
+        parts.append("no value for " + ", ".join(f"{{{m}}}" for m in other))
+    return "; ".join(parts)
+
+
+class CheckRequest(BaseModel):
+    company_id: str
+    theme: Optional[str] = None
+    template_type: str = "general_custom"
+    subject_template: Optional[str] = None
+    body_template: Optional[str] = None
+    message_body: Optional[str] = None
+    recipients: List[Dict[str, Any]]
+
+
+@router.post("/check")
+def check_recipients(req: CheckRequest):
+    """Renders the email for each chosen person (up to 200 per call, nothing is sent) and returns only the ones
+    that would be skipped, with the reason - so every problem is visible before sending, not just the previewed one."""
+    comp = _company(req.company_id)
+    theme = _resolve_theme(comp, req.theme)
+    if len(req.recipients) > 200:
+        raise HTTPException(status_code=400, detail="Check at most 200 people per call.")
+    problems = []
+    for r in req.recipients:
+        em = str(r.get("email") or "").strip()
+        if "@" not in em:
+            problems.append({"email": em, "name": r.get("name") or "", "issue": "no email address"})
+            continue
+        if is_unsubscribed(comp, em):
+            problems.append({"email": em, "name": r.get("name") or "", "issue": "unsubscribed from emails (pressed Unsubscribe)"})
+            continue
+        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r, req.message_body)
+        if rendered["unresolved_placeholders"]:
+            missing = rendered["unresolved_placeholders"]
+            has_spons = bool(donor_sponsorships(comp, em)) if any(m.lower() in SPONSORSHIP_PLACEHOLDERS for m in missing) else True
+            problems.append({"email": em, "name": rendered["recipient_name"], "missing": missing, "issue": _issue_text(missing, has_spons)})
+    return {"checked": len(req.recipients), "ok": len(req.recipients) - len(problems), "problems": problems}

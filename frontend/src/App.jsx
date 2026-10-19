@@ -19,6 +19,7 @@ const AdminView = lazyPage(() => import('./components/AdminView'));
 const TrackerView = lazyPage(() => import('./components/TrackerView'));
 const PayoutsView = lazyPage(() => import('./components/PayoutsView'));
 const FundraiserView = lazyPage(() => import('./components/FundraiserView'));
+const EmailView = lazyPage(() => import('./components/email/EmailView'));
 import DonorDrawer from './components/DonorDrawer';
 import LoginView from './components/LoginView';
 const OpsConsole = lazyPage(() => import('./components/ops/OpsConsole'));
@@ -265,6 +266,13 @@ export default function App() {
     setFilters(INITIAL_FILTERS);
   };
 
+  // Email section, optionally opened with people already chosen (a segment) from Donors or the Sponsorship Tracker
+  const [emailPreset, setEmailPreset] = useState(null);
+  const handleOpenEmail = (segment = {}) => {
+    setEmailPreset({ segment: segment || {}, at: Date.now() });
+    setActiveTab('email');
+  };
+
   const handleNavigateToExplorer = ({ campaign, giving_level, platform, code } = {}) => {
     let sourceFilter = 'All Sources (Combined)';
     if (platform) {
@@ -395,6 +403,28 @@ export default function App() {
     }
   };
 
+  // Google (Gmail) sign-in comes back to /gmail-callback?code=...&state=gmail:<charity>:... - finish it here
+  useEffect(() => {
+    if (!user || window.location.pathname !== '/gmail-callback') return;
+    const q = new URLSearchParams(window.location.search);
+    const state = q.get('state') || '';
+    const comp = state.split(':')[1];
+    const done = (text) => {
+      window.history.replaceState({}, document.title, '/');
+      try { sessionStorage.setItem('crm_email_tab', 'mailbox'); } catch { /* ignore */ }
+      if (comp) { setActiveCompany(comp); localStorage.setItem('crm_active_company', comp); }
+      setActiveTab('email');
+      window.alert(text);
+    };
+    if (q.get('error')) { done(`Google sign-in was cancelled (${q.get('error')}).`); return; }
+    if (!q.get('code') || !state.startsWith('gmail:')) { done('That Google sign-in link was incomplete - press Connect with Google again.'); return; }
+    fetch(`${API_BASE_URL}/api/mailbox/gmail/exchange`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company_id: comp, code: q.get('code'), state, redirect_uri: `${window.location.origin}/gmail-callback` }),
+    }).then(async r => { const d = await r.json().catch(() => ({})); done(r.ok ? `Gmail connected: ${d.connected_email}` : `Gmail wasn't connected: ${d.detail || r.status}`); })
+      .catch(e => done(`Gmail wasn't connected: ${e.message}`));
+  }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!user) {
     return <LoginView theme={theme} onToggleTheme={handleToggleTheme} onLoginSuccess={handleLoginSuccess} />;
   }
@@ -483,7 +513,10 @@ export default function App() {
                 />
               )}
               {activeTab === 'donors' && (
-                <DonorsView key={activeCompany} activeCompany={activeCompany} onSelectDonor={setSelectedDonor} user={user} />
+                <DonorsView key={activeCompany} activeCompany={activeCompany} onSelectDonor={setSelectedDonor} user={user} onOpenEmail={handleOpenEmail} />
+              )}
+              {activeTab === 'email' && (
+                <EmailView key={activeCompany} user={user} activeCompany={activeCompany} onSelectDonor={setSelectedDonor} preset={emailPreset} />
               )}
               {activeTab === 'explorer' && (
                 <ExplorerView 
@@ -523,6 +556,7 @@ export default function App() {
                   onSelectDonor={setSelectedDonor} 
                   accentColor={accentColor} 
                   activeCompany={activeCompany}
+                  onOpenEmail={handleOpenEmail}
                 />
               )}
               {activeTab === 'classifications' && (

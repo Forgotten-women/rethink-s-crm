@@ -6,7 +6,7 @@ import {
 import { API_BASE_URL } from '../../config';
 import DonationDetailModal from '../DonationDetailModal';
 import AddDonationModal, { canEditRecords } from '../AddDonationModal';
-import EmailComposer from '../EmailComposer';
+import SingleEmailComposer from '../email/SingleEmailComposer';
 import { PlusCircle, Send, Search } from 'lucide-react';
 
 const money = (v, cur = '£') => (v === null || v === undefined ? '—' : `${cur}${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
@@ -346,7 +346,8 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
       )}
       {emailing && (
         <span onClick={e => e.stopPropagation()}>
-          <EmailComposer company={companyId} initialDonorIds={[primaryEmail]} onClose={() => setEmailing(false)} />
+          <SingleEmailComposer company={companyId} recipient={{ email: primaryEmail, name: data?.contact?.name || '', donor_id: primaryEmail.toLowerCase() }}
+            onClose={() => setEmailing(false)} onSent={() => setReloadTick(t => t + 1)} />
         </span>
       )}
     </div>

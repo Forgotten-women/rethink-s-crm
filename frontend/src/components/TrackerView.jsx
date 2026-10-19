@@ -9,6 +9,8 @@ import {
   ChevronsLeft, ChevronsRight, ChevronDown, ChevronUp, Code, RotateCcw,
   FileCode, Tag, HelpCircle, LayoutTemplate, Zap, AlertTriangle, Bell, Download, Sliders, SendHorizontal, EyeOff, Ban
 } from 'lucide-react';
+import EmailBuilder, { caretProps } from './email/builder/EmailBuilder';
+import { blankDoc, htmlToDoc, newBlock, renderDoc, signatureBlocks } from './email/builder/emailDoc';
 import { API_BASE_URL } from '../config';
 import AllocationDonorsEditor from './tracker/AllocationDonorsEditor';
 import SponsorshipDonorPanel from './tracker/SponsorshipDonorPanel';
@@ -145,11 +147,19 @@ export const ClassificationBadge = ({
   );
 };
 
-export default function TrackerView({ user, filters, onSelectDonor, activeCompany = 'rethink', companies = [] }) {
+// The mailbox, templates and sponsorship email queue now live in the Email section, which shows them through
+// <TrackerView embeddedTab="queue" | "templates" | "outlook" /> (same screens, without the tracker header).
+const EMAIL_TABS = ['outlook', 'queue', 'campaigns', 'templates'];
+
+// The Unsubscribe button every sent email gets (backend/api/unsubscribe.py adds the real per-person link).
+const unsubscribeFooterPreview = (charity) => `<div style="max-width:600px;margin:24px auto 8px;padding:14px 16px;text-align:center;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#64748b;border-top:1px solid #e2e8f0;">You are receiving this email because you supported ${charity || 'us'}.<br/><span style="display:inline-block;margin-top:8px;padding:6px 16px;border:1px solid #cbd5e1;border-radius:6px;color:#475569;font-weight:bold;font-size:12px;">Unsubscribe</span><div style="margin-top:6px;font-size:10px;color:#94a3b8;">(added automatically to every email)</div></div>`;
+
+export default function TrackerView({ user, filters, onSelectDonor, activeCompany = 'rethink', companies = [], embeddedTab = null, onOpenEmail }) {
   const isConsolidated = activeCompany === 'all';
   
   // Navigation Tabs: 'beneficiaries' | 'allocations' | 'alerts' | 'analytics' | 'outlook' | 'templates'
-  const [activeTab, setActiveTab] = useState('beneficiaries');
+  const [activeTabState, setActiveTab] = useState('beneficiaries');
+  const activeTab = embeddedTab || (EMAIL_TABS.includes(activeTabState) ? 'beneficiaries' : activeTabState);
 
   // Donor details panel, per-allocation donor management, per-donor email dispatcher
   const [donorPanelKey, setDonorPanelKey] = useState(null);
@@ -176,6 +186,32 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const [overdueTargetStatusFilter, setOverdueTargetStatusFilter] = useState('all'); // 'all' | 'target_reached' | 'threshold_reached' | 'below_threshold'
   const [overdueClassificationFilter, setOverdueClassificationFilter] = useState('all');
   const [overdueSearchQuery, setOverdueSearchQuery] = useState('');
+  // More overdue filters: when the slot was earned, last gift, waiting at most N days, slots and amount
+  const OVERDUE_EXTRA_EMPTY = { earned_from: '', earned_to: '', last_gift_from: '', last_gift_to: '', max_days: '', min_slots: '', min_amount: '', max_amount: '' };
+  const [overdueExtra, setOverdueExtra] = useState(OVERDUE_EXTRA_EMPTY);
+  const overdueExtraKey = JSON.stringify(overdueExtra);
+  const appendOverdueExtra = (params) => {
+    Object.entries(overdueExtra).forEach(([k, v]) => { if (v !== '' && v != null) params.append(k, v); });
+    return params;
+  };
+  // The Overdue Alerts filters on screen, in the form the automatic digest saves them
+  const screenDigestFilters = () => {
+    const f = { ...overdueExtra };
+    if (overdueTypeFilter && overdueTypeFilter !== 'All') f.sponsorship_type = overdueTypeFilter;
+    if (overdueTargetStatusFilter && overdueTargetStatusFilter !== 'all') f.target_status = overdueTargetStatusFilter;
+    if (overdueClassificationFilter && overdueClassificationFilter !== 'all') f.classification = overdueClassificationFilter;
+    if (overdueSeverityFilter && overdueSeverityFilter !== 'all') f.severity = overdueSeverityFilter;
+    if (overdueSearchQuery) f.search = overdueSearchQuery;
+    return Object.fromEntries(Object.entries(f).filter(([, v]) => v !== '' && v != null));
+  };
+  const DIGEST_FILTER_LABELS = { sponsorship_type: 'Program', target_status: 'Target', classification: 'Source', severity: 'Severity', search: 'Search',
+    earned_from: 'Slot earned from', earned_to: 'Slot earned to', last_gift_from: 'Last gift from', last_gift_to: 'Last gift to',
+    max_days: 'Waiting ≤ days', min_slots: 'Slots ≥', min_amount: 'Amount ≥ £', max_amount: 'Amount ≤ £' };
+  const digestRequestFilters = (f = {}) => {
+    const top = {}; const rest = {};
+    Object.entries(f || {}).forEach(([k, v]) => { (['sponsorship_type', 'target_status', 'classification', 'severity', 'search'].includes(k) ? top : rest)[k] = v; });
+    return { ...top, filters: rest };
+  };
   const [overdueDonorPage, setOverdueDonorPage] = useState(1);
   const [overdueDonorPageSize, setOverdueDonorPageSize] = useState(15);
   const [overdueCampaignPage, setOverdueCampaignPage] = useState(1);
@@ -191,7 +227,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     threshold_days: 30,
     staff_emails: '',
     digest_frequency: 'weekly',
-    last_digest_sent_at: null
+    last_digest_sent_at: null,
+    digest_filters: {},
+    next_digest_at: null,
+    mailbox_connected: true,
   });
   const [overdueDismissals, setOverdueDismissals] = useState([]);
   const [overdueDismissalsCount, setOverdueDismissalsCount] = useState(0);
@@ -224,6 +263,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const [selectedTypeFilter, setSelectedTypeFilter] = useState('All');
   const [selectedStatusFilter, setSelectedStatusFilter] = useState('All');
   const [selectedDonorType, setSelectedDonorType] = useState('Orphan');
+  // Allocations Matrix: donors & capacity and active allocations are two full-width tabs (the side-by-side split
+  // was too cramped). Both stay mounted so their searches, filters and pages are kept when switching.
+  const [matrixPane, setMatrixPane] = useState('donors');
 
   // --- DONORS LEFT PANEL SEARCH & PAGINATION STATE ---
   const [donorSearchQuery, setDonorSearchQuery] = useState('');
@@ -524,6 +566,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   // Selected charity theme for Tab 5 configuration
+  const [tplPage, setTplPage] = useState(1);
+  const [tplSearch, setTplSearch] = useState('');
   const [selectedCharityTheme, setSelectedCharityTheme] = useState(() => {
     return activeCompany === 'iqra' ? 'iqra' : 'rethink';
   });
@@ -563,7 +607,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     id: null,
     template_type: 'profile_intro',
     subject: '',
-    body_html: ''
+    body_html: '',
+    builder_json: null
   });
   const [templateEditorMode, setTemplateEditorMode] = useState('editor'); // 'editor' | 'preview'
   const [savingTemplate, setSavingTemplate] = useState(false);
@@ -776,6 +821,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     }
     if (overdueSearchQuery) params.append('search', overdueSearchQuery);
     if (forceRefresh) params.append('force_refresh', 'true');
+    appendOverdueExtra(params);
 
     fetch(`${API_BASE_URL}/api/tracker/overdue-donors?${params.toString()}`)
       .then(r => r.json())
@@ -806,6 +852,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     }
     if (overdueSearchQuery) params.append('search', overdueSearchQuery);
     if (forceRefresh) params.append('force_refresh', 'true');
+    appendOverdueExtra(params);
 
     fetch(`${API_BASE_URL}/api/tracker/overdue-campaigns?${params.toString()}`)
       .then(r => r.json())
@@ -947,12 +994,23 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         company_id: activeCompany,
         threshold_days: overdueThreshold,
         recipient_emails: alertSettings.staff_emails,
-        dry_run: dryRun
+        dry_run: dryRun,
+        ...digestRequestFilters(alertSettings.digest_filters)
       })
     })
-      .then(r => r.json())
+      .then(async r => {
+        const text = await r.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = null; }
+        if (!r.ok) return { status: 'error', message: (data && (data.detail || data.message)) || `The server couldn't finish this (error ${r.status}). If the digest may have gone out, check Outlook's Sent Items before trying again.` };
+        return data || { status: 'error', message: 'Unexpected reply from the server.' };
+      })
       .then(res => {
         setSendingDigest(false);
+        if (res && res.status === 'dry_run') {
+          setDigestFeedback({ status: 'success', message: `Preview: the digest would list ${res.summary.total_donors} donors and ${res.summary.total_campaigns} campaigns (${Math.round(res.summary.total_slots)} unallocated slots). Nothing was sent.`, html_preview: res.html_preview });
+          return;
+        }
         setDigestFeedback(res);
         if (res.status === 'success') {
           loadOverdueSettings();
@@ -974,7 +1032,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         company_id: activeCompany,
         threshold_days: alertSettings.threshold_days,
         staff_emails: alertSettings.staff_emails,
-        digest_frequency: alertSettings.digest_frequency
+        digest_frequency: alertSettings.digest_frequency,
+        digest_filters: alertSettings.digest_filters || {}
       })
     })
       .then(r => r.json())
@@ -1041,6 +1100,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           all_records: 'true'
         });
         if (overdueSearchQuery) params.append('search', overdueSearchQuery);
+        if (overdueClassificationFilter && overdueClassificationFilter !== 'all') params.append('classification', overdueClassificationFilter);
+        appendOverdueExtra(params);
 
         const res = await fetch(`${API_BASE_URL}/api/tracker/${endpoint}?${params.toString()}`);
         const data = await res.json();
@@ -1139,7 +1200,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         loadOverdueDismissals();
       }
     }
-  }, [activeTab, activeCompany, overdueActiveSubTab, overdueThreshold, overdueTypeFilter, overdueSeverityFilter, overdueTargetStatusFilter, overdueClassificationFilter, overdueSearchQuery, overdueDonorPage, overdueDonorPageSize, overdueCampaignPage, overdueCampaignPageSize]);
+  }, [activeTab, activeCompany, overdueActiveSubTab, overdueThreshold, overdueTypeFilter, overdueSeverityFilter, overdueTargetStatusFilter, overdueClassificationFilter, overdueSearchQuery, overdueDonorPage, overdueDonorPageSize, overdueCampaignPage, overdueCampaignPageSize, overdueExtraKey]);
 
   useEffect(() => {
     if (activeTab === 'alerts') {
@@ -1149,17 +1210,22 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   }, [activeTab, activeCompany, overdueThreshold, overdueTypeFilter, overdueSeverityFilter, overdueTargetStatusFilter, overdueSearchQuery]);
 
   // Sync template configuration draft when template list, charity theme, or selection changes
+  const pendingTemplateKey = useRef(null); // a just-created template: wait for the list to reload instead of falling back
   useEffect(() => {
     if (emailTemplates && emailTemplates.length > 0) {
       const themeTemplates = emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === selectedCharityTheme);
-      const match = themeTemplates.find(t => t.template_type === selectedTemplateForConfig) || themeTemplates[0] || emailTemplates[0];
+      const exact = themeTemplates.find(t => t.template_type === selectedTemplateForConfig);
+      if (!exact && pendingTemplateKey.current === selectedTemplateForConfig) return;
+      if (exact && pendingTemplateKey.current === selectedTemplateForConfig) pendingTemplateKey.current = null;
+      const match = exact || themeTemplates[0] || emailTemplates[0];
       if (match) {
         setSelectedTemplateForConfig(match.template_type);
         setTemplateDraft({
           id: match.id,
           template_type: match.template_type,
           subject: match.subject || '',
-          body_html: match.body_html || ''
+          body_html: match.body_html || '',
+          builder_json: match.builder_json || null
         });
       }
     }
@@ -1169,7 +1235,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const code = urlParams.get('code');
-    if (code) {
+    if (code && !(urlParams.get('state') || '').startsWith('gmail:')) { // a Google sign-in is handled by App (gmail-callback)
       const redirectUri = `${window.location.origin}/sponsorship-tracker`;
       fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/outlook/exchange-token`), {
         method: 'POST',
@@ -1761,7 +1827,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         company_id: effectiveCompanyId,
         template_type: templateDraft.template_type,
         subject: templateDraft.subject,
-        body_html: templateDraft.body_html
+        body_html: templateDraft.body_html,
+        builder_json: templateDraft.builder_json || null
       })
     })
       .then(r => r.json())
@@ -1829,6 +1896,21 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     }
     const cleanKey = newTemplateForm.template_type.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
     const effectiveCompanyId = (selectedCharityTheme === 'sp' && activeCompany === 'rethink') ? 'sp_rethink' : selectedCharityTheme;
+    // the new template is a builder document: the theme's own layout (from one of its templates) + blocks
+    const themeTpls = emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === selectedCharityTheme);
+    const docOf = (t) => (t.builder_json && t.builder_json.blocks ? JSON.parse(JSON.stringify(t.builder_json)) : htmlToDoc(t.body_html || ''));
+    let newDoc;
+    const source = themeTpls.find(t => String(t.id) === String(newTemplateForm.body_html));
+    if (source) {
+      newDoc = docOf(source);
+      newDoc.blocks = newDoc.blocks.map(b => ({ ...b, id: `${b.id}c${Math.random().toString(36).slice(2, 6)}` }));
+    } else {
+      const base = themeTpls.find(t => t.template_type === 'general_custom') || themeTpls.find(t => t.builder_json) || themeTpls[0];
+      const preset = CHARITY_THEMES_PRESETS[selectedCharityTheme] || {};
+      const st = base ? docOf(base).settings : blankDoc().settings;
+      st._signature = { team: `The ${preset.name || ''} Team`.replace(/\s+/g, ' '), email: preset.contact_email || '', site: preset.website_url || '', siteText: (preset.website_url || '').replace(/^https?:\/\//, '') };
+      newDoc = { version: 1, settings: st, blocks: [newBlock('heading', st), newBlock('text', st), ...signatureBlocks(st)] };
+    }
     fetch(`${API_BASE_URL}/api/tracker/email-templates`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1836,7 +1918,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         company_id: effectiveCompanyId,
         template_type: cleanKey,
         subject: newTemplateForm.subject || `Sponsorship Update: {beneficiary_name}`,
-        body_html: newTemplateForm.body_html || `<p>Dear {donor_name},</p><p>Update on {beneficiary_name}:</p>`
+        body_html: renderDoc(newDoc),
+        builder_json: newDoc
       })
     })
       .then(r => r.json())
@@ -1844,6 +1927,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         if (res.status === 'success') {
           setShowAddTemplateModal(false);
           setNewTemplateForm({ template_type: '', subject: '', body_html: '' });
+          pendingTemplateKey.current = cleanKey;
           setSelectedTemplateForConfig(cleanKey);
           loadBeneficiariesAndAllocations();
         } else {
@@ -2187,6 +2271,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   return (
     <div className="flex flex-col gap-6 p-1 md:p-2">
       {/* Top Header & 4 Tabs Bar */}
+      {!embeddedTab && (
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md p-5 rounded-2xl border border-slate-200/80 dark:border-slate-800 shadow-sm">
         <div>
           <div className="flex items-center gap-3">
@@ -2253,58 +2338,19 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
           </button>
 
 
-          <button
-            onClick={() => setActiveTab('outlook')}
-            className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
-              activeTab === 'outlook'
-                ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <Mail className="w-4 h-4" />
-            Outlook & MS 365
-            {outlookStatus?.connected && (
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            )}
-          </button>
-
-          <button
-            onClick={() => setActiveTab('queue')}
-            className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
-              activeTab === 'queue'
-                ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <Inbox className="w-4 h-4" />
-            Email Queue
-          </button>
-
-          <button
-            onClick={() => setActiveTab('campaigns')}
-            className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
-              activeTab === 'campaigns'
-                ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <Mail className="w-4 h-4" />
-            Email Campaigns
-          </button>
-
-          <button
-            onClick={() => setActiveTab('templates')}
-            className={`px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 ${
-              activeTab === 'templates'
-                ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <LayoutTemplate className="w-4 h-4" />
-            Email Templates {loadingData ? <span className="inline-block w-4 h-2.5 bg-slate-300/80 dark:bg-slate-700 rounded-xs animate-pulse align-middle ml-0.5" /> : `(${emailTemplates.length})`}
-          </button>
+          {onOpenEmail && (
+            <button
+              onClick={() => onOpenEmail({})}
+              title="Mailbox, templates, the email queue and campaigns are in the Email section"
+              className="px-3.5 py-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center gap-2 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+            >
+              <Mail className="w-4 h-4" />
+              Email section →
+            </button>
+          )}
         </div>
       </div>
+      )}
 
       {/* ========================================================= */}
       {/* TAB 1: BENEFICIARIES DIRECTORY */}
@@ -2933,10 +2979,22 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             </div>
           </div>
 
-          {/* 2-Column Split: Donors & Campaigns Capacity on Left, Active Allocations on Right */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Left Column: Qualifying Donors & Campaigns Capacity Engine */}
-            <div className="lg:col-span-5 flex flex-col gap-4">
+          {/* Two tabs: Donors & capacity | Active allocations */}
+          <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800/80 rounded-xl border border-slate-200/80 dark:border-slate-700/60 self-start">
+            {[['donors', 'Donors & capacity', Users], ['allocations', `Active allocations${loadingData ? '' : ` (${allocations.length})`}`, Layers]].map(([id, label, Icon]) => (
+              <button key={id} type="button" onClick={() => setMatrixPane(id)}
+                className={`px-4 py-2 rounded-lg text-xs md:text-sm font-bold flex items-center gap-2 transition-all ${
+                  matrixPane === id
+                    ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200/60 dark:border-slate-700'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}>
+                <Icon className="w-4 h-4" />{label}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-col gap-6">
+            {/* Tab 1: Qualifying Donors & Campaigns Capacity Engine */}
+            <div className={`${matrixPane === 'donors' ? 'flex' : 'hidden'} flex-col gap-4`}>
               <div className="bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm flex flex-col gap-3">
                 {/* Switcher Tab Header */}
                 <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800 flex-wrap gap-2">
@@ -3086,7 +3144,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     </div>
 
                     {/* Donors Paginated Cards Stream */}
-                    <div className="flex flex-col gap-2.5 min-h-[300px] max-h-[520px] overflow-y-auto pr-1">
+                    <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-2.5 content-start [&>*:only-child]:col-span-full min-h-[300px] max-h-[70vh] overflow-y-auto pr-1">
                       {loadingData ? (
                         Array.from({ length: 4 }).map((_, idx) => (
                           <div
@@ -3421,7 +3479,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     </div>
 
                     {/* Campaigns Paginated Cards Stream */}
-                    <div className="flex flex-col gap-2.5 min-h-[300px] max-h-[520px] overflow-y-auto pr-1">
+                    <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-2.5 content-start [&>*:only-child]:col-span-full min-h-[300px] max-h-[70vh] overflow-y-auto pr-1">
                       {loadingData ? (
                         Array.from({ length: 4 }).map((_, idx) => (
                           <div
@@ -3646,7 +3704,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     </div>
 
                     {/* Donors Cards List */}
-                    <div className="flex flex-col gap-2.5 max-h-[650px] overflow-y-auto pr-1">
+                    <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-2.5 content-start [&>*:only-child]:col-span-full max-h-[70vh] overflow-y-auto pr-1">
                       {isSearchingLeftAllCrm ? (
                         <div className="p-8 text-center flex flex-col items-center justify-center gap-2 text-slate-500 text-xs">
                           <RefreshCw className="w-5 h-5 animate-spin text-amber-500" />
@@ -3794,8 +3852,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               </div>
             </div>
 
-            {/* Right Column: Active Allocations */}
-            <div className="lg:col-span-7 flex flex-col gap-4">
+            {/* Tab 2: Active Allocations */}
+            <div className={`${matrixPane === 'allocations' ? 'flex' : 'hidden'} flex-col gap-4`}>
               <div className="bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm">
                 <div className="flex flex-col gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -3925,11 +3983,15 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       <Filter className="w-3.5 h-3.5" />
                       More filters{allocActiveFilterCount > 0 ? ` (${allocActiveFilterCount})` : ''}
                     </button>
-                    <button type="button" onClick={() => setShowBulkEmail(true)}
-                      className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold">
-                      <Send className="w-3.5 h-3.5" />
-                      Bulk email
-                    </button>
+                    {onOpenEmail && (
+                      <button type="button"
+                        onClick={() => onOpenEmail({ sponsored_types: [selectedDonorType], ...(allocationRenewalFilter !== 'all' ? { sponsorship_statuses: [allocationRenewalFilter] } : {}) })}
+                        title="Open the Email section with these sponsors chosen (one email per person, all their sponsorships combined)"
+                        className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold">
+                        <Send className="w-3.5 h-3.5" />
+                        Email these donors
+                      </button>
+                    )}
                   </div>
                   {(allocActiveFilterCount > 0 || allocationTypeFilter !== 'all' || allocationRenewalFilter !== 'all') && !loadingData && (
                     <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
@@ -3942,7 +4004,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   )}
                 </div>
 
-                <div className="flex flex-col gap-3 mt-3 max-h-[620px] overflow-y-auto pr-1">
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 content-start mt-3 max-h-[72vh] overflow-y-auto pr-1 [&>*:only-child]:col-span-full">
                   {loadingData ? (
                     Array.from({ length: 4 }).map((_, idx) => (
                       <div
@@ -4689,6 +4751,27 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   className="w-full pl-9 pr-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 />
               </div>
+            </div>
+
+            {/* More filters: slot earned date, last gift, waiting, slots, amount */}
+            <div className="flex flex-wrap items-end gap-3 pt-3 border-t border-slate-100 dark:border-slate-800">
+              {[
+                ['earned_from', 'Slot earned from', 'date'], ['earned_to', 'Slot earned to', 'date'],
+                ['last_gift_from', 'Last gift from', 'date'], ['last_gift_to', 'Last gift to', 'date'],
+                ['max_days', 'Waiting at most (days)', 'number'], ['min_slots', 'Unallocated slots ≥', 'number'],
+                ['min_amount', 'Donated / raised ≥ £', 'number'], ['max_amount', 'Donated / raised ≤ £', 'number'],
+              ].map(([key, label, type]) => (
+                <label key={key} className="flex flex-col gap-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  {label}
+                  <input type={type} min={type === 'number' ? 0 : undefined} value={overdueExtra[key]}
+                    onChange={(e) => { const v = e.target.value; setOverdueExtra(x => ({ ...x, [key]: v })); setOverdueDonorPage(1); setOverdueCampaignPage(1); }}
+                    className={`${type === 'number' ? 'w-32' : 'w-36'} px-2 py-1 rounded-md text-xs font-normal normal-case tracking-normal bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 border border-slate-300 dark:border-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500`} />
+                </label>
+              ))}
+              {Object.values(overdueExtra).some(v => v !== '') && (
+                <button type="button" onClick={() => { setOverdueExtra(OVERDUE_EXTRA_EMPTY); setOverdueDonorPage(1); setOverdueCampaignPage(1); }}
+                  className="px-2.5 py-1 rounded-md text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40">Clear these filters</button>
+              )}
             </div>
           </div>
 
@@ -5526,6 +5609,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         type="button"
                         onClick={() => {
                           setSelectedCharityTheme(theme.id);
+                          setTplPage(1);
+                          setTplSearch('');
                           const themeTemplates = emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === theme.id);
                           const matched = themeTemplates.find(t => t.template_type === selectedTemplateForConfig) || themeTemplates[0];
                           if (matched) {
@@ -5534,7 +5619,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                               id: matched.id,
                               template_type: matched.template_type,
                               subject: matched.subject || '',
-                              body_html: matched.body_html || ''
+                              body_html: matched.body_html || '',
+                              builder_json: matched.builder_json || null
                             });
                           }
                         }}
@@ -5567,22 +5653,40 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               {/* Templates List */}
               <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200/80 dark:border-slate-800 shadow-sm p-4 flex flex-col gap-2">
                 {(() => {
-                  const filteredTemplates = emailTemplates.filter(
+                  const themeTemplates = emailTemplates.filter(
                     (tpl) => (tpl.charity_theme || tpl.company_id || 'rethink') === selectedCharityTheme
                   );
+                  const q = tplSearch.trim().toLowerCase();
+                  const matching = q
+                    ? themeTemplates.filter(t => `${t.template_type} ${t.subject || ''}`.toLowerCase().includes(q))
+                    : themeTemplates;
+                  const TPL_PAGE = 6;
+                  const tplPages = Math.max(1, Math.ceil(matching.length / TPL_PAGE));
+                  const curPage = Math.min(tplPage, tplPages);
+                  const filteredTemplates = matching.slice((curPage - 1) * TPL_PAGE, curPage * TPL_PAGE);
                   return (
                     <>
                       <div className="flex items-center justify-between px-2">
                         <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
-                          {CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name || 'Charity'} Templates ({filteredTemplates.length})
+                          {CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name || 'Charity'} Templates ({themeTemplates.length})
                         </span>
                         <span className="text-[10px] font-mono text-indigo-600 dark:text-indigo-400">
                           {selectedCharityTheme.toUpperCase()}
                         </span>
                       </div>
+                      {themeTemplates.length > TPL_PAGE && (
+                        <input
+                          value={tplSearch}
+                          onChange={e => { setTplSearch(e.target.value); setTplPage(1); }}
+                          placeholder="Search templates by name or subject"
+                          className="w-full rounded-lg border bg-white text-slate-900 border-slate-300 placeholder:text-slate-400 px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/40 dark:bg-slate-950 dark:text-slate-100 dark:border-slate-600"
+                        />
+                      )}
 
                       <div className="flex flex-col gap-1.5">
-                        {filteredTemplates.length === 0 ? (
+                        {q && matching.length === 0 ? (
+                          <div className="p-4 text-center text-xs text-slate-400">No template matches “{tplSearch}”.</div>
+                        ) : filteredTemplates.length === 0 ? (
                           <div className="p-4 text-center text-xs text-slate-400">
                             No templates found for this charity theme.
                             <button
@@ -5607,7 +5711,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                     id: tpl.id,
                                     template_type: tpl.template_type,
                                     subject: tpl.subject || '',
-                                    body_html: tpl.body_html || ''
+                                    body_html: tpl.body_html || '',
+                                    builder_json: tpl.builder_json || null
                                   });
                                 }}
                                 className={`p-3.5 rounded-xl border cursor-pointer transition-all flex flex-col gap-1.5 relative group ${
@@ -5657,13 +5762,28 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 </div>
 
                                 <div className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-2 leading-relaxed">
-                                  {(tpl.body_html || '').replace(/<[^>]*>?/gm, '').trim() || 'No preview text available'}
+                                  {(tpl.body_html || '').replace(/<(style|title|head)[\s\S]*?<\/\1>/gi, '').replace(/<[^>]*>?/gm, ' ').replace(/&nbsp;|&bull;/g, ' ').replace(/\s+/g, ' ').trim() || 'No preview text available'}
                                 </div>
                               </div>
                             );
                           })
                         )}
                       </div>
+                      {tplPages > 1 && (
+                        <div className="flex items-center justify-between gap-2 px-1 pt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                          <span>{(curPage - 1) * TPL_PAGE + 1}–{Math.min(curPage * TPL_PAGE, matching.length)} of {matching.length}</span>
+                          <div className="flex items-center gap-1">
+                            <button type="button" disabled={curPage <= 1} onClick={() => setTplPage(curPage - 1)} aria-label="Previous page"
+                              className="p-1 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"><ChevronLeft className="w-3.5 h-3.5" /></button>
+                            {Array.from({ length: tplPages }, (_, i) => i + 1).map(n => (
+                              <button key={n} type="button" onClick={() => setTplPage(n)}
+                                className={`min-w-[1.6rem] h-6 rounded-lg text-[11px] font-bold ${n === curPage ? 'bg-indigo-600 text-white' : 'border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>{n}</button>
+                            ))}
+                            <button type="button" disabled={curPage >= tplPages} onClick={() => setTplPage(curPage + 1)} aria-label="Next page"
+                              className="p-1 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"><ChevronRight className="w-3.5 h-3.5" /></button>
+                          </div>
+                        </div>
+                      )}
                     </>
                   );
                 })()}
@@ -5729,8 +5849,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           : 'text-slate-500 hover:text-slate-900 dark:hover:text-white'
                       }`}
                     >
-                      <Code className="w-3.5 h-3.5" />
-                      HTML / Text Editor
+                      <LayoutTemplate className="w-3.5 h-3.5" />
+                      Builder
                     </button>
                     <button
                       type="button"
@@ -5760,54 +5880,21 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     required
                     value={templateDraft.subject}
                     onChange={(e) => setTemplateDraft({ ...templateDraft, subject: e.target.value })}
+                    {...caretProps(v => setTemplateDraft(prev => ({ ...prev, subject: v })))}
                     placeholder="e.g. Sponsorship Update: {beneficiary_name}"
                     className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl font-bold text-xs md:text-sm text-slate-800 dark:text-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
                   />
                 </div>
 
-                {/* Dynamic Variable Chips Bar */}
-                <div className="flex flex-col gap-1.5 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200/80 dark:border-slate-700">
-                  <div className="flex items-center justify-between text-[11px] font-bold text-slate-500">
-                    <span>Quick Insert Variable:</span>
-                    <span className="font-normal text-[10px] text-slate-400">Click a chip to append into body</span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {AVAILABLE_VARIABLES.map((v) => (
-                      <button
-                        key={v.tag}
-                        type="button"
-                        onClick={() => {
-                          setTemplateDraft(prev => ({
-                            ...prev,
-                            body_html: (prev.body_html || '') + ` ${v.tag} `
-                          }));
-                        }}
-                        className="px-2.5 py-1 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px] font-mono font-medium text-slate-700 dark:text-slate-300 hover:border-indigo-500 hover:text-indigo-600 dark:hover:text-indigo-400 transition-all shadow-2xs"
-                      >
-                        {v.tag}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
                 {/* Editor vs Live Preview Container */}
                 {templateEditorMode === 'editor' ? (
-                  <div className="flex flex-col gap-1.5">
-                    <div className="flex items-center justify-between">
-                      <label className="font-bold text-xs text-slate-700 dark:text-slate-300">
-                        Email Body (HTML / Structured Content) *
-                      </label>
-                      <span className="text-[10px] text-slate-400">Standard HTML formatting supported (&lt;p&gt;, &lt;strong&gt;, &lt;a&gt;, &lt;br&gt;)</span>
-                    </div>
-                    <textarea
-                      rows={14}
-                      required
-                      value={templateDraft.body_html}
-                      onChange={(e) => setTemplateDraft({ ...templateDraft, body_html: e.target.value })}
-                      placeholder="<p>Dear {donor_name},</p><p>We are pleased to share an update...</p>"
-                      className="w-full px-3.5 py-3 bg-slate-950 text-emerald-400 dark:text-emerald-300 font-mono text-xs leading-relaxed border border-slate-800 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
-                    />
-                  </div>
+                  <EmailBuilder
+                    key={`${selectedCharityTheme}:${templateDraft.id || templateDraft.template_type}`}
+                    html={templateDraft.body_html}
+                    doc={templateDraft.builder_json}
+                    variables={AVAILABLE_VARIABLES}
+                    onChange={(doc, html) => setTemplateDraft(prev => ({ ...prev, builder_json: doc, body_html: html }))}
+                  />
                 ) : (
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center justify-between text-xs text-slate-500">
@@ -5879,6 +5966,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             .replace(/https:\/\/rethink-s-crm\.vercel\.app\/logos\/rethink_logo\.jpg/gi, '/logos/rethink_email_logo.png')
                             .replace(/\/logos\/rethink_logo\.jpg/gi, '/logos/rethink_email_logo.png')
                             .replace(/https:\/\/rethink-s-crm\.vercel\.app\/logos\/iqra_logo\.png/gi, '/logos/iqra_logo.png')
+                            .replace(/<\/body>|$/i, (m) => (/%%UNSUBSCRIBE_URL%%|mailto:[^"]*\?subject=unsubscribe/i.test(templateDraft.body_html || '') ? m : `${unsubscribeFooterPreview(CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name)}${m}`))
+                            .replace(/%%UNSUBSCRIBE_URL%%/g, '#')
                         }
                       />
                     </div>
@@ -7641,14 +7730,18 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               </div>
 
               <div className="flex flex-col gap-1">
-                <label className="font-semibold text-slate-600 dark:text-slate-400">Default HTML Body Content</label>
-                <textarea
-                  rows={5}
-                  placeholder="<p>Dear {donor_name},</p><p>We are delighted to share an update...</p>"
+                <label className="font-semibold text-slate-600 dark:text-slate-400">Start from</label>
+                <select
                   value={newTemplateForm.body_html}
                   onChange={(e) => setNewTemplateForm({ ...newTemplateForm, body_html: e.target.value })}
-                  className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-mono text-xs"
-                />
+                  className="px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="">The {CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name || 'charity'} layout (logo, footer) with a short message</option>
+                  {emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === selectedCharityTheme).map(t => (
+                    <option key={t.id} value={String(t.id)}>A copy of “{t.template_type}” - {t.subject}</option>
+                  ))}
+                </select>
+                <span className="text-[10px] text-slate-400">You then design it in the builder: add text, buttons, boxes, images and placeholders - no HTML needed.</span>
               </div>
 
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
@@ -7885,14 +7978,51 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   className="w-full px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-amber-500 focus:outline-none"
                 >
                   <option value="daily">Daily Summary (Every morning at 08:00 UTC)</option>
-                  <option value="weekly">Weekly Digest (Every Monday morning)</option>
-                  <option value="monthly">Monthly Audit (1st of each month)</option>
+                  <option value="weekly">Weekly Digest (Every Monday at 08:00 UTC)</option>
+                  <option value="monthly">Monthly Audit (1st of each month, 08:00 UTC)</option>
+                  <option value="off">Off (only when I press Send Digest Now)</option>
                 </select>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  {alertSettings.digest_frequency === 'off'
+                    ? 'No automatic digest.'
+                    : !alertSettings.staff_emails.trim()
+                      ? 'Add staff emails above to switch the automatic digest on.'
+                      : !alertSettings.mailbox_connected
+                        ? 'Connect this charity\'s Outlook mailbox (Email section > Mailbox) - the digest is sent from it.'
+                        : `Sent automatically from this charity's mailbox. The first one goes out at the next scheduled time after you save${alertSettings.next_digest_at ? ` (next: ${new Date(alertSettings.next_digest_at).toLocaleString()})` : ''}.`}
+                </p>
                 {alertSettings.last_digest_sent_at && (
                   <p className="text-[10px] text-slate-400 mt-1">
                     Last digest dispatched: {new Date(alertSettings.last_digest_sent_at).toLocaleString()}
                   </p>
                 )}
+              </div>
+
+              {/* What the automatic digest lists */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5">What the digest includes</label>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-2">
+                  The automatic digest (and Send Digest Now) lists only the overdue donors and campaigns matching these filters.
+                </p>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {Object.keys(alertSettings.digest_filters || {}).length === 0
+                    ? <span className="px-2 py-0.5 rounded-full text-[11px] bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Everyone overdue (no filters)</span>
+                    : Object.entries(alertSettings.digest_filters).map(([k, v]) => (
+                      <span key={k} className="px-2 py-0.5 rounded-full text-[11px] bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 flex items-center gap-1">
+                        {DIGEST_FILTER_LABELS[k] || k}: {String(v).replace(/_/g, ' ')}
+                        <button type="button" aria-label={`Remove ${k}`} onClick={() => setAlertSettings(prev => { const f = { ...(prev.digest_filters || {}) }; delete f[k]; return { ...prev, digest_filters: f }; })}><X className="w-3 h-3" /></button>
+                      </span>
+                    ))}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" onClick={() => setAlertSettings(prev => ({ ...prev, digest_filters: screenDigestFilters() }))}
+                    className="px-2.5 py-1 text-xs rounded-lg font-semibold bg-amber-500 hover:bg-amber-400 text-white">Use the filters on screen</button>
+                  <button type="button" onClick={() => setAlertSettings(prev => ({ ...prev, digest_filters: {} }))}
+                    className="px-2.5 py-1 text-xs rounded-lg font-semibold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200">Include everyone</button>
+                  <button type="button" onClick={() => handleSendOverdueDigest(true)} disabled={sendingDigest}
+                    className="px-2.5 py-1 text-xs rounded-lg font-semibold border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-50 flex items-center gap-1"><Eye className="w-3 h-3" /> Preview</button>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1">Changes here apply after Save Settings.</p>
               </div>
 
               {/* Feedback Alert if Send Digest was clicked */}

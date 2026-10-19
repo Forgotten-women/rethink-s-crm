@@ -134,10 +134,12 @@ def resolve_classification(
     campaign_name: str,
     giving_level: str,
     company_id: str = "iqra",
-    campaign_url: str = ""
+    campaign_url: str = "",
+    campaign_ref: str = ""
 ) -> Dict[str, Any]:
     """
-    2-Tier Classification Resolution:
+    Tier 0 (first): the rule tied to the campaign's GiveBrite ID (core/classification_ids.py) - renamed campaigns
+    keep their classification. Then the 2-tier name resolution:
     Tier 1: Look up platform_campaign_mappings for (company_id, campaign_name, giving_level) where giving_level != ''
     Tier 2: Look up platform_campaign_mappings for (company_id, campaign_name, '')
     Fallback: Auto-insert into platform_campaign_mappings with code='Unassigned'
@@ -149,9 +151,17 @@ def resolve_classification(
 
     resolved_code = None
     tier_info = "Fallback (Unassigned)"
+    id_has_rules = False
+    if campaign_ref:
+        from core.classification_ids import resolve_code_by_ref
+        resolved_code, tier_info_id = resolve_code_by_ref(cursor, "givebright", company_id, campaign_ref, c_name, g_level,
+                                                          conn_for_catalogue=cursor.connection)
+        if resolved_code:
+            tier_info = tier_info_id
+        id_has_rules = bool(resolved_code)
 
     # Tier 1: Exact campaign + giving level
-    if g_level:
+    if g_level and not resolved_code:
         cursor.execute("""
             SELECT code FROM platform_campaign_mappings
             WHERE company_id = ? AND TRIM(campaign_name) = TRIM(?) AND TRIM(giving_level) = TRIM(?)
@@ -189,9 +199,9 @@ def resolve_classification(
                 if not cursor.fetchone():
                     cursor.execute("""
                         INSERT INTO platform_campaign_mappings (
-                            company_id, platform, campaign_name, giving_level, code, campaign_url, created_at, updated_at
-                        ) VALUES (?, 'givebright', ?, ?, 'Unassigned', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, (company_id, c_name, g_level, campaign_url or None))
+                            company_id, platform, campaign_name, giving_level, code, campaign_url, campaign_ref, created_at, updated_at
+                        ) VALUES (?, 'givebright', ?, ?, 'Unassigned', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (company_id, c_name, g_level, campaign_url or None, campaign_ref or None))
                     logger.info(f"Auto-registered new unmapped pair in CRM: Campaign='{c_name}' | Level='{g_level}'")
             except Exception as auto_reg_err:
                 logger.warning(f"Auto-registration notice for '{c_name}': {auto_reg_err}")
@@ -830,7 +840,8 @@ def ingest_givebrite_donations(
 
             # Classification resolution
             cls_meta = resolve_classification(cursor, c_name, g_level, company_id=company_id,
-                                              campaign_url=clean_url(extracted.get("campaign_url")))
+                                              campaign_url=clean_url(extracted.get("campaign_url")),
+                                              campaign_ref=str(extracted.get("campaign_id") or "").strip())
 
             # Build normalized record
             rec = build_donation_record(doc, det=det, classification_meta=cls_meta, extracted_campaign=extracted, company_id=company_id)

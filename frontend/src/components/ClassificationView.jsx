@@ -605,12 +605,10 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       }
 
       setMatrixData(prev => {
-        const targetRow = (prev.rules || []).find(r => r._row_id === rowId);
-        const targetCampaign = cleanText(targetRow?.['Campaign Name'] || targetRow?.campaign_name || '').trim().toLowerCase();
-
         const updatedRules = prev.rules.map(r => {
-          const rCamp = cleanText(r['Campaign Name'] || r.campaign_name || '').trim().toLowerCase();
-          const isTarget = r._row_id === rowId || (targetCampaign && rCamp === targetCampaign);
+          // Only the row being edited: a campaign's primary variant and each giving level keep their own codes
+          // (it used to copy the code to every row of the campaign).
+          const isTarget = r._row_id === rowId;
           if (isTarget) {
             const currentRow = { ...r, Code: newCodeClean };
             if (newSpecialCase !== undefined) {

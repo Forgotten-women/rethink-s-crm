@@ -3,8 +3,9 @@ import { X, User, Mail, Phone, MapPin, Calendar, PieChart, ShieldCheck, Search, 
 import { API_BASE_URL } from '../config';
 import DonationDetailModal from './DonationDetailModal';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
-import EmailComposer from './EmailComposer';
-import { Pencil, PlusCircle, Send } from 'lucide-react';
+import SingleEmailComposer from './email/SingleEmailComposer';
+import EmailThread from './email/EmailThread';
+import { Pencil, PlusCircle, Send, StickyNote, Trash2 } from 'lucide-react';
 
 const NET = 'Total Online Donations Net Amount in Settled Currency';
 const GROSS = 'Total Online Donation Gross Amount in Settled Currency';
@@ -71,7 +72,9 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
   const [editError, setEditError] = useState('');
   const [adding, setAdding] = useState(false);
   const [emailing, setEmailing] = useState(false);
-  const [emails, setEmails] = useState([]);
+  const [notes, setNotes] = useState([]);
+  const [newNote, setNewNote] = useState('');
+  const [noteBusy, setNoteBusy] = useState(false);
   const canEdit = canEditRecords() && activeCompany && activeCompany !== 'all';
 
   const resolvedDonorId = typeof donorId === 'object' && donorId !== null
@@ -91,12 +94,28 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
       .catch(() => { setError('This donor could not be loaded. They may belong to another charity or have no donations.'); setLoading(false); });
   }, [resolvedDonorId, activeCompany, reloadTick]);
 
+  const noteDonorId = profile?.donor_id || resolvedDonorId;
   useEffect(() => {
-    const email = profile?.email && String(profile.email).includes('@') ? profile.email : '';
-    if (!email || !activeCompany || activeCompany === 'all') { setEmails([]); return; }
-    fetch(`${API_BASE_URL}/api/tracker/direct-email/history?company_id=${encodeURIComponent(activeCompany)}&email=${encodeURIComponent(email)}`)
-      .then(r => (r.ok ? r.json() : { emails: [] })).then(d => setEmails(d.emails || [])).catch(() => setEmails([]));
-  }, [profile?.email, activeCompany, reloadTick]);
+    if (!noteDonorId || !activeCompany || activeCompany === 'all') { setNotes([]); return; }
+    fetch(`${API_BASE_URL}/api/donors/notes?company_id=${encodeURIComponent(activeCompany)}&donor_id=${encodeURIComponent(noteDonorId)}`)
+      .then(r => (r.ok ? r.json() : { notes: [] })).then(d => setNotes(d.notes || [])).catch(() => setNotes([]));
+  }, [noteDonorId, activeCompany, reloadTick]);
+  const addNote = async () => {
+    const note = newNote.trim();
+    if (!note) return;
+    setNoteBusy(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/donors/notes`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ company_id: activeCompany, donor_id: noteDonorId, note }) });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Error ${res.status}`);
+      setNewNote(''); setReloadTick(t => t + 1);
+    } catch (e) { window.alert(e.message); } finally { setNoteBusy(false); }
+  };
+  const deleteNote = async (id) => {
+    if (!window.confirm('Delete this note?')) return;
+    const res = await fetch(`${API_BASE_URL}/api/donors/notes/${id}?company_id=${encodeURIComponent(activeCompany)}`, { method: 'DELETE' });
+    if (res.ok) setReloadTick(t => t + 1);
+  };
 
   useEffect(() => { setPage(1); }, [cause, dateFrom, dateTo]);
 
@@ -120,7 +139,7 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
     setEditError('');
     setEditing({ first_name: clean(profile?.first_name) || parts[0] || '', last_name: clean(profile?.last_name) || parts.slice(1).join(' '),
       email: clean(profile?.email), phone: clean(profile?.phone), address: clean(profile?.billing_address), city: clean(profile?.billing_city),
-      postcode: clean(profile?.billing_postcode), country: clean(profile?.billing_country), marketing_consent: clean(profile?.marketing_consent) });
+      postcode: clean(profile?.billing_postcode), country: clean(profile?.billing_country), marketing_consent: clean(profile?.marketing_consent), notes: '' });
   };
   const saveEdit = async () => {
     setSaving(true); setEditError('');
@@ -166,7 +185,7 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
         <DonationDetailModal donationId={clean(openDonation['Donation ID'])} companyId={activeCompany} initial={openDonation} onClose={() => setOpenDonation(null)} onChanged={() => setReloadTick(t => t + 1)} />
       )}
       {adding && <AddDonationModal company={activeCompany} donor={{ name: profile?.display_name, email: clean(profile?.email), phone: clean(profile?.phone), city: clean(profile?.billing_city), country: clean(profile?.billing_country) }} onClose={() => setAdding(false)} onCreated={() => setReloadTick(t => t + 1)} />}
-      {emailing && <EmailComposer company={activeCompany} initialDonorIds={[profile?.donor_id || resolvedDonorId]} onClose={() => setEmailing(false)} onDone={() => setReloadTick(t => t + 1)} />}
+      {emailing && <SingleEmailComposer company={activeCompany} recipient={{ email: clean(profile?.email), name: profile?.display_name || '', donor_id: profile?.donor_id || resolvedDonorId }} onClose={() => setEmailing(false)} onSent={() => setReloadTick(t => t + 1)} />}
       <div className="drawer-content drawer-wide flex flex-col panel-pop" role="dialog" aria-modal="true" aria-label="Donor details">
         {/* Header */}
         <div className="flex items-start justify-between gap-3 px-6 py-4 shrink-0" style={{ borderBottom: '1px solid var(--border-glass)' }}>
@@ -212,6 +231,10 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
                       <option value="">Unknown</option><option value="yes">Yes</option><option value="no">No</option>
                     </select>
                   </label>
+                  <label className="col-span-2 md:col-span-4 flex flex-col gap-1 text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Notes <span className="font-normal" style={{ color: 'var(--text-muted)' }}>(added to their notes with your name and today's date)</span>
+                    <textarea value={editing.notes || ''} onChange={e => setEditing(v => ({ ...v, notes: e.target.value }))} rows={3} placeholder="e.g. Prefers WhatsApp; called 16 Oct about Hafiz renewal"
+                      className="px-2 py-1.5 text-sm rounded-lg font-normal" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }} />
+                  </label>
                 </div>
                 {editError && <div className="text-xs text-rose-500">{editError}</div>}
                 <div className="flex gap-2 justify-end">
@@ -238,6 +261,31 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
                 </div>
               ))}
             </div>
+
+            {/* Notes */}
+            {(notes.length > 0 || canEdit) && (
+              <div className="glass-panel p-3 flex flex-col gap-2">
+                <h3 className="text-xs font-extrabold uppercase tracking-wider flex items-center gap-2" style={{ color: 'var(--text-main)' }}>
+                  <StickyNote className="w-4 h-4 text-amber-500" /> Notes ({notes.length})
+                </h3>
+                {notes.map(n => (
+                  <div key={n.id} className="rounded-lg px-3 py-2 text-xs bg-amber-50 border border-amber-200 dark:bg-amber-950/30 dark:border-amber-900 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="whitespace-pre-wrap text-slate-800 dark:text-slate-100">{n.note}</div>
+                      <div className="mt-1 text-[10px] text-slate-500">{n.created_by || 'Someone'} · {String(n.created_at || '').slice(0, 16)}</div>
+                    </div>
+                    {canEdit && <button type="button" onClick={() => deleteNote(n.id)} aria-label="Delete note" className="p-1 rounded text-slate-400 hover:text-rose-500"><Trash2 className="w-3.5 h-3.5" /></button>}
+                  </div>
+                ))}
+                {canEdit && (
+                  <div className="flex gap-2 items-end">
+                    <textarea value={newNote} onChange={e => setNewNote(e.target.value)} rows={2} placeholder="Add a note about this donor"
+                      className="flex-1 px-2 py-1.5 text-sm rounded-lg" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }} />
+                    <button type="button" onClick={addNote} disabled={noteBusy || !newNote.trim()} className="px-3 py-2 text-xs rounded-lg font-bold bg-amber-500 hover:bg-amber-400 text-white disabled:opacity-40">{noteBusy ? 'Saving…' : 'Add note'}</button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Where the money went */}
             {profile?.category_breakdown?.length > 0 && (
@@ -375,23 +423,13 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
                 </div>
               </div>
             </div>
-            {emails.length > 0 && (
+            {/* Every email with this person and every reply */}
+            {clean(profile?.email) && activeCompany !== 'all' && (
               <div>
                 <h3 className="text-xs font-extrabold uppercase tracking-wider flex items-center gap-2 mb-2" style={{ color: 'var(--text-main)' }}>
-                  <Mail className="w-4 h-4 text-sky-500" /> Emails sent ({emails.length})
+                  <Mail className="w-4 h-4 text-sky-500" /> Email thread
                 </h3>
-                <div className="glass-panel divide-y" style={{ borderColor: 'var(--border-glass)' }}>
-                  {emails.map(e => (
-                    <div key={e.id} className="px-3 py-2 text-xs flex items-center justify-between gap-3 flex-wrap" style={{ color: 'var(--text-main)' }}>
-                      <span className="min-w-0"><b>{e.subject || e.template_type}</b>{e.campaign ? <span style={{ color: 'var(--text-muted)' }}> · {e.campaign}</span> : null}</span>
-                      <span className="flex items-center gap-3" style={{ color: 'var(--text-muted)' }}>
-                        <span>{e.status}{e.detail ? ` (${e.detail})` : ''}</span>
-                        <span className="tabular-nums">{String(e.sent_at || '').slice(0, 16) || '—'}</span>
-                        <span>{e.open_count ? `opened ${e.open_count}×` : 'not opened'}</span>
-                      </span>
-                    </div>
-                  ))}
-                </div>
+                <EmailThread company={activeCompany} email={clean(profile?.email)} reloadKey={reloadTick} />
               </div>
             )}
           </div>

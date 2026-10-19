@@ -145,13 +145,27 @@ class PlatformSyncService:
             from core.database import get_db_connection
             conn = get_db_connection()
             cur = conn.cursor()
-            for plat, comp in (("madinah", "iqra"), ("givebrite", "iqra"), ("givebrite_iqra", "iqra"), ("givebrite_rethink", "rethink")):
+            for plat, comp in (
+                ("madinah", "iqra"),
+                ("givebrite", "iqra"),
+                ("givebrite_iqra", "iqra"),
+                ("givebrite_rethink", "rethink"),
+                ("launchgood_iqra", "iqra"),
+                ("launchgood_rethink", "rethink"),
+            ):
                 if plat in self.health and (not self.health[plat].get("last_ingested_at") or str(self.health[plat].get("last_ingested_at")).lower() in ("nan", "none", "")):
-                    cur.execute("""
-                        SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
-                        FROM donations
-                        WHERE company_id = ? AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
-                    """, (comp, f"%{plat.split('_')[0]}%",))
+                    if plat.startswith("launchgood"):
+                        cur.execute("""
+                            SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
+                            FROM donations
+                            WHERE company_id = ? AND (Platform = 'LaunchGood' OR Source LIKE '%LaunchGood%') AND "Created Date (UTC)" LIKE '20%'
+                        """, (comp,))
+                    else:
+                        cur.execute("""
+                            SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
+                            FROM donations
+                            WHERE company_id = ? AND LOWER(Source) LIKE ? AND "Created Date (UTC)" LIKE '20%'
+                        """, (comp, f"%{plat.split('_')[0]}%",))
                     r = cur.fetchone()
                     if r and r[0] and "nan" not in str(r[0]).lower():
                         self.health[plat]["last_ingested_at"] = r[0]
@@ -757,6 +771,43 @@ class PlatformSyncService:
             self._record_cycle("paysuite", False, None, f"Sync crashed: {ex}")
             paysuite_data = {"platform": "paysuite", "error": str(ex)}
 
+        # LaunchGood: keep the 15-minute session renewed every cycle; pull the donations export every 15 min.
+        launchgood_data = {}
+        try:
+            from core.launchgood_auto_sync import poll_launchgood
+            launchgood_data = poll_launchgood()
+            for comp, res in launchgood_data.items():
+                status = res.get("status")
+                if status == "waiting":
+                    if res.get("last_status") == "success":  # session renewed and the last pull worked
+                        self._record_cycle(f"launchgood_{comp}", True, 200, None, fetched=res.get("fetched", 0))
+                    continue
+                if status == "not_configured":
+                    continue
+                key = f"launchgood_{comp}"
+                if status == "success":
+                    self._record_cycle(key, True, 200, None, ingested=res.get("added", 0), fetched=res.get("fetched", 0))
+                else:
+                    self._record_cycle(key, False, None, res.get("error") or status)
+                logger.info(f"[LaunchGood {comp}] {status} | fetched {res.get('fetched', 0)} | added {res.get('added', 0)} | session: {res.get('session')}"
+                            + (f" | error: {res.get('error')}" if res.get("error") else ""))
+        except Exception as ex:
+            logger.error(f"LaunchGood sync failure: {ex}")
+            launchgood_data = {"platform": "launchgood", "error": str(ex)}
+
+        # Campaign ID catalogue (classification by campaign / giving-level ID): refresh once a day with new campaigns
+        try:
+            if now - getattr(self, "_last_catalogue_run", 0) > 24 * 3600:
+                self._last_catalogue_run = now
+                res = subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts", "build_campaign_id_catalogue.py"), "--apply", "--no-backup"],
+                                     cwd=BASE_DIR, capture_output=True, text=True, timeout=900)
+                last = (res.stdout.strip().splitlines() or [""])[-1]
+                logger.info(f"[Campaign IDs] catalogue refresh: {last[:200]}" if res.returncode == 0 else f"[Campaign IDs] refresh failed: {res.stderr[-300:]}")
+                from core.classification_ids import invalidate as _cid_invalidate
+                _cid_invalidate()
+        except Exception as ex:
+            logger.error(f"Campaign ID catalogue refresh failure: {ex}")
+
         # Atomic writes for service status monitoring
         try:
             atomic_write_json(MADINAH_SYNC_FILE, madinah_data)
@@ -783,7 +834,8 @@ class PlatformSyncService:
                 "givebrite_iqra": givebrite_iqra_data,
                 "givebrite_rethink": givebrite_rethink_data,
                 "stripe": stripe_data,
-                "paysuite": paysuite_data
+                "paysuite": paysuite_data,
+                "launchgood": launchgood_data,
             }
 
             atomic_write_json(MASTER_SYNC_FILE, master_data)

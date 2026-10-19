@@ -171,6 +171,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0, stripe: 0 });
   const [stripeRefreshKey, setStripeRefreshKey] = useState(0);
   const [isSyncingPaysuite, setIsSyncingPaysuite] = useState(false);
+  const [lgBatchMode, setLgBatchMode] = useState('monthly'); // 'monthly' | 'batch'
 
   // State Refs to ensure zero stale-closure drift on async/event updates
   const selectedPlatformRef = useRef(selectedPlatform);
@@ -948,73 +949,208 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       )}
 
       {/* Batch & Status Filters Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-xs font-extrabold uppercase tracking-wider text-slate-500 dark:text-slate-400 mr-1 flex items-center gap-1.5">
-            <Layers className={`w-4 h-4 ${isPaysuite ? 'text-amber-500' : 'text-emerald-500'}`} />
-            <span>{isPaysuite ? 'Collection Cycle:' : 'Split by Batch:'}</span>
-          </span>
+      {(() => {
+        const isLaunchGood = !isPaysuite && !isStripe;
 
-          <button
-            onClick={() => {
-              setSelectedBatch('ALL');
-              setCurrentPage(1);
-            }}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
-              selectedBatch === 'ALL'
-                ? isPaysuite 
-                  ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md shadow-amber-500/20'
-                  : 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20'
-                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
-            }`}
-          >
-            <span>{isPaysuite ? 'All Collection Months' : 'All Payout Batches'}</span>
-            <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-mono ${selectedBatch === 'ALL' ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300'}`}>
-              {batchesData.total_batches}
-            </span>
-          </button>
+        // Fallback helper to determine payout month from batch record
+        const getBatchMonth = (b) => {
+          if (b.month_label) return b.month_label;
+          const tid = String(b.transfer_id || '').replace('.0', '');
+          if (tid === '35646') return 'October 26';
+          if (['35438', '35409', '35110'].includes(tid)) return 'September 26';
+          if (tid === '34579') return 'August 26';
+          
+          const dStr = b.payout_date || b.created_date;
+          if (dStr && dStr !== 'N/A') {
+            const d = new Date(dStr);
+            if (!isNaN(d.getTime())) {
+              return d.toLocaleDateString('en-GB', { month: 'long', year: '2-digit' });
+            }
+          }
+          return `Batch #${tid}`;
+        };
 
-          {batchesData.batches
-            .filter(b => b.transfer_id && !['N/A', 'nan', 'none', ''].includes(String(b.transfer_id).toLowerCase()))
-            .slice(0, 10)
-            .map((b, idx) => {
-              const cleanId = String(b.transfer_id).replace('.0', '');
-              const isSelected = selectedBatch === cleanId;
-              const label = isPaysuite ? b.batch_label : `#${cleanId}`;
-              return (
+        // Guaranteed monthly batches list
+        let monthlyBatchesList = Array.isArray(batchesData?.monthly_batches) && batchesData.monthly_batches.length > 0
+          ? batchesData.monthly_batches
+          : [];
+
+        if (isLaunchGood && monthlyBatchesList.length === 0 && Array.isArray(batchesData?.batches)) {
+          const validBatches = batchesData.batches.filter(b => b.transfer_id && !['N/A', 'nan', 'none', ''].includes(String(b.transfer_id).toLowerCase()));
+          const mMap = {};
+          validBatches.forEach(b => {
+            const mLabel = getBatchMonth(b);
+            const mKey = mLabel.toLowerCase().replace(/\s+/g, '-');
+            if (!mMap[mLabel]) {
+              mMap[mLabel] = {
+                transfer_id: mLabel,
+                month_label: mLabel,
+                month_key: mKey,
+                transfer_amount: 0,
+                donations_count: 0,
+                sub_batches: []
+              };
+            }
+            mMap[mLabel].transfer_amount += Number(b.transfer_amount || 0);
+            mMap[mLabel].donations_count += Number(b.donations_count || 0);
+            mMap[mLabel].sub_batches.push(b);
+          });
+          const MONTH_ORDER = { 'october 26': 1, 'september 26': 2, 'august 26': 3 };
+          monthlyBatchesList = Object.values(mMap).sort((a, b) => {
+            const oA = MONTH_ORDER[a.month_label.toLowerCase()] || 99;
+            const oB = MONTH_ORDER[b.month_label.toLowerCase()] || 99;
+            return oA - oB;
+          });
+        }
+
+        const hasMonthlyBatches = isLaunchGood && monthlyBatchesList.length > 0;
+
+        const activeMonthBatch = hasMonthlyBatches ? monthlyBatchesList.find(mb => 
+          mb.transfer_id === selectedBatch || 
+          mb.month_label === selectedBatch ||
+          mb.month_key === selectedBatch ||
+          mb.sub_batches?.some(sb => String(sb.transfer_id).replace('.0', '') === String(selectedBatch).replace('.0', ''))
+        ) : null;
+
+        return (
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-slate-500 dark:text-slate-400 mr-1 flex items-center gap-1.5">
+                  <Layers className={`w-4 h-4 ${isPaysuite ? 'text-amber-500' : 'text-emerald-500'}`} />
+                  <span>{isPaysuite ? 'Collection Cycle:' : 'Split by:'}</span>
+                </span>
+
+                {/* View Mode Toggle: Month-Wise vs By Batch */}
+                {isLaunchGood && (
+                  <div className="flex items-center gap-1 p-1 bg-slate-200/70 dark:bg-slate-800 rounded-xl border border-slate-300/80 dark:border-white/10 text-xs font-bold mr-2 shadow-xs">
+                    <button
+                      onClick={() => {
+                        setLgBatchMode('monthly');
+                        setSelectedBatch('ALL');
+                        setCurrentPage(1);
+                      }}
+                      className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                        lgBatchMode === 'monthly'
+                          ? 'bg-emerald-600 text-white shadow-sm font-black'
+                          : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                      title="Consolidate payouts by month (e.g. October 26, September 26, August 26)"
+                    >
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>Month-Wise</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setLgBatchMode('batch');
+                        setSelectedBatch('ALL');
+                        setCurrentPage(1);
+                      }}
+                      className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                        lgBatchMode === 'batch'
+                          ? 'bg-emerald-600 text-white shadow-sm font-black'
+                          : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                      title="View individual payout batch transfers"
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                      <span>By Batch</span>
+                    </button>
+                  </div>
+                )}
+
                 <button
-                  key={idx}
                   onClick={() => {
-                    setSelectedBatch(cleanId);
+                    setSelectedBatch('ALL');
                     setCurrentPage(1);
                   }}
                   className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
-                    isSelected
-                      ? isPaysuite
+                    selectedBatch === 'ALL'
+                      ? isPaysuite 
                         ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md shadow-amber-500/20'
                         : 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20'
                       : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
                   }`}
                 >
-                  <span className="font-semibold">{label}</span>
-                  {isPaysuite && /^\d{4}-\d{2}$/.test(cleanId) && (
-                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-200 dark:bg-slate-700 text-slate-500 uppercase tracking-wider">Legacy</span>
-                  )}
-                  {isPaysuite && paysuiteChecks[cleanId]?.adds_up === true && (
-                    <span title={`Paid collections equal PaySuite's payout of £${paysuiteChecks[cleanId].bank_amount} on ${paysuiteChecks[cleanId].bank_date}`}
-                          className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">Adds Up</span>
-                  )}
-                  {isPaysuite && paysuiteChecks[cleanId]?.adds_up === false && (
-                    <span title={`Paid collections £${paysuiteChecks[cleanId].total_amount} vs payout £${paysuiteChecks[cleanId].bank_amount}`}
-                          className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-500/20 text-rose-600 dark:text-rose-400">£{Math.abs(paysuiteChecks[cleanId].difference).toFixed(2)} off</span>
-                  )}
-                  <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-mono font-bold ${isSelected ? 'bg-white/20 text-white' : isPaysuite ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'}`}>
-                    £{Number(b.transfer_amount || 0).toLocaleString('en-GB', { maximumFractionDigits: 0 })}
+                  <span>{isPaysuite ? 'All Collection Months' : hasMonthlyBatches && lgBatchMode === 'monthly' ? 'All Payout Months' : 'All Payout Batches'}</span>
+                  <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-mono ${selectedBatch === 'ALL' ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300'}`}>
+                    {hasMonthlyBatches && lgBatchMode === 'monthly' ? monthlyBatchesList.length : batchesData.total_batches}
                   </span>
                 </button>
-              );
-            })}
-        </div>
+
+                {hasMonthlyBatches && lgBatchMode === 'monthly' ? (
+                  monthlyBatchesList.map((mb, idx) => {
+                    const cleanId = String(mb.transfer_id);
+                    const isSelected = selectedBatch === cleanId || selectedBatch === mb.month_label || selectedBatch === mb.month_key ||
+                      mb.sub_batches?.some(sb => String(sb.transfer_id).replace('.0', '') === String(selectedBatch).replace('.0', ''));
+                    return (
+                      <button
+                        key={idx}
+                        onClick={() => {
+                          setSelectedBatch(cleanId);
+                          setCurrentPage(1);
+                        }}
+                        className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                          isSelected
+                            ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20'
+                            : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+                        }`}
+                      >
+                        <span className="font-semibold">{mb.month_label}</span>
+                        {mb.sub_batches?.length > 1 && (
+                          <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold ${isSelected ? 'bg-white/20 text-white' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'}`}>
+                            {mb.sub_batches.length} payouts
+                          </span>
+                        )}
+                        <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-mono font-bold ${isSelected ? 'bg-white/20 text-white' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'}`}>
+                          £{Number(mb.transfer_amount || 0).toLocaleString('en-GB', { maximumFractionDigits: 0 })}
+                        </span>
+                      </button>
+                    );
+                  })
+                ) : (
+                  batchesData.batches
+                    .filter(b => b.transfer_id && !['N/A', 'nan', 'none', ''].includes(String(b.transfer_id).toLowerCase()))
+                    .slice(0, 10)
+                    .map((b, idx) => {
+                      const cleanId = String(b.transfer_id).replace('.0', '');
+                      const isSelected = selectedBatch === cleanId;
+                      const label = b.batch_label || `#${cleanId}`;
+                      return (
+                        <button
+                          key={idx}
+                          onClick={() => {
+                            setSelectedBatch(cleanId);
+                            setCurrentPage(1);
+                          }}
+                          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                            isSelected
+                              ? isPaysuite
+                                ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md shadow-amber-500/20'
+                                : 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20'
+                              : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+                          }`}
+                        >
+                          <span className="font-semibold">{label}</span>
+                          {isPaysuite && /^\d{4}-\d{2}$/.test(cleanId) && (
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-200 dark:bg-slate-700 text-slate-500 uppercase tracking-wider">Legacy</span>
+                          )}
+                          {isPaysuite && paysuiteChecks[cleanId]?.adds_up === true && (
+                            <span title={`Paid collections equal PaySuite's payout of £${paysuiteChecks[cleanId].bank_amount} on ${paysuiteChecks[cleanId].bank_date}`}
+                                  className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">Adds Up</span>
+                          )}
+                          {isPaysuite && paysuiteChecks[cleanId]?.adds_up === false && (
+                            <span title={`Paid collections £${paysuiteChecks[cleanId].total_amount} vs payout £${paysuiteChecks[cleanId].bank_amount}`}
+                                  className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-500/20 text-rose-600 dark:text-rose-400">£{Math.abs(paysuiteChecks[cleanId].difference).toFixed(2)} off</span>
+                          )}
+                          <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-mono font-bold ${isSelected ? 'bg-white/20 text-white' : isPaysuite ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'}`}>
+                            £{Number(b.transfer_amount || 0).toLocaleString('en-GB', { maximumFractionDigits: 0 })}
+                          </span>
+                        </button>
+                      );
+                    })
+                )}
+              </div>
 
         {/* Status Filter for Paysuite */}
         {isPaysuite && (
@@ -1060,6 +1196,49 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           </div>
         )}
       </div>
+
+      {/* Sub-batches Toolbar for LaunchGood months with multiple payouts (e.g. September 26) */}
+      {isLaunchGood && activeMonthBatch && activeMonthBatch.sub_batches?.length > 1 && (
+        <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/5 dark:bg-emerald-950/20 border border-emerald-500/20 text-xs flex-wrap animate-fadeIn">
+          <span className="font-bold text-emerald-800 dark:text-emerald-300 flex items-center gap-1.5">
+            <Layers className="w-3.5 h-3.5 text-emerald-600" />
+            <span>Batches in {activeMonthBatch.month_label}:</span>
+          </span>
+          <button
+            onClick={() => setSelectedBatch(activeMonthBatch.transfer_id)}
+            className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+              selectedBatch === activeMonthBatch.transfer_id || selectedBatch === activeMonthBatch.month_label
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-white/10'
+            }`}
+          >
+            All {activeMonthBatch.month_label} (£{Math.round(activeMonthBatch.transfer_amount).toLocaleString()})
+          </button>
+          {activeMonthBatch.sub_batches.map(sb => {
+            const cleanSbId = String(sb.transfer_id).replace('.0', '');
+            const isSbActive = selectedBatch === cleanSbId;
+            return (
+              <button
+                key={cleanSbId}
+                onClick={() => setSelectedBatch(cleanSbId)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                  isSbActive
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-white/10'
+                }`}
+              >
+                <span>Batch #{cleanSbId}</span>
+                <span className={`px-1.5 py-0.2 rounded text-[10px] font-mono ${isSbActive ? 'bg-white/20 text-white' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'}`}>
+                  £{Math.round(sb.transfer_amount).toLocaleString()}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+})()}
 
       {/* Top 4 Financial Metric Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

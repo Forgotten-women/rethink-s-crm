@@ -138,10 +138,12 @@ def resolve_madinah_classification(
     campaign_name: str,
     giving_level: str = "",
     company_id: str = "iqra",
-    campaign_url: str = ""
+    campaign_url: str = "",
+    campaign_ref: str = ""
 ) -> Dict[str, Any]:
     """
-    Resolves project classification code for Madinah campaigns using 2-Tier logic:
+    Tier 0 (first): the rule tied to the Madinah campaignId (core/classification_ids.py) - renamed campaigns keep
+    their classification. Then the 2-Tier name logic:
     Tier 1: (campaign_name, giving_level) where giving_level != ''
     Tier 2: (campaign_name, '')
     Fallback: Auto-registers unseen campaigns as 'Unassigned'
@@ -150,9 +152,12 @@ def resolve_madinah_classification(
     c_name = normalize_campaign_text(campaign_name)
     g_level = normalize_campaign_text(giving_level)
     resolved_code = None
+    if campaign_ref:
+        from core.classification_ids import resolve_code_by_ref
+        resolved_code, _tier = resolve_code_by_ref(cursor, "madinah", company_id, campaign_ref, c_name, g_level)
 
     # Tier 1: Look up exact normalized (campaign_name, giving_level)
-    if c_name and g_level:
+    if c_name and g_level and not resolved_code:
         cursor.execute("""
             SELECT code FROM platform_campaign_mappings
             WHERE company_id = ? AND LOWER(platform) = 'madinah'
@@ -193,9 +198,9 @@ def resolve_madinah_classification(
                 if not cursor.fetchone():
                     cursor.execute("""
                         INSERT INTO platform_campaign_mappings (
-                            company_id, platform, campaign_name, giving_level, code, campaign_url, created_at, updated_at
-                        ) VALUES (?, 'madinah', ?, '', 'Unassigned', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, (company_id, c_name, campaign_url or None))
+                            company_id, platform, campaign_name, giving_level, code, campaign_url, campaign_ref, created_at, updated_at
+                        ) VALUES (?, 'madinah', ?, '', 'Unassigned', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (company_id, c_name, campaign_url or None, campaign_ref or None))
                     logger.info(f"Auto-registered new Madinah campaign in CRM: '{c_name}'")
             except Exception as reg_err:
                 logger.warning(f"Madinah auto-registration notice for '{c_name}': {reg_err}")
@@ -512,6 +517,7 @@ def ingest_madinah_donations(
             gl_obj = d.get("givingLevel") if isinstance(d.get("givingLevel"), dict) else {}
             g_level = normalize_campaign_text(str(d.get("givingLevelTitle") or gl_obj.get("title") or d.get("giving_level") or ""))
             cls_meta = resolve_madinah_classification(cursor, c_name, giving_level=g_level, company_id=company_id,
+                                                      campaign_ref=str(d.get("campaignId") or "").strip(),
                                                       campaign_url=madinah_url_for_campaign(d.get("campaignId")))
             rec = build_madinah_record(d, classification_meta=cls_meta, company_id=company_id)
             records_to_insert.append(rec)

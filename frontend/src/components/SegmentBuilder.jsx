@@ -7,9 +7,11 @@ import { API_BASE_URL } from '../config';
  * Segment builder shared by the Donors page, the email composer and email campaigns.
  * value is the segment object understood by the backend (backend/api/donors.py apply_segment):
  *   gift rules  - which gifts count: date_from/date_to, headings, subheadings, codes, sponsorship_types, campaign,
- *                 platforms, frequency, min_amount/max_amount, gift_aid_gift, sp_gift, min_matched_gifts/min_matched_total
+ *                 platforms, frequency, min_amount/max_amount, gift_aid_gift, sp_gift, zakat_gift, fundraisers,
+ *                 giving_levels, page_url + page_type (campaign / community / fundraiser / auto),
+ *                 min_matched_gifts/min_matched_total
  *   donor rules - tiers, min/max_total, min/max_gifts, min/max_avg, recurring, sp, min_allocations, has_email,
- *                 marketing_consent, countries, city, first/last_gift_from/to, manual
+ *                 has_phone, sponsored_types, sponsorship_statuses, marketing_consent, countries, city, first/last_gift_from/to, manual
  * Lists mean "any of"; different rules are combined (AND).
  */
 const optionsCache = {};
@@ -26,6 +28,8 @@ export function useSegmentOptions(company) {
 
 const inputStyle = { backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' };
 const TIERS = ['Low End', 'Medium Low', 'Medium', 'High', 'Super High'];
+const LINK_TYPES = [['auto', 'Detect from link'], ['campaign', 'Campaign page'], ['community', 'Community / team page'], ['fundraiser', 'Fundraiser page']];
+const STATUS_LABELS = { active: 'Active', due: 'Due for renewal (30 days)', grace: 'Grace period (30 days late)', lapsed: 'Lapsed' };
 const YES_NO = [['', 'Any'], ['yes', 'Yes'], ['no', 'No']];
 
 function MultiSelect({ label, options, value = [], onChange, placeholder = 'Any', renderSub }) {
@@ -126,7 +130,9 @@ const LABELS = {
   date_from: 'Gifts from', date_to: 'Gifts to', headings: 'Cause', subheadings: 'Sub-cause', codes: 'Code',
   sponsorship_types: 'Sponsorship', campaign: 'Campaign has', platforms: 'Platform', frequency: 'Gift type',
   min_amount: 'Gift ≥ £', max_amount: 'Gift ≤ £', gift_aid_gift: 'Gift Aid gift', sp_gift: 'SP gift',
-  min_matched_gifts: 'Matching gifts ≥', min_matched_total: 'Matching total ≥ £', tiers: 'Tier', min_total: 'Lifetime ≥ £',
+  min_matched_gifts: 'Matching gifts ≥', min_matched_total: 'Matching total ≥ £', zakat_gift: 'Zakat gift',
+  fundraisers: 'Fundraiser', giving_levels: 'Giving level', page_url: 'Page link', page_type: 'Link type',
+  has_phone: 'Has phone number', sponsorship_statuses: 'Sponsorship status', sponsored_types: 'Sponsors', tiers: 'Tier', min_total: 'Lifetime ≥ £',
   max_total: 'Lifetime ≤ £', min_gifts: 'Gifts ≥', max_gifts: 'Gifts ≤', min_avg: 'Avg gift ≥ £', max_avg: 'Avg gift ≤ £',
   recurring: 'Recurring donor', sp: 'SP donor', min_allocations: 'Sponsorships ≥', has_email: 'Has email',
   marketing_consent: 'Marketing consent', countries: 'Country', city: 'City has', first_gift_from: 'First gift from',
@@ -202,8 +208,26 @@ export default function SegmentBuilder({ company, value = {}, onChange, defaultO
               <Field label="Single gift ≤ £">{num('max_amount')}</Field>
               <Field label="Gift Aid on gift">{yn('gift_aid_gift')}</Field>
               <Field label="Gift via SP page">{yn('sp_gift')}</Field>
+              <Field label="Zakat gift">{yn('zakat_gift')}</Field>
+              <MultiSelect label="Fundraiser" options={(opts?.fundraisers || [])} value={value.fundraisers || []} onChange={v => set('fundraisers', v)} />
+              <MultiSelect label="Giving level" options={(opts?.giving_levels || [])} value={value.giving_levels || []} onChange={v => set('giving_levels', v)} />
               <Field label="Matching gifts ≥">{num('min_matched_gifts')}</Field>
               <Field label="Matching total ≥ £">{num('min_matched_total')}</Field>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+              <Field label="Gifts made through this page (paste a link)">
+                <input value={value.page_url || ''} onChange={e => set('page_url', e.target.value.trim())} placeholder="https://donate.iqracharity.org/fundraiser/…"
+                  className="w-full px-2 py-1.5 text-xs rounded-lg" style={inputStyle} />
+              </Field>
+              <Field label="The link is a">
+                <select value={value.page_type || 'auto'} onChange={e => set('page_type', e.target.value === 'auto' ? '' : e.target.value)} disabled={!value.page_url}
+                  className="w-full px-2 py-1.5 text-xs rounded-lg disabled:opacity-50" style={inputStyle}>
+                  {LINK_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+              </Field>
+              <span className="text-[11px] self-end pb-1.5" style={{ color: 'var(--text-muted)' }}>
+                Campaign = everyone who gave on that campaign; community / team or fundraiser = only gifts made through that page.
+              </span>
             </div>
           </div>
           <div className="flex flex-col gap-2">
@@ -222,6 +246,11 @@ export default function SegmentBuilder({ company, value = {}, onChange, defaultO
               <Field label="SP donor">{yn('sp')}</Field>
               <Field label="Sponsorships ≥">{num('min_allocations')}</Field>
               <Field label="Has email">{yn('has_email')}</Field>
+              <Field label="Has phone number">{yn('has_phone')}</Field>
+              <MultiSelect label="Sponsors (Tracker)" options={(opts?.sponsorship_types || []).map(v => ({ value: v }))}
+                value={value.sponsored_types || []} onChange={v => set('sponsored_types', v)} />
+              <MultiSelect label="Sponsorship status" options={(opts?.sponsorship_statuses || ['active', 'due', 'grace', 'lapsed']).map(v => ({ value: v, sub: STATUS_LABELS[v] }))}
+                value={value.sponsorship_statuses || []} onChange={v => set('sponsorship_statuses', v)} />
               <Field label="Marketing consent">{yn('marketing_consent')}</Field>
               <MultiSelect label="Country" options={(opts?.countries || [])} value={value.countries || []} onChange={v => set('countries', v)} />
               <Field label="City has"><input value={value.city || ''} onChange={e => set('city', e.target.value)} className="w-full px-2 py-1.5 text-xs rounded-lg" style={inputStyle} /></Field>
