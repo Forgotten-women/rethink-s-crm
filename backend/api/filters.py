@@ -33,7 +33,7 @@ def get_filter_options(
 
     if df_raw.empty:
         return {
-            "sources": ["GiveBright", "LaunchGood", "Paysuite", "Rethink Website"],
+            "sources": ["GiveBrite", "LaunchGood", "Paysuite", "Rethink Website"],
             "programme_funds": [],
             "headings": [],
             "subheadings": [],

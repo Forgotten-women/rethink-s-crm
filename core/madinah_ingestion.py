@@ -152,7 +152,8 @@ def resolve_madinah_classification(
     c_name = normalize_campaign_text(campaign_name)
     g_level = normalize_campaign_text(giving_level)
     resolved_code = None
-    if campaign_ref:
+
+    if not resolved_code and campaign_ref:
         from core.classification_ids import resolve_code_by_ref
         resolved_code, _tier = resolve_code_by_ref(cursor, "madinah", company_id, campaign_ref, c_name, g_level)
 
@@ -205,6 +206,10 @@ def resolve_madinah_classification(
             except Exception as reg_err:
                 logger.warning(f"Madinah auto-registration notice for '{c_name}': {reg_err}")
 
+    # Standardize SHAM -> SHM on code
+    if resolved_code and resolved_code.startswith("SHAM-"):
+        resolved_code = "SHM-" + resolved_code[5:]
+
     # Enrich from master_project_codes
     meta = {
         "code": resolved_code,
@@ -229,7 +234,7 @@ def resolve_madinah_classification(
             meta["department"] = m_row[0] or ""
             meta["office"] = m_row[1] or ""
             meta["portfolio"] = m_row[2] or ""
-            meta["country"] = m_row[3] or ""
+            meta["country"] = "SHM" if (m_row[3] or "").strip() == "SHAM" else (m_row[3] or "")
             meta["programme_fund"] = m_row[4] or ""
             meta["fund_code"] = m_row[5] or ""
             meta["zakat_eligibility"] = m_row[6] or ""

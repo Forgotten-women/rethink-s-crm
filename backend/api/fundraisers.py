@@ -795,7 +795,7 @@ def get_available_campaigns_list(company_id: Optional[str] = Query("rethink")):
         # 3. From all 4 classification matrix tables
         matrix_tables = [
             ("campaign_classifications", "LaunchGood"),
-            ("givebright_classifications", "GiveBright"),
+            ("givebright_classifications", "GiveBrite"),
             ("paysuite_classifications", "Paysuite"),
             ("rethink_website_classifications", "Rethink Website")
         ]
@@ -1005,7 +1005,7 @@ def get_fundraisers_list(
                 for _, r in grp[cols_c].drop_duplicates().iterrows():
                     c_name_val = str(r.get("Campaign Name") or "").strip()
                     c_code_val = str(r.get("Code") or "ALL").strip() if "Code" in r else "ALL"
-                    c_plat_val = str(r.get("Platform") or "GiveBright").strip() if "Platform" in r else "GiveBright"
+                    c_plat_val = str(r.get("Platform") or "GiveBrite").strip() if "Platform" in r else "GiveBrite"
                     if c_name_val and (c_name_val.lower(), c_code_val.lower()) not in seen_c:
                         seen_c.add((c_name_val.lower(), c_code_val.lower()))
                         c_list_items.append({
@@ -1455,7 +1455,7 @@ def get_fundraiser_detail(
         for _, r in sub_df[cols_c].drop_duplicates().iterrows():
             c_name_val = str(r.get("Campaign Name") or "").strip()
             c_code_val = str(r.get("Code") or "ALL").strip() if "Code" in r else "ALL"
-            c_plat_val = str(r.get("Platform") or "GiveBright").strip() if "Platform" in r else "GiveBright"
+            c_plat_val = str(r.get("Platform") or "GiveBrite").strip() if "Platform" in r else "GiveBrite"
             if c_name_val and (c_name_val.lower(), c_code_val.lower()) not in seen_c:
                 seen_c.add((c_name_val.lower(), c_code_val.lower()))
                 c_list_items.append({
@@ -1515,7 +1515,7 @@ def get_fundraiser_detail(
                     campaign_breakdown.append({
                         "campaign_name": display_name,
                         "code": code_display,
-                        "platform": str(c_grp["Platform"].iloc[0]) if "Platform" in c_grp.columns and not c_grp["Platform"].empty and pd.notna(c_grp["Platform"].iloc[0]) else "GiveBright",
+                        "platform": str(c_grp["Platform"].iloc[0]) if "Platform" in c_grp.columns and not c_grp["Platform"].empty and pd.notna(c_grp["Platform"].iloc[0]) else "GiveBrite",
                         "gross_raised": round(gross_p if (start_date or end_date) else gross_all, 2),
                         "gross_raised_all_time": round(gross_all, 2),
                         "total_donations": p_txns if (start_date or end_date) else len(c_grp),

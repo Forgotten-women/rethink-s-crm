@@ -563,7 +563,7 @@ export default function FundraiserFormModal({
                 >
                   <option value="ALL">All Platforms</option>
                   <option value="LaunchGood">LaunchGood</option>
-                  <option value="GiveBright">GiveBright</option>
+                  <option value="GiveBrite">GiveBrite</option>
                   <option value="Paysuite">Paysuite</option>
                   <option value="Rethink Website">Rethink Website</option>
                 </select>

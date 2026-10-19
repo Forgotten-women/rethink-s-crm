@@ -588,11 +588,11 @@ def init_classification_db():
                     COALESCE(m.company_id, 'rethink') AS company_id,
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
-                    m.code,
+                    CASE WHEN m.code LIKE 'SHAM-%' THEN 'SHM-' || SUBSTR(m.code, 6) ELSE m.code END AS code,
                     COALESCE(m.special_case, '') AS special_case,
                     COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
-                    COALESCE(m.campaign_url, '') AS campaign_url,
+                    COALESCE(NULLIF(m.campaign_url, ''), cat.url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
                     COALESCE(c.office, 'Unassigned') AS office,
                     COALESCE(c.portfolio, '') AS portfolio,
@@ -602,14 +602,21 @@ def init_classification_db():
                     COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                     COALESCE(c.department, 'Unassigned') AS heading,
                     COALESCE(c.office, 'Unassigned') AS sub_heading,
-                    COALESCE(c.country, 'Unassigned') AS country,
+                    CASE WHEN c.country = 'SHAM' THEN 'SHM' ELSE COALESCE(c.country, 'Unassigned') END AS country,
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
-                    m.campaign_ref AS campaign_ref,
-                    m.giving_level_ref AS giving_level_ref
+                    COALESCE(m.campaign_ref, cat.campaign_ref, '') AS campaign_ref,
+                    COALESCE(m.giving_level_ref, '') AS giving_level_ref
                 FROM platform_campaign_mappings m
+                LEFT JOIN platform_campaign_catalog cat 
+                    ON cat.platform = m.platform 
+                   AND LOWER(COALESCE(cat.company_id, 'rethink')) = LOWER(COALESCE(m.company_id, 'rethink'))
+                   AND (
+                       (m.campaign_ref IS NOT NULL AND cat.campaign_ref = m.campaign_ref)
+                       OR (m.campaign_ref IS NULL AND cat.current_name = m.campaign_name)
+                   )
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
                    AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
@@ -623,11 +630,11 @@ def init_classification_db():
                     COALESCE(m.company_id, 'rethink') AS company_id,
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
-                    m.code,
+                    CASE WHEN m.code LIKE 'SHAM-%' THEN 'SHM-' || SUBSTR(m.code, 6) ELSE m.code END AS code,
                     COALESCE(m.special_case, '') AS special_case,
                     COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
-                    COALESCE(m.campaign_url, '') AS campaign_url,
+                    COALESCE(NULLIF(m.campaign_url, ''), cat.url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
                     COALESCE(c.office, 'Unassigned') AS office,
                     COALESCE(c.portfolio, '') AS portfolio,
@@ -637,19 +644,28 @@ def init_classification_db():
                     COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                     COALESCE(c.department, 'Unassigned') AS heading,
                     COALESCE(c.office, 'Unassigned') AS sub_heading,
-                    COALESCE(c.country, 'Unassigned') AS country,
+                    CASE WHEN c.country = 'SHAM' THEN 'SHM' ELSE COALESCE(c.country, 'Unassigned') END AS country,
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
-                    m.campaign_ref AS campaign_ref,
-                    m.giving_level_ref AS giving_level_ref
+                    COALESCE(m.campaign_ref, cat.campaign_ref, '') AS campaign_ref,
+                    COALESCE(m.giving_level_ref, '') AS giving_level_ref
                 FROM platform_campaign_mappings m
+                LEFT JOIN platform_campaign_catalog cat 
+                    ON cat.platform = m.platform 
+                   AND LOWER(COALESCE(cat.company_id, 'rethink')) = LOWER(COALESCE(m.company_id, 'rethink'))
+                   AND (
+                       (m.campaign_ref IS NOT NULL AND cat.campaign_ref = m.campaign_ref)
+                       OR (m.campaign_ref IS NULL AND cat.current_name = m.campaign_name)
+                   )
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
                    AND COALESCE(m.company_id, 'rethink') = COALESCE(c.company_id, 'rethink')
-                WHERE m.platform = 'givebright';
+                WHERE m.platform IN ('givebright', 'givebrite');
             """)
+            cur.execute("DROP VIEW IF EXISTS givebrite_classifications")
+            cur.execute("CREATE VIEW givebrite_classifications AS SELECT * FROM givebright_classifications;")
 
             cur.execute("DROP VIEW IF EXISTS paysuite_classifications")
             cur.execute("""
@@ -756,11 +772,11 @@ def init_classification_db():
                     COALESCE(m.company_id, 'iqra') AS company_id,
                     m.campaign_name,
                     COALESCE(m.giving_level, '') AS giving_level,
-                    m.code,
+                    CASE WHEN m.code LIKE 'SHAM-%' THEN 'SHM-' || SUBSTR(m.code, 6) ELSE m.code END AS code,
                     COALESCE(m.special_case, '') AS special_case,
                     COALESCE(c.special_treatment, '') AS special_treatment,
                     COALESCE(m.community_name, 'N/A') AS community_name,
-                    COALESCE(m.campaign_url, '') AS campaign_url,
+                    COALESCE(NULLIF(m.campaign_url, ''), cat.url, '') AS campaign_url,
                     COALESCE(c.department, 'Unassigned') AS department,
                     COALESCE(c.office, 'Unassigned') AS office,
                     COALESCE(c.portfolio, '') AS portfolio,
@@ -770,14 +786,21 @@ def init_classification_db():
                     COALESCE(c.legacy_zakat_code, '') AS legacy_zakat_code,
                     COALESCE(c.department, 'Unassigned') AS heading,
                     COALESCE(c.office, 'Unassigned') AS sub_heading,
-                    COALESCE(c.country, 'Unassigned') AS country,
+                    CASE WHEN c.country = 'SHAM' THEN 'SHM' ELSE COALESCE(c.country, 'Unassigned') END AS country,
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
-                    m.campaign_ref AS campaign_ref,
-                    m.giving_level_ref AS giving_level_ref
+                    COALESCE(m.campaign_ref, cat.campaign_ref, '') AS campaign_ref,
+                    COALESCE(m.giving_level_ref, '') AS giving_level_ref
                 FROM platform_campaign_mappings m
+                LEFT JOIN platform_campaign_catalog cat 
+                    ON cat.platform = m.platform 
+                   AND LOWER(COALESCE(cat.company_id, 'iqra')) = LOWER(COALESCE(m.company_id, 'iqra'))
+                   AND (
+                       (m.campaign_ref IS NOT NULL AND cat.campaign_ref = m.campaign_ref)
+                       OR (m.campaign_ref IS NULL AND cat.current_name = m.campaign_name)
+                   )
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
                    AND COALESCE(m.company_id, 'iqra') = COALESCE(c.company_id, 'iqra')
@@ -1074,7 +1097,9 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(is_primary, 0) as "is_primary",
                 COALESCE(donor_name, '') as "Donor Name",
-                COALESCE(donor_email, '') as "Donor Email"
+                COALESCE(donor_email, '') as "Donor Email",
+                COALESCE(campaign_ref, '') as "campaign_ref",
+                COALESCE(giving_level_ref, '') as "giving_level_ref"
             FROM campaign_classifications
             {where_clause}
         """, conn, params=params)
@@ -1254,8 +1279,9 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
         deduped_df["donation_count"] = 0
     if "total_amount" in deduped_df.columns:
         deduped_df["total_amount"] = pd.to_numeric(deduped_df["total_amount"], errors="coerce").fillna(0.0).round(2)
-    else:
-        deduped_df["total_amount"] = 0.0
+    for ref_c in ["campaign_ref", "giving_level_ref"]:
+        if ref_c in deduped_df.columns:
+            deduped_df[ref_c] = deduped_df[ref_c].fillna("").astype(str).str.strip().replace({"Unassigned": "", "None": "", "nan": ""})
 
     return deduped_df
 
@@ -1605,6 +1631,32 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 valid_idx = valid_mask[valid_mask].index
                 df_raw.loc[valid_idx, col] = mapped_series.loc[valid_idx]
 
+    # Classification by ID first (overrides name mapping when an ID rule matches)
+    for plat in ["givebrite", "madinah", "launchgood"]:
+        plat_filter = "givebrite|givebright" if plat == "givebrite" else plat
+        plat_mask = comp_mask & (df_raw["Platform"].astype(str).str.lower().str.contains(plat_filter))
+        if plat_mask.any():
+            plat_sub = df_raw.loc[plat_mask]
+            id_map = _id_rule_values(plat_sub, plat, comp, all_rules, [c.lower().replace("-", "_").replace(" ", "_") for c in target_cols])
+            for col in target_cols:
+                db_f = col.lower().replace("-", "_").replace(" ", "_")
+                if db_f in id_map:
+                    s_id = id_map[db_f]
+                    val_id_mask = s_id.notna() & (~s_id.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
+                    if val_id_mask.any():
+                        df_raw.loc[val_id_mask[val_id_mask].index, col] = s_id[val_id_mask]
+
+    # Eliminate SHAM discrepancy -> SHM
+    for c_col in ["Country", "Target Country"]:
+        if c_col in df_raw.columns:
+            sham_mask = comp_mask & (df_raw[c_col].astype(str).str.upper() == "SHAM")
+            if sham_mask.any():
+                df_raw.loc[sham_mask, c_col] = "SHM"
+    if "Code" in df_raw.columns:
+        sham_code_mask = comp_mask & df_raw["Code"].astype(str).str.upper().str.startswith("SHAM-")
+        if sham_code_mask.any():
+            df_raw.loc[sham_code_mask, "Code"] = df_raw.loc[sham_code_mask, "Code"].apply(lambda x: "SHM-" + str(x)[5:])
+
     df_raw = sanitize_df_dtypes_for_parquet(df_raw)
     df_raw.to_parquet(PARQUET_PATH, index=False, compression=PARQUET_COMPRESSION)
 
@@ -1755,8 +1807,15 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
         if gl.lower() in ["nan", "none", "n/a", "campaign default / general", "campaign default", "default (general)"]:
             gl = ""
         raw_code = str(row.get("Code", "Unassigned")).strip().upper()
-        if not cname or cname.lower() in ["nan", "none", "n/a", "", "campaign_name", "campaign name"]:
-            continue
+        if not cname or cname.lower() in ["nan", "none", "", "campaign_name", "campaign name"]:
+            cname = "n/a"
+
+        camp_ref = str(row.get("campaign_ref") or row.get("Campaign Ref") or "").strip()
+        gl_ref = str(row.get("giving_level_ref") or row.get("Giving Level Ref") or "").strip()
+        if camp_ref in ["Unassigned", "None", "nan", "NaN", "null"]:
+            camp_ref = ""
+        if gl_ref in ["Unassigned", "None", "nan", "NaN", "null"]:
+            gl_ref = ""
 
         c_canon = canonical_campaign_key(cname)
         spec_case = canonicalize_special_case(row.get("Special Case") or row.get("special_case") or "")
@@ -1771,12 +1830,18 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
             if not spec_case:
                 spec_case = canonicalize_special_case(parts[1].rstrip("]").strip())
 
+        # Standardize SHAM to SHM
+        if code.startswith("SHAM-"):
+            code = "SHM-" + code[5:]
+
         cname_gl_to_codes.setdefault((cname.lower(), gl.lower()), set()).add(code.lower())
 
         dept = str(row.get("Department") or row.get("Heading", "Unassigned")).strip()
         off = str(row.get("Office") or row.get("Sub-Heading", "Unassigned")).strip()
         port = str(row.get("Portfolio", "")).strip()
         country = str(row.get("Country", "Unassigned")).strip()
+        if country.upper() == "SHAM":
+            country = "SHM"
         zakat = str(row.get("Zakat Eligibility", "Unassigned")).strip()
         if zakat == "Unassigned":
             zakat = "Zakat"
@@ -1790,7 +1855,7 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
         d_name = str(row.get("Donor Name", "") or "").strip()
         d_email = str(row.get("Donor Email", "") or "").strip()
 
-        mapping_rows.append((platform.lower(), comp, cname, gl, code, comm, curl, is_prim, d_name, d_email, spec_case))
+        mapping_rows.append((platform.lower(), comp, cname, gl, code, comm, curl, is_prim, d_name, d_email, spec_case, camp_ref or None, gl_ref or None))
 
     import time
     for attempt in range(5):
@@ -1864,17 +1929,28 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                     mapping_rows = list(deduped_mapping_rows.values())
 
                     conn.executemany("""
-                        INSERT INTO platform_campaign_mappings (platform, company_id, campaign_name, giving_level, code, community_name, campaign_url, is_primary, donor_name, donor_email, special_case)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO platform_campaign_mappings (platform, company_id, campaign_name, giving_level, code, community_name, campaign_url, is_primary, donor_name, donor_email, special_case, campaign_ref, giving_level_ref)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(platform, company_id, campaign_name, giving_level, code) DO UPDATE SET
                             community_name = COALESCE(NULLIF(excluded.community_name, 'N/A'), platform_campaign_mappings.community_name),
                             campaign_url = COALESCE(NULLIF(excluded.campaign_url, ''), platform_campaign_mappings.campaign_url),
+                            campaign_ref = COALESCE(NULLIF(excluded.campaign_ref, ''), platform_campaign_mappings.campaign_ref),
+                            giving_level_ref = COALESCE(NULLIF(excluded.giving_level_ref, ''), platform_campaign_mappings.giving_level_ref),
                             is_primary = excluded.is_primary,
                             donor_name = CASE WHEN excluded.donor_name != '' THEN excluded.donor_name ELSE platform_campaign_mappings.donor_name END,
                             donor_email = CASE WHEN excluded.donor_email != '' THEN excluded.donor_email ELSE platform_campaign_mappings.donor_email END,
                             special_case = CASE WHEN excluded.special_case != '' THEN excluded.special_case ELSE platform_campaign_mappings.special_case END,
                             updated_at = CURRENT_TIMESTAMP;
                     """, mapping_rows)
+
+                    # Safe URL sync: keep campaign_url in sync for rows sharing campaign_ref
+                    for row in mapping_rows:
+                        _p, _cid, _cn, _gl, _cd, _cm, _cu, _ip, _dn, _de, _sc, _cr, _gr = row
+                        if _cr and _cu:
+                            conn.execute("""UPDATE platform_campaign_mappings 
+                                            SET campaign_url = ?, updated_at = CURRENT_TIMESTAMP
+                                            WHERE platform = ? AND company_id = ? AND campaign_ref = ? AND (campaign_url IS NULL OR campaign_url = '')""",
+                                         (_cu, _p, _cid, _cr))
 
                     if _ref_snapshot:
                         for _id, _n, _g in conn.execute("""SELECT id, LOWER(campaign_name), LOWER(COALESCE(giving_level, ''))
@@ -2168,7 +2244,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
         ("Direct Debit Ref" in df.columns and "Amount" in df.columns) or
         ("Bank Ref" in df.columns and "Amount" in df.columns and ("Due" in df.columns or "Date Due" in df.columns or "Date of collection" in df.columns or "Details" in df.columns))
     )
-    has_non_ws_platform = "Platform" in df.columns and df["Platform"].astype(str).str.lower().str.contains("launchgood|givebright|madinah|paysuite", regex=True, na=False).any()
+    has_non_ws_platform = "Platform" in df.columns and df["Platform"].astype(str).str.lower().str.contains("launchgood|givebright|givebrite|madinah|paysuite", regex=True, na=False).any()
     is_rethink_website = not already_multi_platform and not has_non_ws_platform and (("Reference" in df.columns and "Donor First Name" in df.columns and ("Project Name" in df.columns or "Processor" in df.columns)) or (str(platform).lower() in ["rethink website", "website", "rethink_website"]))
     is_madinah = False
     is_givebright = False
@@ -2176,7 +2252,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
     if not already_multi_platform and not is_paysuite and not is_rethink_website:
         if str(platform).lower() == "madinah":
             is_madinah = True
-        elif str(platform).lower() == "givebright":
+        elif str(platform).lower() in ["givebright", "givebrite"]:
             is_givebright = True
         elif str(platform).lower() in ["auto", "none", ""]:
             mad_sig = {"Invoice ID", "Invoice Number", "Announcement Title", "Giving Levels", "Stripe Fees (USD)", "Net Amount (USD)"}
@@ -2469,7 +2545,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                 conn.close()
 
     elif is_givebright:
-        df["Platform"] = "GiveBright"
+        df["Platform"] = "GiveBrite"
         gb_aliases = {
             "id": "Donation ID",
             "_id": "Donation ID",
@@ -2688,7 +2764,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             gl_series = df["Giving Level Title"].fillna("").astype(str).str.strip().str.lower() if "Giving Level Title" in df.columns else pd.Series("", index=df.index)
 
             _gb_fields = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
-            id_vals = _id_rule_values(df, "givebright", target_cid, db_matrix, [f.lower().replace("-", "_").replace(" ", "_") for f in _gb_fields])
+            id_vals = _id_rule_values(df, "givebrite", target_cid, db_matrix, [f.lower().replace("-", "_").replace(" ", "_") for f in _gb_fields])
             for f in _gb_fields:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
                 mapped_gl = [rule_dict_gl.get((c, g), {}).get(db_f) if g else None for c, g in zip(cname_series, gl_series)]
@@ -2701,7 +2777,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                     df.loc[valid_mask, f] = mapped_vals[valid_mask]
             _id_matched_names = set(df.loc[id_vals["_matched"], "Campaign Name"].astype(str).str.strip().str.lower()) if "_matched" in id_vals else set()
 
-            # Seed new GiveBright campaigns into platform_campaign_mappings database with giving level support
+            # Seed new GiveBrite campaigns into platform_campaign_mappings database with giving level support
             c_curl_map = {}
             if "Campaign URL" in df.columns:
                 for c_u, u_val in zip(df["Campaign Name"], df["Campaign URL"]):
@@ -2723,10 +2799,10 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                     continue  # its campaign ID already has rules (e.g. a renamed campaign): no duplicate "Unassigned" rule
                 if gl_l and gl_l not in ["nan", "none", "n/a", ""]:
                     if (cn_l, gl_l) not in rule_dict_gl:
-                        new_rules.append((target_cid, "givebright", cn, gl, "Unassigned", curl, 0))
+                        new_rules.append((target_cid, "givebrite", cn, gl, "Unassigned", curl, 0))
                 else:
                     if cn_l not in rule_dict_camp:
-                        new_rules.append((target_cid, "givebright", cn, "", "Unassigned", curl, 1))
+                        new_rules.append((target_cid, "givebrite", cn, "", "Unassigned", curl, 1))
 
             if new_rules:
                 conn = get_db_connection(timeout=60.0)
@@ -2737,7 +2813,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                     """, new_rules)
                     conn.commit()
                 except Exception as e:
-                    print(f"Error seeding new givebright rules: {e}")
+                    print(f"Error seeding new givebrite rules: {e}")
                 finally:
                     conn.close()
 
@@ -3072,7 +3148,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
         tbl_name = (
             "rethink_website_classifications" if is_rethink_website else
             "paysuite_classifications" if is_paysuite else
-            "givebright_classifications" if is_givebright else
+            "givebrite_classifications" if is_givebright else
             "madinah_classifications" if is_madinah else
             "campaign_classifications"
         )
@@ -3097,7 +3173,7 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             cname_series = df["Campaign Name"].astype(str).str.strip().str.lower()
             gl_series = df["Giving Level Title"].fillna("").astype(str).str.strip().str.lower() if "Giving Level Title" in df.columns else pd.Series("", index=df.index)
 
-            _id_plat = {"campaign_classifications": "launchgood", "givebright_classifications": "givebright", "madinah_classifications": "madinah"}.get(tbl_name)
+            _id_plat = {"campaign_classifications": "launchgood", "givebright_classifications": "givebrite", "givebrite_classifications": "givebrite", "madinah_classifications": "madinah"}.get(tbl_name)
             id_vals = _id_rule_values(df, _id_plat, target_cid, db_matrix, [f.lower().replace("-", "_").replace(" ", "_") for f in target_cols]) if _id_plat else {}
             for f in target_cols:
                 db_f = f.lower().replace("-", "_").replace(" ", "_")
@@ -3106,6 +3182,11 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                 mapped_vals = pd.Series(mapped_gl, index=df.index).combine_first(mapped_camp)
                 if db_f in id_vals:  # by campaign / giving-level ID first, names fill the rest
                     mapped_vals = id_vals[db_f].combine_first(mapped_vals)
+
+                if db_f in id_vals:
+                    id_match_mask = id_vals[db_f].notna() & (~id_vals[db_f].astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
+                    if id_match_mask.any():
+                        df.loc[id_match_mask, f] = id_vals[db_f][id_match_mask]
 
                 valid_mask = mapped_vals.notna() & (~mapped_vals.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
                 curr_unassigned = df[f].astype(str).str.strip().str.lower().isin(["", "unassigned", "nan", "none"])
@@ -3126,6 +3207,13 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             fill_mask = mapped_vals.notna() & curr_unassigned
             if fill_mask.any():
                 df.loc[fill_mask, tc] = mapped_vals[fill_mask]
+
+    # Standardize SHAM to SHM across countries and codes
+    for c_col in ["Country", "Target Country", "country"]:
+        if c_col in df.columns:
+            df[c_col] = df[c_col].replace({"SHAM": "SHM", "sham": "SHM"})
+    if "Code" in df.columns:
+        df["Code"] = df["Code"].apply(lambda x: ("SHM-" + str(x)[5:]) if str(x).upper().startswith("SHAM-") else x)
 
     for col in df.select_dtypes(include='object').columns:
         df[col] = df[col].astype(str).apply(fix_mojibake)
@@ -4331,7 +4419,9 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(is_primary, 0) as "is_primary",
                 COALESCE(donor_name, '') as "Donor Name",
-                COALESCE(donor_email, '') as "Donor Email"
+                COALESCE(donor_email, '') as "Donor Email",
+                COALESCE(campaign_ref, '') as "campaign_ref",
+                COALESCE(giving_level_ref, '') as "giving_level_ref"
             FROM givebright_classifications
             {where_clause}
         """, conn, params=params)
@@ -4467,8 +4557,11 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
     else:
         deduped_df["total_amount"] = 0.0
 
-    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary"]]
+    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary", "campaign_ref", "giving_level_ref"]]
     deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
+    for ref_c in ["campaign_ref", "giving_level_ref"]:
+        if ref_c in deduped_df.columns:
+            deduped_df[ref_c] = deduped_df[ref_c].fillna("").astype(str).str.strip().replace({"Unassigned": "", "None": "", "nan": ""})
     if "Campaign URL" in deduped_df.columns:
         deduped_df["Campaign URL"] = deduped_df["Campaign URL"].map(clean_campaign_url)
     return deduped_df.reset_index(drop=True)
@@ -4491,6 +4584,8 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
                 COALESCE(giving_level, '') as "Giving Level",
                 COALESCE(code, 'Unassigned') as "Code",
                 COALESCE(campaign_url, '') as "Campaign URL",
+                COALESCE(campaign_ref, '') as "campaign_ref",
+                COALESCE(giving_level_ref, '') as "giving_level_ref",
                 COALESCE(department, heading, 'Unassigned') as "Department",
                 COALESCE(office, sub_heading, 'Unassigned') as "Office",
                 COALESCE(portfolio, '') as "Portfolio",
@@ -4612,16 +4707,23 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
     else:
         deduped_df["total_amount"] = 0.0
 
-    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary"]]
+    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary", "campaign_ref", "giving_level_ref"]]
     deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
+    for ref_c in ["campaign_ref", "giving_level_ref"]:
+        if ref_c in deduped_df.columns:
+            deduped_df[ref_c] = deduped_df[ref_c].fillna("").astype(str).str.strip().replace({"Unassigned": "", "None": "", "nan": ""})
     if "Campaign URL" in deduped_df.columns:
         deduped_df["Campaign URL"] = deduped_df["Campaign URL"].map(clean_campaign_url)
     return deduped_df.reset_index(drop=True)
 
 
 def save_givebright_classification_matrix(matrix_df, company_id: str = "rethink"):
-    """Saves updated GiveBright classification matrix into two-tier architecture."""
-    return save_platform_matrix_rules("givebright", matrix_df, company_id=company_id)
+    """Saves updated GiveBrite classification matrix into two-tier architecture."""
+    return save_platform_matrix_rules("givebrite", matrix_df, company_id=company_id)
+
+
+save_givebrite_classification_matrix = save_givebright_classification_matrix
+get_givebrite_classification_matrix = get_givebright_classification_matrix
 
 
 def normalize_classification_import_df(raw_df):

@@ -61,16 +61,16 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   const isConsolidated = activeCompany === 'all';
   // Enforce company platform partitioning
   // Iqra: LaunchGood, GiveBrite, Madinah, Master
-  // Rethink: LaunchGood, GiveBright, Paysuite, Website, Master
+  // Rethink: LaunchGood, GiveBrite, Paysuite, Website, Master
   const isIqra = activeCompany === 'iqra';
 
   // Persist selected platform in localStorage with company compatibility
   const [platform, setPlatform] = useState(() => {
     const saved = localStorage.getItem('selected_classification_platform');
     if (activeCompany === 'iqra') {
-      return ['master', 'launchgood', 'givebright', 'madinah'].includes(saved) ? saved : 'launchgood';
+      return ['master', 'launchgood', 'givebright', 'givebrite', 'madinah'].includes(saved) ? saved : 'launchgood';
     }
-    return ['master', 'launchgood', 'givebright', 'paysuite', 'website', 'stripe'].includes(saved) ? saved : 'launchgood';
+    return ['master', 'launchgood', 'givebright', 'givebrite', 'paysuite', 'website', 'stripe'].includes(saved) ? saved : 'launchgood';
   });
 
   const [matrixData, setMatrixData] = useState({ total_campaigns: 0, classified_campaigns: 0, unassigned_campaigns: 0, rules: [] });
@@ -93,11 +93,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   // Ensure active platform matches active company
   useEffect(() => {
     if (activeCompany === 'iqra') {
-      if (!['master', 'launchgood', 'givebright', 'madinah'].includes(platform)) {
+      if (!['master', 'launchgood', 'givebright', 'givebrite', 'madinah'].includes(platform)) {
         handleSelectPlatform('launchgood');
       }
     } else if (activeCompany === 'rethink') {
-      if (!['master', 'launchgood', 'givebright', 'paysuite', 'website', 'stripe'].includes(platform)) {
+      if (!['master', 'launchgood', 'givebright', 'givebrite', 'paysuite', 'website', 'stripe'].includes(platform)) {
         handleSelectPlatform('launchgood');
       }
     }
@@ -1218,6 +1218,14 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       activePill: 'bg-purple-600 text-white shadow-purple-500/30',
       countPill: 'border-purple-500/40 text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40'
     },
+    givebrite: {
+      container: 'bg-gradient-to-r from-purple-500/15 via-indigo-500/10 to-transparent border-purple-500/30 text-purple-900 dark:text-purple-200',
+      iconBg: 'bg-purple-600 text-white',
+      title: 'text-purple-700 dark:text-purple-300 font-extrabold',
+      subtitle: 'text-slate-600 dark:text-slate-400 font-medium',
+      activePill: 'bg-purple-600 text-white shadow-purple-500/30',
+      countPill: 'border-purple-500/40 text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40'
+    },
     madinah: {
       container: 'bg-gradient-to-r from-teal-500/15 via-emerald-500/10 to-transparent border-teal-500/30 text-teal-900 dark:text-teal-200',
       iconBg: 'bg-teal-600 text-white',
@@ -1516,18 +1524,18 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           )}
         </button>
 
-        {/* GiveBright Tab (Both Rethink & Iqra) */}
+        {/* GiveBrite Tab (Both Rethink & Iqra) */}
         <button 
-          onClick={() => handleSelectPlatform('givebright')}
+          onClick={() => handleSelectPlatform('givebrite')}
           className={`relative px-5 py-3 rounded-xl font-bold text-xs flex items-center gap-2.5 transition-all cursor-pointer ${
-            platform === 'givebright'
+            platform === 'givebright' || platform === 'givebrite'
               ? 'bg-gradient-to-r from-purple-700 to-indigo-600 text-white shadow-md shadow-purple-500/30 border border-purple-400 ring-2 ring-purple-400/40'
               : 'bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 dark:text-slate-300 border border-slate-300 dark:border-white/5'
           }`}
         >
-          <Gift className={`w-4 h-4 ${platform === 'givebright' ? 'text-white' : 'text-purple-600 dark:text-purple-400'}`} />
-          <span className="font-bold">GiveBright Matrix</span>
-          {platform === 'givebright' && (
+          <Gift className={`w-4 h-4 ${(platform === 'givebright' || platform === 'givebrite') ? 'text-white' : 'text-purple-600 dark:text-purple-400'}`} />
+          <span className="font-bold">GiveBrite Matrix</span>
+          {(platform === 'givebright' || platform === 'givebrite') && (
             <span className="flex h-2.5 w-2.5 relative ml-1">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-white"></span>
@@ -1626,7 +1634,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           <span className={`p-2.5 rounded-xl shadow-sm ${bStyles.iconBg}`}>
             {platform === 'master' ? <Shield className="w-5 h-5" /> :
              platform === 'launchgood' ? <Zap className="w-5 h-5" /> :
-             platform === 'givebright' ? <Gift className="w-5 h-5" /> :
+             (platform === 'givebright' || platform === 'givebrite') ? <Gift className="w-5 h-5" /> :
              platform === 'madinah' ? <Sparkles className="w-5 h-5" /> :
              platform === 'paysuite' ? <CreditCard className="w-5 h-5" /> :
              platform === 'stripe' ? <CreditCard className="w-5 h-5" /> :
@@ -1638,7 +1646,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 ACTIVE {platform === 'master' ? 'CATALOG' : 'MATRIX'}: {
                   platform === 'master' ? 'Canonical Master Project Codes (Single Source of Truth)' :
                   platform === 'launchgood' ? 'LaunchGood Campaign Master' :
-                  platform === 'givebright' ? 'GiveBright Campaign & URL Master' :
+                  (platform === 'givebright' || platform === 'givebrite') ? 'GiveBrite Campaign & URL Master' :
                   platform === 'madinah' ? 'Madinah Campaign & URL Master' :
                   platform === 'paysuite' ? 'Paysuite Direct Debit Master' :
                   platform === 'stripe' ? 'Stripe Payment Links Master' :
@@ -1652,7 +1660,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             <div className={`text-xs mt-0.5 ${bStyles.subtitle}`}>
               {platform === 'master'
                 ? 'Single Source of Truth: Canonical Project Codes ➔ Department, Office, Portfolio, Country, Zakat Eligibility'
-                : platform === 'givebright' || platform === 'madinah'
+                : (platform === 'givebright' || platform === 'givebrite') || platform === 'madinah'
                 ? 'Hierarchy: Campaign Name & URL ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
                 : platform === 'paysuite'
                 ? 'Hierarchy: Direct Debit Ref (Bank Ref) ➔ Code ➔ (Department, Office, Portfolio, Country, Zakat Eligibility)'
@@ -1704,7 +1712,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className={`glass-panel p-4 border-l-4 ${platform === 'launchgood' ? 'border-teal-500 dark:border-cyan-400' : platform === 'givebright' ? 'border-purple-500 dark:border-purple-400' : platform === 'paysuite' ? 'border-amber-500 dark:border-amber-400' : platform === 'stripe' ? 'border-indigo-500 dark:border-indigo-400' : 'border-blue-500 dark:border-blue-400'}`}>
+          <div className={`glass-panel p-4 border-l-4 ${platform === 'launchgood' ? 'border-teal-500 dark:border-cyan-400' : (platform === 'givebright' || platform === 'givebrite') ? 'border-purple-500 dark:border-purple-400' : platform === 'paysuite' ? 'border-amber-500 dark:border-amber-400' : platform === 'stripe' ? 'border-indigo-500 dark:border-indigo-400' : 'border-blue-500 dark:border-blue-400'}`}>
             <div className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase">
               {platform === 'stripe' ? 'Unique Payment Links' : platform === 'paysuite' ? 'Total Tracked Direct Debits' : 'Unique Tracked Campaigns'}
             </div>
@@ -2045,13 +2053,13 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                       <th className="min-w-[180px] text-left">{platform === 'stripe' ? 'Currency & Ref' : 'Giving Level / Option'}</th>
                     )}
 
-                    {/* LaunchGood, GiveBright & Stripe: Campaign URL Column */}
+                    {/* LaunchGood, GiveBrite & Stripe: Campaign URL Column */}
                     {platform !== 'paysuite' && (
                       <th className="w-28 text-center">{platform === 'stripe' ? 'Stripe URL' : 'Campaign URL'}</th>
                     )}
 
-                    {/* LaunchGood & Paysuite & Stripe: Community Name column (Hidden for GiveBright & Madinah) */}
-                    {platform !== 'givebright' && platform !== 'madinah' && (
+                    {/* LaunchGood & Paysuite & Stripe: Community Name column (Hidden for GiveBrite & Madinah) */}
+                    {platform !== 'givebright' && platform !== 'givebrite' && platform !== 'madinah' && (
                       <th className="min-w-[160px] text-left">{platform === 'paysuite' ? 'Platform Source' : platform === 'stripe' ? 'Payment Link ID' : 'Community Name'}</th>
                     )}
                     
@@ -2068,7 +2076,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 <tbody>
                   {paginatedCampaigns.length === 0 ? (
                     <tr>
-                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'madinah' ? 10 : 11} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'givebrite' || platform === 'madinah' ? 10 : 11} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No classification rules match the active search or status filter.
                       </td>
                     </tr>
@@ -2192,8 +2200,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                               </td>
                             )}
 
-                            {/* Community Name Cell (Hidden for GiveBright & Madinah) */}
-                            {platform !== 'givebright' && platform !== 'madinah' && (
+                            {/* Community Name Cell (Hidden for GiveBrite & Madinah) */}
+                            {platform !== 'givebright' && platform !== 'givebrite' && platform !== 'madinah' && (
                               <td className="text-slate-600 dark:text-slate-400 text-xs py-2.5 px-3 min-w-[160px] max-w-[220px]" title={r['Community Name']}>
                                 <div className="truncate font-medium">{r['Community Name']}</div>
                               </td>
@@ -2428,7 +2436,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                             )}
 
                             {/* Community Name */}
-                            {platform !== 'givebright' && platform !== 'madinah' && (
+                            {platform !== 'givebright' && platform !== 'givebrite' && platform !== 'madinah' && (
                               <td className="text-slate-700 dark:text-slate-300 text-xs py-2.5 px-3 min-w-[160px] max-w-[220px]" title={c['Community Name']}>
                                 <div className="truncate font-semibold">{c['Community Name']}</div>
                               </td>
@@ -2591,7 +2599,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                 )}
 
                                 {/* Community Name */}
-                                {platform !== 'givebright' && platform !== 'madinah' && (
+                                {platform !== 'givebright' && platform !== 'givebrite' && platform !== 'madinah' && (
                                   <td className="text-slate-600 dark:text-slate-400 text-xs py-2 px-3 min-w-[160px] max-w-[220px] truncate" title={rule['Community Name']}>
                                     {rule['Community Name']}
                                   </td>
@@ -2866,7 +2874,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                 <div className="mt-1.5 font-mono text-[11px] p-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-slate-800 dark:text-slate-200">
                   {platform === 'paysuite' 
                     ? 'Direct Debit Ref (Bank Ref), Platform Source, Code, Department, Office, Portfolio, Country, Zakat Eligibility'
-                    : platform === 'givebright' || platform === 'madinah'
+                    : platform === 'givebright' || platform === 'givebrite' || platform === 'madinah'
                     ? 'Campaign Name, Campaign URL, Code, Department, Office, Portfolio, Country, Zakat Eligibility'
                     : 'Campaign Name, Community Name, Campaign URL, Code, Department, Office, Portfolio, Country, Zakat Eligibility'}
                 </div>

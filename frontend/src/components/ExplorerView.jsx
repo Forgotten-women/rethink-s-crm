@@ -1819,14 +1819,14 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
                           );
                         }
                         if (c === 'Donation ID' || c === '_id') {
-                          const isGiveBright = String(row['Platform'] || '').toLowerCase().includes('givebright') || String(row['Source'] || '').toLowerCase().includes('givebrite');
+                          const isGiveBrite = String(row['Platform'] || '').toLowerCase().includes('givebright') || String(row['Platform'] || '').toLowerCase().includes('givebrite') || String(row['Source'] || '').toLowerCase().includes('givebrite');
                           const numId = row['_id'] && /^\d+$/.test(String(row['_id'])) ? String(row['_id']) : null;
-                          const displayId = (isGiveBright && numId) ? `#${numId}` : (val !== undefined && val !== null ? String(val) : '');
+                          const displayId = (isGiveBrite && numId) ? `#${numId}` : (val !== undefined && val !== null ? String(val) : '');
                           return (
                             <td 
                               key={c} 
                               className="max-w-[240px] truncate text-slate-300 font-mono text-xs"
-                              title={isGiveBright && numId ? `GiveBright ID: #${numId} | UID: ${row['Donation ID'] || val}` : String(val || '')}
+                              title={isGiveBrite && numId ? `GiveBrite ID: #${numId} | UID: ${row['Donation ID'] || val}` : String(val || '')}
                             >
                               {displayId}
                             </td>

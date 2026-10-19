@@ -5,7 +5,7 @@ import SegmentBuilder, { cleanSegment } from './SegmentBuilder';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
 
 const gbp = (v) => `£${Number(v || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-const PLATFORMS = ['all', 'GiveBright', 'LaunchGood', 'Madinah', 'Rethink Website', 'Paysuite', 'Offline / Manual'];
+const PLATFORMS = ['all', 'GiveBrite', 'LaunchGood', 'Madinah', 'Rethink Website', 'Paysuite', 'Offline / Manual'];
 const TIERS = ['Low End', 'Medium Low', 'Medium', 'High', 'Super High'];
 const TIER_TONE = {
   'Super High': 'bg-violet-500/15 text-violet-700 dark:text-violet-300', High: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',

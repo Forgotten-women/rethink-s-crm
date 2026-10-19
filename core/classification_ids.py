@@ -79,9 +79,9 @@ def _catalogue(conn: sqlite3.Connection, platform: str, company_id: str) -> dict
                                                WHERE platform = ? AND company_id = ?""", (platform, company_id)):
             if lref and not str(lref).startswith("title:"):
                 data["level"][(ref, nkey(name))] = lref
-        if platform == "givebright":
+        if platform in ("givebright", "givebrite"):
             cnt = defaultdict(Counter)
-            for uid, num in conn.execute("""SELECT campaign_uid, campaign_id FROM donations WHERE Platform = 'GiveBright' AND company_id = ?
+            for uid, num in conn.execute("""SELECT campaign_uid, campaign_id FROM donations WHERE Platform IN ('GiveBright', 'GiveBrite') AND company_id = ?
                                             AND COALESCE(campaign_uid,'') NOT IN ('','nan') AND COALESCE(campaign_id,'') NOT IN ('','nan')""",
                                          (company_id,)):
                 cnt[str(num).split(".")[0]][uid] += 1
@@ -104,7 +104,7 @@ def donation_refs(df: pd.DataFrame, platform: str, company_id: str, conn: sqlite
     col = lambda c: df[c] if c in df.columns else pd.Series([None] * len(df), index=df.index)
     url = col("Campaign URL").where(col("Campaign URL").notna(), col("campaign_url"))
     refs = []
-    if platform == "givebright":
+    if platform in ("givebright", "givebrite"):
         for uid, num, u in zip(col("campaign_uid"), col("campaign_id"), url):
             r = None if _blank(uid) else str(uid)
             if not r and not _blank(num):
@@ -118,7 +118,7 @@ def donation_refs(df: pd.DataFrame, platform: str, company_id: str, conn: sqlite
         refs = [slug_of(u) or None for u in url]
     else:
         refs = [None] * len(df)
-    lvl_src = col("impact_name").where(col("impact_name").notna(), col("Giving Level Title")) if platform == "givebright" else col("Giving Level Title")
+    lvl_src = col("impact_name").where(col("impact_name").notna(), col("Giving Level Title")) if platform in ("givebright", "givebrite") else col("Giving Level Title")
     lrefs = []
     for r, gl in zip(refs, lvl_src):
         if not r or _blank(gl):
@@ -140,7 +140,7 @@ def map_fields(df: pd.DataFrame, platform: str, company_id: str, rules: pd.DataF
     if r.empty:
         return out
     r["_lref"] = r.get("giving_level_ref", pd.Series("", index=r.index)).fillna("")
-    r["_name"] = r["campaign_name"].map(nkey)
+    r["_name"] = (r["Campaign Name"] if "Campaign Name" in r.columns else r["campaign_name"]).map(nkey)
     r["_prim"] = pd.to_numeric(r.get("is_primary", 0), errors="coerce").fillna(0)
     r = r.sort_values("_prim", ascending=False)  # primary first, so it wins below
     by_name, by_level, by_camp = {}, {}, {}
@@ -158,8 +158,9 @@ def map_fields(df: pd.DataFrame, platform: str, company_id: str, rules: pd.DataF
         if not ref:
             picked.append(None)
             continue
-        rule = (by_name.get((ref, nm, lref)) if lref else None) or by_name.get((ref, nm, "")) \
-            or (by_level.get((ref, lref)) if lref else None) or by_camp.get(ref)
+        # ID matching first: specific giving level ref, then campaign default/primary ref
+        rule = (by_level.get((ref, lref)) if lref else None) or by_camp.get(ref) \
+            or (by_name.get((ref, nm, lref)) if lref else None) or by_name.get((ref, nm, ""))
         picked.append(rule)
     for f in fields:
         out[f] = pd.Series([(p.get(f) if p else None) for p in picked], index=df.index, dtype=object)
@@ -170,8 +171,13 @@ def map_fields(df: pd.DataFrame, platform: str, company_id: str, rules: pd.DataF
 
 def resolve_code_by_ref(cursor, platform: str, company_id: str, campaign_ref: Optional[str], campaign_name: str = "",
                         giving_level: str = "", conn_for_catalogue: Optional[sqlite3.Connection] = None) -> Tuple[Optional[str], str]:
-    """One donation (API syncs): the code of the rule tied to its campaign ID - exact-name rule first, then the ID's
-    giving-level rule, then its default. (None, "") when the ID has no rule (the name tiers then run)."""
+    """One donation (API syncs): the code of the rule tied to its campaign ID.
+    ID matching takes absolute precedence over campaign/giving level text names:
+      1. (campaign_ref, giving_level_ref)
+      2. (campaign_ref, default / is_primary)
+      3. (campaign_ref, exact name + giving level)
+      4. (campaign_ref, exact name)
+    """
     if not campaign_ref:
         return None, ""
     try:
@@ -187,16 +193,27 @@ def resolve_code_by_ref(cursor, platform: str, company_id: str, campaign_ref: Op
     lref = ""
     if giving_level and str(giving_level).strip():
         lref = f"title:{nkey(giving_level)}"
-        if platform == "givebright" and conn_for_catalogue is not None:
+        if platform in ("givebright", "givebrite") and conn_for_catalogue is not None:
             lref = _catalogue(conn_for_catalogue, platform, company_id)["level"].get((campaign_ref, nkey(giving_level))) or lref
     nm = nkey(campaign_name)
-    for want_name, want_level, tier in ((True, True, "ID: exact name + giving level"), (True, False, "ID: exact name"),
-                                        (False, True, "ID: giving level"), (False, False, "ID: campaign default")):
+
+    # 1. Prioritize ID-based rules (giving level ref, then campaign default)
+    # 2. Then name-qualified variants if multiple exist
+    for want_name, want_level, tier in (
+        (False, True, "ID: giving level"),
+        (False, False, "ID: campaign default"),
+        (True, True, "ID: exact name + giving level"),
+        (True, False, "ID: exact name")
+    ):
         if want_level and not lref:
             continue
         for name, lr, code, _p in rows:
             if want_name and nkey(name) != nm:
                 continue
             if (lr == lref) if want_level else (lr == ""):
-                return code.strip(), tier
+                c_str = code.strip()
+                if c_str.startswith("SHAM-"):
+                    c_str = "SHM-" + c_str[5:]
+                return c_str, tier
     return None, ""
+

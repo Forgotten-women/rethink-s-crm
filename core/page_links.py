@@ -27,7 +27,7 @@ _COMMUNITY_SEGMENTS = {"communitypage", "community", "communities", "team", "tea
 _NOISE_SEGMENTS = {"campaign", "campaigns", "project", "projects", "c", "v1", "v2", "v3", "v4", "donate", "en", "en-gb", "en-us"}
 _TRACKING_PARAMS = re.compile(r"^(utm_.*|src|source|ref|referrer|fbclid|gclid|dclid|msclkid|mc_.*|_ga|_gl|igshid|si|share|s)$")
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_.~%-]*$")
-_PLATFORM_ALIASES = {"givebrite": "givebright"}
+_PLATFORM_ALIASES = {"givebright": "givebrite"}
 
 
 def normalise_platform(name: str) -> str:

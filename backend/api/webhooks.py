@@ -336,7 +336,7 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
             cur.execute("""
                 INSERT INTO platform_campaign_mappings (
                     platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, company_id
-                ) VALUES ('givebright', ?, '', ?, 'GiveBright', ?, 1, ?)
+                ) VALUES ('givebrite', ?, '', ?, 'GiveBrite', ?, 1, ?)
             """, (cname_clean, camp_code, clean_url, comp))
             conn.commit()
             broadcast_event_sync("MATRIX_UPDATED", {"source": "givebrite_webhook", "company_id": comp, "campaign": cname_clean})
@@ -357,7 +357,7 @@ def _ensure_campaign_registered(campaign_name: str, campaign_url: str = "", comp
                 cur.execute("""
                     INSERT INTO platform_campaign_mappings (
                         platform, campaign_name, giving_level, code, community_name, campaign_url, is_primary, company_id
-                    ) VALUES ('givebright', ?, ?, ?, 'GiveBright', ?, 0, ?)
+                    ) VALUES ('givebrite', ?, ?, ?, 'GiveBrite', ?, 0, ?)
                 """, (cname_clean, gl_clean, var_code, clean_url, comp))
                 conn.commit()
                 broadcast_event_sync("MATRIX_UPDATED", {"source": "givebrite_webhook", "company_id": comp, "campaign": cname_clean, "giving_level": gl_clean})
@@ -672,7 +672,7 @@ def build_webhook_donation_record(payload: Dict[str, Any], target_cid: str = "re
         "Lifetime Donor Classification": lifetime_class,
         "Transaction Donor Classification": txn_class,
         "Settlement Currency": settlement_currency,
-        "Platform": "GiveBright",
+        "Platform": "GiveBrite",
         "Payment Type": payment_method,
         "Payment Frequency": payment_freq,
         "Zakat (yes or no)": zakat_str,

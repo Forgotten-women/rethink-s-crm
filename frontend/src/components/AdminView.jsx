@@ -738,7 +738,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
               <Upload className="w-4 h-4 text-emerald-400" /> Raw Data Ingestion & File Upload
             </h3>
             <p className="text-xs text-slate-400">
-              Upload raw transaction datasets (.csv, .xlsx, .xls) for {uploadTargetCompany === 'iqra' ? 'GiveBrite or Madinah' : 'LaunchGood, GiveBright, Paysuite, or Rethink Website'}.
+              Upload raw transaction datasets (.csv, .xlsx, .xls) for {uploadTargetCompany === 'iqra' ? 'GiveBrite or Madinah' : 'LaunchGood, GiveBrite, Paysuite, or Rethink Website'}.
             </p>
           </div>
           {uploadMsg && (
@@ -769,7 +769,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
               onChange={e => {
                 const target = e.target.value;
                 setUploadTargetCompany(target);
-                if (target === 'iqra' && !['auto', 'givebright', 'madinah'].includes(uploadPlatform)) {
+                if (target === 'iqra' && !['auto', 'givebright', 'givebrite', 'madinah'].includes(uploadPlatform)) {
                   setUploadPlatform('auto');
                 }
               }}
@@ -794,14 +794,14 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
               <option value="auto">Auto-Detect Platform</option>
               {uploadTargetCompany === 'iqra' ? (
                 <>
-                  <option value="givebright">GiveBrite</option>
+                  <option value="givebrite">GiveBrite</option>
                   <option value="madinah">Madinah</option>
                 </>
               ) : (
                 <>
                   <option value="launchgood">LaunchGood (Raw Donations)</option>
                   <option value="launchgood payout">LaunchGood Payout Settlement</option>
-                  <option value="givebright">GiveBright</option>
+                  <option value="givebrite">GiveBrite</option>
                   <option value="paysuite">Paysuite</option>
                   <option value="website">Rethink Website</option>
                 </>

@@ -278,7 +278,7 @@ export default function App() {
     if (platform) {
       const pLower = String(platform).toLowerCase();
       if (pLower === 'launchgood') sourceFilter = 'LaunchGood';
-      else if (pLower === 'givebright' || pLower === 'givebrite') sourceFilter = 'GiveBright';
+      else if (pLower === 'givebright' || pLower === 'givebrite') sourceFilter = 'GiveBrite';
       else if (pLower === 'paysuite') sourceFilter = 'Paysuite';
       else if (pLower === 'website') sourceFilter = 'Rethink Website';
       else if (pLower === 'madinah') sourceFilter = 'Madinah';

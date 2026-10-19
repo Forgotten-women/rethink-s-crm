@@ -152,7 +152,8 @@ def resolve_classification(
     resolved_code = None
     tier_info = "Fallback (Unassigned)"
     id_has_rules = False
-    if campaign_ref:
+
+    if not resolved_code and campaign_ref:
         from core.classification_ids import resolve_code_by_ref
         resolved_code, tier_info_id = resolve_code_by_ref(cursor, "givebright", company_id, campaign_ref, c_name, g_level,
                                                           conn_for_catalogue=cursor.connection)
@@ -206,6 +207,10 @@ def resolve_classification(
             except Exception as auto_reg_err:
                 logger.warning(f"Auto-registration notice for '{c_name}': {auto_reg_err}")
 
+    # Standardize SHAM -> SHM on code
+    if resolved_code and resolved_code.startswith("SHAM-"):
+        resolved_code = "SHM-" + resolved_code[5:]
+
     # Enrich metadata from master_project_codes
     meta = {
         "code": resolved_code,
@@ -231,7 +236,7 @@ def resolve_classification(
             meta["department"] = m_row[0] or ""
             meta["office"] = m_row[1] or ""
             meta["portfolio"] = m_row[2] or ""
-            meta["country"] = m_row[3] or ""
+            meta["country"] = "SHM" if (m_row[3] or "").strip() == "SHAM" else (m_row[3] or "")
             meta["programme_fund"] = m_row[4] or ""
             meta["fund_code"] = m_row[5] or ""
             meta["zakat_eligibility"] = m_row[6] or ""
@@ -670,7 +675,7 @@ def build_donation_record(
         "Comments": donor_comments,
         "Email (for tax receipt)": email,
         "Payment Type": payment_method,
-        "Platform": "GiveBright",
+        "Platform": "GiveBrite",
         "Source": "GiveBrite Sync",
         "Donor ID": email,
         "Total LTV": total_ltv,

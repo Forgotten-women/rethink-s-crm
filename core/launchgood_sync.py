@@ -39,7 +39,8 @@ def _load_classification_rules(company_id: str, conn: sqlite3.Connection) -> Dic
     cursor = conn.cursor()
     cursor.execute("""
         SELECT COALESCE(p.campaign_name, p.community_name), p.giving_level, p.code,
-               m.department, m.office, m.portfolio, m.country, m.programme_fund, m.fund_code, m.zakat_eligibility, p.special_case
+               m.department, m.office, m.portfolio, m.country, m.programme_fund, m.fund_code, m.zakat_eligibility, p.special_case,
+               p.campaign_ref, p.giving_level_ref
         FROM platform_campaign_mappings p
         LEFT JOIN master_project_codes m ON UPPER(TRIM(p.code)) = UPPER(TRIM(m.code))
         WHERE p.platform = 'launchgood' AND LOWER(COALESCE(p.company_id, 'rethink')) = ?
@@ -49,17 +50,28 @@ def _load_classification_rules(company_id: str, conn: sqlite3.Connection) -> Dic
     for row in cursor.fetchall():
         c_name = str(row[0] or "").strip().lower()
         g_level = str(row[1] or "").strip().lower()
+        code_val = row[2] or "Unassigned"
+        if code_val.startswith("SHAM-"):
+            code_val = "SHM-" + code_val[5:]
+        country_val = row[6] or ""
+        if country_val.strip() == "SHAM":
+            country_val = "SHM"
         meta = {
-            "code": row[2] or "Unassigned",
+            "code": code_val,
             "department": row[3] or "",
             "office": row[4] or "",
             "portfolio": row[5] or "",
-            "country": row[6] or "",
+            "country": country_val,
             "programme_fund": row[7] or "",
             "fund_code": row[8] or "",
             "zakat_eligibility": row[9] or "Zakat",
             "special_case": row[10] or "",
         }
+        camp_ref = str(row[11] or "").strip().lower()
+        if camp_ref:
+            rules[f"ref:{camp_ref}"] = meta
+            if g_level:
+                rules[f"ref:{camp_ref}::{g_level}"] = meta
         if c_name:
             rules[c_name] = meta
             rules[canonical_campaign_key(c_name)] = meta
@@ -72,26 +84,40 @@ def _load_classification_rules(company_id: str, conn: sqlite3.Connection) -> Dic
 def match_campaign_classification(
     campaign_name: str,
     giving_level: str,
-    rules: Dict[str, Dict[str, str]]
+    rules: Dict[str, Dict[str, str]],
+    campaign_url: str = ""
 ) -> Dict[str, str]:
-    """Matches a LaunchGood campaign and giving level against the loaded classification rules."""
-    cn = str(campaign_name or "").strip().lower()
+    """Matches a LaunchGood campaign and giving level against the loaded classification rules.
+    Prioritizes campaign ID (permanent URL slug) over names.
+    """
     gl = str(giving_level or "").strip().lower()
+
+    # 1. ID Match (LaunchGood permanent key / slug from Campaign URL)
+    if campaign_url:
+        from core.classification_ids import slug_of
+        slug = slug_of(campaign_url)
+        if slug:
+            if gl and f"ref:{slug}::{gl}" in rules:
+                return rules[f"ref:{slug}::{gl}"]
+            if f"ref:{slug}" in rules:
+                return rules[f"ref:{slug}"]
+
+    cn = str(campaign_name or "").strip().lower()
     cn_canon = canonical_campaign_key(cn)
 
-    # 1. Exact Campaign + Giving Level match
+    # 2. Exact Campaign + Giving Level match
     if gl and f"{cn}::{gl}" in rules:
         return rules[f"{cn}::{gl}"]
     if gl and f"{cn_canon}::{gl}" in rules:
         return rules[f"{cn_canon}::{gl}"]
 
-    # 2. Campaign Exact match
+    # 3. Campaign Exact match
     if cn in rules:
         return rules[cn]
     if cn_canon in rules:
         return rules[cn_canon]
 
-    # 3. Base Campaign title match (before | or -)
+    # 4. Base Campaign title match (before | or -)
     for sep in ["|", " - ", " – ", " — "]:
         if sep in cn:
             base_part = cn.split(sep)[0].strip()
@@ -166,7 +192,8 @@ def parse_launchgood_csv(
         phone = (row.get("Phone") or row.get("Donor Phone") or "").strip()
 
         # Classification match
-        meta = match_campaign_classification(c_name, gl_title, rules)
+        c_url = row.get("Campaign URL") or row.get("URL") or row.get("campaign_url") or ""
+        meta = match_campaign_classification(c_name, gl_title, rules, campaign_url=c_url)
 
         record = {
             "Donation ID": d_id,

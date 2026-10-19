@@ -271,7 +271,7 @@ def get_classification_matrix():
         if os.path.exists(PARQUET_PATH):
             df_donations = pd.read_parquet(PARQUET_PATH)
             if not df_donations.empty and "Campaign Name" in df_donations.columns:
-                lg_mask = df_donations.get("Platform", pd.Series("", index=df_donations.index)) != "GiveBright"
+                lg_mask = ~df_donations.get("Platform", pd.Series("", index=df_donations.index)).isin(["GiveBright", "GiveBrite"])
                 lg_df = df_donations[lg_mask] if lg_mask.any() else df_donations
 
                 c_name = lg_df["Campaign Name"].astype(str).fillna("N/A").replace({'nan': 'N/A', '': 'N/A', 'None': 'N/A'})
@@ -385,7 +385,7 @@ def save_classification_matrix(matrix_df):
             target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility"]
 
             # Filter for LaunchGood / non-GiveBright records
-            lg_mask = df_donations.get("Platform", pd.Series("", index=df_donations.index)) != "GiveBright"
+            lg_mask = ~df_donations.get("Platform", pd.Series("", index=df_donations.index)).isin(["GiveBright", "GiveBrite"])
             if not lg_mask.any():
                 lg_mask = pd.Series(True, index=df_donations.index)
 
@@ -486,7 +486,7 @@ def get_givebright_classification_matrix():
         if os.path.exists(PARQUET_PATH):
             df_donations = pd.read_parquet(PARQUET_PATH)
             if not df_donations.empty and "Campaign Name" in df_donations.columns:
-                gb_mask = df_donations.get("Platform", pd.Series("", index=df_donations.index)) == "GiveBright"
+                gb_mask = df_donations.get("Platform", pd.Series("", index=df_donations.index)).isin(["GiveBright", "GiveBrite"])
                 if gb_mask.any():
                     gb_df = df_donations[gb_mask]
                     c_name = gb_df["Campaign Name"].astype(str).fillna("N/A")
@@ -595,7 +595,7 @@ def save_givebright_classification_matrix(matrix_df):
             
             map_data = clean_matrix.set_index("_c_key")
             
-            gb_mask = df_donations.get("Platform", pd.Series("", index=df_donations.index)) == "GiveBright"
+            gb_mask = df_donations.get("Platform", pd.Series("", index=df_donations.index)).isin(["GiveBright", "GiveBrite"])
             if gb_mask.any():
                 c_keys = df_donations.loc[gb_mask, "Campaign Name"].astype(str).fillna("N/A").replace({'nan': 'N/A', '': 'N/A', 'None': 'N/A'})
                 for f in target_cols:
@@ -911,7 +911,7 @@ def _enrich_dataframe(df):
         gb_matrix = pd.read_sql_query("SELECT * FROM givebright_classifications", conn)
         if not gb_matrix.empty and "campaign_name" in gb_matrix.columns:
             gb_map = gb_matrix.set_index("campaign_name")
-            gb_mask = df.get("Platform", pd.Series("", index=df.index)) == "GiveBright"
+            gb_mask = df.get("Platform", pd.Series("", index=df.index)).isin(["GiveBright", "GiveBrite"])
             if gb_mask.any():
                 for f in target_cols:
                     db_f = f.lower().replace("-", "_").replace(" ", "_")
@@ -938,7 +938,7 @@ def _enrich_dataframe(df):
             cols_to_keep = ["Campaign Name", "Community Name"] + [f"{f}_mat" for f in target_cols]
             lg_matrix = lg_matrix[cols_to_keep].drop_duplicates(subset=["Campaign Name", "Community Name"])
             
-            lg_mask = df.get("Platform", pd.Series("", index=df.index)) != "GiveBright"
+            lg_mask = ~df.get("Platform", pd.Series("", index=df.index)).isin(["GiveBright", "GiveBrite"])
             if lg_mask.any():
                 merged = pd.merge(df[lg_mask], lg_matrix, on=["Campaign Name", "Community Name"], how="left")
                 for f in target_cols:
@@ -1055,7 +1055,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
         
     # 2. Platform Schema Adaptation (GiveBright vs LaunchGood)
     is_givebright = False
-    if str(platform).lower() == "givebright":
+    if str(platform).lower() in ["givebright", "givebrite"]:
         is_givebright = True
     elif str(platform).lower() in ["auto", "none", ""]:
         gb_sig = {"donation_id", "campaign_name", "fundraiser_by", "fundraiser_name", "campaign_url", "charge_id", "payment_method_type"}
@@ -1063,7 +1063,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
             is_givebright = True
 
     if is_givebright:
-        df["Platform"] = "GiveBright"
+        df["Platform"] = "GiveBrite"
         col_map = {
             "donation_id": "Donation ID",
             "campaign_name": "Campaign Name",

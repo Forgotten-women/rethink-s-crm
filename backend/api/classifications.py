@@ -527,7 +527,7 @@ def get_campaign_codes_lookup(platform: str = "all", company_id: Optional[str] =
     tables = ["campaign_classifications", "givebright_classifications", "paysuite_classifications", "rethink_website_classifications"]
     if platform.lower() == "launchgood":
         tables = ["campaign_classifications"]
-    elif platform.lower() == "givebright":
+    elif platform.lower() in ["givebright", "givebrite"]:
         tables = ["givebright_classifications"]
     elif platform.lower() == "paysuite":
         tables = ["paysuite_classifications"]
@@ -708,6 +708,14 @@ def _clean_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
     for url_col in ("Campaign URL", "campaign_url"):
         if url_col in df_clean.columns:
             df_clean[url_col] = df_clean[url_col].map(clean_campaign_url)
+    for ref_col in ("campaign_ref", "giving_level_ref", "Campaign Ref", "Giving Level Ref"):
+        if ref_col in df_clean.columns:
+            df_clean[ref_col] = df_clean[ref_col].astype(str).str.strip().replace({"Unassigned": "", "unassigned": "", "None": "", "none": "", "nan": "", "NaN": "", "null": "", "N/A": "", "n/a": ""})
+    for col in df_clean.columns:
+        if col in ["Country", "country"]:
+            df_clean[col] = df_clean[col].replace({"SHAM": "SHM", "sham": "SHM"})
+        elif col in ["Code", "code"]:
+            df_clean[col] = df_clean[col].apply(lambda x: ("SHM-" + str(x)[5:]) if str(x).upper().startswith("SHAM-") else x)
     return df_clean
 
 
@@ -727,7 +735,7 @@ def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
     """Returns GiveBright/GiveBrite classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
     df = _clean_matrix_df(get_givebright_classification_matrix(company_id=comp))
-    return _compute_matrix_summary(df, comp, "GiveBright")
+    return _compute_matrix_summary(df, comp, "GiveBrite")
 
 
 @router.get("/paysuite")
@@ -1054,7 +1062,7 @@ def export_classifications(
         if p_clean == "paysuite":
             cols = ["Direct Debit Ref (Bank Ref)", "Platform Source", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility", "Donor Name", "Donor Email"]
             matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
-        elif p_clean in ["givebright", "madinah"]:
+        elif p_clean in ["givebright", "givebrite", "madinah"]:
             cols = ["Campaign Name", "Campaign URL", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility"]
             matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
         else:
@@ -1171,10 +1179,19 @@ def save_matrix_rules(payload: SaveRulesRequest):
         if gl_val.lower() in ["nan", "none", "n/a", "campaign default / general", "campaign default", "default (general)"]:
             gl_val = ""
 
+        camp_ref = sanitize_text(r.get("campaign_ref") or r.get("Campaign Ref") or "").strip()
+        gl_ref = sanitize_text(r.get("giving_level_ref") or r.get("Giving Level Ref") or "").strip()
+        if camp_ref in ["Unassigned", "None", "nan", "NaN", "null"]:
+            camp_ref = ""
+        if gl_ref in ["Unassigned", "None", "nan", "NaN", "null"]:
+            gl_ref = ""
+
         rules_dict.append({
             "Campaign Name": sanitize_text(r.get("Campaign Name") or r.get("campaign_name", "N/A")),
             "Giving Level": gl_val,
             "Campaign URL": sanitize_text(r.get("Campaign URL") or r.get("campaign_url", "")),
+            "campaign_ref": camp_ref,
+            "giving_level_ref": gl_ref,
             "Community Name": sanitize_text(r.get("Community Name") or r.get("community_name", "Unassigned")),
             "Donor Name": d_name,
             "Donor Email": d_email,
@@ -1206,6 +1223,12 @@ def save_matrix_rules(payload: SaveRulesRequest):
     # Reload central code dictionary after save
     get_code_to_classification_map(force_reload=True, company_id=comp)
     invalidate_payouts_cache()
+
+    try:
+        from core.classification_ids import invalidate as invalidate_id_cache
+        invalidate_id_cache()
+    except Exception:
+        pass
 
     try:
         from backend.api.expenses import clear_expenses_cache
@@ -1241,14 +1264,18 @@ def delete_single_rule(payload: DeleteRuleRequest):
     gl_name = sanitize_text((payload.giving_level or "").strip())
     code = sanitize_text(payload.code.strip()) if payload.code else None
     platform = str(getattr(payload, "platform", "") or "").strip().lower()
-    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
+    plat_db = "givebrite" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=60.0)
         try:
             with conn:
-                del_sql = "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ?"
-                del_params = [comp, plat_db, cname.lower()]
+                if plat_db == "givebrite":
+                    del_sql = "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) IN ('givebright', 'givebrite') AND LOWER(campaign_name) = ?"
+                    del_params = [comp, cname.lower()]
+                else:
+                    del_sql = "DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ? AND LOWER(campaign_name) = ?"
+                    del_params = [comp, plat_db, cname.lower()]
                 # Only the row asked for: a campaign's default (no giving level) rule must not take its giving levels with it
                 del_sql += " AND LOWER(COALESCE(giving_level, '')) = ?"
                 del_params.append(gl_name.lower())
@@ -1335,20 +1362,31 @@ def clear_platform_rules(payload: ClearPlatformRequest):
             detail="Wiping classification rules is restricted to Super Admin accounts."
         )
 
-    plat_db = "givebright" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
+    platform = str(getattr(payload, "platform", "") or "").strip().lower()
+    plat_db = "givebrite" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
 
     with _DB_LOCK:
         conn = get_db_connection(timeout=30.0)
         try:
             with conn:
-                conn.execute("DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ?;", (comp, plat_db))
-                conn.execute("""
-                    UPDATE donations 
-                    SET "Department"='Unassigned', "Office"='Unassigned', "Portfolio"='', 
-                        "Heading"='Unassigned', "Sub-Heading"='Unassigned', "Country"='Unassigned', 
-                        "Code"='Unassigned', "Zakat Eligibility"='Unassigned' 
-                    WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER("Platform") = ?
-                """, (comp, plat_db))
+                if plat_db == "givebrite":
+                    conn.execute("DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) IN ('givebright', 'givebrite');", (comp,))
+                    conn.execute("""
+                        UPDATE donations 
+                        SET "Department"='Unassigned', "Office"='Unassigned', "Portfolio"='', 
+                            "Heading"='Unassigned', "Sub-Heading"='Unassigned', "Country"='Unassigned', 
+                            "Code"='Unassigned', "Zakat Eligibility"='Unassigned' 
+                        WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER("Platform") IN ('givebright', 'givebrite')
+                    """, (comp,))
+                else:
+                    conn.execute("DELETE FROM platform_campaign_mappings WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER(platform) = ?;", (comp, plat_db))
+                    conn.execute("""
+                        UPDATE donations 
+                        SET "Department"='Unassigned', "Office"='Unassigned', "Portfolio"='', 
+                            "Heading"='Unassigned', "Sub-Heading"='Unassigned', "Country"='Unassigned', 
+                            "Code"='Unassigned', "Zakat Eligibility"='Unassigned' 
+                        WHERE LOWER(COALESCE(company_id, 'rethink')) = ? AND LOWER("Platform") = ?
+                    """, (comp, plat_db))
         finally:
             conn.close()
 

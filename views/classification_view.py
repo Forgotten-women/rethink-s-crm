@@ -195,7 +195,7 @@ def render_classification_tab(df_raw, user_session):
     st.header("🏷️ Campaign Classification Manager (Source of Truth)")
     st.markdown("This matrix is your **source of truth** for mapping Campaign Name ➔ Heading, Sub-Heading, Country, Code, and Zakat Eligibility.")
 
-    matrix_platform = st.radio("Platform Matrix", options=["⚡ LaunchGood Matrix", "🎁 GiveBright Matrix", "💳 Paysuite Matrix"], horizontal=True, key="matrix_platform_toggle")
+    matrix_platform = st.radio("Platform Matrix", options=["⚡ LaunchGood Matrix", "🎁 GiveBrite Matrix", "💳 Paysuite Matrix"], horizontal=True, key="matrix_platform_toggle")
     state_key = f"matrix_df_{matrix_platform}"
 
     if st.session_state.get("prev_matrix_platform") != matrix_platform:
@@ -279,7 +279,7 @@ def render_classification_tab(df_raw, user_session):
                     parsed_rules_df = normalize_classification_import_df(raw_import_df)
                     
                     st.write(f"🔍 **Preview ({len(parsed_rules_df):,} rules detected):**")
-                    if matrix_platform == "🎁 GiveBright Matrix":
+                    if matrix_platform == "🎁 GiveBrite Matrix":
                         target_preview_cols = [c for c in ["Campaign Name", "Campaign URL", "Code", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"] if c in parsed_rules_df.columns]
                     else:
                         target_preview_cols = [c for c in ["Campaign Name", "Community Name", "Code", "Heading", "Sub-Heading", "Country", "Zakat Eligibility"] if c in parsed_rules_df.columns]
@@ -300,7 +300,7 @@ def render_classification_tab(df_raw, user_session):
                     if submit_import:
                         with st.spinner(f"Importing and applying rules to {matrix_platform}..."):
                             if import_mode == "Merge / Update Existing Rules" and not matrix_df.empty:
-                                if matrix_platform == "🎁 GiveBright Matrix":
+                                if matrix_platform == "🎁 GiveBrite Matrix":
                                     merged_target = pd.concat([matrix_df, parsed_rules_df], ignore_index=True).drop_duplicates(subset=["Campaign Name"], keep="last")
                                 else:
                                     merged_target = pd.concat([matrix_df, parsed_rules_df], ignore_index=True).drop_duplicates(subset=["Campaign Name", "Community Name"], keep="last")
@@ -332,7 +332,7 @@ def render_classification_tab(df_raw, user_session):
             if st.button(f"🚨 Delete All {matrix_platform} Rules Now", type="primary", disabled=not confirm_clear, key=f"btn_clear_{matrix_platform}"):
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
                 try:
-                    if matrix_platform == "🎁 GiveBright Matrix":
+                    if matrix_platform == "🎁 GiveBrite Matrix":
                         conn.execute("DELETE FROM givebright_classifications;")
                     elif matrix_platform == "💳 Paysuite Matrix":
                         conn.execute("DELETE FROM paysuite_classifications;")
@@ -386,7 +386,7 @@ def render_classification_tab(df_raw, user_session):
             }, inplace=True)
 
         column_config = {}
-        if matrix_platform == "🎁 GiveBright Matrix" and "Campaign URL" in display_matrix_df.columns:
+        if matrix_platform == "🎁 GiveBrite Matrix" and "Campaign URL" in display_matrix_df.columns:
             column_config["Campaign URL"] = st.column_config.LinkColumn("Campaign URL", display_text="Open Link")
 
         edited_df = st.data_editor(
