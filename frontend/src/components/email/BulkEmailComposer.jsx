@@ -89,6 +89,8 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
   const [progress, setProgress] = useState(null);
   const [campaignName, setCampaignName] = useState('');
   const [asCampaign, setAsCampaign] = useState(startAsCampaign);
+  const [customVariables, setCustomVariables] = useState({});
+  const [recipientCustomizations, setRecipientCustomizations] = useState({});
   // Every chosen person's email checked before sending: who would be skipped and why (not only the previewed one)
   const [check, setCheck] = useState(null); // { running, done, total, ok, problems: [] }
   const checkSeq = useRef(0);
@@ -156,13 +158,47 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     const q = listFilter.trim().toLowerCase();
     return (recipients?.recipients || []).filter(r => !q || `${r.name} ${r.email} ${r.matched_causes} ${r.sponsorship_types}`.toLowerCase().includes(q));
   }, [recipients, listFilter]);
+
   const previewRecipient = chosen.find(r => r.email === previewEmail) || chosen[0] || null;
-  const live = useLivePreview({ company, theme, templateType, subject, body, edited, messageBody, recipient: previewRecipient, enabled: step >= 2 });
-  const single = useLivePreview({ company, theme, templateType, subject, body, edited, messageBody, recipient: rowPreview, enabled: !!rowPreview });
+  const activeEmailKey = previewRecipient ? previewRecipient.email.toLowerCase() : '';
+  const activeRecipientCust = recipientCustomizations[activeEmailKey] || {};
+  const combinedPreviewCustomVars = useMemo(() => ({
+    ...customVariables,
+    ...(activeRecipientCust.custom_variables || {}),
+  }), [customVariables, activeRecipientCust.custom_variables]);
+  const activeSelectedAllocationId = activeRecipientCust.selected_allocation_id ?? null;
+
+  const live = useLivePreview({
+    company, theme, templateType, subject, body, edited,
+    messageBody: activeRecipientCust.message_body || messageBody,
+    recipient: previewRecipient,
+    customVariables: combinedPreviewCustomVars,
+    selectedAllocationId: activeSelectedAllocationId,
+    enabled: step >= 2,
+  });
+
+  const singleEmailKey = rowPreview ? rowPreview.email.toLowerCase() : '';
+  const singleCust = recipientCustomizations[singleEmailKey] || {};
+  const singleCustomVars = useMemo(() => ({
+    ...customVariables,
+    ...(singleCust.custom_variables || {}),
+  }), [customVariables, singleCust.custom_variables]);
+  const singleSelectedAllocationId = singleCust.selected_allocation_id ?? null;
+
+  const single = useLivePreview({
+    company, theme, templateType, subject, body, edited,
+    messageBody: singleCust.message_body || messageBody,
+    recipient: rowPreview,
+    customVariables: singleCustomVars,
+    selectedAllocationId: singleSelectedAllocationId,
+    enabled: !!rowPreview,
+  });
 
   const payloadText = () => ({
     company_id: company, theme, template_type: templateType, message_body: messageBody || null,
     subject_template: edited ? subject : null, body_template: edited ? body : null,
+    custom_variables: customVariables,
+    recipient_customizations: recipientCustomizations,
   });
   const insert = (text) => {
     const f = lastField.current;
@@ -221,8 +257,8 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
       }
     }
   };
-  // Re-check whenever the review step is open and what is sent (people, template, text) changes
-  const checkKey = `${step === 3}|${theme}|${templateType}|${edited ? subject : ''}|${edited ? body : ''}|${messageBody}|${chosen.map(r => r.email).join(',')}`;
+  // Re-check whenever the review step is open and what is sent (people, template, text, variables) changes
+  const checkKey = `${step === 3}|${theme}|${templateType}|${edited ? subject : ''}|${edited ? body : ''}|${messageBody}|${JSON.stringify(customVariables)}|${JSON.stringify(recipientCustomizations)}|${chosen.map(r => r.email).join(',')}`;
   useEffect(() => {
     if (step !== 3 || !chosen.length || !theme) return undefined;
     const t = setTimeout(runCheck, 600);
@@ -337,8 +373,17 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
                             <td className="px-2 py-1 tabular-nums whitespace-nowrap">{r.matched_gifts != null ? `${r.matched_gifts} · ${gbp(r.matched_total)}` : (r.gifts ?? '—')}</td>
                             <td className="px-2 py-1 max-w-[16rem] truncate" title={[r.matched_causes, r.matched_sponsorships].filter(Boolean).join(' · ')}>{[r.matched_sponsorships, r.matched_causes].filter(Boolean).join(' · ') || '—'}</td>
                             <td className="px-2 py-1 tabular-nums">{gbp(r.total)}</td>
-                            <td className="px-2 py-1 whitespace-nowrap">{r.matched_last || r.last_gift || '—'}</td>
-                            <td className="px-2 py-1">{r.allocations ? `${r.allocations} (${r.sponsorship_statuses})` : (r.sponsorship_types || '—')}</td>
+                            <td className="px-2 py-1">
+                              {r.allocations > 1 ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200">
+                                  <Users className="w-3 h-3" /> {r.allocations} beneficiaries
+                                </span>
+                              ) : r.allocations === 1 ? (
+                                `${r.allocations} (${r.sponsorship_statuses})`
+                              ) : (
+                                r.sponsorship_types || '—'
+                              )}
+                            </td>
                             <td className="px-2 py-1 whitespace-nowrap text-right">
                               <button type="button" onClick={() => setRowPreview(r)} title="Preview this person's email" className="p-1 rounded hover:bg-sky-100 dark:hover:bg-sky-900/40 text-sky-600"><Eye className="w-3.5 h-3.5" /></button>
                               <button type="button" onClick={() => setExpanded(x => (x === r.email ? null : r.email))} title="Their matching donations" className="p-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
@@ -400,7 +445,36 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
                   {chosen.slice(0, 500).map(r => <option key={r.email} value={r.email}>{r.name || r.email}</option>)}
                 </select>
               </div>
-              <PreviewFrame preview={live.preview} busy={live.busy} height="64vh" />
+              <PreviewFrame
+                preview={live.preview}
+                busy={live.busy}
+                height="64vh"
+                customVariables={combinedPreviewCustomVars}
+                onCustomVariableChange={(p, val) => {
+                  setCustomVariables(cv => ({ ...cv, [p]: val }));
+                  if (activeEmailKey) {
+                    setRecipientCustomizations(rc => ({
+                      ...rc,
+                      [activeEmailKey]: {
+                        ...(rc[activeEmailKey] || {}),
+                        custom_variables: { ...((rc[activeEmailKey] || {}).custom_variables || {}), [p]: val }
+                      }
+                    }));
+                  }
+                }}
+                selectedAllocationId={activeSelectedAllocationId}
+                onSelectAllocation={(allocId) => {
+                  if (activeEmailKey) {
+                    setRecipientCustomizations(rc => ({
+                      ...rc,
+                      [activeEmailKey]: {
+                        ...(rc[activeEmailKey] || {}),
+                        selected_allocation_id: allocId
+                      }
+                    }));
+                  }
+                }}
+              />
             </div>
           </div>
         )}
@@ -414,7 +488,36 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
                   {chosen.slice(0, 500).map(r => <option key={r.email} value={r.email}>{r.name || r.email}</option>)}
                 </select>
               </div>
-              <PreviewFrame preview={live.preview} busy={live.busy} height="52vh" />
+              <PreviewFrame
+                preview={live.preview}
+                busy={live.busy}
+                height="52vh"
+                customVariables={combinedPreviewCustomVars}
+                onCustomVariableChange={(p, val) => {
+                  setCustomVariables(cv => ({ ...cv, [p]: val }));
+                  if (activeEmailKey) {
+                    setRecipientCustomizations(rc => ({
+                      ...rc,
+                      [activeEmailKey]: {
+                        ...(rc[activeEmailKey] || {}),
+                        custom_variables: { ...((rc[activeEmailKey] || {}).custom_variables || {}), [p]: val }
+                      }
+                    }));
+                  }
+                }}
+                selectedAllocationId={activeSelectedAllocationId}
+                onSelectAllocation={(allocId) => {
+                  if (activeEmailKey) {
+                    setRecipientCustomizations(rc => ({
+                      ...rc,
+                      [activeEmailKey]: {
+                        ...(rc[activeEmailKey] || {}),
+                        selected_allocation_id: allocId
+                      }
+                    }));
+                  }
+                }}
+              />
             </div>
             <div className="flex flex-col gap-3">
               <div className={`${CARD} text-xs flex flex-col gap-2 text-slate-800 dark:text-slate-100`}>
@@ -461,10 +564,31 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
                         </div>
                         <div className="max-h-64 overflow-y-auto flex flex-col divide-y divide-amber-200 dark:divide-amber-900">
                           {check.problems.map(p => (
-                            <div key={p.email} className="py-1 flex items-start justify-between gap-2">
-                              <span className="min-w-0"><b className="text-slate-800 dark:text-slate-100">{p.name || p.email}</b> <span className="text-slate-500">{p.email}</span>
-                                <span className="block text-[11px] text-amber-800 dark:text-amber-300">{p.issue}</span></span>
-                              <button type="button" onClick={() => setRowPreview(chosen.find(r => r.email === p.email) || { email: p.email, name: p.name })} title="Preview" className="p-1 text-sky-600 shrink-0"><Eye className="w-3.5 h-3.5" /></button>
+                            <div key={p.email} className="py-2 flex flex-col gap-1.5">
+                              <div className="flex items-start justify-between gap-2">
+                                <span className="min-w-0"><b className="text-slate-800 dark:text-slate-100">{p.name || p.email}</b> <span className="text-slate-500">{p.email}</span>
+                                  <span className="block text-[11px] text-amber-800 dark:text-amber-300">{p.issue}</span></span>
+                                <button type="button" onClick={() => setRowPreview(chosen.find(r => r.email === p.email) || { email: p.email, name: p.name })} title="Preview and supply missing variable" className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-900 dark:text-amber-200 text-[11px] font-semibold flex items-center gap-1 shrink-0"><Eye className="w-3 h-3" /> Supply & Fix</button>
+                              </div>
+                              {p.missing?.length > 0 && (
+                                <div className="flex flex-wrap items-center gap-2 pl-1">
+                                  {p.missing.map(m => (
+                                    <div key={m} className="flex items-center gap-1 text-[11px]">
+                                      <span className="font-mono text-amber-800 dark:text-amber-300">{`{${m}}`}:</span>
+                                      <input
+                                        type="text"
+                                        placeholder={`Value for {${m}}...`}
+                                        value={customVariables[m] || ''}
+                                        onChange={e => {
+                                          const val = e.target.value;
+                                          setCustomVariables(cv => ({ ...cv, [m]: val }));
+                                        }}
+                                        className="text-xs px-2 py-0.5 rounded border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 w-32 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                      />
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -500,7 +624,36 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
               <div className="text-sm font-bold text-slate-900 dark:text-white">What {rowPreview.name || rowPreview.email} would get <span className="font-normal text-slate-500">· template {templateType.replace(/_/g, ' ')}</span></div>
               <button type="button" onClick={() => setRowPreview(null)} aria-label="Close preview" className="w-7 h-7 rounded-full flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"><X className="w-4 h-4" /></button>
             </div>
-            <PreviewFrame preview={single.preview} busy={single.busy} height="65vh" />
+            <PreviewFrame
+              preview={single.preview}
+              busy={single.busy}
+              height="65vh"
+              customVariables={singleCustomVars}
+              onCustomVariableChange={(p, val) => {
+                setCustomVariables(cv => ({ ...cv, [p]: val }));
+                if (singleEmailKey) {
+                  setRecipientCustomizations(rc => ({
+                    ...rc,
+                    [singleEmailKey]: {
+                      ...(rc[singleEmailKey] || {}),
+                      custom_variables: { ...((rc[singleEmailKey] || {}).custom_variables || {}), [p]: val }
+                    }
+                  }));
+                }
+              }}
+              selectedAllocationId={singleSelectedAllocationId}
+              onSelectAllocation={(allocId) => {
+                if (singleEmailKey) {
+                  setRecipientCustomizations(rc => ({
+                    ...rc,
+                    [singleEmailKey]: {
+                      ...(rc[singleEmailKey] || {}),
+                      selected_allocation_id: allocId
+                    }
+                  }));
+                }
+              }}
+            />
           </div>
         </div>,
         document.body,

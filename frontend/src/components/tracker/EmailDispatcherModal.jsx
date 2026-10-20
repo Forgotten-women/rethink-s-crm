@@ -39,6 +39,7 @@ export default function EmailDispatcherModal({
   const [sending, setSending] = useState(false);
   const [results, setResults] = useState(null);
   const [savingDefault, setSavingDefault] = useState(false);
+  const [customVariables, setCustomVariables] = useState({});
   const bodyRef = useRef(null);
 
   // Load the saved template whenever the theme or template type changes (only this charity's themes).
@@ -60,7 +61,8 @@ export default function EmailDispatcherModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           allocation_id: allocation.id, allocation_donor_id: previewDonorId, template_type: templateType,
-          company_id: themeKey, subject_template: subjectTpl, body_template: bodyTpl
+          company_id: themeKey, subject_template: subjectTpl, body_template: bodyTpl,
+          custom_variables: customVariables
         })
       })
         .then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.detail || 'Preview failed'); return j; })
@@ -69,7 +71,7 @@ export default function EmailDispatcherModal({
         .finally(() => setLoadingPreview(false));
     }, edited ? 500 : 0);
     return () => clearTimeout(t);
-  }, [previewDonorId, subjectTpl, bodyTpl, templateType, themeKey, allocation.id, edited]);
+  }, [previewDonorId, subjectTpl, bodyTpl, templateType, themeKey, allocation.id, edited, JSON.stringify(customVariables)]);
 
   const insertTag = (tag) => {
     const el = bodyRef.current;
@@ -95,7 +97,8 @@ export default function EmailDispatcherModal({
         allocation_id: allocation.id, template_type: templateType, company_id: themeKey,
         allocation_donor_ids: selectedIds,
         subject_template: edited ? subjectTpl : undefined,
-        body_template: edited ? bodyTpl : undefined
+        body_template: edited ? bodyTpl : undefined,
+        custom_variables: customVariables
       })
     })
       .then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.detail || 'Send failed'); return j; })
@@ -222,9 +225,41 @@ export default function EmailDispatcherModal({
                       <span><span className="text-slate-500">To:</span> <strong>{preview.recipient_name}</strong> <span className="font-mono">&lt;{preview.recipient_email || 'no email'}&gt;</span></span>
                       <span><span className="text-slate-500">Subject:</span> <strong>{preview.subject}</strong></span>
                     </div>
+                    {preview.has_multiple_beneficiaries && (
+                      <div className="p-2.5 rounded-lg bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-800 text-violet-900 dark:text-violet-200 flex flex-col gap-1.5">
+                        <div className="flex items-center gap-1.5 font-bold text-xs">
+                          <Users className="w-3.5 h-3.5 text-violet-600 shrink-0" />
+                          <span>This donor supports {preview.sponsorships.length} beneficiaries:</span>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 text-[11px]">
+                          {preview.sponsorships.map(s => (
+                            <span key={s.id} className="px-2 py-0.5 rounded-full bg-violet-100 dark:bg-violet-900/60 text-violet-800 dark:text-violet-200">
+                              {s.beneficiary_name} {s.project_code ? `(${s.project_code})` : ''} · {s.sponsorship_type || 'Sponsorship'}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     {preview.unresolved_placeholders?.length > 0 && (
-                      <div className="p-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 flex items-center gap-1.5">
-                        <AlertTriangle className="w-3.5 h-3.5" /> Unknown placeholders (sending is blocked): {preview.unresolved_placeholders.map(p => `{${p}}`).join(', ')}
+                      <div className="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 flex flex-col gap-2">
+                        <div className="flex items-center gap-1.5 font-bold text-xs">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                          <span>Supply missing variables to avoid skipping:</span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {preview.unresolved_placeholders.map(p => (
+                            <div key={p} className="flex flex-col gap-1 bg-white dark:bg-slate-900 p-2 rounded border border-amber-200 dark:border-amber-800">
+                              <span className="font-mono text-[11px] font-bold">{`{${p}}`}</span>
+                              <input
+                                type="text"
+                                placeholder={`Enter value for {${p}}...`}
+                                value={customVariables[p] || ''}
+                                onChange={e => setCustomVariables(cv => ({ ...cv, [p]: e.target.value }))}
+                                className="text-xs px-2 py-1 rounded border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-950 text-slate-800 dark:text-slate-100"
+                              />
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
                   </>

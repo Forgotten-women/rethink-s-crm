@@ -184,15 +184,27 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
         allocs = donor_sponsorships(comp, em)
         if allocs:
             a = allocs[0]  # latest - its links / dates fill the single-value fields
+            days_rem = ""
+            if a.get("end_date"):
+                try:
+                    today = datetime.date.today()
+                    end_d = datetime.datetime.strptime(str(a["end_date"])[:10], "%Y-%m-%d").date()
+                    days_diff = (end_d - today).days
+                    days_rem = f"{days_diff} days" if days_diff >= 0 else f"{-days_diff} days overdue"
+                except Exception:
+                    pass
             v.update({
-                "beneficiary_name": a.get("beneficiary_name") or "", "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
+                "beneficiary_name": a.get("beneficiary_name") or "",
+                "beneficiary_names": _join_names([al.get("beneficiary_name") or "" for al in allocs]),
+                "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
                 "location": a.get("b_location") or "", "project_code": a.get("b_code") or "",
                 "profile_link": a.get("b_profile") or a.get("profile_link") or "", "video_link": a.get("b_video") or "",
                 "report_link": a.get("b_profile") or "", "donor_folder_link": a.get("b_folder") or a.get("b_profile") or "",
                 "folder_link": a.get("b_folder") or a.get("b_profile") or "",
                 "campaign_name": a.get("campaign_name") or "", "community_name": a.get("community_name") or "",
-                "renewal_deadline": a.get("end_date") or "",
-                "sponsorship_year": (a.get("start_date") or "")[:4],
+                "renewal_deadline": str(a.get("end_date") or "")[:10],
+                "days_remaining": days_rem,
+                "sponsorship_year": (str(a.get("start_date") or ""))[:4],
             })
             combined = _combined_sponsorship_vars(allocs)
             if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
@@ -260,7 +272,9 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
 
 
 def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str], body_tpl: Optional[str],
-            recipient: Dict[str, Any], message_body: Optional[str] = None) -> Dict[str, Any]:
+            recipient: Dict[str, Any], message_body: Optional[str] = None,
+            custom_variables: Optional[Dict[str, str]] = None,
+            selected_allocation_id: Optional[int] = None) -> Dict[str, Any]:
     if subject_tpl is None or body_tpl is None:
         conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
         try:
@@ -270,12 +284,70 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
         subject_tpl = tpl["subject"] if subject_tpl is None else subject_tpl
         body_tpl = tpl["body_html"] if body_tpl is None else body_tpl
     variables = _donor_variables(comp, recipient, subject_tpl, message_body)
+
+    # If sender selected a specific beneficiary to feature out of multiple
+    em = str(recipient.get("email") or "").strip().lower()
+    allocs = donor_sponsorships(comp, em) if em else []
+    if selected_allocation_id and allocs:
+        sel_alloc = next((al for al in allocs if al.get("id") == selected_allocation_id), None)
+        if sel_alloc:
+            days_rem = ""
+            if sel_alloc.get("end_date"):
+                try:
+                    today = datetime.date.today()
+                    end_d = datetime.datetime.strptime(str(sel_alloc["end_date"])[:10], "%Y-%m-%d").date()
+                    days_diff = (end_d - today).days
+                    days_rem = f"{days_diff} days" if days_diff >= 0 else f"{-days_diff} days overdue"
+                except Exception:
+                    pass
+            variables.update({
+                "beneficiary_name": sel_alloc.get("beneficiary_name") or "",
+                "sponsorship_type": sel_alloc.get("b_type") or sel_alloc.get("sponsorship_type") or "",
+                "location": sel_alloc.get("b_location") or "",
+                "project_code": sel_alloc.get("b_code") or "",
+                "profile_link": sel_alloc.get("b_profile") or sel_alloc.get("profile_link") or "",
+                "video_link": sel_alloc.get("b_video") or "",
+                "donor_folder_link": sel_alloc.get("b_folder") or sel_alloc.get("b_profile") or "",
+                "renewal_deadline": str(sel_alloc.get("end_date") or "")[:10],
+                "days_remaining": days_rem,
+            })
+
+    # Apply sender-provided custom variables so missing fields are not skipped
+    if custom_variables:
+        for k, val in custom_variables.items():
+            if val is not None and str(val).strip() != "":
+                variables[k.lower()] = str(val).strip()
+
     subject = _render_text(subject_tpl, variables)
     variables["subject"] = subject
     unresolved = sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(subject_tpl + body_tpl)
                          if m.group(1).lower() not in {k.lower() for k, val in variables.items() if val not in (None, "")}})
-    return {"recipient_email": recipient.get("email") or "", "recipient_name": variables["donor_name"], "subject": subject,
-            "body_html": _render_text(body_tpl, variables), "unresolved_placeholders": unresolved}
+
+    sponsorships_data = [{
+        "id": a["id"],
+        "allocation_id": a["id"],
+        "beneficiary_name": a.get("beneficiary_name") or a.get("campaign_name") or "Sponsorship",
+        "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
+        "location": a.get("b_location") or "",
+        "project_code": a.get("b_code") or "",
+        "profile_link": a.get("b_profile") or a.get("profile_link") or "",
+        "video_link": a.get("b_video") or "",
+        "start_date": str(a.get("start_date") or "")[:10],
+        "end_date": str(a.get("end_date") or "")[:10],
+        "cycle_status": a.get("cycle_status") or ""
+    } for a in allocs]
+
+    return {
+        "recipient_email": recipient.get("email") or "",
+        "recipient_name": variables["donor_name"],
+        "subject": subject,
+        "body_html": _render_text(body_tpl, variables),
+        "unresolved_placeholders": unresolved,
+        "variables": variables,
+        "sponsorships": sponsorships_data,
+        "has_multiple_beneficiaries": len(sponsorships_data) > 1,
+        "beneficiaries_count": len(sponsorships_data)
+    }
 
 
 MATCH_FIELDS = ("matched_gifts", "matched_total", "matched_causes", "matched_sponsorships")
@@ -377,16 +449,24 @@ class PreviewRequest(BaseModel):
     theme: Optional[str] = None
     template_type: str = "general_custom"
     subject_template: Optional[str] = None
+class PreviewRequest(BaseModel):
+    company_id: str
+    theme: Optional[str] = None
+    template_type: str = "general_custom"
+    subject_template: Optional[str] = None
     body_template: Optional[str] = None
     message_body: Optional[str] = None
     recipient: Dict[str, Any]
+    custom_variables: Optional[Dict[str, str]] = None
+    selected_allocation_id: Optional[int] = None
 
 
 @router.post("/preview")
 def preview(req: PreviewRequest):
     comp = _company(req.company_id)
     theme = _resolve_theme(comp, req.theme)
-    out = _render(comp, theme, req.template_type, req.subject_template, req.body_template, req.recipient, req.message_body)
+    out = _render(comp, theme, req.template_type, req.subject_template, req.body_template, req.recipient,
+                  req.message_body, req.custom_variables, req.selected_allocation_id)
     from backend.api.unsubscribe import add_footer  # show the Unsubscribe button exactly as it will be sent
     out["body_html"] = add_footer(out.get("body_html") or "", comp, out.get("recipient_email") or "")
     out["unsubscribed"] = is_unsubscribed(comp, out.get("recipient_email") or "")
@@ -403,6 +483,9 @@ class SendRequest(BaseModel):
     recipients: List[Dict[str, Any]]
     dry_run: bool = False
     kind: str = "bulk"  # "single" when written to one person from their donor panel
+    custom_variables: Optional[Dict[str, str]] = None
+    selected_allocation_id: Optional[int] = None
+    recipient_customizations: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @router.post("/send")
@@ -415,7 +498,13 @@ def send(req: SendRequest, request: Request):
     base_url = str(request.base_url).rstrip("/")
     out = []
     for r in req.recipients:
-        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r, req.message_body)
+        em = str(r.get("email") or "").strip().lower()
+        cust = (req.recipient_customizations or {}).get(em, {})
+        c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
+        msg_body = cust.get("message_body") or req.message_body
+        sel_alloc = cust.get("selected_allocation_id") or req.selected_allocation_id
+        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
+                           msg_body, c_vars, sel_alloc)
         if req.dry_run:
             ok = "@" in rendered["recipient_email"] and not rendered["unresolved_placeholders"]
             out.append({"recipient_email": rendered["recipient_email"], "status": "ok" if ok else "skipped",
@@ -839,6 +928,8 @@ class CheckRequest(BaseModel):
     body_template: Optional[str] = None
     message_body: Optional[str] = None
     recipients: List[Dict[str, Any]]
+    custom_variables: Optional[Dict[str, str]] = None
+    recipient_customizations: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @router.post("/check")
@@ -858,7 +949,12 @@ def check_recipients(req: CheckRequest):
         if is_unsubscribed(comp, em):
             problems.append({"email": em, "name": r.get("name") or "", "issue": "unsubscribed from emails (pressed Unsubscribe)"})
             continue
-        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r, req.message_body)
+        cust = (req.recipient_customizations or {}).get(em.lower(), {})
+        c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
+        msg_body = cust.get("message_body") or req.message_body
+        sel_alloc = cust.get("selected_allocation_id")
+        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
+                           msg_body, c_vars, sel_alloc)
         if rendered["unresolved_placeholders"]:
             missing = rendered["unresolved_placeholders"]
             has_spons = bool(donor_sponsorships(comp, em)) if any(m.lower() in SPONSORSHIP_PLACEHOLDERS for m in missing) else True

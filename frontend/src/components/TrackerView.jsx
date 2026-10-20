@@ -7,7 +7,8 @@ import {
   Check, ArrowRight, UserPlus, Users, Link2, Copy, Sparkles,
   Calendar, Award, Inbox, Clock, ChevronRight, ChevronLeft,
   ChevronsLeft, ChevronsRight, ChevronDown, ChevronUp, Code, RotateCcw,
-  FileCode, Tag, HelpCircle, LayoutTemplate, Zap, AlertTriangle, Bell, Download, Sliders, SendHorizontal, EyeOff, Ban
+  FileCode, Tag, HelpCircle, LayoutTemplate, Zap, AlertTriangle, Bell, Download, Sliders, SendHorizontal, EyeOff, Ban,
+  Code2, Pencil
 } from 'lucide-react';
 import EmailBuilder, { caretProps } from './email/builder/EmailBuilder';
 import { blankDoc, htmlToDoc, newBlock, renderDoc, signatureBlocks } from './email/builder/emailDoc';
@@ -489,6 +490,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // --- TAB 4 STATE: OUTLOOK / MICROSOFT 365 SETTINGS ---
   const [outlookStatus, setOutlookStatus] = useState(null);
   const [outlookCreds, setOutlookCreds] = useState({ client_id: '', client_secret: '', tenant_id: 'common' });
+  const [showOutlookClientId, setShowOutlookClientId] = useState(false);
+  const [showOutlookClientSecret, setShowOutlookClientSecret] = useState(false);
+  const [showOutlookTenantId, setShowOutlookTenantId] = useState(false);
   const [savingOutlookCreds, setSavingOutlookCreds] = useState(false);
   const [testEmailRecipient, setTestEmailRecipient] = useState('office@rethinkcharity.org.uk');
   const [sendingTestEmail, setSendingTestEmail] = useState(false);
@@ -602,15 +606,68 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     }
   }, [activeCompany]);
 
-  const [selectedTemplateForConfig, setSelectedTemplateForConfig] = useState('profile_intro');
+  const [selectedTemplateForConfig, setSelectedTemplateForConfig] = useState('');
   const [templateDraft, setTemplateDraft] = useState({
     id: null,
-    template_type: 'profile_intro',
+    template_type: '',
     subject: '',
     body_html: '',
     builder_json: null
   });
-  const [templateEditorMode, setTemplateEditorMode] = useState('editor'); // 'editor' | 'preview'
+  const [templateEditorMode, setTemplateEditorMode] = useState('editor'); // 'editor' | 'code' | 'preview'
+  const [copiedHtml, setCopiedHtml] = useState(false);
+  const rawHtmlTextareaRef = useRef(null);
+
+  const switchEditorMode = (newMode) => {
+    if (templateEditorMode === 'code' && newMode === 'editor') {
+      try {
+        const theme = CHARITY_THEMES_PRESETS[selectedCharityTheme];
+        const parsedDoc = htmlToDoc(templateDraft.body_html || '', theme);
+        if (parsedDoc && Array.isArray(parsedDoc.blocks)) {
+          setTemplateDraft(prev => ({ ...prev, builder_json: parsedDoc }));
+        }
+      } catch (err) {
+        console.warn('Could not re-parse raw HTML into visual blocks:', err);
+      }
+    }
+    setTemplateEditorMode(newMode);
+  };
+
+  const handleHtmlKeyDown = (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = e.target.selectionStart;
+      const end = e.target.selectionEnd;
+      const val = e.target.value;
+      const newVal = val.substring(0, start) + '  ' + val.substring(end);
+      setTemplateDraft(prev => ({ ...prev, body_html: newVal }));
+      requestAnimationFrame(() => {
+        if (rawHtmlTextareaRef.current) {
+          rawHtmlTextareaRef.current.selectionStart = start + 2;
+          rawHtmlTextareaRef.current.selectionEnd = start + 2;
+        }
+      });
+    }
+  };
+
+  const insertTagIntoHtml = (tag) => {
+    const el = rawHtmlTextareaRef.current;
+    if (!el) {
+      setTemplateDraft(prev => ({ ...prev, body_html: (prev.body_html || '') + tag }));
+      return;
+    }
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? el.value.length;
+    const val = el.value || '';
+    const newVal = val.substring(0, start) + tag + val.substring(end);
+    setTemplateDraft(prev => ({ ...prev, body_html: newVal }));
+    requestAnimationFrame(() => {
+      el.focus();
+      el.selectionStart = start + tag.length;
+      el.selectionEnd = start + tag.length;
+    });
+  };
+
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [templateStatusMsg, setTemplateStatusMsg] = useState('');
   const [showAddTemplateModal, setShowAddTemplateModal] = useState(false);
@@ -1815,7 +1872,11 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   const handleSaveTemplate = (e) => {
     if (e) e.preventDefault();
-    if (!templateDraft.template_type) return;
+    const cleanType = (templateDraft.template_type || '').trim();
+    if (!cleanType) {
+      alert("Template title/name cannot be empty.");
+      return;
+    }
     setSavingTemplate(true);
     setTemplateStatusMsg('');
 
@@ -1824,8 +1885,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        id: templateDraft.id || null,
+        original_template_type: selectedTemplateForConfig,
         company_id: effectiveCompanyId,
-        template_type: templateDraft.template_type,
+        template_type: cleanType,
         subject: templateDraft.subject,
         body_html: templateDraft.body_html,
         builder_json: templateDraft.builder_json || null
@@ -1835,11 +1898,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       .then(res => {
         setSavingTemplate(false);
         if (res.status === 'success') {
-          setTemplateStatusMsg(`✅ Template saved for ${CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name || selectedCharityTheme}!`);
+          setTemplateStatusMsg(`✅ Template "${cleanType}" saved for ${CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name || selectedCharityTheme}!`);
+          setSelectedTemplateForConfig(cleanType);
           loadBeneficiariesAndAllocations();
           setTimeout(() => setTemplateStatusMsg(''), 3000);
         } else {
-          setTemplateStatusMsg(`❌ ${res.detail || 'Failed to save template.'}`);
+          setTemplateStatusMsg(`❌ ${res.detail || res.message || 'Failed to save template.'}`);
         }
       })
       .catch(err => {
@@ -1871,16 +1935,31 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       });
   };
 
-  const handleDeleteTemplate = (templateId) => {
-    if (!window.confirm('Are you sure you want to delete this custom email template?')) return;
+  const handleDeleteTemplate = (templateId, templateName = '') => {
+    const displayName = templateName ? `"${templateName}"` : 'this email template';
+    if (!window.confirm(`Are you sure you want to delete ${displayName}?`)) return;
     fetch(`${API_BASE_URL}/api/tracker/email-templates/${templateId}`, {
       method: 'DELETE'
     })
       .then(r => r.json())
       .then(res => {
         if (res.status === 'success') {
+          const remaining = emailTemplates.filter(t => t.id !== templateId);
+          if (remaining.length > 0) {
+            const nextTpl = remaining.find(t => (t.charity_theme || t.company_id || 'rethink') === selectedCharityTheme) || remaining[0];
+            setSelectedTemplateForConfig(nextTpl.template_type);
+            setTemplateDraft({
+              id: nextTpl.id,
+              template_type: nextTpl.template_type,
+              subject: nextTpl.subject || '',
+              body_html: nextTpl.body_html || '',
+              builder_json: nextTpl.builder_json || null
+            });
+          } else {
+            setSelectedTemplateForConfig('');
+            setTemplateDraft({ id: null, template_type: '', subject: '', body_html: '', builder_json: null });
+          }
           loadBeneficiariesAndAllocations();
-          setSelectedTemplateForConfig('profile_intro');
         } else {
           alert(res.detail || 'Failed to delete template');
         }
@@ -5378,20 +5457,30 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
             <div className="flex items-center gap-3">
               {outlookStatus?.connected ? (
-                <button
-                  onClick={() => {
-                    if (window.confirm('Disconnect Microsoft 365 / Outlook account?')) {
-                      fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/outlook/disconnect?company_id=${activeCompany}`), { 
-                        method: 'POST',
-                        headers: getAuthHeaders()
-                      })
-                        .then(() => loadBeneficiariesAndAllocations());
-                    }
-                  }}
-                  className="px-4 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-800 text-xs font-bold hover:bg-rose-100 transition-all"
-                >
-                  Disconnect Account
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleConnectOutlookOAuth}
+                    className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-md transition-all flex items-center gap-2"
+                    title="Sign in with a different Microsoft account"
+                  >
+                    <Mail className="w-4 h-4" />
+                    Switch / Change Account
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (window.confirm('Disconnect Microsoft 365 / Outlook account?')) {
+                        fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/outlook/disconnect?company_id=${activeCompany}`), { 
+                          method: 'POST',
+                          headers: getAuthHeaders()
+                        })
+                          .then(() => loadBeneficiariesAndAllocations());
+                      }
+                    }}
+                    className="px-4 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-800 text-xs font-bold hover:bg-rose-100 transition-all"
+                  >
+                    Disconnect Account
+                  </button>
+                </div>
               ) : (
                 <button
                   onClick={handleConnectOutlookOAuth}
@@ -5415,35 +5504,65 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Application (Client) ID</label>
-                <input
-                  type="text"
-                  placeholder="e.g. 11111111-2222-3333-4444-555555555555"
-                  value={outlookCreds.client_id}
-                  onChange={(e) => setOutlookCreds({ ...outlookCreds, client_id: e.target.value })}
-                  className="px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-mono"
-                />
+                <div className="relative flex items-center">
+                  <input
+                    type={showOutlookClientId ? "text" : "password"}
+                    placeholder="e.g. 11111111-2222-3333-4444-555555555555"
+                    value={outlookCreds.client_id}
+                    onChange={(e) => setOutlookCreds({ ...outlookCreds, client_id: e.target.value })}
+                    className="w-full pr-10 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-mono tracking-wider"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowOutlookClientId(!showOutlookClientId)}
+                    className="absolute right-2.5 p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
+                    title={showOutlookClientId ? "Hide Client ID" : "Show Client ID"}
+                  >
+                    {showOutlookClientId ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Client Secret</label>
-                <input
-                  type="password"
-                  placeholder="Azure App Client Secret Value"
-                  value={outlookCreds.client_secret}
-                  onChange={(e) => setOutlookCreds({ ...outlookCreds, client_secret: e.target.value })}
-                  className="px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg"
-                />
+                <div className="relative flex items-center">
+                  <input
+                    type={showOutlookClientSecret ? "text" : "password"}
+                    placeholder="Azure App Client Secret Value"
+                    value={outlookCreds.client_secret}
+                    onChange={(e) => setOutlookCreds({ ...outlookCreds, client_secret: e.target.value })}
+                    className="w-full pr-10 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg tracking-wider"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowOutlookClientSecret(!showOutlookClientSecret)}
+                    className="absolute right-2.5 p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
+                    title={showOutlookClientSecret ? "Hide Client Secret" : "Show Client Secret"}
+                  >
+                    {showOutlookClientSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Directory (Tenant) ID</label>
-                <input
-                  type="text"
-                  placeholder="common (or your Azure Tenant GUID)"
-                  value={outlookCreds.tenant_id}
-                  onChange={(e) => setOutlookCreds({ ...outlookCreds, tenant_id: e.target.value })}
-                  className="px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-mono"
-                />
+                <div className="relative flex items-center">
+                  <input
+                    type={showOutlookTenantId ? "text" : "password"}
+                    placeholder="common (or your Azure Tenant GUID)"
+                    value={outlookCreds.tenant_id}
+                    onChange={(e) => setOutlookCreds({ ...outlookCreds, tenant_id: e.target.value })}
+                    className="w-full pr-10 px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg font-mono tracking-wider"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowOutlookTenantId(!showOutlookTenantId)}
+                    className="absolute right-2.5 p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
+                    title={showOutlookTenantId ? "Hide Tenant ID" : "Show Tenant ID"}
+                  >
+                    {showOutlookTenantId ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               <button
@@ -5741,19 +5860,17 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                       </span>
                                     )}
 
-                                    {!isSystemDefault && (
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleDeleteTemplate(tpl.id);
-                                        }}
-                                        className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-100 dark:hover:bg-rose-950 text-rose-500 transition-all"
-                                        title="Delete this custom template"
-                                      >
-                                        <Trash2 className="w-3.5 h-3.5" />
-                                      </button>
-                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDeleteTemplate(tpl.id, tpl.template_type);
+                                      }}
+                                      className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-100 dark:hover:bg-rose-950 text-rose-500 transition-all"
+                                      title={`Delete ${tpl.template_type} template`}
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
                                   </div>
                                 </div>
 
@@ -5824,11 +5941,22 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               <form onSubmit={handleSaveTemplate} className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200/80 dark:border-slate-800 shadow-sm p-5 md:p-6 flex flex-col gap-5">
                 {/* Editor Header */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100 dark:border-slate-800">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-sm font-black text-indigo-600 dark:text-indigo-400">
-                        {templateDraft.template_type}
-                      </span>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <div className="relative flex items-center group">
+                        <input
+                          type="text"
+                          required
+                          value={templateDraft.template_type || ''}
+                          onChange={(e) => {
+                            setTemplateDraft(prev => ({ ...prev, template_type: e.target.value }));
+                          }}
+                          placeholder="Template name..."
+                          className="font-mono text-sm md:text-base font-black text-indigo-600 dark:text-indigo-400 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800/80 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-indigo-400 dark:hover:border-indigo-500 rounded-xl px-3 py-1.5 focus:bg-white dark:focus:bg-slate-900 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all pr-8 shadow-2xs"
+                          title="Click to edit template title / identifier for all templates"
+                        />
+                        <Pencil className="w-3.5 h-3.5 text-slate-400 group-hover:text-indigo-500 absolute right-2.5 pointer-events-none transition-colors" />
+                      </div>
                       <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-500">
                         Editable Template
                       </span>
@@ -5838,11 +5966,11 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     </span>
                   </div>
 
-                  {/* Mode Switcher: Code / Live Preview */}
+                  {/* Mode Switcher: Builder / Raw HTML / Live Preview */}
                   <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-xl border border-slate-200/80 dark:border-slate-700">
                     <button
                       type="button"
-                      onClick={() => setTemplateEditorMode('editor')}
+                      onClick={() => switchEditorMode('editor')}
                       className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
                         templateEditorMode === 'editor'
                           ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs'
@@ -5854,7 +5982,19 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     </button>
                     <button
                       type="button"
-                      onClick={() => setTemplateEditorMode('preview')}
+                      onClick={() => switchEditorMode('code')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                        templateEditorMode === 'code'
+                          ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs'
+                          : 'text-slate-500 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      <Code2 className="w-3.5 h-3.5" />
+                      Raw HTML
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchEditorMode('preview')}
                       className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
                         templateEditorMode === 'preview'
                           ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs'
@@ -5886,7 +6026,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   />
                 </div>
 
-                {/* Editor vs Live Preview Container */}
+                {/* Editor vs Raw HTML vs Live Preview Container */}
                 {templateEditorMode === 'editor' ? (
                   <EmailBuilder
                     key={`${selectedCharityTheme}:${templateDraft.id || templateDraft.template_type}`}
@@ -5895,6 +6035,75 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     variables={AVAILABLE_VARIABLES}
                     onChange={(doc, html) => setTemplateDraft(prev => ({ ...prev, builder_json: doc, body_html: html }))}
                   />
+                ) : templateEditorMode === 'code' ? (
+                  <div className="flex flex-col gap-3">
+                    {/* Top Bar for Code View */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-100 dark:bg-slate-800/80 px-3.5 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-slate-700 dark:text-slate-200 flex items-center gap-1.5">
+                          <Code2 className="w-4 h-4 text-indigo-500" />
+                          Raw HTML Source Code
+                        </span>
+                        <span className="text-[10px] font-mono bg-indigo-100 dark:bg-indigo-950/80 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded-md font-bold">
+                          Directly Editable
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        <span>{(templateDraft.body_html || '').split('\n').length} lines</span>
+                        <span>&bull;</span>
+                        <span>{(templateDraft.body_html || '').length.toLocaleString()} characters</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(templateDraft.body_html || '');
+                            setCopiedHtml(true);
+                            setTimeout(() => setCopiedHtml(false), 2000);
+                          }}
+                          className="ml-2 px-2.5 py-1 rounded-lg bg-white dark:bg-slate-700 hover:bg-slate-50 dark:hover:bg-slate-600 border border-slate-200 dark:border-slate-600 font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1.5 transition-all shadow-2xs"
+                        >
+                          {copiedHtml ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                          {copiedHtml ? 'Copied!' : 'Copy Code'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Variable Inserter */}
+                    <div className="flex flex-col gap-1.5 bg-slate-50 dark:bg-slate-900/60 p-3 rounded-xl border border-slate-200/80 dark:border-slate-800">
+                      <div className="flex items-center justify-between text-slate-600 dark:text-slate-300">
+                        <span className="text-[11px] font-bold flex items-center gap-1">
+                          <Tag className="w-3 h-3 text-indigo-500" />
+                          Click variable tag to insert at cursor into HTML:
+                        </span>
+                        <span className="text-[10px] text-slate-400">Tag replacements occur live during dispatch</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {AVAILABLE_VARIABLES.map((v) => (
+                          <button
+                            key={v.tag}
+                            type="button"
+                            onClick={() => insertTagIntoHtml(v.tag)}
+                            className="px-2 py-0.5 rounded-md bg-white dark:bg-slate-800 border border-indigo-200 dark:border-indigo-800 font-mono text-[10px] text-indigo-700 dark:text-indigo-300 hover:bg-indigo-600 hover:text-white transition-all shadow-2xs"
+                            title={`Click to insert ${v.tag} (e.g. ${v.example})`}
+                          >
+                            {v.tag}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Textarea Container */}
+                    <div className="relative rounded-2xl overflow-hidden border border-slate-300 dark:border-slate-700 shadow-sm focus-within:ring-2 focus-within:ring-indigo-500/20 focus-within:border-indigo-500">
+                      <textarea
+                        ref={rawHtmlTextareaRef}
+                        value={templateDraft.body_html || ''}
+                        onChange={(e) => setTemplateDraft(prev => ({ ...prev, body_html: e.target.value }))}
+                        onKeyDown={handleHtmlKeyDown}
+                        spellCheck="false"
+                        placeholder="<!-- Custom email HTML code here -->"
+                        className="w-full h-[580px] p-4 font-mono text-xs md:text-[13px] leading-relaxed bg-slate-950 text-emerald-300 selection:bg-indigo-600 selection:text-white resize-y outline-none"
+                      />
+                    </div>
+                  </div>
                 ) : (
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center justify-between text-xs text-slate-500">
@@ -5985,6 +6194,17 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   </div>
 
                   <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end">
+                    {templateDraft.id && (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteTemplate(templateDraft.id, templateDraft.template_type)}
+                        className="px-3.5 py-2.5 rounded-xl border border-rose-200 dark:border-rose-900/50 hover:bg-rose-50 dark:hover:bg-rose-950/40 text-rose-600 dark:text-rose-400 font-bold text-xs flex items-center justify-center gap-1.5 transition-all"
+                        title="Delete this template"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Delete Template
+                      </button>
+                    )}
                     <button
                       type="submit"
                       disabled={savingTemplate}

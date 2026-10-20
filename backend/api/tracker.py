@@ -466,6 +466,7 @@ class OutlookSendRequest(BaseModel):
     subject_template: Optional[str] = None  # edited template text with {placeholders}; defaults to the saved template
     body_template: Optional[str] = None
     queue_item_ids: Optional[List[int]] = None
+    custom_variables: Optional[Dict[str, str]] = None
     # Legacy single-message fields (pre-rendered by the browser).
     recipient_email: Optional[str] = ""
     recipient_name: Optional[str] = "Donor"
@@ -494,12 +495,15 @@ class EmailPreviewRequest(BaseModel):
     company_id: Optional[str] = None  # email theme
     subject_template: Optional[str] = None
     body_template: Optional[str] = None
+    custom_variables: Optional[Dict[str, str]] = None
 
 class OutlookTestEmailRequest(BaseModel):
     company_id: Optional[str] = "rethink"
     recipient_email: Optional[str] = "office@rethinkcharity.org.uk"
 
 class TemplateUpdateRequest(BaseModel):
+    id: Optional[int] = None
+    original_template_type: Optional[str] = None
     template_type: str
     subject: str
     body_html: str
@@ -4036,18 +4040,19 @@ def get_outlook_auth_url(company_id: Optional[str] = Query("rethink"), redirect_
     if not auth or not auth["client_id"]:
         raise HTTPException(status_code=400, detail="Microsoft Azure Client ID not configured. Please save credentials first.")
 
-    r_uri = redirect_uri or "http://localhost:5173/sponsorship-tracker"
+    r_uri = redirect_uri if isinstance(redirect_uri, str) and redirect_uri else "http://localhost:5173/sponsorship-tracker"
     scopes = "https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read offline_access"
     tenant = auth["tenant_id"] or "common"
 
     auth_url = (
         f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?"
         f"client_id={auth['client_id']}&"
-        f"redirect_uri={requests.utils.quote(r_uri)}&"
+        f"redirect_uri={urllib.parse.quote(str(r_uri))}&"
         f"response_type=code&"
         f"response_mode=query&"
-        f"scope={requests.utils.quote(scopes)}&"
-        f"state={comp}"
+        f"scope={urllib.parse.quote(str(scopes))}&"
+        f"state={comp}&"
+        f"prompt=select_account"
     )
     return {"auth_url": auth_url}
 
@@ -4154,13 +4159,45 @@ def _resolve_theme(allocation_company: str, requested_theme: Optional[str]) -> s
 
 
 def _get_template(cur, theme: str, template_type: str) -> Dict[str, str]:
-    """Template for this theme only; never falls back to another charity's templates."""
+    """Template for this theme only; never falls back to another charity's templates.
+    If missing from database, auto-populates from defaults or falls back gracefully."""
+    theme_key = (theme or "rethink").strip().lower()
     row = cur.execute(
-        "SELECT subject, body_html FROM sponsorship_email_templates WHERE company_id = ? AND template_type = ?",
-        (theme, template_type)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"No '{template_type}' template saved for the '{theme}' theme.")
-    return {"subject": row[0] or "", "body_html": row[1] or ""}
+        "SELECT subject, body_html FROM sponsorship_email_templates WHERE LOWER(company_id) = ? AND template_type = ?",
+        (theme_key, template_type)).fetchone()
+    if row and (row[0] or row[1]):
+        return {"subject": row[0] or "", "body_html": row[1] or ""}
+
+    # 1. Look in DEFAULT_TEMPLATES_BY_CHARITY for this theme or rethink
+    defaults_dict = globals().get("DEFAULT_TEMPLATES_BY_CHARITY", {})
+    theme_defaults = defaults_dict.get(theme_key) or defaults_dict.get("rethink") or []
+    default_tpl = next((dt for dt in theme_defaults if dt.get("template_type") == template_type), None)
+    if default_tpl:
+        try:
+            cur.execute("""
+                INSERT INTO sponsorship_email_templates (company_id, template_type, subject, body_html)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(company_id, template_type) DO UPDATE SET subject = excluded.subject, body_html = excluded.body_html
+            """, (theme_key, default_tpl["template_type"], default_tpl["subject"], default_tpl["body_html"]))
+        except Exception:
+            pass
+        return {"subject": default_tpl["subject"] or "", "body_html": default_tpl["body_html"] or ""}
+
+    # 2. Fall back to any active template for this theme
+    fallback_row = cur.execute(
+        "SELECT subject, body_html FROM sponsorship_email_templates WHERE LOWER(company_id) = ? ORDER BY id ASC LIMIT 1",
+        (theme_key,)).fetchone()
+    if fallback_row and (fallback_row[0] or fallback_row[1]):
+        return {"subject": fallback_row[0] or "", "body_html": fallback_row[1] or ""}
+
+    # 3. Last-resort fallback wrapper so it NEVER crashes with 404
+    wrap_fn = globals().get("_wrap_email_html_template")
+    fallback_subject = f"Sponsorship Update | {theme_key.title()}"
+    fallback_body = """<p style="margin: 0 0 12px 0;">Dear {First_Name},</p>
+<p style="margin: 0 0 12px 0;">Thank you for your generous sponsorship and support for <strong>{beneficiary_name}</strong>.</p>
+<p style="margin: 0 0 12px 0;">{message_body}</p>"""
+    fallback_html = wrap_fn(fallback_subject, fallback_body, theme_key) if wrap_fn else f"<html><body>{fallback_body}</body></html>"
+    return {"subject": fallback_subject, "body_html": fallback_html}
 
 
 def _allocation_cycle(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -4253,7 +4290,8 @@ def _render_text(text: str, variables: Dict[str, str]) -> str:
 
 def render_email_for_donor(cur, allocation_id: int, allocation_donor_id: Optional[int], template_type: str,
                            theme: Optional[str], subject_template: Optional[str] = None,
-                           body_template: Optional[str] = None) -> Dict[str, Any]:
+                           body_template: Optional[str] = None,
+                           custom_variables: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     ctx = _load_render_context(cur, allocation_id, allocation_donor_id)
     comp = _owner_company(ctx["allocation"]["company_id"])
     theme = _resolve_theme(comp, theme)
@@ -4262,8 +4300,39 @@ def render_email_for_donor(cur, allocation_id: int, allocation_donor_id: Optiona
         subject_template = tpl["subject"] if subject_template is None else subject_template
         body_template = tpl["body_html"] if body_template is None else body_template
     variables = _template_variables(ctx, subject_template)
+    if custom_variables:
+        for k, val in custom_variables.items():
+            if val is not None and str(val).strip() != "":
+                variables[k.lower()] = str(val).strip()
     subject = _render_text(subject_template, variables)
     variables["subject"] = subject
+    unresolved = sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(subject + body_template)
+                         if m.group(1).lower() not in {k.lower() for k, val in variables.items() if val not in (None, "")}})
+
+    # Check for multiple beneficiaries for this recipient
+    allocs = []
+    donor_em = (ctx["donor"].get("donor_email") or "").strip().lower()
+    if donor_em:
+        try:
+            from backend.api.donor_email import donor_sponsorships
+            allocs = donor_sponsorships(comp, donor_em)
+        except Exception:
+            pass
+
+    sponsorships_data = [{
+        "id": a["id"],
+        "allocation_id": a["id"],
+        "beneficiary_name": a.get("beneficiary_name") or a.get("campaign_name") or "Sponsorship",
+        "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
+        "location": a.get("b_location") or "",
+        "project_code": a.get("b_code") or "",
+        "profile_link": a.get("b_profile") or a.get("profile_link") or "",
+        "video_link": a.get("b_video") or "",
+        "start_date": str(a.get("start_date") or "")[:10],
+        "end_date": str(a.get("end_date") or "")[:10],
+        "cycle_status": a.get("cycle_status") or ""
+    } for a in allocs] if allocs else []
+
     return {
         "company_id": comp,
         "theme": theme,
@@ -4273,8 +4342,11 @@ def render_email_for_donor(cur, allocation_id: int, allocation_donor_id: Optiona
         "recipient_name": variables["donor_name"],
         "subject": subject,
         "body_html": _render_text(body_template, variables),
-        "unresolved_placeholders": sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(subject + body_template)
-                                           if m.group(1).lower() not in variables}),
+        "unresolved_placeholders": unresolved,
+        "variables": variables,
+        "sponsorships": sponsorships_data,
+        "has_multiple_beneficiaries": len(sponsorships_data) > 1,
+        "beneficiaries_count": len(sponsorships_data),
         "donors": [{"id": d["id"], "donor_name": d["donor_name"], "donor_email": d["donor_email"],
                     "role": d["role"], "is_primary": d["is_primary"],
                     "contribution_amount": d["contribution_amount"]} for d in ctx["donors"]],
@@ -4286,9 +4358,12 @@ def preview_email(payload: EmailPreviewRequest):
     """Renders exactly what one donor would receive (same code path as sending)."""
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
-        out = render_email_for_donor(conn.cursor(), payload.allocation_id, payload.allocation_donor_id,
+        cur = conn.cursor()
+        out = render_email_for_donor(cur, payload.allocation_id, payload.allocation_donor_id,
                                      payload.template_type or "profile_intro", payload.company_id,
-                                     payload.subject_template, payload.body_template)
+                                     payload.subject_template, payload.body_template,
+                                     payload.custom_variables)
+        conn.commit()
         if isinstance(out, dict) and out.get("body_html") and out.get("recipient_email"):
             from backend.api.unsubscribe import add_footer, is_unsubscribed  # the Unsubscribe button, as sent
             out["body_html"] = add_footer(out["body_html"], out.get("company_id") or payload.company_id, out["recipient_email"])
@@ -4332,17 +4407,20 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
                    subject=rendered["subject"])
     if not to_email or "@" not in to_email:
         log_event("email.skipped", level="warning", message=f"No email for {rendered['recipient_name']}", **log_ctx)
-        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "skipped",
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "recipient_email": to_email,
+                "recipient_name": rendered.get("recipient_name", ""), "status": "skipped",
                 "detail": "Donor has no email address"}
     if rendered["unresolved_placeholders"]:
         log_event("email.failed", level="error", message="Unknown placeholders in template",
                   placeholders=rendered["unresolved_placeholders"], **log_ctx)
-        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed",
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "recipient_email": to_email,
+                "recipient_name": rendered.get("recipient_name", ""), "status": "failed",
                 "detail": "Unknown placeholders: " + ", ".join(rendered["unresolved_placeholders"])}
     from backend.api.unsubscribe import is_unsubscribed
     if is_unsubscribed(comp, to_email):
         log_event("email.skipped", level="warning", message=f"{to_email} has unsubscribed - not emailed", **log_ctx)
-        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "skipped",
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "recipient_email": to_email,
+                "recipient_name": rendered.get("recipient_name", ""), "status": "skipped",
                 "detail": "Unsubscribed from emails"}
     from backend.api.mailbox import is_connected, provider, send_email
     if not is_connected(comp):
@@ -4355,7 +4433,8 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
     if not sent["ok"]:
         log_event("email.failed", level="error", message=f"Send failed ({sent.get('http_status')}) to {to_email}",
                   http_status=sent.get("http_status"), detail=sent["detail"][:300], mailbox=sender_email, **log_ctx)
-        return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "failed", "detail": sent["detail"][:300]}
+        return {"allocation_donor_id": rendered["allocation_donor_id"], "recipient_email": to_email,
+                "recipient_name": rendered.get("recipient_name", ""), "status": "failed", "detail": sent["detail"][:300]}
 
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
@@ -4395,7 +4474,7 @@ def _send_per_donor(payload: OutlookSendRequest, request: Request) -> Dict[str, 
     try:
         cur = conn.cursor()
         rendered_list = [render_email_for_donor(cur, payload.allocation_id, donor_id, template_type, payload.company_id,
-                                                payload.subject_template, payload.body_template)
+                                                payload.subject_template, payload.body_template, payload.custom_variables)
                          for donor_id in dict.fromkeys(payload.allocation_donor_ids or [])]
     finally:
         conn.close()
@@ -5547,10 +5626,22 @@ DEFAULT_TEMPLATES_BY_CHARITY = {
         },
         {
             "template_type": "general_custom",
-            "subject": "Important Sponsorship Update from Rethink Charity",
+            "subject": "Thank You for Your Sponsorship Support | Rethink Charity",
             "body_html": _wrap_email_html_template(
-                "Important Sponsorship Update from Rethink Charity",
-                """<p style="margin: 0 0 12px 0;">{{Message_Body}}</p>""",
+                "Sponsorship Support Update & Thank You",
+                """<p style="margin: 0 0 12px 0;">Dear {First_Name},</p>
+<p style="margin: 0 0 12px 0;">Thank you for your generous contribution and ongoing support toward <strong>{beneficiary_name}</strong> ({project_code}).</p>
+<div style="background-color: #FAF5FF; border: 1px solid #E9D5FF; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
+  <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Supported Beneficiary:</strong> {beneficiary_name}</p>
+  <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Sponsorship Type:</strong> {sponsorship_type}</p>
+  <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Location:</strong> {location}</p>
+  <p style="margin: 0; font-size: 14px;"><strong>Project Code:</strong> <span style="font-family: monospace; font-weight: bold; color: #A051CF;">{project_code}</span></p>
+</div>
+<p style="margin: 14px 0 8px 0;">You can view and follow their ongoing progress below:</p>
+<p style="margin: 0 0 16px 0;">
+  <a href="{donor_folder_link}" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #A051CF; color: #FFFFFF; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 13.5px;">View Sponsorship Folder</a>
+</p>
+<p style="margin: 12px 0 0 0;">Your compassion brings hope and vital care to those who need it most. Thank you for making a real difference.</p>""",
                 "rethink"
             )
         }
@@ -6031,23 +6122,55 @@ def update_email_template(payload: TemplateUpdateRequest):
             builder = json.dumps(builder, separators=(",", ":"))
         if builder and len(builder) > 2_000_000:
             raise HTTPException(status_code=400, detail="This template is too large to save.")
-        # the first time a template is saved from the builder, keep its original HTML (legacy_html) to roll back to
-        cur.execute("""
-            INSERT INTO sponsorship_email_templates (company_id, template_type, subject, body_html, builder_json)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(company_id, template_type) DO UPDATE SET
-                legacy_html = COALESCE(sponsorship_email_templates.legacy_html,
-                                       CASE WHEN sponsorship_email_templates.builder_json IS NULL AND excluded.builder_json IS NOT NULL
-                                            THEN sponsorship_email_templates.body_html END),
-                subject = excluded.subject,
-                body_html = excluded.body_html,
-                builder_json = excluded.builder_json
-        """, (comp, payload.template_type.strip(), payload.subject.strip(), payload.body_html.strip(), builder))
-        conn.commit()
-        log_event("template.saved", category="template", company_id=_owner_company(comp), theme=comp,
-                  template=payload.template_type, subject=payload.subject,
-                  message=f"Template '{payload.template_type}' saved for {comp}")
-        return {"status": "success", "message": f"Email template '{payload.template_type}' saved successfully for charity '{comp}'."}
+        new_type = payload.template_type.strip()
+        orig_type = (payload.original_template_type or "").strip()
+
+        # If payload.id or original_template_type was provided, find existing row to update
+        target_id = payload.id
+        if not target_id and orig_type:
+            cur.execute("SELECT id FROM sponsorship_email_templates WHERE LOWER(company_id) = ? AND template_type = ?", (comp, orig_type))
+            found = cur.fetchone()
+            if found:
+                target_id = found[0]
+
+        if target_id:
+            # Check for conflict if renaming to another template's type in this charity
+            cur.execute("SELECT id FROM sponsorship_email_templates WHERE LOWER(company_id) = ? AND template_type = ? AND id != ?", (comp, new_type, target_id))
+            conflict = cur.fetchone()
+            if conflict:
+                raise HTTPException(status_code=400, detail=f"Another template named '{new_type}' already exists for this charity.")
+
+            cur.execute("""
+                UPDATE sponsorship_email_templates
+                SET template_type = ?,
+                    subject = ?,
+                    body_html = ?,
+                    builder_json = ?
+                WHERE id = ? AND LOWER(company_id) = ?
+            """, (new_type, payload.subject.strip(), payload.body_html.strip(), builder, target_id, comp))
+            conn.commit()
+            log_event("template.saved", category="template", company_id=_owner_company(comp), theme=comp,
+                      template=new_type, subject=payload.subject,
+                      message=f"Template {target_id} updated to '{new_type}' for {comp}")
+            return {"status": "success", "message": f"Email template '{new_type}' saved successfully for charity '{comp}'."}
+        else:
+            # the first time a template is saved from the builder, keep its original HTML (legacy_html) to roll back to
+            cur.execute("""
+                INSERT INTO sponsorship_email_templates (company_id, template_type, subject, body_html, builder_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(company_id, template_type) DO UPDATE SET
+                    legacy_html = COALESCE(sponsorship_email_templates.legacy_html,
+                                           CASE WHEN sponsorship_email_templates.builder_json IS NULL AND excluded.builder_json IS NOT NULL
+                                                THEN sponsorship_email_templates.body_html END),
+                    subject = excluded.subject,
+                    body_html = excluded.body_html,
+                    builder_json = excluded.builder_json
+            """, (comp, new_type, payload.subject.strip(), payload.body_html.strip(), builder))
+            conn.commit()
+            log_event("template.saved", category="template", company_id=_owner_company(comp), theme=comp,
+                      template=new_type, subject=payload.subject,
+                      message=f"Template '{new_type}' saved for {comp}")
+            return {"status": "success", "message": f"Email template '{new_type}' saved successfully for charity '{comp}'."}
     finally:
         conn.close()
 
@@ -7681,24 +7804,36 @@ def send_email_queue_items(payload: QueueActionRequest, request: Request):
     try:
         ph = ",".join("?" * len(payload.ids)) or "NULL"
         items = [dict(r) for r in conn.execute(
-            f"SELECT * FROM sponsorship_email_queue WHERE company_id = ? AND status = 'pending' AND id IN ({ph})",
+            f"""SELECT q.*, d.donor_name, d.donor_email, b.name AS beneficiary_name
+                FROM sponsorship_email_queue q
+                LEFT JOIN sponsorship_allocation_donors d ON d.id = q.allocation_donor_id
+                LEFT JOIN sponsorship_allocations a ON a.id = q.allocation_id
+                LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                WHERE q.company_id = ? AND q.status = 'pending' AND q.id IN ({ph})""",
             [comp, *payload.ids]).fetchall()]
     finally:
         conn.close()
     results = []
     for item in items:
+        to_email = (item.get("donor_email") or "").strip()
+        recipient_name = (item.get("donor_name") or "").strip()
         try:
             conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
             try:
                 rendered = render_email_for_donor(conn.cursor(), item["allocation_id"], item["allocation_donor_id"],
                                                   item["template_type"], payload.charity_theme)
+                conn.commit()
             finally:
                 conn.close()
             res = deliver_rendered_email(rendered, item["allocation_id"], base_url)
+            if not res.get("recipient_email"):
+                res["recipient_email"] = to_email
+            if not res.get("recipient_name"):
+                res["recipient_name"] = recipient_name
         except HTTPException as e:
-            res = {"status": "failed", "detail": e.detail}
+            res = {"status": "failed", "detail": e.detail, "recipient_email": to_email, "recipient_name": recipient_name}
         except Exception as e:
-            res = {"status": "failed", "detail": str(e)}
+            res = {"status": "failed", "detail": str(e), "recipient_email": to_email, "recipient_name": recipient_name}
         if res["status"] != "sent":
             conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
             try:
@@ -7708,10 +7843,22 @@ def send_email_queue_items(payload: QueueActionRequest, request: Request):
                 conn.commit()
             finally:
                 conn.close()
-        results.append({"queue_id": item["id"], **res})
+        results.append({
+            "queue_id": item["id"],
+            "recipient_email": res.get("recipient_email") or to_email,
+            "recipient_name": res.get("recipient_name") or recipient_name,
+            "beneficiary_name": item.get("beneficiary_name") or "",
+            **res
+        })
     sent = sum(1 for r in results if r["status"] == "sent")
+    sent_emails = [r["recipient_email"] for r in results if r["status"] == "sent" and r.get("recipient_email")]
+    sent_emails_str = f" to: {', '.join(sent_emails)}" if sent_emails else ""
     log_event("queue.sent", category="queue", company_id=comp, level="info" if sent == len(results) else "warning",
               requested=len(payload.ids), sent=sent, failed=len(results) - sent,
-              message=f"Queue send: {sent} of {len(results)} sent")
-    return {"status": "success" if results and sent == len(results) else ("partial" if sent else "failed"),
-            "message": f"Sent {sent} of {len(results)} queued email(s).", "results": results}
+              message=f"Queue send: {sent} of {len(results)} sent{sent_emails_str}")
+    return {
+        "status": "success" if results and sent == len(results) else ("partial" if sent else "failed"),
+        "message": f"Sent {sent} of {len(results)} queued email(s){sent_emails_str}.",
+        "sent_emails": sent_emails,
+        "results": results
+    }

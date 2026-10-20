@@ -24,6 +24,8 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [threadKey, setThreadKey] = useState(0);
+  const [customVariables, setCustomVariables] = useState({});
+  const [selectedAllocationId, setSelectedAllocationId] = useState(null);
   const lastField = useRef({ name: 'message', el: null });
 
   useEffect(() => { if (!theme && selected) setTheme(selected); }, [selected, theme]);
@@ -42,7 +44,10 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   }, [onClose]);
 
   const who = useMemo(() => ({ donor_id: recipient.donor_id || recipient.email, email: recipient.email, name: recipient.name || '' }), [recipient]);
-  const { preview, busy } = useLivePreview({ company, theme, templateType, subject, body, edited, messageBody, recipient: who });
+  const { preview, busy } = useLivePreview({
+    company, theme, templateType, subject, body, edited, messageBody,
+    recipient: who, customVariables, selectedAllocationId
+  });
 
   const insert = (text) => {
     const f = lastField.current;
@@ -54,7 +59,10 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
 
   const send = async () => {
     setError(''); setResult(null);
-    if (preview?.unresolved_placeholders?.length) { setError(`The template needs ${preview.unresolved_placeholders.join(', ')} for this person.`); return; }
+    if (preview?.unresolved_placeholders?.length) {
+      setError(`Please provide the missing variables (${preview.unresolved_placeholders.map(p => `{${p}}`).join(', ')}) above before sending.`);
+      return;
+    }
     if (!window.confirm(`Send this email to ${who.name || who.email}?`)) return;
     setSending(true);
     try {
@@ -62,6 +70,8 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
         company_id: company, theme, template_type: templateType, message_body: messageBody || null,
         subject_template: edited ? subject : null, body_template: edited ? body : null,
         recipients: [who], dry_run: false, kind: 'single',
+        custom_variables: customVariables,
+        selected_allocation_id: selectedAllocationId,
       });
       const r = d.results?.[0] || {};
       setResult(r);
@@ -125,7 +135,15 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
           {/* Live preview */}
           <div className="xl:col-span-5 flex flex-col gap-2 xl:overflow-y-auto">
             <div className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Live preview - exactly what {who.name ? who.name.split(' ')[0] : 'they'} will get</div>
-            <PreviewFrame preview={preview} busy={busy} height="62vh" />
+            <PreviewFrame
+              preview={preview}
+              busy={busy}
+              height="62vh"
+              customVariables={customVariables}
+              onCustomVariableChange={(k, v) => setCustomVariables(cv => ({ ...cv, [k]: v }))}
+              selectedAllocationId={selectedAllocationId}
+              onSelectAllocation={setSelectedAllocationId}
+            />
           </div>
 
           {/* Their thread */}
