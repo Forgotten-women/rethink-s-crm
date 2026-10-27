@@ -162,7 +162,7 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
     last = gifts.iloc[-1] if gifts is not None and len(gifts) else None
     money = lambda v: f"{float(_clean(v) or 0):,.2f}"  # noqa: E731
     v = {
-        "first_name": name.split(" ")[0], "donor_name": name, "email": recipient.get("email") or "",
+        "first_name": name.split(" ")[0], "last_name": _last_name(name), "donor_name": name, "email": recipient.get("email") or "",
         "recipient_email": recipient.get("email") or "",
         "total_given": money(row.get("total")), "gifts_count": str(int(row.get("gifts") or 0)),
         "average_gift": money(row.get("avg_gift")), "lifetime_tier": str(row.get("tier") or ""),
@@ -195,6 +195,8 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
                     pass
             v.update({
                 "beneficiary_name": a.get("beneficiary_name") or "",
+                "beneficiary_first_name": _first_name(a.get("beneficiary_name")),
+                "beneficiary_last_name": _last_name(a.get("beneficiary_name")),
                 "beneficiary_names": _join_names([al.get("beneficiary_name") or "" for al in allocs]),
                 "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
                 "location": a.get("b_location") or "", "project_code": a.get("b_code") or "",
@@ -208,7 +210,7 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
             })
             combined = _combined_sponsorship_vars(allocs)
             if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
-                combined = {k: combined[k] for k in ("beneficiary_names", "sponsorships_count", "sponsorships_list")}
+                combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list")}
             v.update(combined)
     return v
 
@@ -240,6 +242,18 @@ def donor_sponsorships(comp: str, email: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _first_name(name: Optional[str]) -> str:
+    """The beneficiary's first name ("Ahmed Ali Hassan" -> "Ahmed")."""
+    parts = str(name or "").split()
+    return parts[0] if parts else ""
+
+
+def _last_name(name: Optional[str]) -> str:
+    """Everything after the first name ("Ahmed Ali Hassan" -> "Ali Hassan"); empty for a single-word name."""
+    parts = str(name or "").split()
+    return " ".join(parts[1:])
+
+
 def _join_names(names: List[str]) -> str:
     names = [n for n in dict.fromkeys(n.strip() for n in names if n and n.strip())]
     return names[0] if len(names) == 1 else (", ".join(names[:-1]) + " and " + names[-1]) if names else ""
@@ -261,6 +275,9 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
     return {
         "beneficiary_name": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
         "beneficiary_names": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
+        "beneficiary_first_name": _join_names([_first_name(a.get("beneficiary_name")) for a in allocs]),
+        "beneficiary_first_names": _join_names([_first_name(a.get("beneficiary_name")) for a in allocs]),
+        "beneficiary_last_name": _join_names([_last_name(a.get("beneficiary_name")) for a in allocs]),
         "sponsorship_type": _join_names([a.get("b_type") or a.get("sponsorship_type") or "" for a in allocs]),
         "location": _join_names([a.get("b_location") or "" for a in allocs]),
         "sponsorships_count": str(len(allocs)),
@@ -302,6 +319,8 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
                     pass
             variables.update({
                 "beneficiary_name": sel_alloc.get("beneficiary_name") or "",
+                "beneficiary_first_name": _first_name(sel_alloc.get("beneficiary_name")),
+                "beneficiary_last_name": _last_name(sel_alloc.get("beneficiary_name")),
                 "sponsorship_type": sel_alloc.get("b_type") or sel_alloc.get("sponsorship_type") or "",
                 "location": sel_alloc.get("b_location") or "",
                 "project_code": sel_alloc.get("b_code") or "",
@@ -895,7 +914,7 @@ def email_activity(company_id: str = Query(...), direction: Optional[str] = Quer
     return {"items": rows[:limit]}
 
 
-SPONSORSHIP_PLACEHOLDERS = {"beneficiary_name", "beneficiary_names", "sponsorship_type", "location", "project_code", "profile_link",
+SPONSORSHIP_PLACEHOLDERS = {"beneficiary_name", "beneficiary_names", "beneficiary_first_name", "beneficiary_first_names", "beneficiary_last_name", "sponsorship_type", "location", "project_code", "profile_link",
                             "video_link", "report_link", "donor_folder_link", "folder_link", "renewal_deadline", "sponsorship_year",
                             "sponsorships_list", "sponsorships_count", "campaign_name", "community_name"}
 LINK_PLACEHOLDERS = {"profile_link", "video_link", "report_link", "donor_folder_link", "folder_link"}

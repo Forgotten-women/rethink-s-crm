@@ -11,12 +11,12 @@ export const LABEL = 'flex flex-col gap-1 text-[11px] font-bold uppercase tracki
 export const CARD = 'rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-900/60 p-3';
 
 export const VARIABLES = [
-  ['first_name', 'First name'], ['donor_name', 'Full name'], ['total_given', 'Lifetime given'], ['gifts_count', 'Number of gifts'],
+  ['first_name', 'First name'], ['last_name', 'Last name'], ['donor_name', 'Full name'], ['total_given', 'Lifetime given'], ['gifts_count', 'Number of gifts'],
   ['average_gift', 'Average gift'], ['lifetime_tier', 'LTV tier'], ['first_gift_date', 'First gift date'],
   ['last_gift_date', 'Last gift date'], ['last_gift_amount', 'Last gift amount'], ['last_gift_cause', 'Last gift cause'],
   ['top_cause', 'Top cause'], ['matching_total', 'Matching donations total'], ['matching_gifts_count', 'Matching donations'],
   ['matching_causes', 'Matching causes'], ['matching_sponsorships', 'Matching sponsorships'], ['sponsorship_types', 'Sponsorship types'],
-  ['beneficiary_name', 'Beneficiary (all, joined)'], ['sponsorships_list', 'List of all their sponsorships'],
+  ['beneficiary_name', 'Beneficiary (all, joined)'], ['beneficiary_first_name', 'Beneficiary first name'], ['beneficiary_last_name', 'Beneficiary last name'], ['sponsorships_list', 'List of all their sponsorships'],
   ['sponsorships_count', 'Number of sponsorships'], ['sponsorship_type', 'Sponsorship type'], ['location', 'Location'],
   ['profile_link', 'Profile link'], ['video_link', 'Video link'], ['renewal_deadline', 'Renewal date'],
   ['days_remaining', 'Days remaining'], ['message_body', 'Your message'],

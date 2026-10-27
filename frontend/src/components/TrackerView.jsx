@@ -679,9 +679,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
   const AVAILABLE_VARIABLES = [
     { tag: '{First_Name}', label: 'Recipient / Donor First Name', example: 'Sarah' },
+    { tag: '{last_name}', label: 'Recipient / Donor Last Name', example: 'Ahmed' },
     { tag: '{donor_name}', label: 'Recipient / Donor Full Name', example: 'Sarah Ahmed' },
     { tag: '{Email}', label: 'Recipient Email Address', example: 'sarah.ahmed@example.com' },
     { tag: '{beneficiary_name}', label: 'Beneficiary Name', example: 'Zayd Al-Mansoor' },
+    { tag: '{beneficiary_first_name}', label: 'Beneficiary First Name', example: 'Zayd' },
+    { tag: '{beneficiary_last_name}', label: 'Beneficiary Last Name', example: 'Al-Mansoor' },
     { tag: '{sponsorship_type}', label: 'Sponsorship Type', example: 'Orphan Sponsorship' },
     { tag: '{sponsorship_year}', label: 'Current Sponsorship Cycle / Year', example: 'Year 1' },
     { tag: '{renewal_deadline}', label: 'Renewal Deadline / End Date', example: '2027-09-21' },
@@ -6123,7 +6126,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             <span className="font-bold text-slate-900 dark:text-white">
                               {templateDraft.subject
                                 .replace(/{{First_Name}}|{First_Name}/gi, 'Sarah')
+                                .replace(/{{last_name}}|{last_name}/gi, 'Ahmed')
                                 .replace(/{{donor_name}}|{donor_name}/gi, 'Sarah Ahmed')
+                                .replace(/{{beneficiary_first_name}}|{beneficiary_first_name}/gi, 'Zayd')
+                                .replace(/{{beneficiary_last_name}}|{beneficiary_last_name}/gi, 'Al-Mansoor')
                                 .replace(/{{beneficiary_name}}|{beneficiary_name}/gi, 'Zayd Al-Mansoor')
                                 .replace(/{{sponsorship_type}}|{sponsorship_type}/gi, 'Orphan Sponsorship')
                                 .replace(/{{sponsorship_year}}|{sponsorship_year}/gi, 'Year 1')
@@ -6155,8 +6161,11 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         srcDoc={
                           (templateDraft.body_html || '')
                             .replace(/{{First_Name}}|{First_Name}/gi, 'Sarah')
+                            .replace(/{{last_name}}|{last_name}/gi, 'Ahmed')
                             .replace(/{{donor_name}}|{donor_name}/gi, 'Sarah Ahmed')
                             .replace(/{{Email}}|{Email}|{{recipient_email}}|{recipient_email}/gi, 'sarah.ahmed@example.com')
+                            .replace(/{{beneficiary_first_name}}|{beneficiary_first_name}/gi, 'Zayd')
+                            .replace(/{{beneficiary_last_name}}|{beneficiary_last_name}/gi, 'Al-Mansoor')
                             .replace(/{{beneficiary_name}}|{beneficiary_name}/gi, 'Zayd Al-Mansoor')
                             .replace(/{{sponsorship_type}}|{sponsorship_type}/gi, 'Orphan Sponsorship')
                             .replace(/{{sponsorship_year}}|{sponsorship_year}/gi, 'Year 1')
