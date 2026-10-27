@@ -104,7 +104,7 @@ def page_group_label(group: str, comp: str) -> str:
 
 
 def platform_label(platform: str) -> str:
-    known = {"launchgood": "LaunchGood", "givebright": "GiveBrite", "madinah": "Madinah"}
+    known = {"launchgood": "LaunchGood", "givebrite": "GiveBrite", "givebright": "GiveBrite", "madinah": "Madinah"}
     return known.get(platform, platform.title() if platform and platform != "*" else "Any platform")
 
 

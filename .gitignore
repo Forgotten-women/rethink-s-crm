@@ -24,6 +24,7 @@ node_modules/
 *.parquet
 *.parquet.tmp
 *.tmp
+config/launchgood_tokens_rethink.json
 *.md
 # Allow AES-256 Encrypted Parquet Backups & Metadata Manifest
 !*.parquet.enc

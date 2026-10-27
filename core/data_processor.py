@@ -213,7 +213,8 @@ def clean_campaign_url(value: Any) -> str:
 # Domains a platform's campaign links live on (platforms not listed accept any link)
 _PLATFORM_LINK_HOSTS = {
     "launchgood": ("launchgood.com",),
-    "givebright": ("givebrite.com", "iqracharity.org"),
+    "givebrite": ("givebrite.com", "iqracharity.org"),
+    "givebright": ("givebrite.com", "iqracharity.org"),  # old spelling
     "madinah": ("madinah.com",),
 }
 
@@ -1352,7 +1353,7 @@ def sync_donors_to_classification_matrix(df_raw=None, company_id: str = "rethink
 
         platforms_data = [
             ("launchgood", df[lg_mask]),
-            ("givebright", df[gb_mask]),
+            ("givebrite", df[gb_mask]),
             ("madinah", df[mad_mask]),
             ("paysuite", df[ps_mask]),
             ("website", df[ws_mask])
@@ -4389,7 +4390,7 @@ def ensure_database_indexes():
 
 
 def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"):
-    """Returns GiveBright classification matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for a company."""
+    """Returns GiveBrite classification matrix DataFrame with unique (Campaign Name, Giving Level, Code) granularity for a company."""
     ensure_classification_db()
     target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
     comp = str(company_id or "rethink").lower().strip()
@@ -4462,7 +4463,7 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
                 GROUP BY "Campaign Name", "Giving Level", "Code"
             """).df()
     except Exception as e:
-        print(f"[GiveBright DuckDB Notice]: {e}")
+        print(f"[GiveBrite DuckDB Notice]: {e}")
         donor_distinct = None
 
     if donor_distinct is None or donor_distinct.empty:

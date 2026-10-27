@@ -63,7 +63,12 @@ def _blank(v) -> bool:
     return v is None or str(v).strip().lower() in ("", "nan", "none", "n/a", "null")
 
 
+def _plat(platform: str) -> str:
+    return "givebrite" if platform == "givebright" else platform  # old spelling of GiveBrite
+
+
 def _catalogue(conn: sqlite3.Connection, platform: str, company_id: str) -> dict:
+    platform = _plat(platform)
     key = (platform, company_id)
     with _LOCK:
         hit = _CACHE.get(key)
@@ -100,6 +105,7 @@ def invalidate() -> None:
 
 def donation_refs(df: pd.DataFrame, platform: str, company_id: str, conn: sqlite3.Connection) -> Tuple[pd.Series, pd.Series]:
     """(campaign_ref, giving_level_ref) for every row; None where the campaign can't be identified."""
+    platform = _plat(platform)
     cat = _catalogue(conn, platform, company_id)
     col = lambda c: df[c] if c in df.columns else pd.Series([None] * len(df), index=df.index)
     url = col("Campaign URL").where(col("Campaign URL").notna(), col("campaign_url"))
@@ -180,6 +186,7 @@ def resolve_code_by_ref(cursor, platform: str, company_id: str, campaign_ref: Op
     """
     if not campaign_ref:
         return None, ""
+    platform = _plat(platform)
     try:
         rows = cursor.execute("""SELECT campaign_name, COALESCE(giving_level_ref, ''), code, COALESCE(is_primary, 0)
                                  FROM platform_campaign_mappings WHERE platform = ? AND company_id = ? AND campaign_ref = ?

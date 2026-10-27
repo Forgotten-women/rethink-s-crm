@@ -155,7 +155,7 @@ def resolve_classification(
 
     if not resolved_code and campaign_ref:
         from core.classification_ids import resolve_code_by_ref
-        resolved_code, tier_info_id = resolve_code_by_ref(cursor, "givebright", company_id, campaign_ref, c_name, g_level,
+        resolved_code, tier_info_id = resolve_code_by_ref(cursor, "givebrite", company_id, campaign_ref, c_name, g_level,
                                                           conn_for_catalogue=cursor.connection)
         if resolved_code:
             tier_info = tier_info_id
@@ -201,7 +201,7 @@ def resolve_classification(
                     cursor.execute("""
                         INSERT INTO platform_campaign_mappings (
                             company_id, platform, campaign_name, giving_level, code, campaign_url, campaign_ref, created_at, updated_at
-                        ) VALUES (?, 'givebright', ?, ?, 'Unassigned', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ) VALUES (?, 'givebrite', ?, ?, 'Unassigned', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """, (company_id, c_name, g_level, campaign_url or None, campaign_ref or None))
                     logger.info(f"Auto-registered new unmapped pair in CRM: Campaign='{c_name}' | Level='{g_level}'")
             except Exception as auto_reg_err:

@@ -474,7 +474,7 @@ def init_givebright_classification_db():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"GiveBright Classification DB init notice: {e}")
+        print(f"GiveBrite Classification DB init notice: {e}")
 
 def get_givebright_classification_matrix():
     """Returns the givebright_classifications matrix from live Parquet (source of truth) supplemented by SQLite."""
@@ -554,7 +554,7 @@ def get_givebright_classification_matrix():
     return matrix_df
 
 def save_givebright_classification_matrix(matrix_df):
-    """Saves edited GiveBright classification matrix into SQLite DB and re-enriches active GiveBright records."""
+    """Saves edited GiveBrite classification matrix into SQLite DB and re-enriches active GiveBrite records."""
     if matrix_df.empty:
         return 0
 
@@ -1019,7 +1019,7 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
         try:
             import_givebright_classifications_file(gb_csv_local)
         except Exception as e:
-            print(f"Auto seed GiveBright classification notice: {e}")
+            print(f"Auto seed GiveBrite classification notice: {e}")
 
     # 1. Parse Excel or CSV
     is_csv = False

@@ -7341,6 +7341,9 @@ def _consent_for_row(row: pd.Series) -> Optional[str]:
     if platform in ("givebright", "givebrite") and optin in ("true", "false"):
         return "Yes" if optin == "true" else "No"
     if platform == "madinah":
+        recorded = _clean(row.get("Marketing Consent")).lower()  # from Madinah's donor export ("Receive Email Updates")
+        if recorded in ("yes", "no"):
+            return recorded.capitalize()
         hidden = _clean(row.get("Anonymous or Public")).lower() == "anonymous" or not _clean(row.get("Email"))
         return "No" if hidden else "Yes (inferred)"
     mc = _clean(row.get("Marketing Consent")).lower()

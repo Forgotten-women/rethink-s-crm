@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Users, Search, ChevronLeft, ChevronRight, ArrowUp, ArrowDown, Gift, X, PlusCircle, Mail, Repeat, SlidersHorizontal } from 'lucide-react';
+import { Users, Search, ChevronLeft, ChevronRight, ArrowUp, ArrowDown, Gift, X, PlusCircle, Mail, Repeat, SlidersHorizontal, UserPlus } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 import SegmentBuilder, { cleanSegment } from './SegmentBuilder';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
+import AddDonorModal, { useAgents } from './AddDonorModal';
 
 const gbp = (v) => `£${Number(v || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const PLATFORMS = ['all', 'GiveBrite', 'LaunchGood', 'Madinah', 'Rethink Website', 'Paysuite', 'Offline / Manual'];
@@ -28,6 +29,9 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
   const [tier, setTier] = useState('all');
   const [recurring, setRecurring] = useState('all');
   const [sp, setSp] = useState('all');
+  const [sa, setSa] = useState('all');
+  const [agent, setAgent] = useState('all');
+  const [addingDonor, setAddingDonor] = useState(false);
   const [segment, setSegment] = useState({});
   const [showMore, setShowMore] = useState(false);
   const [sortBy, setSortBy] = useState('total');
@@ -49,7 +53,7 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
     return () => clearTimeout(t);
   }, [search]);
 
-  useEffect(() => { setPage(1); }, [platform, giftAid, source, tier, recurring, sp, segJson, sortBy, sortDir, pageSize, activeCompany]);
+  useEffect(() => { setPage(1); }, [platform, giftAid, source, tier, recurring, sp, sa, agent, segJson, sortBy, sortDir, pageSize, activeCompany]);
 
   useEffect(() => {
     const qs = new URLSearchParams({ company_id: activeCompany, sort_by: sortBy, sort_dir: sortDir, page: String(page), page_size: String(pageSize) });
@@ -60,6 +64,8 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
     if (tier !== 'all') qs.set('tier', tier);
     if (recurring !== 'all') qs.set('recurring', recurring);
     if (sp !== 'all') qs.set('sp', sp);
+    if (sa !== 'all') qs.set('sa', sa);
+    if (agent !== 'all') qs.set('agent', agent);
     if (segJson !== '{}') qs.set('segment', segJson);
     setLoading(true); setError('');
     const ctrl = new AbortController();
@@ -68,7 +74,15 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
       .then(j => { setData(j); setLoading(false); })
       .catch(e => { if (e.name !== 'AbortError') { setError(e.message); setLoading(false); } });
     return () => ctrl.abort();
-  }, [activeCompany, searchApplied, platform, giftAid, source, tier, recurring, sp, segJson, sortBy, sortDir, page, pageSize, refreshTick]);
+  }, [activeCompany, searchApplied, platform, giftAid, source, tier, recurring, sp, sa, agent, segJson, sortBy, sortDir, page, pageSize, refreshTick]);
+  const agents = useAgents(activeCompany, refreshTick);
+  // One "Donor type" control over the sp / sa filters: normal = neither SP nor SA
+  const donorType = sp === 'yes' ? 'sp' : (sa === 'yes' ? 'sa' : (sp === 'no' && sa === 'no' ? 'normal' : 'all'));
+  const setDonorType = (t) => {
+    setSp(t === 'sp' ? 'yes' : (t === 'normal' ? 'no' : 'all'));
+    setSa(t === 'sa' ? 'yes' : (t === 'normal' ? 'no' : 'all'));
+  };
+  const showSa = activeCompany === 'iqra' || (data?.summary?.sa_donors ?? 0) > 0;
 
   // Live refresh when new donations arrive (app-wide live update stream)
   useEffect(() => {
@@ -82,13 +96,14 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
     if (sortBy === key) setSortDir(d => (d === 'desc' ? 'asc' : 'desc'));
     else { setSortBy(key); setSortDir(key === 'name' ? 'asc' : 'desc'); }
   };
-  const filtersActive = searchApplied || platform !== 'all' || giftAid !== 'all' || source !== 'all' || tier !== 'all' || recurring !== 'all' || sp !== 'all' || segJson !== '{}';
-  const clearFilters = () => { setSearch(''); setSearchApplied(''); setPlatform('all'); setGiftAid('all'); setSource('all'); setTier('all'); setRecurring('all'); setSp('all'); setSegment({}); };
+  const filtersActive = searchApplied || platform !== 'all' || giftAid !== 'all' || source !== 'all' || tier !== 'all' || recurring !== 'all' || sp !== 'all' || sa !== 'all' || agent !== 'all' || segJson !== '{}';
+  const clearFilters = () => { setSearch(''); setSearchApplied(''); setPlatform('all'); setGiftAid('all'); setSource('all'); setTier('all'); setRecurring('all'); setSp('all'); setSa('all'); setAgent('all'); setSegment({}); };
   // Everything on screen as one segment (for emailing exactly these donors)
   const fullSegment = () => cleanSegment({
     ...segment, search: searchApplied || segment.search, platforms: platform !== 'all' ? [platform] : segment.platforms,
     gift_aid: giftAid !== 'all' ? giftAid : segment.gift_aid, manual: source === 'manual' ? 'yes' : (source === 'platform' ? 'no' : segment.manual),
     tiers: tier !== 'all' ? [tier] : segment.tiers, recurring: recurring !== 'all' ? recurring : segment.recurring, sp: sp !== 'all' ? sp : segment.sp,
+    sa: sa !== 'all' ? sa : segment.sa, agents: agent !== 'all' ? [agent] : segment.agents,
   });
   const s = data?.summary || {};
   const inputStyle = { backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' };
@@ -118,6 +133,11 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
         </div>
         <div className="flex gap-2">
           {canEdit && (
+            <button type="button" onClick={() => setAddingDonor(true)} className="px-3 py-2 text-xs rounded-lg font-bold bg-sky-600 hover:bg-sky-500 text-white flex items-center gap-1.5">
+              <UserPlus className="w-4 h-4" /> Add donor
+            </button>
+          )}
+          {canEdit && (
             <button type="button" onClick={() => setAdding(true)} className="px-3 py-2 text-xs rounded-lg font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5">
               <PlusCircle className="w-4 h-4" /> Add donation
             </button>
@@ -126,7 +146,7 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
       </div>
       {notice && <div className="text-xs rounded-lg px-3 py-2 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/25 flex justify-between">{notice}<button type="button" onClick={() => setNotice('')}><X className="w-3.5 h-3.5" /></button></div>}
 
-      <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3">
+      <div className={`grid grid-cols-2 md:grid-cols-4 ${showSa ? 'xl:grid-cols-8' : 'xl:grid-cols-7'} gap-3`}>
         {[
           ['Donors', (s.donors ?? 0).toLocaleString()],
           ['Total given', gbp(s.total_raised)],
@@ -134,6 +154,7 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
           ['Average gift', gbp(s.average_gift)],
           ['Recurring donors', (s.recurring_donors ?? 0).toLocaleString()],
           ['SP donors', (s.sp_donors ?? 0).toLocaleString()],
+          ...(showSa ? [['SA donors', (s.sa_donors ?? 0).toLocaleString()]] : []),
           ['Gift Aid donors', (s.gift_aid_donors ?? 0).toLocaleString()],
         ].map(([label, value]) => (
           <div key={label} className="glass-panel p-3">
@@ -180,12 +201,15 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
           {sel('donor-tier', tier, setTier, [['all', 'Any tier'], ...TIERS.map(t => [t, t])])}</label>
         <label className="flex flex-col gap-0.5"><span className="text-[10px] font-semibold" style={{ color: 'var(--text-sub)' }}>Recurring</span>
           {sel('donor-recurring', recurring, setRecurring, [['all', 'Any'], ['yes', 'Recurring donors'], ['no', 'One-off only']])}</label>
-        <label className="flex flex-col gap-0.5"><span className="text-[10px] font-semibold" style={{ color: 'var(--text-sub)' }}>SP (Sisters' Project)</span>
-          {sel('donor-sp', sp, setSp, [['all', 'Everyone'], ['yes', 'SP donors'], ['no', 'Non-SP donors']])}</label>
+        <label className="flex flex-col gap-0.5"><span className="text-[10px] font-semibold" style={{ color: 'var(--text-sub)' }}>Donor type</span>
+          {sel('donor-type', donorType, setDonorType, [['all', 'All types'], ['normal', 'Normal donors'], ['sp', "SP donors (Sisters' Project)"],
+            ...(showSa ? [['sa', 'SA donors']] : [])])}</label>
+        <label className="flex flex-col gap-0.5"><span className="text-[10px] font-semibold" style={{ color: 'var(--text-sub)' }}>Agent</span>
+          {sel('donor-agent', agent, setAgent, [['all', 'All agents'], ['none', 'No agent'], ...agents.map(a => [a.name, `${a.name} (${a.donors})`])])}</label>
         <label className="flex flex-col gap-0.5"><span className="text-[10px] font-semibold" style={{ color: 'var(--text-sub)' }}>Gift Aid</span>
           {sel('donor-giftaid', giftAid, setGiftAid, [['all', 'Any'], ['yes', 'Has Gift Aid'], ['no', 'No Gift Aid']])}</label>
         <label className="flex flex-col gap-0.5"><span className="text-[10px] font-semibold" style={{ color: 'var(--text-sub)' }}>Source</span>
-          {sel('donor-source', source, setSource, [['all', 'Everyone'], ['platform', 'Platform donations'], ['manual', 'Added in Sponsorship Tracker']])}</label>
+          {sel('donor-source', source, setSource, [['all', 'Everyone'], ['platform', 'Platform donations'], ['manual', 'Added in Sponsorship Tracker'], ['manual_donor', 'Added as a donor (no donations)']])}</label>
         <button type="button" onClick={() => setShowMore(v => !v)} className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg flex items-center gap-1 border ${showMore || segJson !== '{}' ? 'text-cyan-600 border-cyan-500/40' : ''}`} style={showMore || segJson !== '{}' ? undefined : { borderColor: 'var(--border-glass)', color: 'var(--text-sub)' }}>
           <SlidersHorizontal className="w-3.5 h-3.5" /> More filters{segJson !== '{}' ? ` (${Object.keys(cleanSegment(segment)).length})` : ''}
         </button>
@@ -229,7 +253,9 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
                     <div className="font-bold flex items-center gap-1.5" style={{ color: 'var(--text-main)' }}>
                       {d.name || 'Unnamed donor'}
                       {d.sp && <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-pink-500/15 text-pink-700 dark:text-pink-300 font-bold" title="Gave through a Sisters' Project page">SP</span>}
+                      {d.sa && <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300 font-bold" title="SA donor">SA</span>}
                     </div>
+                    {d.agent && <div className="text-[10px] font-semibold text-sky-600 dark:text-sky-400" title="Agent">Agent: {d.agent}</div>}
                     <div className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>{d.donor_id}</div>
                   </td>
                   <td className="px-3 py-2">
@@ -275,6 +301,7 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
           </div>
         )}
       </div>
+      {addingDonor && <AddDonorModal company={activeCompany} onClose={() => setAddingDonor(false)} onCreated={(d) => { setNotice(d.linked_to_existing ? `This email already belongs to a donor - agent / group added to ${d.donor_id}.` : `Donor added (${d.donor_id}).`); setRefreshTick(t => t + 1); }} />}
       {adding && <AddDonationModal company={activeCompany} onClose={() => setAdding(false)} onCreated={(d) => { setNotice(`Donation ${d.donation_id} added (£${d.net.toFixed(2)}, ${d.code}).`); setRefreshTick(t => t + 1); }} />}
     </div>
   );

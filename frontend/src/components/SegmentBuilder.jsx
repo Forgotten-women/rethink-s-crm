@@ -134,7 +134,7 @@ const LABELS = {
   fundraisers: 'Fundraiser', giving_levels: 'Giving level', page_url: 'Page link', page_type: 'Link type',
   has_phone: 'Has phone number', sponsorship_statuses: 'Sponsorship status', sponsored_types: 'Sponsors', tiers: 'Tier', min_total: 'Lifetime ≥ £',
   max_total: 'Lifetime ≤ £', min_gifts: 'Gifts ≥', max_gifts: 'Gifts ≤', min_avg: 'Avg gift ≥ £', max_avg: 'Avg gift ≤ £',
-  recurring: 'Recurring donor', sp: 'SP donor', min_allocations: 'Sponsorships ≥', has_email: 'Has email',
+  recurring: 'Recurring donor', sp: 'SP donor', sa: 'SA donor', agents: 'Agent', min_allocations: 'Sponsorships ≥', has_email: 'Has email',
   marketing_consent: 'Marketing consent', countries: 'Country', city: 'City has', first_gift_from: 'First gift from',
   first_gift_to: 'First gift to', last_gift_from: 'Last gift from', last_gift_to: 'Last gift to', manual: 'Added manually',
   search: 'Search',
@@ -243,7 +243,18 @@ export default function SegmentBuilder({ company, value = {}, onChange, defaultO
               <Field label="Average gift ≥ £">{num('min_avg')}</Field>
               <Field label="Average gift ≤ £">{num('max_avg')}</Field>
               <Field label="Recurring donor">{yn('recurring')}</Field>
-              <Field label="SP donor">{yn('sp')}</Field>
+              <Field label="Donor type">
+                <select value={value.sp === 'yes' ? 'sp' : value.sa === 'yes' ? 'sa' : (value.sp === 'no' && value.sa === 'no') ? 'normal' : ''}
+                  onChange={e => { const t = e.target.value; onChange({ ...value, sp: t === 'sp' ? 'yes' : t === 'normal' ? 'no' : undefined, sa: t === 'sa' ? 'yes' : t === 'normal' ? 'no' : undefined }); }}
+                  className="w-full px-2 py-1.5 text-xs rounded-lg" style={inputStyle}>
+                  <option value="">Any</option><option value="normal">Normal donors</option><option value="sp">SP donors</option>
+                  {(opts?.has_sa || value.sa) && <option value="sa">SA donors</option>}
+                </select>
+              </Field>
+              {(opts?.agents?.length > 0 || value.agents?.length > 0) && (
+                <MultiSelect label="Agent" options={[{ value: 'none', sub: 'donors without an agent' }, ...(opts?.agents || []).map(a => ({ value: a.value, count: a.count }))]}
+                  value={value.agents || []} onChange={v => set('agents', v)} />
+              )}
               <Field label="Sponsorships ≥">{num('min_allocations')}</Field>
               <Field label="Has email">{yn('has_email')}</Field>
               <Field label="Has phone number">{yn('has_phone')}</Field>

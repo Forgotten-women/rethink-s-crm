@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { X, PlusCircle, HeartHandshake, Info } from 'lucide-react';
+import { X, PlusCircle, HeartHandshake, Info, Search } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 
 /** Who may add / edit donor records: super admins and accounts with "Edit donors" (the server checks this too). */
@@ -65,6 +65,24 @@ export default function AddDonationModal({ company, donor, defaults = {}, onClos
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  // Choosing an existing donor (incl. one added without donations): the gift is attached to exactly that donor
+  const [donorId, setDonorId] = useState(donor?.donor_id || '');
+  const [q, setQ] = useState('');
+  const [hits, setHits] = useState([]);
+  useEffect(() => {
+    if (donor || q.trim().length < 2) { setHits([]); return undefined; }
+    const t = setTimeout(() => {
+      fetch(`${API_BASE_URL}/api/donors/directory?company_id=${encodeURIComponent(company)}&search=${encodeURIComponent(q.trim())}&page_size=8&sort_by=name&sort_dir=asc`)
+        .then(r => (r.ok ? r.json() : { donors: [] })).then(d => setHits(d.donors || [])).catch(() => setHits([]));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [q, company, donor]);
+  const pick = (d) => {
+    const parts = (d.name || '').trim().split(' ');
+    setF(p => ({ ...p, first_name: parts[0] || '', last_name: parts.slice(1).join(' '), email: d.email || '', phone: d.phone || '',
+      city: d.city || '', country: d.country || '' }));
+    setDonorId(d.donor_id); setQ(''); setHits([]);
+  };
   const match = useMemo(() => codes.find(c => c.code.toUpperCase() === String(f.code).trim().toUpperCase()), [codes, f.code]);
   const sType = sponsorshipTypeFor(f.code, f.campaign_name, f.giving_level);
 
@@ -82,7 +100,7 @@ export default function AddDonationModal({ company, donor, defaults = {}, onClos
     if (f.code && !match) { setError(`'${f.code}' isn't one of this charity's project codes.`); return; }
     setSaving(true);
     try {
-      const body = { ...f, company_id: company, amount: Number(f.amount), fee: Number(f.fee || 0),
+      const body = { ...f, company_id: company, donor_id: donorId || null, amount: Number(f.amount), fee: Number(f.fee || 0),
         settled_amount_gbp: f.currency === 'GBP' ? null : Number(f.settled_amount_gbp), code: f.code.trim().toUpperCase() };
       const res = await fetch(`${API_BASE_URL}/api/donors/donations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const data = await res.json().catch(() => ({}));
@@ -108,6 +126,26 @@ export default function AddDonationModal({ company, donor, defaults = {}, onClos
         <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-5">
           <section className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="sm:col-span-2 text-xs font-black uppercase tracking-wider" style={{ color: 'var(--text-main)' }}>Donor</div>
+            {!donor && (
+              <div className="sm:col-span-2 flex flex-col gap-1 relative">
+                <span className="text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Find the donor (name, email or phone) - or type a new donor's details below</span>
+                <span className="relative">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input value={q} onChange={e => setQ(e.target.value)} placeholder="Start typing…" className="w-full pl-8 pr-2.5 py-2 text-sm rounded-lg" style={inputStyle} />
+                </span>
+                {hits.length > 0 && (
+                  <div className="absolute top-full left-0 right-0 mt-1 z-10 rounded-lg border shadow-lg overflow-hidden" style={{ backgroundColor: 'var(--bg-card, var(--bg-main))', borderColor: 'var(--border-glass)' }}>
+                    {hits.map(d => (
+                      <button key={d.donor_id} type="button" onClick={() => pick(d)} className="w-full text-left px-3 py-2 text-xs hover:bg-emerald-500/10 border-b last:border-0" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}>
+                        <b>{d.name || d.email || d.donor_id}</b>{d.sa ? ' · SA' : ''}{d.agent ? ` · ${d.agent}` : ''}
+                        <span className="block" style={{ color: 'var(--text-muted)' }}>{[d.email, d.phone].filter(Boolean).join(' · ') || d.donor_id} · {d.gifts} gift{d.gifts === 1 ? '' : 's'}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {donorId && <span className="text-[11px] text-emerald-600 dark:text-emerald-400">Adding to donor {donorId} <button type="button" className="underline ml-1" onClick={() => setDonorId('')}>use a different donor</button></span>}
+              </div>
+            )}
             <Field label="First name">{input('first_name')}</Field>
             <Field label="Last name">{input('last_name')}</Field>
             <Field label="Email">{input('email', { type: 'email', placeholder: 'Links the gift to the donor' })}</Field>

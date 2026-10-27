@@ -3,6 +3,7 @@ import { X, User, Mail, Phone, MapPin, Calendar, PieChart, ShieldCheck, Search, 
 import { API_BASE_URL } from '../config';
 import DonationDetailModal from './DonationDetailModal';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
+import { AgentInput, useAgents } from './AddDonorModal';
 import SingleEmailComposer from './email/SingleEmailComposer';
 import EmailThread from './email/EmailThread';
 import { Pencil, PlusCircle, Send, StickyNote, Trash2 } from 'lucide-react';
@@ -46,6 +47,7 @@ const COLUMNS = [
 
 export default function DonorDrawer({ donorId, onClose, activeCompany }) {
   const [profile, setProfile] = useState(null);
+  const agents = useAgents(activeCompany);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [records, setRecords] = useState([]);
@@ -139,15 +141,29 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
     setEditError('');
     setEditing({ first_name: clean(profile?.first_name) || parts[0] || '', last_name: clean(profile?.last_name) || parts.slice(1).join(' '),
       email: clean(profile?.email), phone: clean(profile?.phone), address: clean(profile?.billing_address), city: clean(profile?.billing_city),
-      postcode: clean(profile?.billing_postcode), country: clean(profile?.billing_country), marketing_consent: clean(profile?.marketing_consent), notes: '' });
+      postcode: clean(profile?.billing_postcode), country: clean(profile?.billing_country), marketing_consent: clean(profile?.marketing_consent), notes: '',
+      agent: profile?.agent || '', sa: String(profile?.donor_group || '').toUpperCase().includes('SA'), interests: profile?.interests || '' });
   };
   const saveEdit = async () => {
     setSaving(true); setEditError('');
     try {
-      const res = await fetch(`${API_BASE_URL}/api/donors/update-donor`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ company_id: activeCompany, donor_id: profile?.donor_id || resolvedDonorId, fields: editing }) });
-      const d = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(d.detail || `Error ${res.status}`);
+      const { agent, sa, interests, ...contact } = editing;
+      const post = async (path, body) => {
+        const res = await fetch(`${API_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(d.detail || `Error ${res.status}`);
+        return d;
+      };
+      const did = profile?.donor_id || resolvedDonorId;
+      if (profile?.manual_donor) {  // no donations to update: everything lives on the donor profile
+        await post('/api/donors/profile', { company_id: activeCompany, donor_id: did, agent, donor_group: sa ? 'SA' : '', interests,
+          first_name: contact.first_name, last_name: contact.last_name, email: contact.email, phone: contact.phone, city: contact.city, country: contact.country });
+      } else {
+        await post('/api/donors/update-donor', { company_id: activeCompany, donor_id: did, fields: contact });
+        if (agent !== (profile?.agent || '') || sa !== String(profile?.donor_group || '').toUpperCase().includes('SA') || interests !== (profile?.interests || '')) {
+          await post('/api/donors/profile', { company_id: activeCompany, donor_id: did, agent, donor_group: sa ? 'SA' : '', interests });
+        }
+      }
       setEditing(null); setReloadTick(t => t + 1);
     } catch (e) { setEditError(e.message); } finally { setSaving(false); }
   };
@@ -231,6 +247,17 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
                       <option value="">Unknown</option><option value="yes">Yes</option><option value="no">No</option>
                     </select>
                   </label>
+                  <label className="flex flex-col gap-1 text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Agent
+                    <AgentInput value={editing.agent || ''} onChange={v => setEditing(e => ({ ...e, agent: v }))} agents={agents} id="drawer-agent" />
+                  </label>
+                  <label className="flex flex-col gap-1 text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Donor group
+                    <span className="flex items-center gap-2 text-sm font-normal py-1.5" style={{ color: 'var(--text-main)' }}>
+                      <input type="checkbox" checked={!!editing.sa} onChange={e => setEditing(v => ({ ...v, sa: e.target.checked }))} /> SA donor
+                    </span>
+                  </label>
+                  <label className="col-span-2 flex flex-col gap-1 text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Interested in (projects)
+                    <input value={editing.interests || ''} onChange={e => setEditing(v => ({ ...v, interests: e.target.value }))} className="px-2 py-1.5 text-sm rounded-lg font-normal" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }} />
+                  </label>
                   <label className="col-span-2 md:col-span-4 flex flex-col gap-1 text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Notes <span className="font-normal" style={{ color: 'var(--text-muted)' }}>(added to their notes with your name and today's date)</span>
                     <textarea value={editing.notes || ''} onChange={e => setEditing(v => ({ ...v, notes: e.target.value }))} rows={3} placeholder="e.g. Prefers WhatsApp; called 16 Oct about Hafiz renewal"
                       className="px-2 py-1.5 text-sm rounded-lg font-normal" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', border: '1px solid var(--input-border)' }} />
@@ -253,6 +280,8 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
                 ['Giving pattern', clean(profile?.payment_frequency) || '—', clean(profile?.payment_type) || ''],
                 ['Gift Aid', clean(profile?.gift_aid) || '—', `Tax receipt: ${clean(profile?.tax_receipt_requested) || '—'}`],
                 ['Marketing consent', clean(profile?.marketing_consent) || '—', `Shown as: ${clean(profile?.anonymous_public) || '—'}`],
+                ...(profile?.agent || profile?.donor_group || profile?.interests ? [['Agent', profile?.agent || '—',
+                  [profile?.donor_group ? `${profile.donor_group} donor` : '', profile?.interests ? `Interested in: ${profile.interests}` : ''].filter(Boolean).join(' · ')]] : []),
               ].map(([label, value, sub]) => (
                 <div key={label} className="glass-panel p-3 min-w-0">
                   <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--text-sub)' }}>{label}</div>

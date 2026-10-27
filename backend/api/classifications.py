@@ -732,7 +732,7 @@ def get_launchgood_matrix(company_id: Optional[str] = Query("rethink")):
 @router.get("/givebrite")
 @cached(scopes=["donations", "classification"], ttl=86400)
 def get_givebright_matrix(company_id: Optional[str] = Query("rethink")):
-    """Returns GiveBright/GiveBrite classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
+    """Returns GiveBrite classification matrix rules with (Campaign Name, Giving Level, Code) granularity."""
     comp = (company_id or "rethink").strip().lower()
     df = _clean_matrix_df(get_givebright_classification_matrix(company_id=comp))
     return _compute_matrix_summary(df, comp, "GiveBrite")

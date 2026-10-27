@@ -250,7 +250,7 @@ def upload_raw_data_file(
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Bulk uploads a raw donation dataset (.csv, .xlsx, .xls) for LaunchGood, GiveBright, Paysuite, or Rethink Website."""
+    """Bulk uploads a raw donation dataset (.csv, .xlsx, .xls) for LaunchGood, GiveBrite, Paysuite, or Rethink Website."""
     role = current_user.get("role", user_role)
     if role not in ["super_admin", "admin", "data_editor"]:
         raise HTTPException(
