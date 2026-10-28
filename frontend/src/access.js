@@ -64,7 +64,6 @@ const SCOPED_TABS = ['explorer', 'donors', 'fundraisers'];
 
 export function canSeeTab(user, tabId, company) {
   if (tabId === 'access') return canSomewhere(user, 'users.view');
-  if (tabId === 'activity') return canSomewhere(user, 'logs.view');
   if (recordScope(user, company, 'fundraiser') && !SCOPED_TABS.includes(tabId)) return false;
   const perms = TAB_PERMISSIONS[tabId];
   return !perms || canAny(user, perms, company);

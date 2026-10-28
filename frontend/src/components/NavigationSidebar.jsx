@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail, KeyRound, ScrollText } from 'lucide-react';
+import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail, KeyRound } from 'lucide-react';
 import { canSeeTab } from '../access';
 import { API_BASE_URL } from '../config';
 import { useUnsubscribeAlerts, UnsubscribeToast } from './email/unsubscribeAlerts';
@@ -26,7 +26,6 @@ const tabs = [
   { id: 'expenses', label: 'Expenses', icon: CreditCard },
   { id: 'admin', label: 'Admin & Data', icon: Database },
   { id: 'access', label: 'Users & Access', icon: KeyRound },
-  { id: 'activity', label: 'Activity log', icon: ScrollText },
 ];
 
 export default function NavigationSidebar({ 

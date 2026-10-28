@@ -145,7 +145,6 @@ export default function App() {
 
   // Auto-collapse sidebar after 3 seconds of switching tab
   const handleSetActiveTab = (tabId) => {
-    if (tabId === 'activity') { setOpsOpen('logs'); return; }  // the activity log opens in the ops console
     setActiveTab(tabId);
     setTimeout(() => {
       setSidebarCollapsed(true);
@@ -349,8 +348,10 @@ export default function App() {
   const [opsOpen, setOpsOpen] = useState(false); // false | 'status' | 'logs' | 'sessions' | 'cache'
   const [opsHealth, setOpsHealth] = useState(null);
   const isSuperAdmin = user?.role === 'super_admin';
+  // Ctrl+Alt+O (or #ops): the full console for super admins; the activity log for people a super admin gave log access
+  const canOpenLogs = isSuperAdmin || canSomewhere(user, 'logs.view');
   useEffect(() => {
-    if (!isSuperAdmin) return undefined;
+    if (!canOpenLogs) return undefined;
     const SEQUENCE = ['arrowup', 'arrowup', 'arrowdown', 'arrowdown', 'arrowleft', 'arrowright', 'arrowleft', 'arrowright', 'b', 'a'];
     let pos = 0;
     let last = 0;
@@ -379,7 +380,7 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     window.addEventListener('hashchange', fromHash);
     return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('hashchange', fromHash); };
-  }, [isSuperAdmin]);
+  }, [canOpenLogs]);
   useEffect(() => {
     if (!isSuperAdmin) return undefined;
     const check = () => fetch(`${API_BASE_URL}/api/ops/status`).then(r => (r.ok ? r.json() : null)).then(d => setOpsHealth(d?.overall || null)).catch(() => {});

@@ -387,7 +387,10 @@ function LogsTab({ logsOnly = false, companies = [] }) {
             {/* who did what: one employee's actions */}
             <select value={filters.actor} onChange={e => set('actor', e.target.value)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 text-xs">
               <option value="all">All employees</option>
-              {(data.actors || []).map(a => <option key={a} value={a}>{a}</option>)}
+              {/* current accounts only; old names / failed sign-in attempts are still found with the search box */}
+              {(data.actors || []).filter(a => a.current).map(a => (
+                <option key={a.actor} value={a.actor}>{a.name ? `${a.name} (${a.actor})` : a.actor}</option>
+              ))}
             </select>
             <input value={filters.search} onChange={e => set('search', e.target.value)} placeholder="Search message, email, event…"
               className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 placeholder:text-slate-400 w-56 text-xs" />

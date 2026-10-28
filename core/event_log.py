@@ -245,9 +245,16 @@ def query_local(category: Optional[str] = None, level: Optional[str] = None, com
             f"WHERE {clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", params + [limit, offset]).fetchall()
         cats = [r[0] for r in conn.execute("SELECT DISTINCT category FROM app_event_logs ORDER BY category")]
         # everyone who appears in the log (within what the viewer may see), for the "employee" filter
-        actors = [r[0] for r in conn.execute(
+        logged = [r[0] for r in conn.execute(
             f"SELECT actor, COUNT(*) n FROM app_event_logs WHERE {' AND '.join(base_where)} AND COALESCE(actor, '') != '' "
-            f"GROUP BY actor ORDER BY n DESC LIMIT 200", base_params)]
+            f"GROUP BY actor ORDER BY n DESC LIMIT 300", base_params)]
+        # current accounts by name first; anything else (removed accounts, failed sign-in names) marked as former
+        try:
+            people = {str(e).lower(): (n or u) for e, u, n in conn.execute("SELECT email, username, display_name FROM users")}
+        except sqlite3.OperationalError:
+            people = {}
+        actors = sorted(({"actor": a, "name": people.get(a.lower(), ""), "current": a.lower() in people} for a in logged),
+                        key=lambda x: (not x["current"], (x["name"] or x["actor"]).lower()))
     finally:
         conn.close()
     items = []
