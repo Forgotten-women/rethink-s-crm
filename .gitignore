@@ -68,3 +68,6 @@ data_cache/backups/
 *_token.json
 .givebrite*token*.json
 .madinah*token*.json
+
+# Server-held key for the LaunchGood session bookmarklet (backend/api/ops.py) - secret
+data_cache/.sync_helper_key
