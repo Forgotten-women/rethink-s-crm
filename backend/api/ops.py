@@ -30,7 +30,10 @@ async def _ops_access(request: Request) -> Dict[str, Any]:
     if user.get("role") == "super_admin":
         return user
     endpoint = request.scope.get("endpoint")
-    if getattr(endpoint, "__name__", "") == "ops_logs" and companies_with(user, "logs.view"):
+    name = getattr(endpoint, "__name__", "")
+    if name == "ops_logs" and companies_with(user, "logs.view"):
+        return user
+    if name == "ops_status" and companies_with(user, "status.view"):
         return user
     raise HTTPException(status_code=403, detail="This operation is restricted to Super Admin accounts.")
 
@@ -534,11 +537,22 @@ def _outlook_status() -> List[Dict[str, Any]]:
         conn.close()
 
 
+# which charity each platform integration belongs to (for people who only see their own charities' status)
+PLATFORM_COMPANY = {"givebrite_iqra": "iqra", "givebrite_rethink": "rethink", "madinah": "iqra", "paysuite": "rethink",
+                    "stripe_rethink": "rethink", "launchgood_rethink": "rethink", "launchgood_iqra": "iqra"}
+
+
 @router.get("/status")
-def ops_status(live: bool = Query(False)):
+def ops_status(request: Request, live: bool = Query(False)):
     health = _read_json(HEALTH_FILE)
     sync = _read_json(SYNC_FILE)
-    platforms = [_platform_status(p, health, live) for p in ("givebrite_iqra", "givebrite_rethink", "madinah", "paysuite", "stripe_rethink", "launchgood_rethink", "launchgood_iqra")]
+    user = getattr(request.state, "api_user", None) or {}
+    visible = None  # None = every charity (super admin)
+    if user.get("role") != "super_admin":
+        from core.rbac import companies_with
+        visible = companies_with(user, "status.view") or set()
+    names = [p for p in PLATFORM_COMPANY if visible is None or PLATFORM_COMPANY[p] in visible]
+    platforms = [_platform_status(p, health, live) for p in names]
     services = [_service_state("platform-sync.service")]
     for s in services:
         if s["active"] != "active":
@@ -555,7 +569,7 @@ def ops_status(live: bool = Query(False)):
         "platforms": platforms,
         "services": services,
         "sync_heartbeat": (sync.get("meta") or {}).get("last_synced_at"),
-        "outlook": _outlook_status(),
+        "outlook": [o for o in _outlook_status() if visible is None or str(o.get("company_id") or "").lower() in visible],
         "logging": {**shipping_status(), "errors_last_24h": errors_24h},
         "backup": _backup_status(),
     }

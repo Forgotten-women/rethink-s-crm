@@ -788,7 +788,10 @@ function CacheTab() {
 }
 
 /** Hidden operations console (super admins). Opened with Ctrl+Alt+O or URL hash #ops */
-export default function OpsConsole({ onClose, initialTab = 'status', logsOnly = false, companies = [] }) {
+export default function OpsConsole({ onClose, initialTab = 'status', allowedTabs = null, companies = [] }) {
+  // allowedTabs: null = super admin (everything); otherwise what a super admin granted (status and/or logs),
+  // each filtered to the person's own charities by the server
+  const logsOnly = allowedTabs !== null;
   const [tab, setTab] = useState(['status', 'logs', 'sessions', 'cache'].includes(initialTab) ? initialTab : 'status');
   useEffect(() => {
     if (['status', 'logs', 'sessions', 'cache'].includes(initialTab)) setTab(initialTab);
@@ -799,7 +802,10 @@ export default function OpsConsole({ onClose, initialTab = 'status', logsOnly = 
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
   // people given the activity log (not super admins) see only the log, for their charities (server-filtered)
-  const tabs = logsOnly ? [['logs', ScrollText, 'Activity log']] : [
+  const tabs = logsOnly ? [
+    ...(allowedTabs.includes('status') ? [['status', Activity, 'Service status']] : []),
+    ...(allowedTabs.includes('logs') ? [['logs', ScrollText, 'Activity log']] : []),
+  ] : [
     ['status', Activity, 'Status'],
     ['logs', ScrollText, 'Logs'],
     ['sessions', KeyRound, 'Sessions'],
@@ -814,7 +820,7 @@ export default function OpsConsole({ onClose, initialTab = 'status', logsOnly = 
         {/* Solid opaque sticky header — completely blocks background bleed-through when scrolling */}
         <div className="sticky top-0 z-30 px-5 py-3.5 bg-slate-50 dark:bg-slate-950 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shadow-xs">
           <div className="flex items-center gap-3">
-            <span className="font-bold text-sm text-slate-900 dark:text-slate-100">{logsOnly ? 'Activity log' : 'Ops console'}</span>
+            <span className="font-bold text-sm text-slate-900 dark:text-slate-100">{logsOnly ? 'Status & activity' : 'Ops console'}</span>
             <div className="flex bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700/60">
               {tabs.map(([id, Icon, label]) => (
                 <button
@@ -842,8 +848,8 @@ export default function OpsConsole({ onClose, initialTab = 'status', logsOnly = 
           </button>
         </div>
         <div className="p-5">
-          {tab === 'status' && !logsOnly && <StatusTab />}
-          {(tab === 'logs' || logsOnly) && <LogsTab logsOnly={logsOnly} companies={companies} />}
+          {tab === 'status' && (!logsOnly || allowedTabs.includes('status')) && <StatusTab />}
+          {tab === 'logs' && (!logsOnly || allowedTabs.includes('logs')) && <LogsTab logsOnly={logsOnly} companies={companies} />}
           {tab === 'sessions' && !logsOnly && <SessionsTab />}
           {tab === 'cache' && !logsOnly && <CacheTab />}
         </div>

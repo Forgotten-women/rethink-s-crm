@@ -178,8 +178,7 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
       if (next.has(p) && !inherited.has(p)) o[p] = 'grant';
       if (!next.has(p) && inherited.has(p)) o[p] = 'deny';
     });
-    const keepLogs = (overrides[comp] || {})['logs.view'];
-    if (keepLogs) o['logs.view'] = keepLogs;
+    ['logs.view', 'status.view'].forEach(p => { const keep = (overrides[comp] || {})[p]; if (keep) o[p] = keep; });
     setOverrides(prev => ({ ...prev, [comp]: o }));
   };
 
@@ -299,7 +298,7 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
                     </div>
                     {editing === comp && !hidden && (
                       <div className="flex flex-col gap-3">
-                        <PermissionGrid catalogue={catalogue.filter(r => r.key !== 'logs')} perms={out} base={base} onChange={next => setGridPerms(comp, next)} />
+                        <PermissionGrid catalogue={catalogue.filter(r => !['logs', 'status'].includes(r.key))} perms={out} base={base} onChange={next => setGridPerms(comp, next)} />
                         {comp !== ALL && (
                           <div className="rounded-xl border p-3 flex flex-col gap-2" style={{ borderColor: 'var(--border-glass)' }}>
                             <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>Limit to specific fundraisers (optional)</div>
@@ -342,22 +341,25 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
             </div>
             {actorSuper && (
               <div className="rounded-xl border p-3 flex flex-col gap-2 border-amber-400/40 bg-amber-500/5">
-                <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>Activity log (who did what) - only a super admin can change this</div>
-                <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Lets this person open the Activity log for the charities ticked here (only where they also have access).</div>
-                <div className="flex flex-wrap gap-3">
-                  {charityIds.map(comp => {
-                    const on = (overrides[comp] || {})['logs.view'] === 'grant';
-                    return (
-                      <label key={comp} className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-main)' }}>
-                        <input type="checkbox" checked={on} onChange={() => setOverrides(o => {
-                          const m = { ...(o[comp] || {}) };
-                          if (on) delete m['logs.view']; else m['logs.view'] = 'grant';
-                          return { ...o, [comp]: m };
-                        })} /> {charityName(comp)}
-                      </label>
-                    );
-                  })}
-                </div>
+                <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>Ops console (Ctrl+Alt+O) - only a super admin can change this</div>
+                <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>For the charities ticked (and only where the person also has access).</div>
+                {[['logs.view', 'Activity log (who did what)'], ['status.view', 'Service status (integrations, mailboxes, sync, backups)']].map(([perm, label]) => (
+                  <div key={perm} className="flex flex-wrap items-center gap-3">
+                    <span className="text-xs font-semibold min-w-[260px]" style={{ color: 'var(--text-main)' }}>{label}</span>
+                    {charityIds.map(comp => {
+                      const on = (overrides[comp] || {})[perm] === 'grant';
+                      return (
+                        <label key={comp} className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-main)' }}>
+                          <input type="checkbox" checked={on} onChange={() => setOverrides(o => {
+                            const m = { ...(o[comp] || {}) };
+                            if (on) delete m[perm]; else m[perm] = 'grant';
+                            return { ...o, [comp]: m };
+                          })} /> {charityName(comp)}
+                        </label>
+                      );
+                    })}
+                  </div>
+                ))}
               </div>
             )}
             {!isSelf && <div className="flex justify-end"><Btn disabled={busy} onClick={saveAccess}><Save className="w-3.5 h-3.5" /> Save access</Btn></div>}
@@ -395,7 +397,7 @@ function PresetEditor({ preset, catalogue, onClose, onSaved, superAdmin }) {
           <label className="flex flex-col gap-1"><span className="text-[11px] font-semibold" style={{ color: 'var(--text-sub)' }}>Description</span>
             <input value={description} onChange={e => setDescription(e.target.value)} className="px-2.5 py-2 text-sm rounded-lg" style={inputStyle} /></label>
         </div>
-        <PermissionGrid catalogue={superAdmin ? catalogue : catalogue.filter(r => r.key !== 'logs')} perms={perms} onChange={setPerms} />
+        <PermissionGrid catalogue={superAdmin ? catalogue : catalogue.filter(r => !['logs', 'status'].includes(r.key))} perms={perms} onChange={setPerms} />
       </div>
     </Modal>
   );

@@ -349,7 +349,8 @@ export default function App() {
   const [opsHealth, setOpsHealth] = useState(null);
   const isSuperAdmin = user?.role === 'super_admin';
   // Ctrl+Alt+O (or #ops): the full console for super admins; the activity log for people a super admin gave log access
-  const canOpenLogs = isSuperAdmin || canSomewhere(user, 'logs.view');
+  const opsTabs = isSuperAdmin ? null : [...(canSomewhere(user, 'status.view') ? ['status'] : []), ...(canSomewhere(user, 'logs.view') ? ['logs'] : [])];
+  const canOpenLogs = isSuperAdmin || opsTabs.length > 0;
   useEffect(() => {
     if (!canOpenLogs) return undefined;
     const SEQUENCE = ['arrowup', 'arrowup', 'arrowdown', 'arrowdown', 'arrowleft', 'arrowright', 'arrowleft', 'arrowright', 'b', 'a'];
@@ -661,9 +662,9 @@ export default function App() {
         <button type="button" onClick={() => setOpsOpen('status')} title="A platform integration is not working - open the ops console"
           className="fixed bottom-3 right-3 z-[70] w-3 h-3 rounded-full bg-rose-500 animate-pulse shadow" aria-label="Integration problem" />
       )}
-      {(isSuperAdmin || canSomewhere(user, 'logs.view')) && opsOpen && (
+      {canOpenLogs && opsOpen && (
         <Suspense fallback={null}>
-          <OpsConsole initialTab={isSuperAdmin ? opsOpen : 'logs'} logsOnly={!isSuperAdmin} companies={companies} onClose={() => {
+          <OpsConsole initialTab={isSuperAdmin ? opsOpen : opsTabs[0]} allowedTabs={opsTabs} companies={companies} onClose={() => {
             setOpsOpen(false);
             if ((window.location.hash || '').startsWith('#ops')) window.history.replaceState(null, '', window.location.pathname + window.location.search);
           }} />

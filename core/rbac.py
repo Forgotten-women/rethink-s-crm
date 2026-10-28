@@ -79,6 +79,8 @@ CATALOGUE: List[Dict[str, Any]] = [
      "actions": [("edit", "Edit charity settings and logos", EXTRA)]},
     {"key": "logs", "label": "Activity log", "description": "Who did what (Ops console log view). Only a super admin can give this.",
      "actions": [("view", "See the activity log of their charities", EXTRA)]},
+    {"key": "status", "label": "Service status", "description": "Platform integrations, mailboxes, sync service, backups (Ops console). Only a super admin can give this.",
+     "actions": [("view", "See the service status of their charities", EXTRA)]},
     {"key": "users", "label": "Users & access", "description": "People, presets and access levels",
      "actions": [("view", "View users and their access", READ),
                  ("manage", "Create users, assign presets and overrides", EXTRA),
@@ -86,7 +88,7 @@ CATALOGUE: List[Dict[str, Any]] = [
 ]
 
 # Only a super admin may grant (or take away) these - in presets or for a person.
-SUPER_ONLY_PERMISSIONS = {"logs.view"}
+SUPER_ONLY_PERMISSIONS = {"logs.view", "status.view"}
 
 ALL_PERMISSIONS: List[str] = [f"{r['key']}.{a[0]}" for r in CATALOGUE for a in r["actions"]]
 _PERMISSION_SET = set(ALL_PERMISSIONS)
@@ -104,7 +106,7 @@ def _level(*resources: str, level: str = READ) -> List[str]:
     return [p for p in ALL_PERMISSIONS if p.split(".")[0] in resources and ACTION_LEVEL[p] in want]
 
 
-_ALL_RESOURCES = [r["key"] for r in CATALOGUE if r["key"] not in ("users", "charities", "logs")]
+_ALL_RESOURCES = [r["key"] for r in CATALOGUE if r["key"] not in ("users", "charities", "logs", "status")]
 
 # System presets (seeded once; editable afterwards - edits are kept).
 SYSTEM_PRESETS: List[Dict[str, Any]] = [

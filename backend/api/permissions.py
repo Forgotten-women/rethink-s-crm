@@ -287,7 +287,7 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "webhooks.get_givebrite_webhook_logs": SUPER,
     "webhooks.trigger_givebrite_live_sync": SUPER,
     "webhooks.trigger_givebrite_backfill": SUPER,
-    "ops.ops_status": SUPER,
+    "ops.ops_status": "status.view",                # filtered to the viewer's charities (backend/api/ops.py)
     "ops.ops_logs": "logs.view",                    # filtered to the viewer's charities (backend/api/ops.py)
     "ops.list_sessions": SUPER,
     "ops.upload_session": SUPER,
