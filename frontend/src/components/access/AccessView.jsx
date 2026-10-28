@@ -151,6 +151,7 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
   });
   const [editing, setEditing] = useState(null); // charity whose permissions are open
   const [scopeOptions, setScopeOptions] = useState({});
+  const [scopeSearch, setScopeSearch] = useState({}); // charity -> search text for the fundraiser picker
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
 
@@ -303,8 +304,25 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
                           <div className="rounded-xl border p-3 flex flex-col gap-2" style={{ borderColor: 'var(--border-glass)' }}>
                             <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>Limit to specific fundraisers (optional)</div>
                             <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>When any are picked, this person only sees those fundraisers in {charityName(comp)}.</div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <input type="search" value={scopeSearch[comp] || ''} placeholder="Search fundraisers…"
+                                onChange={e => setScopeSearch(q => ({ ...q, [comp]: e.target.value }))}
+                                className="px-2.5 py-1.5 text-xs rounded-lg w-64" style={inputStyle} />
+                              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                                {(scopes[comp] || []).length} picked
+                                {(scopes[comp] || []).length > 0 && (
+                                  <button type="button" className="ml-2 underline" onClick={() => setScopes(s => ({ ...s, [comp]: [] }))}>clear</button>
+                                )}
+                              </span>
+                            </div>
                             <div className="flex flex-wrap gap-1.5 max-h-48 overflow-y-auto">
-                              {(scopeOptions[comp] || []).map(o => {
+                              {(scopeOptions[comp] || [])
+                                .filter(o => {
+                                  const q = (scopeSearch[comp] || '').trim().toLowerCase();
+                                  return !q || (o.label || '').toLowerCase().includes(q) || (scopes[comp] || []).includes(o.id);
+                                })
+                                .sort((a, b) => Number((scopes[comp] || []).includes(b.id)) - Number((scopes[comp] || []).includes(a.id)))  // picked first
+                                .map(o => {
                                 const on = (scopes[comp] || []).includes(o.id);
                                 return (
                                   <button key={o.id} type="button" onClick={() => setScopes(s => ({ ...s, [comp]: on ? (s[comp] || []).filter(x => x !== o.id) : [...(s[comp] || []), o.id] }))}
