@@ -29,6 +29,7 @@ import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target
 
 import { API_BASE_URL } from './config';
 import { accessibleCompanies, canSeeTab, canSomewhere } from './access';
+import { readRoute, writeRoute } from './routes';
 
 
 const INITIAL_FILTERS = {
@@ -57,8 +58,9 @@ const DEFAULT_COMPANIES_FALLBACK = [
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [activeTab, setActiveTab] = useState('overview');
-  const [selectedDonor, setSelectedDonor] = useState(null);
+  // page, charity and open donor come from the address first (/rethink/donors?donor=...), see routes.js
+  const [activeTab, setActiveTab] = useState(() => readRoute().tab || 'overview');
+  const [selectedDonor, setSelectedDonor] = useState(() => readRoute().donor);
   const [metrics, setMetrics] = useState(null);
   const [filters, setFilters] = useState(INITIAL_FILTERS);
   
@@ -75,9 +77,27 @@ export default function App() {
   });
 
   const [activeCompany, setActiveCompany] = useState(() => {
+    const fromUrl = readRoute().company;
+    if (fromUrl) return fromUrl;  // checked against the person's access once signed in (effect below)
     const saved = localStorage.getItem('crm_active_company') || 'rethink';
     return saved === 'sp' ? 'rethink' : saved;
   });
+
+  // Address <-> state: keep the URL in step, and restore page / charity / donor on back / forward.
+  useEffect(() => {
+    if (!user) return;
+    writeRoute(activeCompany, activeTab, selectedDonor);
+  }, [user, activeCompany, activeTab, selectedDonor]);
+  useEffect(() => {
+    const onPop = () => {
+      const r = readRoute();
+      if (r.company) { setActiveCompany(r.company); try { localStorage.setItem('crm_active_company', r.company); } catch { /* ignore */ } }
+      setActiveTab(r.tab || 'overview');
+      setSelectedDonor(r.donor);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
   const [accentColor, setAccentColor] = useState(() => {
     return localStorage.getItem('crm_accent') || 'cyan';
