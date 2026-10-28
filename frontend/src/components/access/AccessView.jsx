@@ -347,14 +347,33 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
                   <div key={perm} className="flex flex-wrap items-center gap-3">
                     <span className="text-xs font-semibold min-w-[260px]" style={{ color: 'var(--text-main)' }}>{label}</span>
                     {charityIds.map(comp => {
-                      const on = (overrides[comp] || {})[perm] === 'grant';
+                      // "All charities" includes every charity: those boxes show as ticked and greyed out.
+                      // Unticking one charity while "All" is on turns "All" off and ticks the others one by one.
+                      const allOn = (overrides[ALL] || {})[perm] === 'grant';
+                      const own = (overrides[comp] || {})[perm] === 'grant';
+                      const on = comp === ALL ? allOn : (allOn || own);
+                      const toggle = () => setOverrides(o => {
+                        const next = { ...o };
+                        const setGrant = (c, value) => {
+                          const m = { ...(next[c] || {}) };
+                          if (value) m[perm] = 'grant'; else delete m[perm];
+                          next[c] = m;
+                        };
+                        if (comp === ALL) {
+                          setGrant(ALL, !allOn);
+                          if (!allOn) charityIds.filter(c => c !== ALL).forEach(c => setGrant(c, false)); // covered by All
+                        } else if (allOn) {
+                          setGrant(ALL, false);
+                          charityIds.filter(c => c !== ALL).forEach(c => setGrant(c, c !== comp));
+                        } else {
+                          setGrant(comp, !own);
+                        }
+                        return next;
+                      });
                       return (
-                        <label key={comp} className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-main)' }}>
-                          <input type="checkbox" checked={on} onChange={() => setOverrides(o => {
-                            const m = { ...(o[comp] || {}) };
-                            if (on) delete m[perm]; else m[perm] = 'grant';
-                            return { ...o, [comp]: m };
-                          })} /> {charityName(comp)}
+                        <label key={comp} className={`flex items-center gap-1.5 text-xs ${comp !== ALL && allOn ? 'opacity-60' : ''}`} style={{ color: 'var(--text-main)' }}
+                          title={comp !== ALL && allOn ? 'Included by "All charities" - untick to leave this charity out' : undefined}>
+                          <input type="checkbox" checked={on} onChange={toggle} /> {charityName(comp)}
                         </label>
                       );
                     })}
