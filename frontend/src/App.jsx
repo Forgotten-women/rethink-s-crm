@@ -83,6 +83,30 @@ export default function App() {
     return saved === 'sp' ? 'rethink' : saved;
   });
 
+  // Browser tab: the selected charity's logo as the icon and "<page> · <charity>" as the title.
+  useEffect(() => {
+    const PAGE_TITLES = {
+      overview: 'Dashboard', kanban: 'Kanban', ltv: 'Lifetime LTV', explorer: 'Data Explorer', donors: 'Donors',
+      email: 'Email', fundraisers: 'Fundraisers', payouts: 'Payouts', tracker: 'Sponsorship Tracker',
+      classifications: 'Classifications', expenses: 'Expenses', admin: 'Admin & Data', access: 'Users & Access',
+    };
+    const comp = companies.find(c => c.id === activeCompany);
+    const charity = activeCompany === 'all' ? 'All charities' : (comp?.name || 'CRM');
+    document.title = user ? `${PAGE_TITLES[activeTab] || 'CRM'} · ${charity}` : `${charity} CRM`;
+    const raw = activeCompany !== 'all' ? comp?.logo_url : '';
+    let href = '/favicon.svg';
+    if (raw) {
+      const base = (API_BASE_URL || '').replace(/\/+$/, '');
+      href = /^(https?:|data:)/.test(raw) ? raw : `${base}${raw.startsWith('/') ? raw : `/${raw}`}`;
+    }
+    let link = document.querySelector("link[rel~='icon']");
+    if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link); }
+    if (link.getAttribute('href') !== href) {
+      link.removeAttribute('type');  // a charity logo may be PNG / JPEG, not SVG
+      link.href = href;
+    }
+  }, [user, activeCompany, activeTab, companies]);
+
   // Address <-> state: keep the URL in step, and restore page / charity / donor on back / forward.
   useEffect(() => {
     if (!user) return;
