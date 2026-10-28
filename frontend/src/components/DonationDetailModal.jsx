@@ -147,7 +147,8 @@ export default function DonationDetailModal({ donationId, companyId, initial, on
   const status = pick(d, 'Status');
   const name = [pick(d, 'First Name'), pick(d, 'Last Name')].filter(Boolean).join(' ') || pick(d, 'Billing Name', 'Display Name', 'Email') || 'Unnamed donor';
   const isManualEntry = String(d.Source || '') === 'Manual Entry';
-  const canEdit = canEditRecords() && companyId && companyId !== 'all' && !manual && data && !error;
+  const canEdit = canEditRecords(null, 'explorer.edit', companyId) && companyId && companyId !== 'all' && !manual && data && !error;
+  const canDelete = canEditRecords(null, 'donors.delete', companyId) && companyId && companyId !== 'all' && !manual && data && !error;
   const startEdit = () => {
     const f = {};
     [...EDIT_FIELDS, ...(isManualEntry ? AMOUNT_FIELDS : []), ['Code', 'Code']].forEach(([k]) => { f[k] = d[k] ?? ''; });
@@ -208,7 +209,7 @@ export default function DonationDetailModal({ donationId, companyId, initial, on
         <div className="relative px-6 pt-5 pb-4 bg-gradient-to-br from-cyan-500/15 via-sky-500/5 to-transparent border-b" style={{ borderColor: 'var(--border-glass)' }}>
           <div className="absolute top-4 right-4 flex items-center gap-2">
             {canEdit && !editing && <button type="button" onClick={startEdit} className="px-2.5 py-1.5 text-xs rounded-lg font-semibold border flex items-center gap-1" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}><Pencil className="w-3.5 h-3.5" /> Edit</button>}
-            {canEdit && isManualEntry && !editing && <button type="button" onClick={deleteManual} className="px-2.5 py-1.5 text-xs rounded-lg font-semibold text-rose-600 border border-rose-500/30 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> Delete</button>}
+            {canDelete && isManualEntry && !editing && <button type="button" onClick={deleteManual} className="px-2.5 py-1.5 text-xs rounded-lg font-semibold text-rose-600 border border-rose-500/30 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> Delete</button>}
             <button type="button" onClick={onClose} aria-label="Close donation details"
               className="w-8 h-8 rounded-full flex items-center justify-center hover:bg-black/10" style={{ color: 'var(--text-sub)' }}>
               <X className="w-4 h-4" />

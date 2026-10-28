@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Table, Search, Download, ChevronLeft, ChevronRight, ChevronDown, Edit3, UserCheck, Eye, Columns, CheckSquare, Square, Save, ArrowUpDown, ArrowUp, ArrowDown, X, Check, AlertCircle, Layers, Filter, SlidersHorizontal, Globe, Receipt, Plus } from 'lucide-react';
 import { API_BASE_URL, downloadFile } from '../config';
+import { can } from '../access';
 import DonationDetailModal from './DonationDetailModal';
 import AddDonationModal from './AddDonationModal';
 import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
@@ -311,7 +312,7 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
   const [bulkSaving, setBulkSaving] = useState(false);
   const [bulkMessage, setBulkMessage] = useState('');
 
-  const canEdit = (user?.role === 'super_admin' || user?.can_edit_donors === 1) && activeCompany !== 'all';
+  const canEdit = can(user, 'explorer.edit', activeCompany) && activeCompany !== 'all';
 
   const getAuthHeaders = (extra = {}) => {
     const token = localStorage.getItem('analytics_token');
@@ -889,7 +890,8 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
             </button>
           )}
           {/* Export Dropdown Group */}
-          <div className="relative inline-block text-left">
+          {can(user, 'explorer.export', activeCompany) && (
+<div className="relative inline-block text-left">
             <div className="flex items-center bg-slate-900/90 border border-emerald-500/30 p-1 rounded-xl shadow-lg">
               <button 
                 onClick={() => handleExportDonors('xlsx', false)}
@@ -969,6 +971,7 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
               </div>
             )}
           </div>
+)}
 
           <select
             value={preset}
@@ -989,7 +992,7 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
             <Columns className="w-3.5 h-3.5" /> 📐 Choose Visible Columns ({selectedColumns.length})
           </button>
 
-          {(user?.role === 'super_admin' || user?.can_edit_donors === 1) && (
+          {can(user, 'explorer.bulk_edit', activeCompany) && (
             <button 
               onClick={() => setShowBulkEdit(!showBulkEdit)}
               className="btn-secondary text-xs flex items-center gap-1.5 text-purple-400 border-purple-500/30 hover:bg-purple-500/10"

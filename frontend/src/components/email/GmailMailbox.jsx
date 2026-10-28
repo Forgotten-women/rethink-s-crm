@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, ExternalLink, Mail, RefreshCw, Send, Unplug, XCircle } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
+import { can } from '../../access';
 import { FIELD, LABEL, post } from './emailUi';
 import { localTime } from './EmailThread';
 
@@ -14,7 +15,7 @@ export default function GmailMailbox({ company, user }) {
   const [testTo, setTestTo] = useState('office@rethinkcharity.org.uk');
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState(null);
-  const isSuper = user?.role === 'super_admin';
+  const isSuper = can(user, 'mailbox.configure', company); // name kept: gates connect / disconnect
   const load = () => fetch(`${API_BASE_URL}/api/mailbox/status?company_id=${encodeURIComponent(company)}`)
     .then(r => (r.ok ? r.json() : null)).then(setSt).catch(() => setSt(null));
   useEffect(() => { load(); }, [company]); // eslint-disable-line react-hooks/exhaustive-deps

@@ -87,7 +87,7 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
   });
   const filteredSettled = donations.reduce((a, d) => a + (Number(d.settled_amount) || 0), 0);
   const visibleDonations = showAllDonations || filtersOn ? donations : donations.slice(0, 10);
-  const canEdit = canEditRecords() && companyId && companyId !== 'all';
+  const canEdit = canEditRecords(null, 'donors.create', companyId) && companyId && companyId !== 'all';
   const primaryEmail = data?.contact?.emails?.[0] || '';
   const focusType = sponsorshipType && sponsorshipType !== 'All' ? sponsorshipType : null;
   const giving = (data?.giving || []).slice().sort((a, b) => (a.sponsorship_type === focusType ? -1 : b.sponsorship_type === focusType ? 1 : 0));

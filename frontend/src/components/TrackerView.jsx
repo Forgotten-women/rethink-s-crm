@@ -13,6 +13,7 @@ import {
 import EmailBuilder, { caretProps } from './email/builder/EmailBuilder';
 import { blankDoc, htmlToDoc, newBlock, renderDoc, signatureBlocks } from './email/builder/emailDoc';
 import { API_BASE_URL } from '../config';
+import { can } from '../access';
 import AllocationDonorsEditor from './tracker/AllocationDonorsEditor';
 import SponsorshipDonorPanel from './tracker/SponsorshipDonorPanel';
 import EmailDispatcherModal from './tracker/EmailDispatcherModal';
@@ -157,6 +158,12 @@ const unsubscribeFooterPreview = (charity) => `<div style="max-width:600px;margi
 
 export default function TrackerView({ user, filters, onSelectDonor, activeCompany = 'rethink', companies = [], embeddedTab = null, onOpenEmail }) {
   const isConsolidated = activeCompany === 'all';
+  // RBAC (access.js): what this person may change here; the server checks every action again.
+  const allowed = (perm) => {
+    if (can(user, perm, activeCompany)) return true;
+    window.alert("Your access doesn't include this action. Ask an admin if you need it.");
+    return false;
+  };
   
   // Navigation Tabs: 'beneficiaries' | 'allocations' | 'alerts' | 'analytics' | 'outlook' | 'templates'
   const [activeTabState, setActiveTab] = useState('beneficiaries');
@@ -680,6 +687,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const AVAILABLE_VARIABLES = [
     { tag: '{First_Name}', label: 'Recipient / Donor First Name', example: 'Sarah' },
     { tag: '{last_name}', label: 'Recipient / Donor Last Name', example: 'Ahmed' },
+    { tag: '{donor_first_name}', label: 'Donor First Name', example: 'Sarah' },
+    { tag: '{donor_last_name}', label: 'Donor Last Name', example: 'Ahmed' },
     { tag: '{donor_name}', label: 'Recipient / Donor Full Name', example: 'Sarah Ahmed' },
     { tag: '{Email}', label: 'Recipient Email Address', example: 'sarah.ahmed@example.com' },
     { tag: '{beneficiary_name}', label: 'Beneficiary Name', example: 'Zayd Al-Mansoor' },
@@ -989,6 +998,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleConfirmDismissal = () => {
+    if (!allowed('tracker.edit')) { return; }
     if (!dismissModalData.item) return;
     setDismissing(true);
     const finalReason = dismissModalData.reason === 'Other' 
@@ -1023,6 +1033,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleRestoreDismissal = (item) => {
+    if (!allowed('tracker.edit')) { return; }
     if (!window.confirm(`Restore "${item.entity_name || item.entity_id}" back to active overdue alerts?`)) return;
     fetch(`${API_BASE_URL}/api/tracker/overdue-undismiss`, {
       method: 'POST',
@@ -1045,6 +1056,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleSendOverdueDigest = (dryRun = false) => {
+    if (!allowed('email.send')) { return; }
     setSendingDigest(true);
     setDigestFeedback(null);
     fetch(`${API_BASE_URL}/api/tracker/send-overdue-digest`, {
@@ -1083,6 +1095,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleSaveAlertSettings = (e) => {
+    if (!allowed('tracker.settings')) { if (e?.preventDefault) e.preventDefault(); return; }
     if (e) e.preventDefault();
     setSavingAlertSettings(true);
     fetch(`${API_BASE_URL}/api/tracker/overdue-settings`, {
@@ -1366,6 +1379,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleDeleteBeneficiary = (id, name) => {
+    if (!allowed('tracker.delete')) { return; }
     if (!window.confirm(`Are you sure you want to delete beneficiary "${name}"? This will also remove associated allocations.`)) return;
 
     fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/beneficiaries/${id}`), { 
@@ -1448,6 +1462,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleDeleteManualDonor = async (donor) => {
+    if (!allowed('tracker.delete')) { return; }
     if (!window.confirm(`Are you sure you want to delete manual donor "${donor.donor_name}"?`)) {
       return;
     }
@@ -1467,6 +1482,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleClassifyDonor = async (donor, newClassification) => {
+    if (!allowed('tracker.edit')) { return; }
     try {
       const comp = activeCompany === 'all' ? (newClassification.startsWith('Iqra') ? 'iqra' : 'rethink') : activeCompany;
       const res = await fetch(`${API_BASE_URL}/api/tracker/donors/classify`, {
@@ -1496,6 +1512,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleClassifyCampaign = async (campaign, newClassification) => {
+    if (!allowed('tracker.edit')) { return; }
     try {
       const comp = activeCompany === 'all' ? (newClassification.startsWith('Iqra') ? 'iqra' : 'rethink') : activeCompany;
       const res = await fetch(`${API_BASE_URL}/api/tracker/campaigns/classify`, {
@@ -1554,6 +1571,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleConfirmAllocation = () => {
+    if (!allowed('tracker.edit')) { return; }
     if (!allocateModalBeneficiary) return;
 
     const draftPayload = allocDonorsDraft.map(d => ({
@@ -1663,6 +1681,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleDeallocate = (allocId, bName) => {
+    if (!allowed('tracker.delete')) { return; }
     if (!window.confirm(`Release beneficiary "${bName}" from this donor allocation?`)) return;
 
     fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/allocations/${allocId}`), { 
@@ -1694,6 +1713,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleAddFeedback = (e) => {
+    if (!allowed('tracker.edit')) { if (e?.preventDefault) e.preventDefault(); return; }
     e.preventDefault();
     if (!feedbackForm.feedback_title || !timelineBeneficiary) return;
 
@@ -1727,6 +1747,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleDeleteFeedback = (fbId) => {
+    if (!allowed('tracker.delete')) { return; }
     if (!window.confirm('Delete this feedback report?')) return;
     fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/feedbacks/${fbId}`), { 
       method: 'DELETE',
@@ -1745,6 +1766,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // SPONSORSHIP RENEWAL & DATES ACTIONS
   // -------------------------------------------------------------
   const handleRenewAllocation = (allocId) => {
+    if (!allowed('tracker.edit')) { return; }
     if (!window.confirm('Renew this sponsorship allocation for +1 Year (+365 days)?')) return;
     setRenewingAllocationId(allocId);
 
@@ -1770,6 +1792,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleSaveDates = (e) => {
+    if (!allowed('tracker.edit')) { if (e?.preventDefault) e.preventDefault(); return; }
     e.preventDefault();
     if (!editingDatesAllocation) return;
 
@@ -1805,6 +1828,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleSaveContact = async (e) => {
+    if (!allowed('tracker.edit')) { if (e?.preventDefault) e.preventDefault(); return; }
     e.preventDefault();
     if (!editingContactAllocation) return;
     if (!contactForm.donor_email.trim() && !contactForm.donor_phone.trim()) {
@@ -1874,6 +1898,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // EMAIL TEMPLATE MANAGEMENT ACTIONS
   // -------------------------------------------------------------
   const handleSaveTemplate = (e) => {
+    if (!allowed('email.templates')) { if (e?.preventDefault) e.preventDefault(); return; }
     if (e) e.preventDefault();
     const cleanType = (templateDraft.template_type || '').trim();
     if (!cleanType) {
@@ -1916,6 +1941,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleResetDefaultTemplates = () => {
+    if (!allowed('email.templates')) { return; }
     const themeName = CHARITY_THEMES_PRESETS[selectedCharityTheme]?.name || selectedCharityTheme;
     if (!window.confirm(`Reset all templates to factory defaults for "${themeName}"? Any custom modifications will be overwritten.`)) return;
     setSavingTemplate(true);
@@ -1939,6 +1965,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleDeleteTemplate = (templateId, templateName = '') => {
+    if (!allowed('email.templates')) { return; }
     const displayName = templateName ? `"${templateName}"` : 'this email template';
     if (!window.confirm(`Are you sure you want to delete ${displayName}?`)) return;
     fetch(`${API_BASE_URL}/api/tracker/email-templates/${templateId}`, {
@@ -1971,6 +1998,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleCreateCustomTemplate = (e) => {
+    if (!allowed('email.templates')) { if (e?.preventDefault) e.preventDefault(); return; }
     e.preventDefault();
     if (!newTemplateForm.template_type.trim()) {
       alert('Please enter a unique template key identifier (e.g. quarterly_checkin)');
@@ -2024,7 +2052,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   const handleSaveTargets = (e) => {
     e.preventDefault();
-    if (user?.role !== 'super_admin') return;
+    if (!can(user, 'tracker.settings', activeCompany)) return;
     setSavingTargets(true);
     setStatusMessage('');
 
@@ -2077,6 +2105,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleSaveOutlookCredentials = (e) => {
+    if (!allowed('mailbox.configure')) { if (e?.preventDefault) e.preventDefault(); return; }
     e.preventDefault();
     setSavingOutlookCreds(true);
     fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/outlook/save-credentials`), {
@@ -2104,6 +2133,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleActivateOutlookSubscription = () => {
+    if (!allowed('mailbox.configure')) { return; }
     if (!outlookStatus?.connected) {
       alert("Please click the blue 'Connect with Microsoft 365' button first to sign in to your Microsoft account. Once connected, the webhook subscription will automatically activate and self-renew!");
       return;
@@ -2132,6 +2162,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   };
 
   const handleSendTestOutlookEmail = () => {
+    if (!allowed('mailbox.configure')) { return; }
     if (!outlookStatus?.connected) {
       alert("Please connect your Microsoft 365 account first.");
       return;
@@ -2848,13 +2879,15 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 <Edit3 className="w-3.5 h-3.5" />
                               </button>
 
-                              <button
+                              {can(user, 'tracker.delete', activeCompany) && (
+<button
                                 onClick={() => handleDeleteBeneficiary(b.id, b.name)}
                                 className="p-1.5 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-all"
                                 title="Delete Beneficiary"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
+)}
                             </div>
                           </td>
                         </tr>
@@ -3047,7 +3080,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 <UserPlus className="w-3.5 h-3.5" />
                 Add Manual Donor
               </button>
-              {!isConsolidated && canEditRecords() && (
+              {!isConsolidated && canEditRecords(null, 'donors.create', activeCompany) && (
                 <button
                   type="button"
                   onClick={() => setAddingDonation(true)}
@@ -4387,12 +4420,14 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           </div>
 
                           <div className="flex items-center gap-1.5">
-                            <button
+                            {can(user, 'tracker.delete', activeCompany) && (
+<button
                               onClick={() => handleDeallocate(a.id, a.beneficiary_name)}
                               className="px-2.5 py-1 rounded-md text-rose-500 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 text-xs font-semibold transition-all"
                             >
                               Release
                             </button>
+)}
                           </div>
                         </div>
                       </div>
@@ -4589,7 +4624,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 Alert Settings
               </button>
 
-              <button
+              {can(user, 'email.send', activeCompany) && (
+<button
                 disabled={sendingDigest}
                 onClick={() => handleSendOverdueDigest(false)}
                 className="px-4 py-2 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold transition-all flex items-center gap-2 shadow-sm disabled:opacity-50"
@@ -4598,6 +4634,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 <SendHorizontal className="w-4 h-4" />
                 {sendingDigest ? 'Sending Digest...' : 'Send Digest to Staff'}
               </button>
+)}
             </div>
           </div>
 
@@ -5811,13 +5848,15 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         ) : filteredTemplates.length === 0 ? (
                           <div className="p-4 text-center text-xs text-slate-400">
                             No templates found for this charity theme.
-                            <button
+                            {can(user, 'email.templates', activeCompany) && (
+<button
                               type="button"
                               onClick={handleResetDefaultTemplates}
                               className="mt-2 text-indigo-600 hover:underline block mx-auto text-xs font-semibold"
                             >
                               Seed Default Templates
                             </button>
+)}
                           </div>
                         ) : (
                           filteredTemplates.map((tpl) => {
@@ -6127,6 +6166,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                               {templateDraft.subject
                                 .replace(/{{First_Name}}|{First_Name}/gi, 'Sarah')
                                 .replace(/{{last_name}}|{last_name}/gi, 'Ahmed')
+                                .replace(/{{donor_first_name}}|{donor_first_name}/gi, 'Sarah')
+                                .replace(/{{donor_last_name}}|{donor_last_name}/gi, 'Ahmed')
                                 .replace(/{{donor_name}}|{donor_name}/gi, 'Sarah Ahmed')
                                 .replace(/{{beneficiary_first_name}}|{beneficiary_first_name}/gi, 'Zayd')
                                 .replace(/{{beneficiary_last_name}}|{beneficiary_last_name}/gi, 'Al-Mansoor')
@@ -6162,6 +6203,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           (templateDraft.body_html || '')
                             .replace(/{{First_Name}}|{First_Name}/gi, 'Sarah')
                             .replace(/{{last_name}}|{last_name}/gi, 'Ahmed')
+                            .replace(/{{donor_first_name}}|{donor_first_name}/gi, 'Sarah')
+                            .replace(/{{donor_last_name}}|{donor_last_name}/gi, 'Ahmed')
                             .replace(/{{donor_name}}|{donor_name}/gi, 'Sarah Ahmed')
                             .replace(/{{Email}}|{Email}|{{recipient_email}}|{recipient_email}/gi, 'sarah.ahmed@example.com')
                             .replace(/{{beneficiary_first_name}}|{beneficiary_first_name}/gi, 'Zayd')
@@ -6204,7 +6247,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
                   <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end">
                     {templateDraft.id && (
-                      <button
+                      (can(user, 'email.templates', activeCompany) ? (
+<button
                         type="button"
                         onClick={() => handleDeleteTemplate(templateDraft.id, templateDraft.template_type)}
                         className="px-3.5 py-2.5 rounded-xl border border-rose-200 dark:border-rose-900/50 hover:bg-rose-50 dark:hover:bg-rose-950/40 text-rose-600 dark:text-rose-400 font-bold text-xs flex items-center justify-center gap-1.5 transition-all"
@@ -6213,6 +6257,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         <Trash2 className="w-3.5 h-3.5" />
                         Delete Template
                       </button>
+) : null)
                     )}
                     <button
                       type="submit"
@@ -6682,13 +6727,15 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         </span>
                       </div>
 
-                      <button
+                      {can(user, 'tracker.delete', activeCompany) && (
+<button
                         onClick={() => handleDeleteFeedback(fb.id)}
                         className="text-rose-500 hover:text-rose-700 p-1"
                         title="Delete feedback entry"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
+)}
                     </div>
 
                     {fb.progress_summary && (
@@ -8248,8 +8295,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     className="px-2.5 py-1 text-xs rounded-lg font-semibold bg-amber-500 hover:bg-amber-400 text-white">Use the filters on screen</button>
                   <button type="button" onClick={() => setAlertSettings(prev => ({ ...prev, digest_filters: {} }))}
                     className="px-2.5 py-1 text-xs rounded-lg font-semibold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200">Include everyone</button>
-                  <button type="button" onClick={() => handleSendOverdueDigest(true)} disabled={sendingDigest}
+                  {can(user, 'email.send', activeCompany) && (
+<button type="button" onClick={() => handleSendOverdueDigest(true)} disabled={sendingDigest}
                     className="px-2.5 py-1 text-xs rounded-lg font-semibold border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-50 flex items-center gap-1"><Eye className="w-3 h-3" /> Preview</button>
+)}
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">Changes here apply after Save Settings.</p>
               </div>
@@ -8279,7 +8328,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
               {/* Action Buttons */}
               <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
-                <button
+                {can(user, 'email.send', activeCompany) && (
+<button
                   type="button"
                   onClick={() => handleSendOverdueDigest(false)}
                   disabled={sendingDigest || !alertSettings.staff_emails.trim()}
@@ -8289,6 +8339,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   <SendHorizontal className="w-3.5 h-3.5" />
                   {sendingDigest ? 'Dispatching...' : 'Send Digest Now'}
                 </button>
+)}
 
                 <div className="flex items-center gap-2">
                   <button

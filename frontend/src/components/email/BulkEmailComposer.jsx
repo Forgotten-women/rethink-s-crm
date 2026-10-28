@@ -5,6 +5,7 @@ import { API_BASE_URL } from '../../config';
 import SegmentBuilder, { cleanSegment, segmentChips } from '../SegmentBuilder';
 import { CARD, FIELD, LABEL, PreviewFrame, VariableChips, gbp, insertAtCursor, post, useLivePreview, useTemplates } from './emailUi';
 import DesignModal from './builder/DesignModal';
+import { denyUnless } from '../../access';
 
 const BATCH = 25;
 const CHECK_BATCH = 200;
@@ -214,6 +215,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     for (let i = 0; i < chosen.length; i += BATCH) {
       setProgress({ done: i, total: chosen.length, dryRun });
       try {
+if (denyUnless('email.send')) return;
         const d = await post('/api/tracker/direct-email/send', { ...payloadText(), recipients: chosen.slice(i, i + BATCH), dry_run: dryRun });
         all.push(...d.results);
       } catch (e) { setError(e.message); break; }
@@ -228,6 +230,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     if (!campaignName.trim()) { setError('Give the campaign a name.'); return; }
     setLoading(true);
     try {
+if (denyUnless('email.campaigns')) return;
       const d = await post('/api/tracker/direct-email/campaigns', {
         ...payloadText(), name: campaignName.trim(),
         donor_ids: chosen.map(r => r.donor_id || r.email).filter(Boolean),

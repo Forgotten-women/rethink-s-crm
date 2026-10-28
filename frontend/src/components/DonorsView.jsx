@@ -44,7 +44,7 @@ export default function DonorsView({ activeCompany, onSelectDonor, user, onOpenE
   const [refreshTick, setRefreshTick] = useState(0);
   const [adding, setAdding] = useState(false);
   const [notice, setNotice] = useState('');
-  const canEdit = canEditRecords(user) && activeCompany !== 'all';
+  const canEdit = canEditRecords(user, 'donors.create', activeCompany) && activeCompany !== 'all';
   const segJson = useMemo(() => JSON.stringify(cleanSegment(segment)), [segment]);
   const hasGiftRules = GIFT_RULES.some(k => segment[k] !== undefined);
 

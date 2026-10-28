@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { X, Send, Search, Loader2, CheckCircle2, AlertTriangle, Eye, Users, PenLine, RotateCcw, Mail } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 import { themeStorageKey } from './trackerUtils';
+import { denyUnless } from '../../access';
 
 const BATCH = 25;  // matches BULK_SEND_BATCH_LIMIT in backend/api/tracker.py
 const LIFECYCLES = [['all', 'All cycles'], ['active', 'Active'], ['due', 'Due (30d)'], ['grace', 'Grace (30d)'], ['lapsed', 'Lapsed']];
@@ -120,6 +121,7 @@ export default function BulkEmailModal({ companyId, themes, templates, variables
     const results = [];
     setProgress({ done: 0, total: items.length, results, dryRun });
     for (let i = 0; i < items.length; i += BATCH) {
+if (denyUnless('email.send')) return;
       const res = await fetch(`${API_BASE_URL}/api/tracker/bulk-email/send`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...basePayload(), items: items.slice(i, i + BATCH), dry_run: dryRun })

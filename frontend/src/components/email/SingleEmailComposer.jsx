@@ -4,6 +4,7 @@ import { CheckCircle2, History, LayoutTemplate, Mail, Send, X } from 'lucide-rea
 import { CARD, FIELD, LABEL, PreviewFrame, VariableChips, insertAtCursor, post, useLivePreview, useTemplates } from './emailUi';
 import EmailThread from './EmailThread';
 import DesignModal from './builder/DesignModal';
+import { denyUnless } from '../../access';
 
 /**
  * Write to ONE person (from their donor panel or a sponsorship): their address is fixed, the message is written
@@ -66,6 +67,7 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
     if (!window.confirm(`Send this email to ${who.name || who.email}?`)) return;
     setSending(true);
     try {
+if (denyUnless('email.send')) return;
       const d = await post('/api/tracker/direct-email/send', {
         company_id: company, theme, template_type: templateType, message_body: messageBody || null,
         subject_template: edited ? subject : null, body_template: edited ? body : null,

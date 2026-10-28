@@ -3,6 +3,7 @@ import { RefreshCw, Send, Ban, Loader2, Inbox, Eye, CheckCircle2, AlertTriangle,
 import { API_BASE_URL } from '../../config';
 import TrackerFilterBar from './TrackerFilterBar';
 import { readFiltersFromUrl, writeFiltersToUrl, filtersToParams, donorKeyFor } from './trackerUtils';
+import { denyUnless } from '../../access';
 
 const TEMPLATE_LABELS = {
   profile_intro: 'Profile introduction',
@@ -73,6 +74,7 @@ export default function EmailQueueView({ companyId, sponsorshipTypes = [], onOpe
     const sendIds = confirmSendItems.map(i => i.id);
     setBusy('send'); setMessage(null);
     try {
+if (denyUnless('email.send')) return;
       const res = await post('/api/tracker/email-queue/send', { company_id: companyId, ids: sendIds });
       const failed = (res.results || []).filter(r => r.status !== 'sent');
       const sentList = res.sent_emails || (res.results || []).filter(r => r.status === 'sent').map(r => r.recipient_email || r.recipient_name);

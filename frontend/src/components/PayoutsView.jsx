@@ -42,6 +42,7 @@ import {
   Sparkles
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import { can } from '../access';
 import StripePayoutsPanel from './payouts/StripePayoutsPanel';
 
 const ALL_SHEET10_SPECIAL_CASES = [
@@ -161,8 +162,9 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   const [purging, setPurging] = useState(false);
   const [purgeMsg, setPurgeMsg] = useState('');
 
-  const isSuperAdmin = user?.role === 'super_admin';
-  const canEdit = user?.role === 'super_admin' || user?.role === 'admin' || user?.can_edit_donors === 1;
+  // What this person may do here (access.js; the server checks every action again).
+  const isSuperAdmin = can(user, 'data.purge', activeCompany); // name kept: gates the purge button
+  const canEdit = can(user, 'payouts.classify', activeCompany);
   const currSymbol = '£';
   const isPaysuite = selectedPlatform === 'paysuite';
   const isStripe = selectedPlatform === 'stripe';
@@ -863,7 +865,8 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           </div>
 
           {/* Export Multi-Sheet Excel Button */}
-          <button
+          {can(user, isStripe ? 'stripe.export' : 'payouts.export', activeCompany) && (
+<button
             onClick={handleExportExcel}
             disabled={exporting || loading}
             className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isStripe ? 'from-cyan-600 to-blue-600 shadow-cyan-500/20 hover:from-cyan-500 hover:to-blue-500' : isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
@@ -876,6 +879,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             )}
             <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' && !isStripe ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
           </button>
+)}
 
           {/* Sync PaySuite API Button (the PaySuite account is Rethink's) */}
           {isPaysuite && activeCompany === 'rethink' && (

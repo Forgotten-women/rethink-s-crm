@@ -10,15 +10,18 @@ import {
   ChevronDown, ChevronUp, Plus
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import { can } from '../access';
 import FundraiserFormModal from './FundraiserFormModal';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
 import DonationDetailModal from './DonationDetailModal';
 
 export default function FundraiserView({ user, accentColor = 'cyan', activeCompany = 'rethink', companies = [] }) {
   const isConsolidated = activeCompany === 'all';
-  // Strictly enforce that only Super Admin accounts can manage fundraisers
-  const isSuperAdmin = user?.role?.toLowerCase() === 'super_admin';
-  const canEditPages = canEditRecords(user) && activeCompany !== 'all';
+  // What this person may do here (access.js; the server checks every action again)
+  const canEditF = can(user, 'fundraisers.edit', activeCompany);
+  const canDeleteF = can(user, 'fundraisers.delete', activeCompany);
+  const canSyncF = can(user, 'fundraisers.sync', activeCompany);
+  const canEditPages = canEditF && activeCompany !== 'all';
   const [linkFormFor, setLinkFormFor] = useState(null);
   const [linkType, setLinkType] = useState('fundraiser_url');
   const [linkValue, setLinkValue] = useState('');
@@ -278,7 +281,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
     fetch(`${API_BASE_URL}/api/fundraisers?${params.toString()}`)
       .then(res => res.json())
       .then(data => {
-        setFundraisersData(data);
+        setFundraisersData(Array.isArray(data?.fundraisers) ? data : { ...data, fundraisers: [] });
         setLoading(false);
         setRefreshing(false);
       })
@@ -293,7 +296,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const loadCampaignsList = () => {
     fetch(`${API_BASE_URL}/api/fundraisers/campaigns-list?company_id=${encodeURIComponent(activeCompany)}`)
       .then(res => res.json())
-      .then(data => setAvailableCampaigns(data || []))
+      .then(data => setAvailableCampaigns(Array.isArray(data) ? data : []))  // a refused request returns {detail}
       .catch(err => console.error('Error fetching campaigns list:', err));
   };
 
@@ -427,7 +430,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
 
   // Open Create Modal
   const handleOpenCreateModal = () => {
-    if (!isSuperAdmin) return;
+    if (!canEditF) return;
     setEditingFundraiser(null);
     setShowModal(true);
     loadCampaignsList();
@@ -435,7 +438,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
 
   // Open Edit Modal
   const handleOpenEditModal = (f) => {
-    if (!isSuperAdmin) return;
+    if (!canEditF) return;
     setEditingFundraiser(f);
     setShowModal(true);
     loadCampaignsList();
@@ -443,7 +446,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
 
   // Delete Fundraiser
   const handleDeleteFundraiser = (fid) => {
-    if (!isSuperAdmin) return;
+    if (!canDeleteF) return;
     setDeleting(true);
 
     fetch(`${API_BASE_URL}/api/fundraisers/${fid}?user_role=${user?.role}&company_id=${encodeURIComponent(activeCompany)}`, {
@@ -823,7 +826,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
         </div>
 
         <div className="flex items-center gap-2">
-          {isSuperAdmin && (
+          {canSyncF && (
             <button
               onClick={handleSyncDiscovered}
               disabled={syncing}
@@ -844,7 +847,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} /> Refresh Live
           </button>
 
-          {isSuperAdmin && (
+          {canEditF && (
             <button
               onClick={() => {
                 if (isConsolidated) {
@@ -1261,7 +1264,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               {searchQuery ? `No fundraisers match search "${searchQuery}".` : 'Create your first fundraiser and assign campaigns to start tracking live progress.'}
             </p>
           </div>
-          {isSuperAdmin && (
+          {canEditF && (
             <button
               onClick={handleOpenCreateModal}
               className="btn-primary text-xs flex items-center gap-1.5 px-3.5 py-1.5"
@@ -1496,22 +1499,26 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                     <Eye className="w-3.5 h-3.5" /> View Drilldown
                   </button>
 
-                  {isSuperAdmin && (
+                  {(canEditF || canDeleteF) && (
                     <div className="flex items-center gap-1">
-                      <button
+                      {canEditF && (
+<button
                         onClick={() => handleOpenEditModal(f)}
                         className="p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700/60 text-slate-400 hover:text-cyan-500 transition-colors"
                         title="Edit Fundraiser"
                       >
                         <Edit3 className="w-3.5 h-3.5" />
                       </button>
-                      <button
+)}
+                      {canDeleteF && (
+<button
                         onClick={() => setDeleteConfirm(f)}
                         className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 transition-colors"
                         title="Delete Fundraiser"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
+)}
                     </div>
                   )}
                 </div>
@@ -1695,22 +1702,26 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                         >
                           <Eye className="w-3 h-3" />
                         </button>
-                        {isSuperAdmin && (
+                        {(canEditF || canDeleteF) && (
                           <>
-                            <button
+                            {canEditF && (
+<button
                               onClick={() => handleOpenEditModal(f)}
                               className="p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700/60 text-slate-400 hover:text-cyan-500 transition-colors"
                               title="Edit Fundraiser"
                             >
                               <Edit3 className="w-3 h-3" />
                             </button>
-                            <button
+)}
+                            {canDeleteF && (
+<button
                               onClick={() => setDeleteConfirm(f)}
                               className="p-1 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 transition-colors"
                               title="Delete Fundraiser"
                             >
                               <Trash2 className="w-3 h-3" />
                             </button>
+)}
                           </>
                         )}
                       </div>
@@ -1736,13 +1747,13 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
           loadFundraisers(true);
           loadCampaignsList();
         }}
-        isSuperAdmin={isSuperAdmin}
+        isSuperAdmin={canEditF}
         user={user}
         activeCompany={activeCompany}
       />
 
       {/* ── Super Admin: Delete Confirmation Modal ──────────────── */}
-      {deleteConfirm && isSuperAdmin && (
+      {deleteConfirm && canDeleteF && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
           <div 
             className="glass-panel max-w-md w-full p-5 rounded-2xl border shadow-2xl animate-in zoom-in-95"

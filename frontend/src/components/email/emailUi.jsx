@@ -11,7 +11,8 @@ export const LABEL = 'flex flex-col gap-1 text-[11px] font-bold uppercase tracki
 export const CARD = 'rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-900/60 p-3';
 
 export const VARIABLES = [
-  ['first_name', 'First name'], ['last_name', 'Last name'], ['donor_name', 'Full name'], ['total_given', 'Lifetime given'], ['gifts_count', 'Number of gifts'],
+  ['donor_first_name', 'Donor first name'], ['donor_last_name', 'Donor last name'], ['donor_name', 'Donor full name'],
+  ['first_name', 'First name (same as donor first name)'], ['last_name', 'Last name (same as donor last name)'], ['total_given', 'Lifetime given'], ['gifts_count', 'Number of gifts'],
   ['average_gift', 'Average gift'], ['lifetime_tier', 'LTV tier'], ['first_gift_date', 'First gift date'],
   ['last_gift_date', 'Last gift date'], ['last_gift_amount', 'Last gift amount'], ['last_gift_cause', 'Last gift cause'],
   ['top_cause', 'Top cause'], ['matching_total', 'Matching donations total'], ['matching_gifts_count', 'Matching donations'],

@@ -20,6 +20,7 @@ const TrackerView = lazyPage(() => import('./components/TrackerView'));
 const PayoutsView = lazyPage(() => import('./components/PayoutsView'));
 const FundraiserView = lazyPage(() => import('./components/FundraiserView'));
 const EmailView = lazyPage(() => import('./components/email/EmailView'));
+const AccessView = lazyPage(() => import('./components/access/AccessView'));
 import DonorDrawer from './components/DonorDrawer';
 import LoginView from './components/LoginView';
 const OpsConsole = lazyPage(() => import('./components/ops/OpsConsole'));
@@ -27,6 +28,7 @@ const OpsConsole = lazyPage(() => import('./components/ops/OpsConsole'));
 import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Gift, Layers, DollarSign, Filter, ChevronUp, ChevronDown } from 'lucide-react';
 
 import { API_BASE_URL } from './config';
+import { accessibleCompanies, canSeeTab, canSomewhere } from './access';
 
 
 const INITIAL_FILTERS = {
@@ -101,18 +103,21 @@ export default function App() {
       .catch(err => console.warn('Could not fetch registered companies:', err));
   };
 
+  // re-read when the person (or their charity access) changes: the server only lists charities they can open
+  const accessKey = user ? `${user.id}:${Object.keys(user.access?.companies || {}).sort().join(',')}` : '';
   useEffect(() => {
-    fetchCompanies();
-  }, [dataVersion]);
+    if (user) fetchCompanies();
+  }, [dataVersion, accessKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // If previous session had a removed company (such as 'sp') or invalid tenant, auto-reset to rethink
   useEffect(() => {
     if (activeCompany !== 'all' && companies.length > 0) {
       const exists = companies.some(c => c.id === activeCompany);
       if (!exists || activeCompany === 'sp') {
-        setActiveCompany('rethink');
+        const fallback = companies[0]?.id || 'rethink';
+        setActiveCompany(fallback);
         try {
-          localStorage.setItem('crm_active_company', 'rethink');
+          localStorage.setItem('crm_active_company', fallback);
         } catch (e) {}
       }
     }
@@ -140,6 +145,7 @@ export default function App() {
 
   // Auto-collapse sidebar after 3 seconds of switching tab
   const handleSetActiveTab = (tabId) => {
+    if (tabId === 'activity') { setOpsOpen('logs'); return; }  // the activity log opens in the ops console
     setActiveTab(tabId);
     setTimeout(() => {
       setSidebarCollapsed(true);
@@ -208,6 +214,49 @@ export default function App() {
       }
     }
   }, []);
+
+  // Re-read the account from the server (its access included). Called when the live stream says an admin
+  // changed this person's access, so tabs and buttons follow within seconds - no sign-in needed.
+  const refreshUser = () => {
+    const token = localStorage.getItem('analytics_token');
+    if (!token) return;
+    fetch(`${API_BASE_URL}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => (res.status === 401 ? Promise.reject(new Error('signed out')) : res.json()))
+      .then(data => {
+        if (!data?.user) return;
+        setUser(prev => {
+          const next = { ...data.user, login_timestamp: prev?.login_timestamp || Date.now() };
+          localStorage.setItem('analytics_user', JSON.stringify(next));
+          return next;
+        });
+      })
+      .catch(err => { if (err.message === 'signed out') handleSignOut(); });
+  };
+
+  // Keep the person inside what they may see: a charity or tab they lost access to is swapped for one they have.
+  useEffect(() => {
+    if (!user) return;
+    const reachable = accessibleCompanies(user);
+    if (reachable && activeCompany !== 'all' && !reachable.includes(activeCompany) && reachable.length) {
+      setActiveCompany(reachable[0]);
+      localStorage.setItem('crm_active_company', reachable[0]);
+      return;
+    }
+    // 'All companies' needs every charity, and can't apply a "limited to specific fundraisers" scope
+    const limited = Object.keys(user.access?.scopes || {}).length > 0;
+    const TAB_IDS = ['overview', 'donors', 'explorer', 'tracker', 'fundraisers', 'payouts', 'email', 'classifications', 'expenses', 'kanban', 'ltv', 'admin'];
+    const nothingInAll = activeCompany === 'all' && !TAB_IDS.some(t => canSeeTab(user, t, 'all'));
+    if (reachable && activeCompany === 'all' && (limited || nothingInAll || !(user.allowed_companies || []).includes('ALL')) && reachable.length) {
+      setActiveCompany(reachable[0]);
+      localStorage.setItem('crm_active_company', reachable[0]);
+      return;
+    }
+    if (!canSeeTab(user, activeTab, activeCompany)) {
+      const first = ['overview', 'donors', 'explorer', 'tracker', 'fundraisers', 'payouts', 'email', 'classifications',
+        'expenses', 'kanban', 'ltv', 'admin', 'access'].find(t => canSeeTab(user, t, activeCompany));
+      if (first) setActiveTab(first);
+    }
+  }, [user, activeCompany, activeTab]);
 
   // Update theme class on HTML root element
   useEffect(() => {
@@ -375,6 +424,13 @@ export default function App() {
         failures = 0;
         try { onToken(JSON.parse(e.data).token); } catch { /* ignore malformed event */ }
       });
+      // an admin changed this person's access: refresh it now (or sign out if the account was disabled)
+      source.addEventListener('access', (e) => {
+        let info = {};
+        try { info = JSON.parse(e.data); } catch { /* ignore */ }
+        if (info.signed_out) { source.close(); handleSignOut(); return; }
+        refreshUser();
+      });
       source.onerror = () => {
         failures += 1;
         if (failures >= 3) { source.close(); source = null; startPolling(); }  // e.g. a proxy that blocks streaming
@@ -450,6 +506,7 @@ export default function App() {
         activeCompany={activeCompany}
         currentCompany={currentCompany}
         companies={companies}
+        user={user}
       />
 
       {/* Main Right Area */}
@@ -576,6 +633,9 @@ export default function App() {
                   companies={companies}
                 />
               )}
+              {activeTab === 'access' && (
+                <AccessView user={user} companies={companies} onChanged={refreshUser} />
+              )}
               {activeTab === 'admin' && (
                 <AdminView 
                   key={`${activeCompany}-${dataVersion}`} 
@@ -600,9 +660,9 @@ export default function App() {
         <button type="button" onClick={() => setOpsOpen('status')} title="A platform integration is not working - open the ops console"
           className="fixed bottom-3 right-3 z-[70] w-3 h-3 rounded-full bg-rose-500 animate-pulse shadow" aria-label="Integration problem" />
       )}
-      {isSuperAdmin && opsOpen && (
+      {(isSuperAdmin || canSomewhere(user, 'logs.view')) && opsOpen && (
         <Suspense fallback={null}>
-          <OpsConsole initialTab={opsOpen} onClose={() => {
+          <OpsConsole initialTab={isSuperAdmin ? opsOpen : 'logs'} logsOnly={!isSuperAdmin} companies={companies} onClose={() => {
             setOpsOpen(false);
             if ((window.location.hash || '').startsWith('#ops')) window.history.replaceState(null, '', window.location.pathname + window.location.search);
           }} />

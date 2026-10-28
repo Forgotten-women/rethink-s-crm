@@ -77,7 +77,7 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
   const [notes, setNotes] = useState([]);
   const [newNote, setNewNote] = useState('');
   const [noteBusy, setNoteBusy] = useState(false);
-  const canEdit = canEditRecords() && activeCompany && activeCompany !== 'all';
+  const canEdit = canEditRecords(null, 'donors.edit', activeCompany) && activeCompany && activeCompany !== 'all';
 
   const resolvedDonorId = typeof donorId === 'object' && donorId !== null
     ? (donorId.donor_id || donorId.email || donorId.name || '')

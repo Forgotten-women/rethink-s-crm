@@ -3,6 +3,7 @@ import { Mail, Plus, Send, XCircle, Trash2, ChevronDown, ChevronUp, RefreshCw, U
 import { API_BASE_URL } from '../../config';
 import EmailComposer from '../EmailComposer';
 import { segmentChips } from '../SegmentBuilder';
+import { denyUnless } from '../../access';
 
 const STATUS_TONE = {
   queued: 'bg-amber-500/15 text-amber-700 dark:text-amber-300', sending: 'bg-sky-500/15 text-sky-700 dark:text-sky-300',
@@ -48,6 +49,7 @@ export default function EmailCampaignsView({ companyId }) {
     let remaining = c.pending, done = 0;
     try {
       while (remaining > 0) {
+if (denyUnless('email.send')) return;
         const d = await call('POST', `/api/tracker/direct-email/campaigns/${c.id}/send`, { company_id: companyId, limit: 25 });
         done += d.results.length; remaining = d.remaining;
         setSending({ id: c.id, done, total: done + remaining });

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CreditCard, PlusCircle, Check, X, Mail, Filter, Wallet, Search, ChevronLeft, ChevronRight, LayoutGrid, List, Trash2, AlertTriangle, Settings, Eye, EyeOff, SendHorizonal, ChevronDown, ChevronUp, ShieldCheck, Wifi, WifiOff, RefreshCw, Download, FileSpreadsheet, ArrowRightLeft, History } from 'lucide-react';
 import { API_BASE_URL, getAuthHeaders } from '../config';
+import { can } from '../access';
 import TransferFundsModal from './TransferFundsModal';
 import TransferHistoryModal from './TransferHistoryModal';
 
@@ -88,7 +89,12 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
   const [savingSettings, setSavingSettings] = useState(false);
   const [testingEmail, setTestingEmail] = useState(false);
 
-  const isSuperAdmin = user?.role === 'super_admin' || user?.can_edit_donors === 1;
+  // What this person may do here (access.js; the server checks every action again).
+  const canApprove = can(user, 'expenses.approve', activeCompany);
+  const canDeleteExp = can(user, 'expenses.delete', activeCompany);
+  const canTransfer = can(user, 'expenses.transfers', activeCompany);
+  const canReview = canApprove || canDeleteExp;
+  const isSuperAdmin = user?.role === 'super_admin'; // the approval email / SMTP settings are global: super admins only
 
   const loadSettings = () => {
     fetch(`${API_BASE_URL}/api/expenses/settings`, { headers: getAuthHeaders({}, user) })
@@ -362,7 +368,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
   // Review Expense (Approve / Reject)
   const handleReview = (expenseId, action) => {
-    if (!isSuperAdmin) return;
+    if (!canApprove) return;
     setReviewMsg('');
 
     fetch(`${API_BASE_URL}/api/expenses/review`, {
@@ -391,7 +397,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
   // Delete Expense
   const handleDelete = (expenseId) => {
-    if (!isSuperAdmin) return;
+    if (!canDeleteExp) return;
     setDeleting(true);
 
     fetch(`${API_BASE_URL}/api/expenses/delete`, {
@@ -470,7 +476,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
             <History className="w-3.5 h-3.5 text-purple-400" /> Transfer History
           </button>
 
-          {isSuperAdmin && (
+          {canTransfer && (
             <button
               onClick={() => { 
                 if (isConsolidated) {
@@ -824,7 +830,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                     {b.code} <Eye className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                   </span>
                   <div className="flex items-center gap-1.5">
-                    {isSuperAdmin && (
+                    {canTransfer && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1000,13 +1006,13 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                   <th>Title & Vendor</th>
                   <th>Amount</th>
                   <th>Status</th>
-                  {isSuperAdmin && <th className="text-right">Actions</th>}
+                  {canReview && <th className="text-right">Actions</th>}
                 </tr>
               </thead>
               <tbody>
                 {expensesData.expenses?.length === 0 ? (
                   <tr>
-                    <td colSpan={isSuperAdmin ? 13 : 12} className="text-center py-12 text-xs font-semibold" style={{ color: 'var(--text-muted)' }}>
+                    <td colSpan={canReview ? 13 : 12} className="text-center py-12 text-xs font-semibold" style={{ color: 'var(--text-muted)' }}>
                       No expense claims found matching filter '{statusFilter}'.
                     </td>
                   </tr>
@@ -1061,7 +1067,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                         </span>
                       </td>
 
-                      {isSuperAdmin && (
+                      {canReview && (
                         <td className="text-right">
                           <div className="flex items-center justify-end gap-2">
                             {exp.status === 'PENDING_APPROVAL' && (
@@ -1450,7 +1456,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
 
             {/* Quick Actions for Selected Code */}
             <div className="flex items-center gap-2 pt-1">
-              {isSuperAdmin && (
+              {canTransfer && (
                 <button
                   onClick={() => {
                     const code = selectedCodeDetail.code;
@@ -1505,7 +1511,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                         <th>Amount</th>
                         <th>Status</th>
                         <th>Requested By</th>
-                        {(user?.role === 'super_admin' || user?.can_edit_donors === 1) && <th>Actions</th>}
+                        {canReview && <th>Actions</th>}
                       </tr>
                     </thead>
                     <tbody>
@@ -1531,7 +1537,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
                             <td className="text-xs font-black text-white">£{exp.amount?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                             <td>{getStatusBadge(exp.status)}</td>
                             <td className="text-xs" style={{ color: 'var(--text-main)' }}>{exp.requested_by}</td>
-                            {(user?.role === 'super_admin' || user?.can_edit_donors === 1) && (
+                            {canReview && (
                               <td>
                                 <div className="flex items-center gap-1.5">
                                   {exp.status === 'PENDING_APPROVAL' && (
@@ -1596,7 +1602,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
           loadExpenses();
         }}
         user={user}
-        isSuperAdmin={isSuperAdmin}
+        isSuperAdmin={canTransfer}
         activeCompany={activeCompany}
       />
 
@@ -1607,7 +1613,7 @@ export default function ExpenseView({ user, activeCompany = 'rethink', companies
           setHistoryFilterCode('');
         }}
         user={user}
-        isSuperAdmin={isSuperAdmin}
+        isSuperAdmin={canTransfer}
         filterCode={historyFilterCode}
         activeCompany={activeCompany}
         onTransfersUpdated={() => {

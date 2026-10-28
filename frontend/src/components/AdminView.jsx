@@ -5,6 +5,7 @@ import {
   RefreshCw, Building, Image, FileUp, Palette, Plus, Eye 
 } from 'lucide-react';
 import { API_BASE_URL, getAuthHeaders } from '../config';
+import { can, canSomewhere } from '../access';
 
 const COLOR_NAME_TO_HEX = {
   emerald: '#10B981',
@@ -73,12 +74,15 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
   const [purgePayoutConfirm, setPurgePayoutConfirm] = useState(false);
   const [purgingPayout, setPurgingPayout] = useState(false);
 
-  const isSuperAdmin = user?.role === 'super_admin';
-  const canManageTags = isSuperAdmin || user?.can_manage_tags === 1;
-  const canPurgeData = isSuperAdmin || user?.can_purge_data === 1;
+  // What this person may do here (access.js; the server checks every action again)
+  const isSuperAdmin = user?.role === 'super_admin'; // charities, logos and the global approval email
+  const canEditCharities = can(user, 'charities.edit', activeCompany);
+  const canManageTags = can(user, 'data.tags', activeCompany);
+  const canPurgeData = can(user, 'data.purge', activeCompany);
+  const canUpload = can(user, 'data.upload', activeCompany);
 
   const handlePurgePayouts = () => {
-    if (!isSuperAdmin) return;
+    if (!canPurgeData) return;
     if (!purgePayoutConfirm) {
       setMsg('❌ Please check the confirmation box before purging payout data.');
       return;
@@ -117,7 +121,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
   };
 
   const handlePurgeDatabase = () => {
-    if (!isSuperAdmin) return;
+    if (!canPurgeData) return;
     if (!purgeConfirm) {
       setMsg('❌ Please check the confirmation box before purging database records.');
       return;
@@ -280,7 +284,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
   const handleSaveCompany = async (e) => {
     e.preventDefault();
-    if (!isSuperAdmin || !companyModal?.data) return;
+    if (!canEditCharities || !companyModal?.data) return;
     setSavingCompany(true);
     setCompanyMsg('');
 
@@ -316,7 +320,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
 
   const handleUploadLogo = async (e) => {
     e.preventDefault();
-    if (!isSuperAdmin || !uploadLogoModal?.companyId || !logoFile) return;
+    if (!canEditCharities || !uploadLogoModal?.companyId || !logoFile) return;
     setUploadingLogo(true);
     setCompanyMsg('');
 
@@ -578,7 +582,7 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
       </div>
 
       {/* 🏢 Multi-Company Partitioning & Brand Identity Settings Card */}
-      {isSuperAdmin && (
+      {canEditCharities && (
         <div className="glass-panel p-5 border-l-4 border-cyan-500 flex flex-col gap-4">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <div>
@@ -748,7 +752,8 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
           )}
         </div>
 
-        <form onSubmit={handleUploadData} className="grid grid-cols-1 md:grid-cols-5 gap-3 bg-slate-900/60 p-4 rounded-xl border border-white/10">
+        {canUpload && (
+<form onSubmit={handleUploadData} className="grid grid-cols-1 md:grid-cols-5 gap-3 bg-slate-900/60 p-4 rounded-xl border border-white/10">
           {/* File Input */}
           <div className="flex flex-col gap-1 md:col-span-2">
             <label className="text-[11px] font-bold text-slate-300">Select Dataset File (.csv, .xlsx)</label>
@@ -834,222 +839,15 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
             </button>
           </div>
         </form>
+)}
       </div>
 
-      {/* Predefined RBAC Roles Matrix Table */}
-      <div className="glass-panel p-5 border-l-4 border-purple-400 flex flex-col gap-4">
-        <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-          <ShieldCheck className="w-4 h-4 text-purple-400" /> Predefined Role-Based Access Matrix Table
-        </h3>
-
-        <div className="overflow-x-auto">
-          <table className="crm-table">
-            <thead>
-              <tr>
-                <th>Role Profile</th>
-                <th>Description</th>
-                <th>Edit Donors</th>
-                <th>Edit Matrix</th>
-                <th>Manage Tags</th>
-                <th>Purge Data</th>
-              </tr>
-            </thead>
-            <tbody>
-              {predefinedRoles.map((r, idx) => (
-                <tr key={idx}>
-                  <td>
-                    <span className={`badge ${r.badge}`}>{r.name}</span>
-                  </td>
-                  <td className="text-xs text-slate-400 max-w-[280px]">{r.desc}</td>
-                  <td>{r.donors ? <span className="text-emerald-400 font-bold text-xs flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Allowed</span> : <span className="text-slate-500 text-xs flex items-center gap-1"><X className="w-3.5 h-3.5" /> Restricted</span>}</td>
-                  <td>{r.matrix ? <span className="text-emerald-400 font-bold text-xs flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Allowed</span> : <span className="text-slate-500 text-xs flex items-center gap-1"><X className="w-3.5 h-3.5" /> Restricted</span>}</td>
-                  <td>{r.tags ? <span className="text-emerald-400 font-bold text-xs flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Allowed</span> : <span className="text-slate-500 text-xs flex items-center gap-1"><X className="w-3.5 h-3.5" /> Restricted</span>}</td>
-                  <td>{r.purge ? <span className="text-emerald-400 font-bold text-xs flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Allowed</span> : <span className="text-slate-500 text-xs flex items-center gap-1"><X className="w-3.5 h-3.5" /> Restricted</span>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* User Accounts & Granular Permission Assign/Revoke Section */}
-      {isSuperAdmin && (
-        <div className="glass-panel p-5 border-l-4 border-cyan-400 flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-              <Key className="w-4 h-4 text-cyan-400" /> User Accounts & Access Control Settings
-            </h3>
-          </div>
-
-          {userMsg && <div className="text-xs font-bold text-emerald-400">{userMsg}</div>}
-
-          <div className="overflow-x-auto">
-            <table className="crm-table">
-              <thead>
-                <tr>
-                  <th>User Identity</th>
-                  <th>Role</th>
-                  <th>Edit Donors</th>
-                  <th>Edit Matrix</th>
-                  <th>Manage Tags</th>
-                  <th>Purge Data</th>
-                  <th>Assign Predefined Role</th>
-                  {isSuperAdmin && <th>Edit Details</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {usersList.map((u, idx) => (
-                  <tr key={idx}>
-                    <td className="font-bold text-slate-200">
-                      {editingUser && editingUser.id === u.id ? (
-                        <div className="flex flex-col gap-2 max-w-[200px]">
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-[9px] text-slate-500 uppercase font-black">Email Address</span>
-                            <input 
-                              type="email" 
-                              value={editingUser.email}
-                              onChange={e => setEditingUser({ ...editingUser, email: e.target.value })}
-                              className="bg-slate-900 border border-white/10 rounded px-2.5 py-1 text-xs text-white focus:outline-none focus:border-cyan-400"
-                              placeholder="Email"
-                            />
-                          </div>
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-[9px] text-slate-500 uppercase font-black">Username</span>
-                            <input 
-                              type="text"
-                              value={editingUser.username}
-                              onChange={e => setEditingUser({ ...editingUser, username: e.target.value })}
-                              className="bg-slate-900 border border-white/10 rounded px-2.5 py-1 text-xs text-white focus:outline-none focus:border-cyan-400"
-                              placeholder="Username"
-                            />
-                          </div>
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-[9px] text-slate-500 uppercase font-black">Reset Password</span>
-                            <input 
-                              type="password"
-                              value={editingUser.password}
-                              onChange={e => setEditingUser({ ...editingUser, password: e.target.value })}
-                              className="bg-slate-900 border border-white/10 rounded px-2.5 py-1 text-[10px] text-white focus:outline-none focus:border-cyan-400"
-                              placeholder="Type new password (optional)"
-                            />
-                          </div>
-                        </div>
-                      ) : (
-                        <>
-                          <div>{u.email}</div>
-                          <div className="text-[10px] text-slate-500 font-normal">@{u.username}</div>
-                        </>
-                      )}
-                    </td>
-                    <td>
-                      <span className={`badge ${u.role === 'super_admin' ? 'badge-purple' : u.role === 'data_editor' ? 'badge-cyan' : 'badge-emerald'}`}>
-                        {u.role}
-                      </span>
-                    </td>
-
-                    {/* Toggle Granular Permissions */}
-                    <td className="text-center">
-                      <button 
-                        disabled={!isSuperAdmin || u.role === 'super_admin'}
-                        onClick={() => handleTogglePermission(u, 'can_edit_donors')}
-                        className={`btn-secondary text-[11px] px-2.5 py-1 ${u.can_edit_donors || u.role === 'super_admin' ? 'text-emerald-400 border-emerald-500/30' : 'text-slate-500'}`}
-                      >
-                        {u.can_edit_donors || u.role === 'super_admin' ? '✓ YES' : '✗ NO'}
-                      </button>
-                    </td>
-
-                    <td className="text-center">
-                      <button 
-                        disabled={!isSuperAdmin || u.role === 'super_admin'}
-                        onClick={() => handleTogglePermission(u, 'can_edit_matrix')}
-                        className={`btn-secondary text-[11px] px-2.5 py-1 ${u.can_edit_matrix || u.role === 'super_admin' ? 'text-emerald-400 border-emerald-500/30' : 'text-slate-500'}`}
-                      >
-                        {u.can_edit_matrix || u.role === 'super_admin' ? '✓ YES' : '✗ NO'}
-                      </button>
-                    </td>
-
-                    <td className="text-center">
-                      <button 
-                        disabled={!isSuperAdmin || u.role === 'super_admin'}
-                        onClick={() => handleTogglePermission(u, 'can_manage_tags')}
-                        className={`btn-secondary text-[11px] px-2.5 py-1 ${u.can_manage_tags || u.role === 'super_admin' ? 'text-emerald-400 border-emerald-500/30' : 'text-slate-500'}`}
-                      >
-                        {u.can_manage_tags || u.role === 'super_admin' ? '✓ YES' : '✗ NO'}
-                      </button>
-                    </td>
-
-                    <td className="text-center">
-                      <button 
-                        disabled={!isSuperAdmin || u.role === 'super_admin'}
-                        onClick={() => handleTogglePermission(u, 'can_purge_data')}
-                        className={`btn-secondary text-[11px] px-2.5 py-1 ${u.can_purge_data || u.role === 'super_admin' ? 'text-emerald-400 border-emerald-500/30' : 'text-slate-500'}`}
-                      >
-                        {u.can_purge_data || u.role === 'super_admin' ? '✓ YES' : '✗ NO'}
-                      </button>
-                    </td>
-
-                    {/* Quick Preset Assignment */}
-                    <td>
-                      <div className="flex gap-1">
-                        <button 
-                          disabled={!isSuperAdmin}
-                          onClick={() => handleAssignPreset(u.email, 'super_admin')}
-                          className="btn-secondary text-[10px] px-2 py-1 text-purple-400 hover:bg-purple-500/20"
-                        >
-                          Super Admin
-                        </button>
-                        <button 
-                          disabled={!isSuperAdmin}
-                          onClick={() => handleAssignPreset(u.email, 'data_editor')}
-                          className="btn-secondary text-[10px] px-2 py-1 text-cyan-400 hover:bg-cyan-500/20"
-                        >
-                          Data Editor
-                        </button>
-                        <button 
-                          disabled={!isSuperAdmin}
-                          onClick={() => handleAssignPreset(u.email, 'admin')}
-                          className="btn-secondary text-[10px] px-2 py-1 text-emerald-400 hover:bg-emerald-500/20"
-                        >
-                          Admin
-                        </button>
-                      </div>
-                    </td>
-
-                    {/* Actions Column */}
-                    {isSuperAdmin && (
-                      <td>
-                        {editingUser && editingUser.id === u.id ? (
-                          <div className="flex items-center gap-1.5">
-                            <button 
-                              onClick={handleSaveUserEdit}
-                              className="btn-primary text-[10px] px-2 py-1 text-emerald-400 hover:bg-emerald-500/10 flex items-center gap-0.5"
-                              title="Save"
-                            >
-                              <Check className="w-3.5 h-3.5" /> Save
-                            </button>
-                            <button 
-                              onClick={() => setEditingUser(null)}
-                              className="btn-secondary text-[10px] px-2 py-1 text-rose-400 hover:bg-rose-500/10 flex items-center gap-0.5"
-                              title="Cancel"
-                            >
-                              <X className="w-3.5 h-3.5" /> Cancel
-                            </button>
-                          </div>
-                        ) : (
-                          <button 
-                            onClick={() => setEditingUser({ id: u.id, email: u.email, username: u.username, password: '' })}
-                            className="btn-secondary text-[10px] px-2.5 py-1 text-cyan-400 hover:bg-cyan-500/10 flex items-center gap-1"
-                            title="Edit User Details"
-                          >
-                            <Edit className="w-3.5 h-3.5" /> Edit
-                          </button>
-                        )}
-                      </td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {/* People and their access moved to the Users & Access tab (RBAC: presets per charity, overrides). */}
+      {canSomewhere(user, 'users.view') && (
+        <div className="glass-panel p-5 border-l-4 border-cyan-400 flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <h3 className="text-sm font-bold flex items-center gap-2" style={{ color: 'var(--text-main)' }}><Key className="w-4 h-4 text-cyan-400" /> Users & access</h3>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>People, presets (Finance, Donor Care, ...) and what each person can see and do per charity are managed in the Users & Access tab.</p>
           </div>
         </div>
       )}

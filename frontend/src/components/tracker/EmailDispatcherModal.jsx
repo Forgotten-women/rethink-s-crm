@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Mail, X, Code, Eye, Send, Loader2, CheckCircle2, AlertTriangle, Users, Save, MinusCircle } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 import { themeStorageKey } from './trackerUtils';
+import { denyUnless } from '../../access';
 
 const PER_DONOR_VARIABLES = [
   { tag: '{contribution_amount}', label: "This donor's share of the sponsorship (e.g. 160)" },
@@ -90,6 +91,7 @@ export default function EmailDispatcherModal({
     const names = donors.filter(d => selectedIds.includes(d.id)).map(d => d.donor_name || d.donor_email).join(', ');
     if (!window.confirm(`Send ${selectedIds.length} separate personalised email(s) from the ${allocCompany} mailbox to: ${names}?`)) return;
     setSending(true);
+if (denyUnless('email.send')) return;
     fetch(`${API_BASE_URL}/api/tracker/outlook/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

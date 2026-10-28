@@ -29,6 +29,7 @@ import {
   Table
 } from 'lucide-react';
 import { API_BASE_URL, downloadFile } from '../config';
+import { can } from '../access';
 import SpecialCaseCombobox, { ALL_SHEET10_SPECIAL_CASES, canonicalizeSpecialCase } from './SpecialCaseCombobox';
 
 // Robust frontend text cleaner to repair mojibake / corrupted UTF-8 and strip zero-width characters
@@ -142,7 +143,12 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   const [importMsg, setImportMsg] = useState('');
   const fileInputRef = useRef(null);
 
-  const isSuperAdmin = user?.role === 'super_admin';
+  // What this person may change here (access.js; the server checks every save again).
+  const canEditRules = can(user, 'classifications.edit', activeCompany);
+  const canMasterCodes = can(user, 'classifications.master_codes', activeCompany);
+  const canDeleteRules = can(user, 'classifications.delete', activeCompany);
+  const canImportRules = can(user, 'classifications.import', activeCompany);
+  const isSuperAdmin = platform === 'master' ? canMasterCodes : canEditRules; // name kept: gates the editing controls
 
   // Update platform handler with localStorage persistence
   const handleSelectPlatform = (newPlat) => {
@@ -225,7 +231,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   };
 
   const handleQuickUpdateStatus = async (code, newStatus, newActive) => {
-    if (!isSuperAdmin) return;
+    if (!canMasterCodes) return;
     try {
       const res = await fetch(`${API_BASE_URL}/api/classifications/master-codes/status`, {
         method: 'POST',
@@ -255,7 +261,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
   const handleSaveMasterCodeSubmit = async (e) => {
     e.preventDefault();
-    if (!isSuperAdmin || !masterCodeModal) return;
+    if (!canMasterCodes || !masterCodeModal) return;
     setSavingMasterCode(true);
     setMasterCodeModalMsg('');
 
@@ -312,7 +318,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   };
 
   const handleDeleteMasterCode = async (rule) => {
-    if (!isSuperAdmin) return;
+    if (!canMasterCodes) return;
     const cCode = rule.code || rule['Code'];
     if (!window.confirm(`Are you sure you want to delete Master Project Code "${cCode}"?\n\nThis will remove it from the canonical codes registry.`)) {
       return;
@@ -1068,7 +1074,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   };
 
   const handleDeleteRule = async (rule) => {
-    if (!isSuperAdmin) return;
+    if (!canDeleteRules) return;
     if (isConsolidated) {
       alert('Deleting classification rules is disabled in Consolidated (All Companies) mode.');
       return;
@@ -1453,7 +1459,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
           {/* Export Dropdown */}
           <div className="flex items-center rounded-xl overflow-hidden border border-slate-200 dark:border-white/10 bg-slate-100 dark:bg-slate-800/60 shadow-sm">
-            <button 
+            {can(user, 'classifications.export', activeCompany) && (
+<button 
               onClick={() => handleExport('csv')}
               className="px-3 py-2 text-xs font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors flex items-center gap-1.5 cursor-pointer"
               title="Download Rules as CSV"
@@ -1461,8 +1468,10 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
               <Download className="w-3.5 h-3.5 text-cyan-600 dark:text-cyan-400" />
               <span>CSV</span>
             </button>
+)}
             <div className="w-[1px] h-4 bg-slate-300 dark:bg-white/10"></div>
-            <button 
+            {can(user, 'classifications.export', activeCompany) && (
+<button 
               onClick={() => handleExport('xlsx')}
               className="px-3 py-2 text-xs font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors flex items-center gap-1.5 cursor-pointer"
               title="Download Rules as Excel Spreadsheet"
@@ -1470,6 +1479,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
               <span>Excel</span>
             </button>
+)}
           </div>
         </div>
       </div>
@@ -2308,7 +2318,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                   >
                                     <Plus className="w-4 h-4" />
                                   </button>
-                                  <button 
+                                  {canDeleteRules && (
+<button 
                                     type="button"
                                     onClick={() => handleDeleteRule(r)}
                                     className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-500/10 rounded-lg transition-colors cursor-pointer"
@@ -2316,6 +2327,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                   >
                                     <Trash2 className="w-4 h-4" />
                                   </button>
+)}
                                 </div>
                               </td>
                             )}
@@ -2714,7 +2726,8 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                       >
                                         <Plus className="w-4 h-4" />
                                       </button>
-                                      <button 
+                                      {canDeleteRules && (
+<button 
                                         type="button"
                                         onClick={() => handleDeleteRule(rule)}
                                         className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-500/10 rounded-lg transition-colors cursor-pointer"
@@ -2722,6 +2735,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                       >
                                         <Trash2 className="w-4 h-4" />
                                       </button>
+)}
                                     </div>
                                   </td>
                                 )}
@@ -2850,7 +2864,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       )}
 
       {/* 📂 Bulk Upload / Importer Modal */}
-      {showImportModal && isSuperAdmin && (
+      {showImportModal && canImportRules && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fade-in">
           <div className="glass-panel p-6 max-w-lg w-full rounded-2xl border border-white/20 shadow-2xl relative bg-white dark:bg-slate-900">
             <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-white/10">
@@ -2963,7 +2977,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       )}
 
       {/* 🏷️ Add / Edit Master Project Code Modal */}
-      {masterCodeModal && isSuperAdmin && (
+      {masterCodeModal && canMasterCodes && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fade-in">
           <div className="glass-panel p-6 max-w-lg w-full rounded-2xl border border-white/20 shadow-2xl relative bg-white dark:bg-slate-900">
             <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-white/10">

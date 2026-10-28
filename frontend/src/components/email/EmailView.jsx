@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowDownLeft, ArrowUpRight, Inbox, LayoutTemplate, ListChecks, Mail, MailOpen, Activity, PenSquare, Search, UserMinus, X } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
+import { can } from '../../access';
 import BulkEmailComposer from './BulkEmailComposer';
 import EmailThread, { localTime } from './EmailThread';
 import EmailCampaignsView from '../tracker/EmailCampaignsView';
@@ -41,7 +42,7 @@ function UnsubscribedList({ company, user, onSelectDonor }) {
   const pages = Math.max(1, Math.ceil(items.length / PAGE));
   const p = Math.min(page, pages);
   const rows = items.slice((p - 1) * PAGE, p * PAGE);
-  const canResub = ['admin', 'super_admin'].includes(user?.role);
+  const canResub = can(user, 'email.resubscribe', company);
   return (
     <div className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden">
       <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex items-center gap-2 flex-wrap">

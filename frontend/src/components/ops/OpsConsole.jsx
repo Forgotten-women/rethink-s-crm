@@ -327,9 +327,9 @@ function StatusTab() {
 
 const RANGES = { '1h': 1, '24h': 24, '7d': 168, '30d': 720 };
 
-function LogsTab() {
-  const [filters, setFilters] = useState({ category: 'all', level: 'all', company_id: 'all', search: '', range: '24h' });
-  const [data, setData] = useState({ items: [], total: 0, categories: [] });
+function LogsTab({ logsOnly = false, companies = [] }) {
+  const [filters, setFilters] = useState({ category: 'all', level: 'all', company_id: 'all', actor: 'all', search: '', range: '24h' });
+  const [data, setData] = useState({ items: [], total: 0, categories: [], actors: [] });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [expanded, setExpanded] = useState(null);
@@ -344,7 +344,7 @@ function LogsTab() {
     if (source !== 'local') return;
     setLoading(true); setError('');
     const p = new URLSearchParams({ limit: pageSize, offset: page * pageSize, since: new Date(Date.now() - RANGES[filters.range] * 3600000).toISOString() });
-    ['category', 'level', 'company_id', 'search'].forEach(k => { if (filters[k] && filters[k] !== 'all') p.set(k, filters[k]); });
+    ['category', 'level', 'company_id', 'actor', 'search'].forEach(k => { if (filters[k] && filters[k] !== 'all') p.set(k, filters[k]); });
     getJson(`/api/ops/logs?${p}`).then(setData).catch(e => setError(e.message)).finally(() => setLoading(false));
   }, [filters, page, source]);
   useEffect(() => { load(); }, [load]);
@@ -362,7 +362,7 @@ function LogsTab() {
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-end gap-2">
         <div className="flex bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700/60">
-          {['local', 'axiom'].map(s => (
+          {(logsOnly ? ['local'] : ['local', 'axiom']).map(s => (
             <button key={s} type="button" onClick={() => setSource(s)} className={`px-2.5 py-1 rounded-md font-semibold ${source === s ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-2xs' : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-300'}`}>
               {s === 'local' ? 'This server' : 'Axiom (APL)'}
             </button>
@@ -380,7 +380,14 @@ function LogsTab() {
               <option value="all">All levels</option><option value="warning">Warnings + errors</option><option value="error">Errors only</option><option value="info">Info only</option>
             </select>
             <select value={filters.company_id} onChange={e => set('company_id', e.target.value)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 text-xs">
-              <option value="all">Both charities</option><option value="rethink">Rethink</option><option value="iqra">Iqra</option>
+              <option value="all">{logsOnly ? 'All my charities' : 'All charities'}</option>
+              {(companies.length ? companies.filter(c => c.id !== 'all') : [{ id: 'rethink', short_code: 'Rethink' }, { id: 'iqra', short_code: 'Iqra' }])
+                .map(c => <option key={c.id} value={c.id}>{c.short_code || c.name || c.id}</option>)}
+            </select>
+            {/* who did what: one employee's actions */}
+            <select value={filters.actor} onChange={e => set('actor', e.target.value)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 text-xs">
+              <option value="all">All employees</option>
+              {(data.actors || []).map(a => <option key={a} value={a}>{a}</option>)}
             </select>
             <input value={filters.search} onChange={e => set('search', e.target.value)} placeholder="Search message, email, event…"
               className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 placeholder:text-slate-400 w-56 text-xs" />
@@ -444,9 +451,11 @@ function SessionsTab() {
   const [msg, setMsg] = useState(null);
   const [copiedBookmarklet, setCopiedBookmarklet] = useState(false);
   const load = () => getJson('/api/ops/platform-sessions').then(setSessions).catch(e => setMsg({ type: 'error', text: e.message }));
-  useEffect(() => { load(); }, []);
+  const [syncKey, setSyncKey] = useState('');
+  useEffect(() => { load(); getJson('/api/ops/sync-helper-key').then(d => setSyncKey(d.key || '')).catch(() => {}); }, []);
 
-  const bookmarkletCode = `javascript:(function(){const CRM='${window.location.origin}';const KEY='lg_sync_rethink_2026_crm';if(!location.hostname.includes('launchgood.com')){alert('Please open launchgood.com first before clicking this bookmarklet!');return;}let b=document.getElementById('lg-sync-box');if(!b){b=document.createElement('div');b.id='lg-sync-box';b.style.cssText='position:fixed;top:18px;right:18px;z-index:9999999;padding:13px 18px;background:#0f172a;color:#f8fafc;border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,0.4);font-family:system-ui,-apple-system,sans-serif;font-size:13px;display:flex;align-items:center;gap:10px;border:1px solid #334155;';document.body.appendChild(b);}b.innerHTML='🔄 Connecting LaunchGood session to CRM...';function getTok(){let m=(document.cookie||'').match(/(?:^|;\\s*)token=([^;]+)/);if(m)return m[1];try{for(let i=0;i<localStorage.length;i++){let v=localStorage.getItem(localStorage.key(i));if(typeof v==='string'&&/^(Bearer\\s+)?eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$/.test(v.trim()))return v.trim();}}catch(e){}return'';}function sync(){const t=getTok();if(!t){b.innerHTML='⚠️ Not signed in to LaunchGood. Please log in first.';setTimeout(()=>b.remove(),5000);return;}fetch(CRM+'/api/ops/sync-helper/launchgood_rethink',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({accessToken:t,rawCookie:document.cookie||'',source:'bookmarklet-1click',syncKey:KEY})}).then(r=>r.json()).then(res=>{if(res.ok){b.innerHTML='🟢 <b style=\"color:#34d399;\">LaunchGood Synced!</b> Auto-sync active (every 5m).';b.style.background='#064e3b';b.style.borderColor='#059669';if(!window.__lgInt){window.__lgInt=setInterval(sync,300000);}setTimeout(()=>{b.style.opacity='0.6';},4000);}else{b.innerHTML='⚠️ Notice: '+(res.detail||'Check connection');setTimeout(()=>b.remove(),6000);}}).catch(e=>{b.innerHTML='❌ Error: '+e.message;setTimeout(()=>b.remove(),6000);});}sync();})();`;
+  // the key comes from the server (super admins only); it is never written in the code
+  const bookmarkletCode = `javascript:(function(){const CRM='${window.location.origin}';const KEY='${syncKey}';if(!location.hostname.includes('launchgood.com')){alert('Please open launchgood.com first before clicking this bookmarklet!');return;}let b=document.getElementById('lg-sync-box');if(!b){b=document.createElement('div');b.id='lg-sync-box';b.style.cssText='position:fixed;top:18px;right:18px;z-index:9999999;padding:13px 18px;background:#0f172a;color:#f8fafc;border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,0.4);font-family:system-ui,-apple-system,sans-serif;font-size:13px;display:flex;align-items:center;gap:10px;border:1px solid #334155;';document.body.appendChild(b);}b.innerHTML='🔄 Connecting LaunchGood session to CRM...';function getTok(){let m=(document.cookie||'').match(/(?:^|;\\s*)token=([^;]+)/);if(m)return m[1];try{for(let i=0;i<localStorage.length;i++){let v=localStorage.getItem(localStorage.key(i));if(typeof v==='string'&&/^(Bearer\\s+)?eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+$/.test(v.trim()))return v.trim();}}catch(e){}return'';}function sync(){const t=getTok();if(!t){b.innerHTML='⚠️ Not signed in to LaunchGood. Please log in first.';setTimeout(()=>b.remove(),5000);return;}fetch(CRM+'/api/ops/sync-helper/launchgood_rethink',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({accessToken:t,rawCookie:document.cookie||'',source:'bookmarklet-1click',syncKey:KEY})}).then(r=>r.json()).then(res=>{if(res.ok){b.innerHTML='🟢 <b style=\"color:#34d399;\">LaunchGood Synced!</b> Auto-sync active (every 5m).';b.style.background='#064e3b';b.style.borderColor='#059669';if(!window.__lgInt){window.__lgInt=setInterval(sync,300000);}setTimeout(()=>{b.style.opacity='0.6';},4000);}else{b.innerHTML='⚠️ Notice: '+(res.detail||'Check connection');setTimeout(()=>b.remove(),6000);}}).catch(e=>{b.innerHTML='❌ Error: '+e.message;setTimeout(()=>b.remove(),6000);});}sync();})();`;
 
   const upload = async () => {
     let token = form.accessToken.trim();
@@ -776,7 +785,7 @@ function CacheTab() {
 }
 
 /** Hidden operations console (super admins). Opened with Ctrl+Alt+O or URL hash #ops */
-export default function OpsConsole({ onClose, initialTab = 'status' }) {
+export default function OpsConsole({ onClose, initialTab = 'status', logsOnly = false, companies = [] }) {
   const [tab, setTab] = useState(['status', 'logs', 'sessions', 'cache'].includes(initialTab) ? initialTab : 'status');
   useEffect(() => {
     if (['status', 'logs', 'sessions', 'cache'].includes(initialTab)) setTab(initialTab);
@@ -786,7 +795,8 @@ export default function OpsConsole({ onClose, initialTab = 'status' }) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
-  const tabs = [
+  // people given the activity log (not super admins) see only the log, for their charities (server-filtered)
+  const tabs = logsOnly ? [['logs', ScrollText, 'Activity log']] : [
     ['status', Activity, 'Status'],
     ['logs', ScrollText, 'Logs'],
     ['sessions', KeyRound, 'Sessions'],
@@ -801,7 +811,7 @@ export default function OpsConsole({ onClose, initialTab = 'status' }) {
         {/* Solid opaque sticky header — completely blocks background bleed-through when scrolling */}
         <div className="sticky top-0 z-30 px-5 py-3.5 bg-slate-50 dark:bg-slate-950 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shadow-xs">
           <div className="flex items-center gap-3">
-            <span className="font-bold text-sm text-slate-900 dark:text-slate-100">Ops console</span>
+            <span className="font-bold text-sm text-slate-900 dark:text-slate-100">{logsOnly ? 'Activity log' : 'Ops console'}</span>
             <div className="flex bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700/60">
               {tabs.map(([id, Icon, label]) => (
                 <button
@@ -829,10 +839,10 @@ export default function OpsConsole({ onClose, initialTab = 'status' }) {
           </button>
         </div>
         <div className="p-5">
-          {tab === 'status' && <StatusTab />}
-          {tab === 'logs' && <LogsTab />}
-          {tab === 'sessions' && <SessionsTab />}
-          {tab === 'cache' && <CacheTab />}
+          {tab === 'status' && !logsOnly && <StatusTab />}
+          {(tab === 'logs' || logsOnly) && <LogsTab logsOnly={logsOnly} companies={companies} />}
+          {tab === 'sessions' && !logsOnly && <SessionsTab />}
+          {tab === 'cache' && !logsOnly && <CacheTab />}
         </div>
       </div>
     </div>

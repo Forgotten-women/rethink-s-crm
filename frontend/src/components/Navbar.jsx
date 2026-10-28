@@ -36,7 +36,7 @@ export default function Navbar({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  const roleBadge = user?.role === 'super_admin' ? '⚡ SUPER ADMIN' : '👤 ADMIN';
+  const roleBadge = user?.role === 'super_admin' ? '⚡ SUPER ADMIN' : '👤 TEAM';
   
   const colors = [
     { id: 'cyan', bg: 'bg-cyan-500' },
@@ -84,7 +84,9 @@ export default function Navbar({
 
   // Determine allowed companies for user
   const userAllowed = user?.allowed_companies || ['ALL'];
-  const canAccessAll = user?.role === 'super_admin' || userAllowed.includes('ALL');
+  // 'All companies' needs every charity, and isn't offered to someone limited to specific fundraisers
+  const canAccessAll = user?.role === 'super_admin'
+    || (userAllowed.includes('ALL') && !Object.keys(user?.access?.scopes || {}).length);
 
   const isCompanySelectable = (cid) => {
     if (canAccessAll) return true;
@@ -170,7 +172,7 @@ export default function Navbar({
                 </div>
 
                 <div className="space-y-1">
-                  {companies.map((comp) => {
+                  {companies.filter(c => isCompanySelectable(c.id)).map((comp) => {  // charities without access are not shown at all
                     const isSelected = activeCompany === comp.id;
                     const selectable = isCompanySelectable(comp.id);
 

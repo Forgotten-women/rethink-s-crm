@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail } from 'lucide-react';
+import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail, KeyRound, ScrollText } from 'lucide-react';
+import { canSeeTab } from '../access';
 import { API_BASE_URL } from '../config';
 import { useUnsubscribeAlerts, UnsubscribeToast } from './email/unsubscribeAlerts';
 
@@ -24,6 +25,8 @@ const tabs = [
   { id: 'classifications', label: 'Classifications', icon: Shield },
   { id: 'expenses', label: 'Expenses', icon: CreditCard },
   { id: 'admin', label: 'Admin & Data', icon: Database },
+  { id: 'access', label: 'Users & Access', icon: KeyRound },
+  { id: 'activity', label: 'Activity log', icon: ScrollText },
 ];
 
 export default function NavigationSidebar({ 
@@ -33,7 +36,8 @@ export default function NavigationSidebar({
   setAccentColor,
   activeCompany = 'rethink',
   currentCompany,
-  companies = []
+  companies = [],
+  user = null,
 }) {
   const [isHovered, setIsHovered] = useState(false);
   const showExpanded = isHovered;
@@ -116,7 +120,7 @@ export default function NavigationSidebar({
 
       {/* Navigation Links */}
       <div className="flex-1 overflow-y-auto py-6 px-3 flex flex-col gap-1.5 custom-scrollbar">
-        {tabs.map(t => {
+        {tabs.filter(t => canSeeTab(user, t.id, activeCompany)).map(t => {
           const Icon = t.icon;
           const isActive = activeTab === t.id;
           

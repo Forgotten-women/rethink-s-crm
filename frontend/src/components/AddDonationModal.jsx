@@ -2,14 +2,15 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { X, PlusCircle, HeartHandshake, Info, Search } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import { can, storedCompany, storedUser } from '../access';
 
-/** Who may add / edit donor records: super admins and accounts with "Edit donors" (the server checks this too). */
+/** Whether to show an add / edit control: the person holds `perm` in the charity (access.js; the server checks
+ *  every action again, so this only decides what is shown). */
 export function currentUser() {
-  try { return JSON.parse(localStorage.getItem('analytics_user') || 'null') || {}; } catch { return {}; }
+  return storedUser() || {};
 }
-export function canEditRecords(user) {
-  const u = user || currentUser();
-  return u?.role === 'super_admin' || u?.can_edit_donors === 1 || u?.can_edit_donors === true;
+export function canEditRecords(user, perm = 'donors.edit', company) {
+  return can(user || storedUser(), perm, company || storedCompany());
 }
 
 const codesCache = {};
