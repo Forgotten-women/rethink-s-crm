@@ -340,45 +340,69 @@ function PersonEditor({ person, me, roles, catalogue, companies, onClose, onSave
               })}
             </div>
             {actorSuper && (
-              <div className="rounded-xl border p-3 flex flex-col gap-2 border-amber-400/40 bg-amber-500/5">
-                <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>Ops console (Ctrl+Alt+O) - only a super admin can change this</div>
-                <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>For the charities ticked (and only where the person also has access).</div>
-                {[['logs.view', 'Activity log (who did what)'], ['status.view', 'Service status (integrations, mailboxes, sync, backups)']].map(([perm, label]) => (
-                  <div key={perm} className="flex flex-wrap items-center gap-3">
-                    <span className="text-xs font-semibold min-w-[260px]" style={{ color: 'var(--text-main)' }}>{label}</span>
-                    {charityIds.map(comp => {
-                      // "All charities" includes every charity: those boxes show as ticked and greyed out.
-                      // Unticking one charity while "All" is on turns "All" off and ticks the others one by one.
-                      const allOn = (overrides[ALL] || {})[perm] === 'grant';
-                      const own = (overrides[comp] || {})[perm] === 'grant';
-                      const on = comp === ALL ? allOn : (allOn || own);
-                      const toggle = () => setOverrides(o => {
-                        const next = { ...o };
-                        const setGrant = (c, value) => {
-                          const m = { ...(next[c] || {}) };
-                          if (value) m[perm] = 'grant'; else delete m[perm];
-                          next[c] = m;
-                        };
-                        if (comp === ALL) {
-                          setGrant(ALL, !allOn);
-                          if (!allOn) charityIds.filter(c => c !== ALL).forEach(c => setGrant(c, false)); // covered by All
-                        } else if (allOn) {
-                          setGrant(ALL, false);
-                          charityIds.filter(c => c !== ALL).forEach(c => setGrant(c, c !== comp));
-                        } else {
-                          setGrant(comp, !own);
-                        }
-                        return next;
-                      });
-                      return (
-                        <label key={comp} className={`flex items-center gap-1.5 text-xs ${comp !== ALL && allOn ? 'opacity-60' : ''}`} style={{ color: 'var(--text-main)' }}
-                          title={comp !== ALL && allOn ? 'Included by "All charities" - untick to leave this charity out' : undefined}>
-                          <input type="checkbox" checked={on} onChange={toggle} /> {charityName(comp)}
-                        </label>
-                      );
-                    })}
-                  </div>
-                ))}
+              <div className="flex flex-col gap-2 pt-2">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="text-xs font-black uppercase tracking-wider" style={{ color: 'var(--text-sub)' }}>Ops console (Ctrl+Alt+O)</div>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-700 dark:text-amber-300 flex items-center gap-1">
+                    <Lock className="w-3 h-3" /> Only a super admin can change this
+                  </span>
+                </div>
+                {[
+                  ['logs.view', 'Activity log', 'Who did what - every change, sign-in and refusal, with an employee filter.'],
+                  ['status.view', 'Service status', 'Platform integrations, mailboxes, the sync service and backups.'],
+                ].map(([perm, label, help]) => {
+                  const allOn = (overrides[ALL] || {})[perm] === 'grant';
+                  const count = allOn ? charityIds.length - 1 : charityIds.filter(c => c !== ALL && (overrides[c] || {})[perm] === 'grant').length;
+                  return (
+                    <div key={perm} className="rounded-xl border p-3 flex flex-col gap-2" style={{ borderColor: 'var(--border-glass)' }}>
+                      <div className="flex items-start justify-between gap-3 flex-wrap">
+                        <div>
+                          <div className="text-sm font-bold" style={{ color: 'var(--text-main)' }}>{label}</div>
+                          <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{help} Only for charities they can also open.</div>
+                        </div>
+                        <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                          {allOn ? 'All charities' : count ? `${count} ${count === 1 ? 'charity' : 'charities'}` : 'Off'}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {charityIds.map(comp => {
+                          // "All charities" includes every charity (shown ticked, dimmed). Unticking one charity while
+                          // "All" is on turns "All" off and keeps the others ticked one by one.
+                          const own = (overrides[comp] || {})[perm] === 'grant';
+                          const on = comp === ALL ? allOn : (allOn || own);
+                          const viaAll = comp !== ALL && allOn;
+                          const toggle = () => setOverrides(o => {
+                            const next = { ...o };
+                            const setGrant = (c, value) => {
+                              const m = { ...(next[c] || {}) };
+                              if (value) m[perm] = 'grant'; else delete m[perm];
+                              next[c] = m;
+                            };
+                            if (comp === ALL) {
+                              setGrant(ALL, !allOn);
+                              if (!allOn) charityIds.filter(c => c !== ALL).forEach(c => setGrant(c, false)); // covered by All
+                            } else if (allOn) {
+                              setGrant(ALL, false);
+                              charityIds.filter(c => c !== ALL).forEach(c => setGrant(c, c !== comp));
+                            } else {
+                              setGrant(comp, !own);
+                            }
+                            return next;
+                          });
+                          return (
+                            <button key={comp} type="button" onClick={toggle}
+                              title={viaAll ? 'Included by "All charities" - click to leave this charity out' : undefined}
+                              className={`text-[11px] px-2 py-1 rounded-md border flex items-center gap-1 ${on ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-700 dark:text-emerald-300' : ''} ${viaAll ? 'opacity-60' : ''}`}
+                              style={on ? undefined : { borderColor: 'var(--border-glass)', color: 'var(--text-muted)' }}>
+                              {on ? <Check className="w-3 h-3" /> : <Minus className="w-3 h-3" />}
+                              {comp === ALL ? 'All charities (incl. future ones)' : charityName(comp)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
             {!isSelf && <div className="flex justify-end"><Btn disabled={busy} onClick={saveAccess}><Save className="w-3.5 h-3.5" /> Save access</Btn></div>}
