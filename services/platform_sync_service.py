@@ -49,7 +49,7 @@ from core.givebrite_ingestion import (
 from core.madinah_ingestion import (
     ingest_madinah_donations,
     run_madinah_historical_backfill,
-    MADINAH_APIM_BASE
+    MADINAH_CAMPAIGN_API
 )
 from core.event_log import log_event, set_service_name
 
@@ -70,7 +70,11 @@ HEALTH_FILE = os.path.join(DATA_CACHE_DIR, "platform_health.json")
 SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", 60))  # standard interval
 DEEP_SYNC_INTERVAL_SEC = 1800  # 30 minutes for deep campaign catalog scans
 GIVEBRITE_CHARITY_ID = GIVEBRITE_CHARITY_IDS.get("iqra", "")
-MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
+# Madinah moved off Azure API Management (md-backend-prod-api.azure-api.net stopped resolving on 27 Oct 2026);
+# each server now has its own host, as used by www.madinah.com.
+MADINAH_MAIN_API = "https://api-main.madinah.com/api/v1"
+MADINAH_CAMPAIGN_API = "https://api-campaigns.madinah.com/api/v1"
+MADINAH_DASHBOARD_API = "https://api-dashboard.madinah.com/api/v1"
 
 # Logging setup
 logging.basicConfig(
@@ -252,7 +256,7 @@ class PlatformSyncService:
                 if (force_refresh or (exp and time_left_sec < 3600)) and refresh_token:
                     logger.info(f"Madinah token refreshing via pure HTTP (Time remaining: {time_left_sec/60:.1f}m)...")
                     r = self.session.post(
-                        f"{MADINAH_APIM_BASE}/main-server/api/v1/user/token",
+                        f"{MADINAH_MAIN_API}/user/token",
                         headers={"Content-Type": "application/json", "Accept": "application/json"},
                         json={"refreshToken": refresh_token},
                         timeout=(5, 25)
@@ -395,7 +399,7 @@ class PlatformSyncService:
 
         while True:
             url_madinah_donations = (
-                f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest"
+                f"{MADINAH_CAMPAIGN_API}/campaign/donations/latest"
                 f"?startDate={start_window}&endDate={today}&page={page}&limit=100"
             )
             try:
@@ -467,7 +471,7 @@ class PlatformSyncService:
         # 3. Donation Stats / Recovery Summary
         try:
             r = self.session.get(
-                f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest/stats",
+                f"{MADINAH_CAMPAIGN_API}/campaign/donations/latest/stats",
                 headers=headers,
                 timeout=(5, 25)
             )
@@ -489,7 +493,7 @@ class PlatformSyncService:
         # 4. Overall Revenue & Donor Geography (Using tested dashboard date parameters)
         try:
             r = self.session.get(
-                f"{MADINAH_APIM_BASE}/dashboard-server/api/v1/user/dashboard/overview?startDate={today}&endDate={today}&dateValue=today&dateName=Today",
+                f"{MADINAH_DASHBOARD_API}/user/dashboard/overview?startDate={today}&endDate={today}&dateValue=today&dateName=Today",
                 headers=headers,
                 timeout=(5, 25)
             )
@@ -503,7 +507,7 @@ class PlatformSyncService:
         if is_deep:
             try:
                 r = self.session.get(
-                    f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/dashboard?page=1&limit=50&sortBy=createdAt&sortOrder=desc",
+                    f"{MADINAH_CAMPAIGN_API}/campaign/dashboard?page=1&limit=50&sortBy=createdAt&sortOrder=desc",
                     headers=headers,
                     timeout=(5, 25)
                 )

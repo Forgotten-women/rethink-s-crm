@@ -47,7 +47,11 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
+# Madinah moved off Azure API Management (md-backend-prod-api.azure-api.net stopped resolving on 27 Oct 2026);
+# each server now has its own host, as used by www.madinah.com.
+MADINAH_MAIN_API = "https://api-main.madinah.com/api/v1"
+MADINAH_CAMPAIGN_API = "https://api-campaigns.madinah.com/api/v1"
+MADINAH_DASHBOARD_API = "https://api-dashboard.madinah.com/api/v1"
 
 
 # campaignId -> public link. The donations feed only carries campaignId; the link uses the campaign's
@@ -640,7 +644,7 @@ def run_madinah_historical_backfill(
         "Content-Type": "application/json"
     }
 
-    base_url = f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest"
+    base_url = f"{MADINAH_CAMPAIGN_API}/campaign/donations/latest"
     page = 1
     total_inserted = 0
     total_skipped = 0

@@ -31,7 +31,10 @@ const GIVEBRITE_SYNC_FILE = path.join(DATA_CACHE_DIR, 'givebrite_sync_data.json'
 const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_SEC || '60', 10) * 1000; // 60s default
 const DEEP_SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes for deep catalog scan
 const GIVEBRITE_CHARITY_ID = '68625e0d6d1a99441e34e2ea';
-const MADINAH_APIM_BASE = 'https://md-backend-prod-api.azure-api.net';
+// Madinah moved off Azure API Management (md-backend-prod-api.azure-api.net stopped resolving on 27 Oct 2026).
+const MADINAH_MAIN_API = 'https://api-main.madinah.com/api/v1';
+const MADINAH_CAMPAIGN_API = 'https://api-campaigns.madinah.com/api/v1';
+const MADINAH_DASHBOARD_API = 'https://api-dashboard.madinah.com/api/v1';
 
 // Asynchronous File Lock to prevent concurrent overlapping writes to the same file
 const fileLocks = new Map();
@@ -126,7 +129,7 @@ async function ensureMadinahToken() {
   if (expMs && (expMs - now < 20 * 60 * 1000) && tokenData.refreshToken) {
     log('Madinah accessToken near expiration. Renewing via pure HTTP token endpoint...');
     try {
-      const res = await fetch(`${MADINAH_APIM_BASE}/main-server/api/v1/user/token`, {
+      const res = await fetch(`${MADINAH_MAIN_API}/user/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ refreshToken: tokenData.refreshToken }),
@@ -188,7 +191,7 @@ async function syncMadinah(isDeep = false) {
 
   // 1. Latest Real-Time Donations Stream
   try {
-    const res = await fetch(`${MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest?page=1&limit=50`, {
+    const res = await fetch(`${MADINAH_CAMPAIGN_API}/campaign/donations/latest?page=1&limit=50`, {
       headers,
       signal: AbortSignal.timeout(12000)
     });
@@ -207,7 +210,7 @@ async function syncMadinah(isDeep = false) {
 
   // 2. Donation Analytics & Recovery Stats
   try {
-    const res = await fetch(`${MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest/stats`, {
+    const res = await fetch(`${MADINAH_CAMPAIGN_API}/campaign/donations/latest/stats`, {
       headers,
       signal: AbortSignal.timeout(12000)
     });
@@ -224,7 +227,7 @@ async function syncMadinah(isDeep = false) {
 
   // 3. Organization Overview & Total Revenue
   try {
-    const res = await fetch(`${MADINAH_APIM_BASE}/dashboard-server/api/v1/user/dashboard/overview?startDateFilter=2024-01-01&endDateFilter=${today}`, {
+    const res = await fetch(`${MADINAH_DASHBOARD_API}/user/dashboard/overview?startDateFilter=2024-01-01&endDateFilter=${today}`, {
       headers,
       signal: AbortSignal.timeout(12000)
     });
@@ -239,7 +242,7 @@ async function syncMadinah(isDeep = false) {
   // 4. Campaign Catalog (In deep sync)
   if (isDeep) {
     try {
-      const res = await fetch(`${MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/dashboard?page=1&limit=50&sortBy=createdAt&sortOrder=desc`, {
+      const res = await fetch(`${MADINAH_CAMPAIGN_API}/campaign/dashboard?page=1&limit=50&sortBy=createdAt&sortOrder=desc`, {
         headers,
         signal: AbortSignal.timeout(15000)
       });

@@ -35,7 +35,11 @@ TOKEN_FILES = {
 HEALTH_FILE = os.path.join(BASE_DIR, "data_cache", "platform_health.json")
 SYNC_FILE = os.path.join(BASE_DIR, "data_cache", "platform_sync_data.json")
 GIVEBRITE_CHARITY_ID = GIVEBRITE_CHARITY_IDS.get("iqra", "")
-MADINAH_APIM_BASE = "https://md-backend-prod-api.azure-api.net"
+# Madinah moved off Azure API Management (md-backend-prod-api.azure-api.net stopped resolving on 27 Oct 2026);
+# each server now has its own host, as used by www.madinah.com.
+MADINAH_MAIN_API = "https://api-main.madinah.com/api/v1"
+MADINAH_CAMPAIGN_API = "https://api-campaigns.madinah.com/api/v1"
+MADINAH_DASHBOARD_API = "https://api-dashboard.madinah.com/api/v1"
 
 
 def _now() -> datetime.datetime:
@@ -138,7 +142,7 @@ def _live_check(platform: str, token: Optional[str] = None) -> Dict[str, Any]:
     auth = token if token.startswith("Bearer ") else f"Bearer {token}"
     try:
         if platform == "madinah":
-            r = requests.get(f"{MADINAH_APIM_BASE}/campaign-server/api/v1/campaign/donations/latest?page=1&limit=1",
+            r = requests.get(f"{MADINAH_CAMPAIGN_API}/campaign/donations/latest?page=1&limit=1",
                              headers={"Authorization": auth, "Accept": "application/json",
                                       "Origin": "https://www.madinah.com"}, timeout=12)
         else:
