@@ -240,22 +240,14 @@ def authenticate_user(email_or_username: str, password: str) -> Optional[Dict[st
             if res.status_code == 200:
                 data = res.json()
                 user_obj = data.get("user", {})
-                user_meta = user_obj.get("user_metadata", {})
-                app_meta = user_obj.get("app_metadata", {})
-                role = user_meta.get("role") or app_meta.get("role") or "admin"
-                
                 email = user_obj.get("email", user_identity)
-                if "superadmin" in email.lower() or "super" in str(role).lower():
-                    role = "super_admin"
-
-                return {
-                    "id": user_obj.get("id"),
-                    "email": email,
-                    "username": email.split("@")[0],
-                    "role": role,
-                    "provider": "supabase",
-                    "access_token": data.get("access_token")
-                }
+                # Supabase only proves the password. The role and permissions always come from the local users
+                # table - never from Supabase user_metadata (which the user can edit) or from the email address.
+                local = get_user_by_identity(email)
+                if not local:
+                    print(f"[Security] Supabase login for {email} refused: no local account")
+                    return None
+                return {**local, "provider": "supabase", "access_token": data.get("access_token")}
         except Exception as err:
             print(f"Supabase Auth attempt notice: {err}")
 
@@ -283,25 +275,7 @@ def authenticate_user(email_or_username: str, password: str) -> Optional[Dict[st
                     except Exception as up_err:
                         print(f"[Security Notice] Password hash upgrade notice: {up_err}")
 
-                is_super = (row[3] == "super_admin")
-                raw_comp = row[8] if row[8] else '["ALL"]'
-                try:
-                    allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
-                except Exception:
-                    allowed_comp = ["ALL"]
-
-                return {
-                    "id": row[0],
-                    "username": row[1],
-                    "email": row[2],
-                    "role": row[3],
-                    "can_edit_donors": 1 if (is_super or row[4]) else 0,
-                    "can_edit_matrix": 1 if (is_super or row[5]) else 0,
-                    "can_manage_tags": 1 if (is_super or row[6]) else 0,
-                    "can_purge_data": 1 if (is_super or row[7]) else 0,
-                    "allowed_companies": allowed_comp,
-                    "provider": "local"
-                }
+                return get_user_by_identity(row[2])  # None if the account is disabled
     except Exception as e:
         print(f"Local auth error: {e}")
     finally:
@@ -311,48 +285,66 @@ def authenticate_user(email_or_username: str, password: str) -> Optional[Dict[st
 
 
 def get_user_by_identity(user_identity: str) -> Optional[Dict[str, Any]]:
-    """
-    Retrieves user dict by username, email, or user id.
-    """
+    """The account as it is right now (by email or username), with its effective access from RBAC
+    (core/rbac.py). Disabled or unknown accounts return None, so their sessions stop working at once."""
     if not user_identity or not str(user_identity).strip():
         return None
-
+    from core import rbac
     ident = str(user_identity).strip()
     init_user_db()
+    rbac.init_rbac()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data, allowed_companies FROM users
-            WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
-        """, (ident, ident))
-        row = cur.fetchone()
-        if row:
-            is_super = (row[3] == "super_admin")
-            raw_comp = row[8] if row[8] else '["ALL"]'
-            try:
-                allowed_comp = json.loads(raw_comp) if isinstance(raw_comp, str) else raw_comp
-            except Exception:
-                allowed_comp = ["ALL"]
-
-            return {
-                "id": row[0],
-                "username": row[1],
-                "email": row[2],
-                "role": row[3],
-                "can_edit_donors": 1 if (is_super or row[4]) else 0,
-                "can_edit_matrix": 1 if (is_super or row[5]) else 0,
-                "can_manage_tags": 1 if (is_super or row[6]) else 0,
-                "can_purge_data": 1 if (is_super or row[7]) else 0,
-                "allowed_companies": allowed_comp,
-                "provider": "local"
-            }
+        row = conn.execute("""
+            SELECT id, username, email, role, can_edit_donors, can_edit_matrix, can_manage_tags, can_purge_data,
+                   COALESCE(is_active, 1) AS is_active, COALESCE(token_version, 0) AS token_version, display_name
+            FROM users WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
+        """, (ident, ident)).fetchone()
     except Exception as e:
         print(f"Session restoration notice: {e}")
+        row = None
     finally:
         conn.close()
+    if not row or not row["is_active"]:
+        return None
+    is_super = row["role"] == "super_admin"
+    access = rbac.effective_access(row["id"], is_super)
+    companies = sorted(access["companies"])
+    every = set(rbac._all_company_ids())
+    # allowed_companies is derived from RBAC (kept for the charity guards): every charity -> ["ALL"]
+    allowed = ["ALL"] if is_super or (every and every <= set(companies)) else companies
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "email": row["email"],
+        "display_name": row["display_name"] or "",
+        "role": row["role"],
+        # legacy flags, still read by older endpoints until they move to permissions
+        "can_edit_donors": 1 if (is_super or row["can_edit_donors"]) else 0,
+        "can_edit_matrix": 1 if (is_super or row["can_edit_matrix"]) else 0,
+        "can_manage_tags": 1 if (is_super or row["can_manage_tags"]) else 0,
+        "can_purge_data": 1 if (is_super or row["can_purge_data"]) else 0,
+        "allowed_companies": allowed,
+        "access": access,
+        "token_version": row["token_version"],
+        "provider": "local",
+    }
 
-    return None
+
+def user_from_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The live account behind a session token, or None (bad/expired token, removed or disabled account, or a
+    session ended by 'sign out everywhere'). The only way any part of the app turns a token into a user."""
+    tok = (token or "").strip()
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    payload = decode_access_token(tok) if tok else None
+    if not payload or not payload.get("sub"):
+        return None
+    user = get_user_by_identity(payload["sub"])
+    if not user or int(payload.get("tv") or 0) != int(user.get("token_version") or 0):
+        return None
+    return user
 
 
 def send_password_reset_request(email: str):

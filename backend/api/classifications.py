@@ -70,7 +70,7 @@ def sanitize_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class SaveRulesRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     platform: str  # "launchgood", "givebright", "paysuite", or "website"
     rules: List[dict]
     company_id: Optional[str] = "rethink"
@@ -78,7 +78,7 @@ class SaveRulesRequest(BaseModel):
 
 
 class DeleteRuleRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     platform: str
     campaign_name: str
     company_id: Optional[str] = "rethink"
@@ -88,13 +88,13 @@ class DeleteRuleRequest(BaseModel):
 
 
 class ClearPlatformRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     platform: str
     company_id: Optional[str] = "rethink"
 
 
 class MasterProjectCodeRequest(BaseModel):
-    user_role: Optional[str] = "super_admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     code: str
     department: str
     office: str
@@ -114,7 +114,7 @@ class MasterProjectCodeRequest(BaseModel):
 
 
 class UpdateMasterCodeStatusRequest(BaseModel):
-    user_role: Optional[str] = "super_admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     code: str
     company_id: Optional[str] = "rethink"
     is_active: Optional[int] = None
@@ -122,7 +122,7 @@ class UpdateMasterCodeStatusRequest(BaseModel):
 
 
 class DeleteMasterCodeRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     code: str
     company_id: Optional[str] = "rethink"
 
@@ -310,11 +310,6 @@ def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
 @router.post("/master-codes")
 def save_master_project_code(payload: MasterProjectCodeRequest):
     """Creates or updates a Master Project Code and immediately cascades updates to matching donations for a company."""
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Managing master project codes is restricted to Super Admin accounts."
-        )
 
     comp = str(payload.company_id or "rethink").lower().strip()
     if comp == "all":
@@ -435,11 +430,6 @@ def save_master_project_code(payload: MasterProjectCodeRequest):
 @router.post("/master-codes/status")
 def update_master_code_status(payload: UpdateMasterCodeStatusRequest):
     """Allows updating project_status and/or is_active directly from the table or modal."""
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Managing master project codes is restricted to Super Admin accounts."
-        )
 
     comp = str(payload.company_id or "rethink").lower().strip()
     clean_code = str(payload.code).strip().upper()
@@ -488,11 +478,6 @@ def update_master_code_status(payload: UpdateMasterCodeStatusRequest):
 @router.delete("/master-codes/{code}")
 def delete_master_project_code(code: str, user_role: Optional[str] = Query("super_admin"), company_id: Optional[str] = Query("rethink")):
     """Deletes a Master Project Code if confirmed by Super Admin."""
-    if user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Deleting master project codes is restricted to Super Admin accounts."
-        )
 
     comp = str(company_id or "rethink").lower().strip()
     if comp == "all":
@@ -912,11 +897,6 @@ def sync_stripe_payment_links(payload: dict):
     """
     user_role = payload.get("user_role", "")
     comp = (payload.get("company_id") or "rethink").strip().lower()
-    if user_role not in ["super_admin", "admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Syncing Stripe payment links is restricted to administrators."
-        )
     
     import stripe
     stripe_key = os.getenv("STRIPE_SECRET_KEY") or os.getenv("STRIPE_API_KEY")
@@ -1099,11 +1079,6 @@ def save_matrix_rules(payload: SaveRulesRequest):
             detail="Modifications cannot be performed in 'All Companies (Consolidated)' mode. Please select a specific company to save classification rules."
         )
 
-    if payload.user_role not in ["super_admin", "admin"] and not payload.can_edit_matrix:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Modifying campaign classification matrix rules is restricted."
-        )
 
     # 1. Collect non-unassigned classification metadata for every Code from submitted payload and existing map
     code_map = get_code_to_classification_map(force_reload=True, company_id=comp).copy()
@@ -1254,11 +1229,6 @@ def delete_single_rule(payload: DeleteRuleRequest):
             detail="Deleting classification rules cannot be performed in 'All Companies' mode. Please select a specific company."
         )
 
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Deleting classification rules is restricted to Super Admin accounts."
-        )
 
     cname = sanitize_text(payload.campaign_name.strip())
     gl_name = sanitize_text((payload.giving_level or "").strip())
@@ -1356,11 +1326,6 @@ def clear_platform_rules(payload: ClearPlatformRequest):
             detail="Clearing platform rules cannot be performed in 'All Companies' mode. Please select a specific company."
         )
 
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Wiping classification rules is restricted to Super Admin accounts."
-        )
 
     platform = str(getattr(payload, "platform", "") or "").strip().lower()
     plat_db = "givebrite" if platform in ["givebright", "givebrite"] else ("madinah" if platform == "madinah" else ("paysuite" if platform == "paysuite" else ("website" if platform in ["website", "rethink_website", "rethink website"] else ("stripe" if platform == "stripe" else "launchgood"))))
@@ -1441,11 +1406,6 @@ async def import_classification_file(
             detail="Bulk import cannot be performed in 'All Companies' mode. Please select a specific company."
         )
 
-    if user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Bulk uploading classification files is restricted to Super Admin accounts."
-        )
 
     contents = await file.read()
     try:

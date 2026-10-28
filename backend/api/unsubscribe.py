@@ -316,8 +316,6 @@ class ResubscribeRequest(BaseModel):
 def resubscribe(payload: ResubscribeRequest, user: Dict[str, Any] = Depends(get_current_user)):
     """Only when the person has asked to receive emails again: lets the CRM email them; consent is left as No
     (set it on the donor if they gave consent)."""
-    if user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Only an admin can resubscribe someone.")
     comp = _company(user, payload.company_id)
     email = payload.email.strip().lower()
     conn = _db()

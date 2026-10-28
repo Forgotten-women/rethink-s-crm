@@ -371,7 +371,7 @@ class ProviderRequest(BaseModel):
 
 
 @router.post("/provider")
-def set_provider(payload: ProviderRequest, user: Dict[str, Any] = Depends(require_super_admin)):
+def set_provider(payload: ProviderRequest, user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, payload.company_id)
     prov = payload.provider.strip().lower()
     if prov not in PROVIDERS:
@@ -397,7 +397,7 @@ class GmailCredentials(BaseModel):
 
 
 @router.post("/gmail/credentials")
-def save_gmail_credentials(payload: GmailCredentials, user: Dict[str, Any] = Depends(require_super_admin)):
+def save_gmail_credentials(payload: GmailCredentials, user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, payload.company_id)
     cid, sec = payload.client_id.strip(), payload.client_secret.strip()
     sa = (payload.service_account_id or "").strip() or None
@@ -422,7 +422,7 @@ def save_gmail_credentials(payload: GmailCredentials, user: Dict[str, Any] = Dep
 
 
 @router.get("/gmail/auth-url")
-def gmail_auth_url(company_id: str = Query(...), redirect_uri: str = Query(...), user: Dict[str, Any] = Depends(require_super_admin)):
+def gmail_auth_url(company_id: str = Query(...), redirect_uri: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, company_id)
     r = _gmail_row(comp)
     if not r or not r["client_id"]:
@@ -440,7 +440,7 @@ class GmailExchange(BaseModel):
 
 
 @router.post("/gmail/exchange")
-def gmail_exchange(payload: GmailExchange, user: Dict[str, Any] = Depends(require_super_admin)):
+def gmail_exchange(payload: GmailExchange, user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, payload.company_id)
     if not _check_state(payload.state, comp):
         raise HTTPException(status_code=400, detail="That Google sign-in link has expired or wasn't started here - press Connect again.")
@@ -478,7 +478,7 @@ def gmail_exchange(payload: GmailExchange, user: Dict[str, Any] = Depends(requir
 
 
 @router.post("/gmail/disconnect")
-def gmail_disconnect(company_id: str = Query(...), user: Dict[str, Any] = Depends(require_super_admin)):
+def gmail_disconnect(company_id: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, company_id)
     r = _gmail_row(comp)
     if r and r["refresh_token"]:
@@ -504,7 +504,7 @@ class TestSend(BaseModel):
 
 
 @router.post("/test-send")
-def mailbox_test_send(payload: TestSend, user: Dict[str, Any] = Depends(require_super_admin)):
+def mailbox_test_send(payload: TestSend, user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, payload.company_id)
     to = payload.recipient_email.strip()
     if "@" not in to:

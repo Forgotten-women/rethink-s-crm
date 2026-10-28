@@ -162,7 +162,8 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
     last = gifts.iloc[-1] if gifts is not None and len(gifts) else None
     money = lambda v: f"{float(_clean(v) or 0):,.2f}"  # noqa: E731
     v = {
-        "first_name": name.split(" ")[0], "last_name": _last_name(name), "donor_name": name, "email": recipient.get("email") or "",
+        "first_name": name.split(" ")[0], "last_name": _last_name(name), "donor_name": name,
+        "donor_first_name": name.split(" ")[0], "donor_last_name": _last_name(name), "email": recipient.get("email") or "",
         "recipient_email": recipient.get("email") or "",
         "total_given": money(row.get("total")), "gifts_count": str(int(row.get("gifts") or 0)),
         "average_gift": money(row.get("avg_gift")), "lifetime_tier": str(row.get("tier") or ""),

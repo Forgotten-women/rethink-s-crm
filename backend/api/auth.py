@@ -11,7 +11,8 @@ from core.auth import (
     change_user_password,
     get_user_by_identity,
     create_access_token,
-    decode_access_token
+    decode_access_token,
+    user_from_token,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -24,25 +25,6 @@ def _legacy_auth_fallback_enabled() -> bool:
     """Header/query/body identity fallbacks are spoofable (no password, no signature).
     Off by default; set LEGACY_AUTH_FALLBACK=1 only as a temporary escape hatch."""
     return os.environ.get("LEGACY_AUTH_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _user_from_claims(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Builds a session user from verified JWT claims (e.g. Supabase-backed accounts
-    that have no row in the local users table)."""
-    role = payload.get("role") or "admin"
-    is_super = role == "super_admin"
-    return {
-        "id": None,
-        "username": payload.get("username") or str(payload["sub"]).split("@")[0],
-        "email": payload["sub"],
-        "role": role,
-        "can_edit_donors": 1 if is_super else 0,
-        "can_edit_matrix": 1 if is_super else 0,
-        "can_manage_tags": 1 if is_super else 0,
-        "can_purge_data": 1 if is_super else 0,
-        "allowed_companies": payload.get("allowed_companies") or ["ALL"],
-        "provider": "token",
-    }
 
 
 async def _resolve_legacy_identity(request: Request, user_identity: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -155,9 +137,11 @@ async def get_current_user(
             token_str = auth_hdr.strip()[7:].strip()
 
     if token_str:
-        payload = decode_access_token(token_str)
-        if payload and payload.get("sub"):
-            return get_user_by_identity(payload["sub"]) or _user_from_claims(payload)
+        # the account as it is NOW: removed/disabled accounts and sessions ended by "sign out everywhere"
+        # (token_version bumped) are refused
+        user = user_from_token(token_str)
+        if user:
+            return user
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session token has expired or is invalid. Please log in again."
@@ -186,9 +170,9 @@ def user_company_ids(user: Dict[str, Any]) -> Optional[set]:
     if isinstance(allowed, str):
         allowed = [allowed]
     normalized = {str(c).strip().lower() for c in allowed if str(c).strip()}
-    if not normalized or "all" in normalized:
+    if "all" in normalized:
         return None
-    return normalized
+    return normalized  # empty = no charity at all (never "everything")
 
 
 def require_company_access(user: Dict[str, Any], company_id: Optional[str]) -> str:
@@ -230,15 +214,24 @@ def _route_company_default(request: Request) -> tuple:
         return False, None
     target = inspect.unwrap(endpoint)
     try:
-        param = inspect.signature(target).parameters.get("company_id")
+        params = inspect.signature(target).parameters
     except (TypeError, ValueError):
         return False, None
-    if param is None:
-        return False, None
-    default = param.default
-    if default is inspect.Parameter.empty:
-        return True, None
-    return True, getattr(default, "default", default)  # Query("rethink") -> "rethink"
+    param = params.get("company_id")
+    if param is not None:
+        default = param.default
+        if default is inspect.Parameter.empty:
+            return True, None
+        value = getattr(default, "default", default)  # Query("rethink") -> "rethink"
+        return True, (value if isinstance(value, str) else None)  # Query(...) (required) -> None
+    # a JSON body model with a company_id field (e.g. company_id: str = "rethink") left out of the request
+    from pydantic import BaseModel as _BaseModel
+    for p in params.values():
+        ann = p.annotation
+        if inspect.isclass(ann) and issubclass(ann, _BaseModel) and "company_id" in ann.model_fields:
+            field = ann.model_fields["company_id"]
+            return True, (field.default if not field.is_required() and isinstance(field.default, str) else None)
+    return False, None
 
 
 async def _request_inputs(request: Request) -> tuple:
@@ -281,69 +274,6 @@ def _requested_companies(query, body: dict, form, path_params: dict) -> list:
     return found
 
 
-# --- Privileges claimed by the client ------------------------------------------------------------------
-# Older endpoints read user_role / can_edit_* from the request (and a few default to "super_admin" when the
-# field is missing). The browser must never be able to raise its own privileges, so any claim - sent, or the
-# endpoint default it would fall back to - above what the signed-in user really has is refused.
-_ROLE_RANK = {"super_admin": 3, "admin": 2}
-_PERMISSION_FIELDS = ("can_edit_donors", "can_edit_matrix", "can_manage_tags", "can_purge_data")
-
-
-def _truthy(value) -> bool:
-    return str(value).strip().lower() in ("1", "true", "yes", "on", "t")
-
-
-def _endpoint_privilege_defaults(request: Request) -> Dict[str, Any]:
-    """Defaults the endpoint applies when user_role / can_* are omitted (query params and body models)."""
-    import inspect
-    from pydantic import BaseModel as _BaseModel
-    endpoint = request.scope.get("endpoint") or getattr(request.scope.get("route"), "endpoint", None)
-    if endpoint is None:
-        return {}
-    defaults: Dict[str, Any] = {}
-    try:
-        params = inspect.signature(inspect.unwrap(endpoint)).parameters
-    except (TypeError, ValueError):
-        return {}
-    for name, param in params.items():
-        if name in ("user_role",) + _PERMISSION_FIELDS and param.default is not inspect.Parameter.empty:
-            defaults[name] = getattr(param.default, "default", param.default)
-        annotation = param.annotation
-        if inspect.isclass(annotation) and issubclass(annotation, _BaseModel):
-            for field_name, field in annotation.model_fields.items():
-                if field_name in ("user_role",) + _PERMISSION_FIELDS and not field.is_required():
-                    defaults.setdefault(field_name, field.default)
-    return defaults
-
-
-def _check_claimed_privileges(request: Request, user: Dict[str, Any], query, body: dict, form) -> None:
-    defaults = _endpoint_privilege_defaults(request)
-    real_role = str(user.get("role") or "").strip().lower()
-    real_rank = _ROLE_RANK.get(real_role, 1)
-    claims = {}
-    for name in ("user_role",) + _PERMISSION_FIELDS:
-        sent = _all_values(name, query, body, form, {})
-        if sent:
-            claims[name] = sent
-        elif name in defaults and defaults[name] not in (None, ""):
-            claims[name] = [defaults[name]]
-    problem = None
-    for role in claims.get("user_role", []):
-        if _ROLE_RANK.get(str(role).strip().lower(), 1) > real_rank:
-            problem = f"role '{role}'"
-    for perm in _PERMISSION_FIELDS:
-        if real_role == "super_admin" or user.get(perm):
-            continue
-        if any(_truthy(v) for v in claims.get(perm, [])):
-            problem = f"permission '{perm}'"
-    if problem:
-        log_event("access.privilege_claim_blocked", category="security", level="warning", actor=user.get("email"),
-                  path=request.url.path, message=f"Refused {request.method} {request.url.path}: request claimed {problem} "
-                                                 f"but the account is '{real_role or 'unknown'}'")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Your account does not have permission for this action.")
-
-
 # --- Records addressed by ID ------------------------------------------------------------------------------
 # request key -> (table, id column). The owner of the record must be a charity the user may access and, when
 # the request names a charity, that same charity; otherwise the record is reported as not found.
@@ -370,14 +300,16 @@ def _record_owners(key: str, value) -> set:
     return {r[0] for r in rows}
 
 
-def _check_record_ownership(request: Request, user: Dict[str, Any], query, body: dict, form, named: list) -> None:
+def _check_record_ownership(request: Request, user: Dict[str, Any], query, body: dict, form, named: list) -> set:
     allowed = user_company_ids(user)
+    found: set = set()
     named_set = {str(c).strip().lower() for c in named if str(c).strip().lower() != "all"}
     for key in _OWNED_RECORDS:
         for value in _all_values(key, query, body, form, dict(request.path_params)):
             owners = _record_owners(key, value)
             if not owners:
                 continue  # unknown id: the endpoint returns its own 404
+            found |= owners
             if key == "donation_id" and named_set:
                 ok = bool(owners & named_set)  # the same Donation ID may exist in both charities
             else:
@@ -388,6 +320,7 @@ def _check_record_ownership(request: Request, user: Dict[str, Any], query, body:
                           message=f"Blocked {request.method} {request.url.path}: {key}={value} belongs to "
                                   f"{','.join(sorted(owners))}")
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Record not found for this charity.")
+    return found
 
 
 # Opened from emails without a session; each verifies its own single-use token.
@@ -419,10 +352,81 @@ async def api_access_guard(request: Request) -> Dict[str, Any]:
                       company_id=str(comp).strip().lower(), path=request.url.path,
                       message=f"Blocked {request.method} {request.url.path} for company '{comp}'")
             raise
-    _check_claimed_privileges(request, user, query, body, form)
-    _check_record_ownership(request, user, query, body, form, requested)
+    owners = _check_record_ownership(request, user, query, body, form, requested)
+    enforce_route_permission(request, user, list(requested) + sorted(owners))
     request.state.api_user = user
     return user
+
+
+def _enforce_record_scope(request: Request, user: Dict[str, Any], companies: list, endpoint) -> None:
+    """A person limited to specific fundraisers in a charity may only use endpoints that apply that limit there
+    (backend/api/permissions.py SCOPE_AWARE), and may only change fundraisers on their list."""
+    from backend.api.permissions import SCOPE_AWARE, SCOPED_FUNDRAISER_WRITES, endpoint_key
+    from core.rbac import record_scope
+    scopes = (user.get("access") or {}).get("scopes") or {}
+    if not scopes:
+        return
+    comps = {str(c).strip().lower() for c in companies if str(c).strip()} or set(scopes)
+    if "all" in comps:  # the consolidated view can't apply a per-charity limit
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Your access is limited to specific fundraisers - choose a charity.")
+    key = endpoint_key(endpoint) if endpoint else ""
+    for comp in comps:
+        scope = record_scope(user, comp, "fundraiser")
+        if scope is None:
+            continue
+        fid = str(request.path_params.get("fundraiser_id") or "")
+        allowed = key in SCOPE_AWARE or (key in SCOPED_FUNDRAISER_WRITES and fid in scope)
+        if not allowed:
+            log_event("access.scope_denied", category="security", level="warning", actor=user.get("email"),
+                      path=request.url.path, company_id=comp, endpoint=key,
+                      message=f"Refused {request.method} {request.url.path}: account is limited to specific fundraisers in {comp}")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail=f"Your access in {comp} is limited to specific fundraisers.")
+
+
+def enforce_route_permission(request: Request, user: Dict[str, Any], companies: list) -> None:
+    """RBAC: the endpoint's required permission (backend/api/permissions.py) must be held for every charity the
+    request is about. No charity named at all -> held in at least one charity. Unlisted endpoints are refused."""
+    from backend.api.permissions import AllOf, PUBLIC, SIGNED_IN, SUPER, describe, endpoint_key, requirement_for
+    from core.rbac import user_has
+    endpoint = request.scope.get("endpoint") or getattr(request.scope.get("route"), "endpoint", None)
+    req = requirement_for(endpoint)
+    # for the activity log: which charity the request was about
+    request.state.audit_companies = sorted({str(c).strip().lower() for c in companies if str(c).strip()})
+    if req in (PUBLIC, SIGNED_IN):
+        return
+    is_super = user.get("role") == "super_admin"
+    if req == SUPER:
+        ok = is_super
+    elif req is None:
+        ok = False  # deny by default: the endpoint has no permission configured
+    else:
+        comps = sorted({str(c).strip().lower() for c in companies if str(c).strip()})
+        perms = req if isinstance(req, tuple) else (req,)
+
+        def holds(perm: str) -> bool:
+            if comps:
+                return all(user_has(user, perm, c) for c in comps)
+            return any(perm in p for p in ((user.get("access") or {}).get("companies") or {}).values()) or is_super
+
+        ok = all(holds(p) for p in perms) if isinstance(req, AllOf) else any(holds(p) for p in perms)
+    if ok and not is_super and req not in (SUPER,):
+        _enforce_record_scope(request, user, companies, endpoint)
+        from backend.api.permissions import CONTACT_EXPORTS
+        if endpoint is not None and endpoint_key(endpoint) in CONTACT_EXPORTS:
+            comps = sorted({str(c).strip().lower() for c in companies if str(c).strip()})
+            if not comps or not all(user_has(user, "donors.contact", c) for c in comps):
+                ok, req = False, "donors.contact"  # the file holds emails / phones / addresses
+    if not ok:
+        what = "this action" if req is None else describe(req)
+        where = ", ".join(sorted({str(c).strip().lower() for c in companies if str(c).strip()})) or "any charity"
+        log_event("access.permission_denied", category="security", level="warning", actor=user.get("email"),
+                  path=request.url.path, permission=what, company_id=where,
+                  endpoint=endpoint_key(endpoint) if endpoint else None,
+                  message=f"Refused {request.method} {request.url.path}: needs {what} for {where}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Your access doesn't include {what} for {where}. Ask an admin if you need it.")
 
 
 class LoginRequest(BaseModel):
@@ -459,11 +463,8 @@ def login_endpoint(payload: LoginRequest):
         )
 
     # Generate JWT Bearer Token
-    token_claims = {
-        "sub": user["email"],
-        "username": user["username"],
-        "role": user["role"]
-    }
+    # Only the identity goes in the token; role and permissions are read from the database on every request.
+    token_claims = {"sub": user["email"], "tv": int(user.get("token_version") or 0)}
     access_token = create_access_token(token_claims)
     log_event("auth.login", category="security", actor=user["email"], role=user["role"],
               message=f"{user['email']} logged in")

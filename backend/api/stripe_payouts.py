@@ -108,7 +108,7 @@ def get_stripe_payouts(limit: int = Query(25, ge=1, le=100), company_id: Optiona
 
 
 @router.post("/reconcile")
-def run_payout_reconciliation(req: ReconcileRequest, current_user = Depends(require_super_admin)):
+def run_payout_reconciliation(req: ReconcileRequest, current_user = Depends(get_current_user)):
     """Runs read-only Stripe reconciliation for a payout, matching against CRM data."""
     try:
         summary = reconcile_stripe_payout(payout_id=req.payout_id, company_id=_account_company(req.company_id))
@@ -120,7 +120,7 @@ def run_payout_reconciliation(req: ReconcileRequest, current_user = Depends(requ
 
 
 @router.post("/resync")
-def resync_payout_classifications(req: ResyncRequest, current_user = Depends(require_super_admin)):
+def resync_payout_classifications(req: ResyncRequest, current_user = Depends(get_current_user)):
     """
     Re-syncs an already reconciled payout against current CRM classifications and donations.
     Prevents discrepancies if someone manually edited a donation code or classification in CRM.
@@ -137,10 +137,10 @@ def resync_payout_classifications(req: ResyncRequest, current_user = Depends(req
 
 
 @router.post("/approve")
-def approve_payout(req: ApproveRequest, current_user = Depends(require_super_admin)):
+def approve_payout(req: ApproveRequest, current_user = Depends(get_current_user)):
     """Approves a payout and posts the verified financial breakdown + CSV report to Slack #rt-payouts."""
     try:
-        approver = req.approved_by or (current_user.get("email") if isinstance(current_user, dict) else "Admin")
+        approver = current_user.get("email") or "unknown"  # the signed-in account, not a name sent by the browser
         comp = _account_company(req.company_id)
         _owned_payout(req.payout_id, comp)
         result = approve_and_send_to_slack(payout_id=req.payout_id, approved_by=approver, company_id=comp)
@@ -154,7 +154,7 @@ def approve_payout(req: ApproveRequest, current_user = Depends(require_super_adm
 
 
 @router.post("/resend")
-def resend_to_slack(req: ResendRequest, current_user = Depends(require_super_admin)):
+def resend_to_slack(req: ResendRequest, current_user = Depends(get_current_user)):
     """Resends an already approved payout report to Slack #rt-payouts."""
     try:
         comp = _account_company(req.company_id)
@@ -354,7 +354,7 @@ class ClassifyLineRequest(BaseModel):
 
 
 @router.post("/classify-line")
-def classify_line(req: ClassifyLineRequest, current_user = Depends(require_super_admin)):
+def classify_line(req: ClassifyLineRequest, current_user = Depends(get_current_user)):
     """Classifies one payout line (or, with apply_to_project, its project name in the matrix too)."""
     try:
         return classify_payout_line(req.balance_transaction_id, req.code, company_id=_account_company(req.company_id),

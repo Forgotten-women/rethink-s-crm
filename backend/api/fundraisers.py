@@ -1,4 +1,5 @@
 from core.cache import cached
+from core import rbac
 import os
 import math
 import sqlite3
@@ -574,7 +575,7 @@ class CampaignAssignment(BaseModel):
 
 
 class CreateFundraiserRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored (permissions come from the account)
     can_edit_donors: Optional[bool] = False
     name: str
     company_id: Optional[str] = "rethink"
@@ -589,7 +590,7 @@ class CreateFundraiserRequest(BaseModel):
 
 
 class UpdateFundraiserRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored (permissions come from the account)
     can_edit_donors: Optional[bool] = False
     name: str
     company_id: Optional[str] = "rethink"
@@ -604,7 +605,7 @@ class UpdateFundraiserRequest(BaseModel):
 
 
 class AssignDonationsRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored (permissions come from the account)
     can_edit_donors: Optional[bool] = False
     fundraiser_name: str
     company_id: Optional[str] = "rethink"
@@ -665,14 +666,10 @@ def _prepare_assignments(items: Optional[List["CampaignAssignment"]], comp: str,
     return rows
 
 
-def _check_super_admin(user_role: str, can_edit_donors: bool = False):
-    """Strictly enforces that only Super Admin accounts can manage fundraisers."""
-    role_clean = str(user_role or "").strip().lower()
-    if role_clean != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Managing fundraisers is strictly restricted to Super Admin accounts."
-        )
+def _check_super_admin(user_role: str = None, can_edit_donors: bool = False):
+    """No-op kept for the call sites: fundraisers.edit / fundraisers.delete are enforced by the router guard
+    (backend/api/permissions.py) from the signed-in account - never from the user_role the browser sends."""
+    return None
 
 
 @router.get("/campaigns-list")
@@ -920,6 +917,9 @@ def get_fundraisers_list(
         query += " ORDER BY created_at DESC"
         cur.execute(query, params)
         fundraiser_rows = [dict(r) for r in cur.fetchall()]
+        scope = rbac.request_scope(comp)  # a person limited to specific fundraisers sees only those
+        if scope is not None:
+            fundraiser_rows = [r for r in fundraiser_rows if str(r["id"]) in scope]
 
         if comp != "all":
             cur.execute("SELECT fundraiser_id, campaign_name, code, platform FROM fundraiser_campaigns WHERE company_id = ?", (comp,))
@@ -1101,6 +1101,8 @@ def get_fundraisers_list(
             f_start_date = ""
             created_at = ""
 
+        if scope is not None and str(fid) not in scope:
+            continue  # limited to specific fundraisers (incl. pages discovered from donation data)
         if status_clean != "ALL" and status.upper() != status_clean:
             continue
         group = resolve_page_group(f_meta.get("page_group") if f_meta else None, fname,
@@ -1298,8 +1300,6 @@ class RamadanPeriodsRequest(BaseModel):
 def update_ramadan_periods(payload: RamadanPeriodsRequest, request: Request):
     import json as _json
     user = getattr(request.state, "api_user", None) or {}
-    if user.get("role") != "super_admin":
-        raise HTTPException(status_code=403, detail="Only Super Admins can change the Ramadan dates.")
     clean = []
     for p in payload.periods:
         try:
@@ -1338,6 +1338,9 @@ def get_fundraiser_detail(
     individual campaign breakdown, monthly timeline, and recent transactions log.
     Includes both directly stamped donations and live donations matching assigned campaigns.
     """
+    scope = rbac.request_scope(company_id)
+    if scope is not None and str(fundraiser_id) not in scope:
+        raise HTTPException(status_code=404, detail="Fundraiser not found.")
     init_fundraiser_db()
     comp = (company_id or "rethink").strip().lower()
 
@@ -1972,7 +1975,7 @@ def assign_unassigned_donations(payload: AssignDonationsRequest):
 @router.delete("/{fundraiser_id}")
 def delete_fundraiser(
     fundraiser_id: str, 
-    user_role: str = "guest", 
+    user_role: Optional[str] = None,
     can_edit_donors: bool = False,
     company_id: Optional[str] = Query("rethink")
 ):
@@ -2037,10 +2040,7 @@ class AddLinkRequest(BaseModel):
 
 
 def _require_link_editor(request: Request) -> Dict[str, Any]:
-    user = getattr(request.state, "api_user", None) or {}
-    if not (user.get("role") == "super_admin" or user.get("can_edit_donors")):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your account can't change fundraiser pages.")
-    return user
+    return getattr(request.state, "api_user", None) or {}  # fundraisers.edit is enforced by the router guard
 
 
 @router.post("/{fundraiser_id}/links")

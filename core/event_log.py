@@ -18,7 +18,7 @@ import socket
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import List, Any, Dict, Optional
 
 import requests
 
@@ -205,8 +205,20 @@ def shipping_status() -> Dict[str, Any]:
 
 def query_local(category: Optional[str] = None, level: Optional[str] = None, company_id: Optional[str] = None,
                 search: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None,
-                event: Optional[str] = None, limit: int = 200, offset: int = 0) -> Dict[str, Any]:
+                event: Optional[str] = None, limit: int = 200, offset: int = 0, actor: Optional[str] = None,
+                visible_companies: Optional[List[str]] = None, visible_actors: Optional[List[str]] = None) -> Dict[str, Any]:
+    """visible_companies / visible_actors (None = everything): a non-super viewer sees events of their charities,
+    plus charity-less events (sign-ins, access changes) of the people who work in those charities."""
     where, params = ["1=1"], []
+    if visible_companies is not None:
+        comps = list(visible_companies) or ["-"]
+        people = list(visible_actors or []) or ["-"]
+        where.append(f"(LOWER(COALESCE(company_id, '')) IN ({','.join('?' * len(comps))}) OR "
+                     f"(COALESCE(company_id, '') = '' AND LOWER(COALESCE(actor, '')) IN ({','.join('?' * len(people))})))")
+        params.extend(comps + [p.lower() for p in people])
+    base_where, base_params = list(where), list(params)
+    if actor and actor != "all":
+        where.append("LOWER(COALESCE(actor, '')) = ?"); params.append(actor.strip().lower())
     if category and category != "all":
         where.append("category = ?"); params.append(category)
     if level and level != "all":
@@ -232,6 +244,10 @@ def query_local(category: Optional[str] = None, level: Optional[str] = None, com
             f"SELECT id, ts, level, category, event, message, company_id, actor, service, data_json FROM app_event_logs "
             f"WHERE {clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", params + [limit, offset]).fetchall()
         cats = [r[0] for r in conn.execute("SELECT DISTINCT category FROM app_event_logs ORDER BY category")]
+        # everyone who appears in the log (within what the viewer may see), for the "employee" filter
+        actors = [r[0] for r in conn.execute(
+            f"SELECT actor, COUNT(*) n FROM app_event_logs WHERE {' AND '.join(base_where)} AND COALESCE(actor, '') != '' "
+            f"GROUP BY actor ORDER BY n DESC LIMIT 200", base_params)]
     finally:
         conn.close()
     items = []
@@ -242,7 +258,7 @@ def query_local(category: Optional[str] = None, level: Optional[str] = None, com
             data = {"raw": r[9]}
         items.append({"id": r[0], "ts": r[1], "level": r[2], "category": r[3], "event": r[4], "message": r[5],
                       "company_id": r[6], "actor": r[7], "service": r[8], "data": data})
-    return {"total": total, "items": items, "categories": cats}
+    return {"total": total, "items": items, "categories": cats, "actors": actors}
 
 
 def query_axiom(apl: str, since_hours: int = 24) -> Dict[str, Any]:

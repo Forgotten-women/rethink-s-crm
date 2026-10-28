@@ -16,6 +16,11 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# Contact details (RBAC donors.contact): masks emails / phones / addresses in JSON for people without the
+# permission and translates their opaque donor ids back. Added first = innermost (sees the raw JSON before GZip).
+from backend.api.contact_mask import ContactMaskMiddleware
+app.add_middleware(ContactMaskMiddleware)
+
 # Enable CORS for React / Vercel frontend
 app.add_middleware(
     CORSMiddleware,
@@ -70,10 +75,25 @@ async def audit_log_middleware(request, call_next):
             level = "error" if status_code >= 500 else ("warning" if status_code in (401, 403) else "info")
             category = "security" if status_code in (401, 403) else "audit"
             event = "http.denied" if status_code in (401, 403) else ("http.error" if status_code >= 500 else "http.change")
+            # who did what, in words: the action the endpoint stands for (backend/api/permissions.py + RBAC labels)
+            what = ""
+            try:
+                from backend.api.permissions import endpoint_key, requirement_for
+                from core.rbac import ACTION_LABEL
+                ep = request.scope.get("endpoint")
+                req = requirement_for(ep) if ep else None
+                first = req[0] if isinstance(req, tuple) else req
+                what = ACTION_LABEL.get(first or "", "") or (endpoint_key(ep).split(".")[-1].replace("_", " ") if ep else "")
+            except Exception:
+                pass
+            comps = getattr(request.state, "audit_companies", None) or []
+            company = request.query_params.get("company_id") or (comps[0] if len(comps) == 1 else None)
+            outcome = {401: "not signed in", 403: "refused"}.get(status_code, "failed" if status_code >= 500 else "")
             await asyncio.to_thread(
                 log_event, event, category=category, level=level,
-                message=f"{request.method} {path} -> {status_code}",
-                company_id=request.query_params.get("company_id"), actor=actor,
+                message=(f"{what} - " if what else "") + f"{request.method} {path} -> {status_code}"
+                        + (f" ({outcome})" if outcome else ""),
+                company_id=company, actor=actor, action=what,
                 method=request.method, path=path, status=status_code,
                 duration_ms=round((_time.perf_counter() - start) * 1000),
                 client_ip=request.headers.get("x-forwarded-for", request.client.host if request.client else None),
@@ -109,6 +129,8 @@ app.include_router(webhooks.router)
 app.include_router(unsubscribe.public_router)  # the Unsubscribe button in emails: public, HMAC-signed links
 app.include_router(unsubscribe.router, dependencies=_GUARDED)
 app.include_router(mailbox.router, dependencies=_GUARDED)  # which mailbox each charity sends from + Gmail
+from backend.api import rbac as rbac_api
+app.include_router(rbac_api.router, dependencies=_GUARDED)  # access control: people, presets, per-charity access
 
 # Mount logos directory for branded email assets
 logos_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache", "logos")
@@ -308,16 +330,17 @@ async def _directory_warm_loop():
     import asyncio
     import time as _time
     from core.cache import version_token
-    from backend.api.donors import _directory_data
-    await asyncio.sleep(20)
+    from backend.api.donors import _directory_data, directory_is_built
+    await asyncio.sleep(5)
     seen, since = {}, {}
     while True:
-        for company in ("rethink", "iqra"):
+        for company in ("rethink", "iqra", "all"):  # 'all' (consolidated) is the slowest to build (~20 s)
             try:
                 token = await asyncio.to_thread(version_token, ["donations", "classification", "tracker", "fundraisers"], company)
                 if token != seen.get(company):
                     seen[company], since[company] = token, _time.time()
-                if _time.time() - since[company] >= 30:
+                # no copy in this worker yet: build now; otherwise wait until the data has settled for 30 s
+                if not directory_is_built(company) or _time.time() - since[company] >= 30:
                     await asyncio.to_thread(_directory_data, company)  # no-op when already current
             except Exception as warm_err:
                 print(f"[Directory warm-up notice] {company}: {warm_err}")

@@ -437,10 +437,10 @@ def _request_wants_bypass() -> bool:
     if req is None or req.query_params.get("nocache") not in ("1", "true"):
         return False
     try:  # only super admins may bypass
-        from core.auth import decode_access_token
+        from core.auth import user_from_token
         hdr = req.headers.get("authorization", "")
-        claims = decode_access_token(hdr[7:].strip()) if hdr.lower().startswith("bearer ") else None
-        return bool(claims and claims.get("role") == "super_admin")
+        user = user_from_token(hdr) if hdr.lower().startswith("bearer ") else None
+        return bool(user and user.get("role") == "super_admin")  # the account's role, not one written in the token
     except Exception:
         return False
 
@@ -471,7 +471,9 @@ def cached(scopes: List[str], ttl: int = 3600, company_param: str = "company_id"
             ver = versions(scopes, company)
             if daily:
                 ver["day"] = time.strftime("%Y-%m-%d", time.gmtime())
-            raw_key = json.dumps({"e": endpoint, "p": params, "v": ver, "c": code_version(), "fmt": "gz1"},
+            from core.rbac import scope_signature  # people limited to specific records get their own results
+            raw_key = json.dumps({"e": endpoint, "p": params, "v": ver, "c": code_version(), "fmt": "gz1",
+                                  "s": scope_signature()},
                                  sort_keys=True, default=str)
             key = hashlib.sha256(raw_key.encode()).hexdigest()
             etag = f'W/"{key[:32]}"'

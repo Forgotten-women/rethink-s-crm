@@ -20,7 +20,8 @@ from pydantic import BaseModel
 
 from core.data_processor import load_data, LOCAL_DB_PATH
 from core.security import encrypt_string, decrypt_string
-from backend.api.auth import get_current_user, require_super_admin, require_company_access, user_company_ids
+from backend.api.auth import (get_current_user, require_super_admin, require_company_access, user_company_ids,
+                              _route_company_default, enforce_route_permission)
 from core.event_log import log_event
 
 logger = logging.getLogger(__name__)
@@ -93,21 +94,34 @@ async def tracker_access_guard(request: Request) -> Optional[dict]:
             pass
 
     requested = request.query_params.get("company_id") or body.get("company_id")
+    if not requested:
+        # left out: check the charity the endpoint will actually use (many default to "rethink")
+        has_param, default = _route_company_default(request)
+        if has_param:
+            requested = default if default not in (None, "") else "all"
     requested_owner = _owner_company(requested) if requested else None
     if requested_owner:
-        require_company_access(user, requested_owner)
+        try:
+            require_company_access(user, requested_owner)
+        except HTTPException:
+            log_event("access.cross_company_blocked", category="security", level="warning", actor=user.get("email"),
+                      company_id=requested_owner, path=path,
+                      message=f"Blocked {request.method} {path} for company '{requested_owner}'")
+            raise
 
     referenced = dict(request.path_params)
     for key in ("allocation_id", "beneficiary_id", "allocation_donor_id"):
         if body.get(key) not in (None, "") and key not in referenced:
             referenced[key] = body[key]
 
+    record_owners = set()
     for param, value in referenced.items():
         if param not in _OWNED_RESOURCES:
             continue
         owner = _lookup_owner(param, value)
         if owner is None:
             continue  # let the endpoint return its own 404
+        record_owners.add(owner)
         if (allowed is not None and owner not in allowed) or (
                 requested_owner and requested_owner != "all" and owner != requested_owner):
             log_event("access.cross_company_blocked", category="security", level="warning", actor=user.get("email"),
@@ -115,6 +129,8 @@ async def tracker_access_guard(request: Request) -> Optional[dict]:
                       message=f"Blocked access to {owner} record {param}={value}")
             raise HTTPException(status_code=404, detail="Record not found for this charity.")
 
+    # RBAC: the endpoint's permission (backend/api/permissions.py) for the charity named or owning the record
+    enforce_route_permission(request, user, ([requested_owner] if requested_owner else []) + sorted(record_owners))
     request.state.tracker_user = user
     return user
 
@@ -358,7 +374,7 @@ class ManualDonorUpdateRequest(BaseModel):
     classification: Optional[str] = None
 
 class UpdateTargetsRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     targets: Dict[str, float]
     company_id: Optional[str] = "rethink"
 
@@ -525,7 +541,7 @@ class UpdateAlertSettingsRequest(BaseModel):
     staff_emails: Optional[str] = ""
     digest_frequency: Optional[str] = "weekly"  # daily | weekly | monthly | off
     digest_filters: Optional[Dict[str, Any]] = None  # None = keep the saved ones, {} = everyone
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
 
 
 DIGEST_FILTER_KEYS = ("sponsorship_type", "target_status", "classification", "severity", "search", "earned_from", "earned_to",
@@ -619,7 +635,7 @@ class SendOverdueDigestRequest(BaseModel):
     threshold_days: Optional[int] = None
     recipient_emails: Optional[str] = None
     dry_run: Optional[bool] = False
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     # the Overdue Alerts screen's filters: the digest lists exactly what the team sees on screen
     sponsorship_type: Optional[str] = None
     target_status: Optional[str] = None
@@ -672,11 +688,6 @@ def get_targets(company_id: Optional[str] = Query("rethink")):
 @router.post("/targets")
 def update_targets(payload: UpdateTargetsRequest, current_user: dict = Depends(get_current_user)):
     """Updates target values (restricted to super_admin)."""
-    if current_user.get("role") != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Updating target values is restricted to Super Admin accounts."
-        )
     comp = (payload.company_id or "rethink").strip().lower()
     if comp == "all":
         raise HTTPException(
@@ -4005,7 +4016,7 @@ def get_outlook_status(company_id: Optional[str] = Query("rethink")):
     }
 
 @router.post("/outlook/save-credentials")
-def save_outlook_credentials(payload: OutlookCredentialsRequest, current_user = Depends(require_super_admin)):
+def save_outlook_credentials(payload: OutlookCredentialsRequest, current_user = Depends(get_current_user)):
     """Saves Microsoft Azure App Client ID, Secret, and Tenant ID."""
     comp = (payload.company_id or "rethink").strip().lower()
     tenant = (payload.tenant_id or "common").strip()
@@ -4057,7 +4068,7 @@ def get_outlook_auth_url(company_id: Optional[str] = Query("rethink"), redirect_
     return {"auth_url": auth_url}
 
 @router.post("/outlook/exchange-token")
-def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = Depends(require_super_admin)):
+def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = Depends(get_current_user)):
     """Exchanges authorization code for tokens and retrieves connected Microsoft 365 email."""
     comp = (payload.company_id or "rethink").strip().lower()
     auth = _get_outlook_auth_row(comp)
@@ -4120,7 +4131,7 @@ def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = 
         conn.close()
 
 @router.post("/outlook/disconnect")
-def disconnect_outlook(company_id: Optional[str] = Query("rethink"), current_user = Depends(require_super_admin)):
+def disconnect_outlook(company_id: Optional[str] = Query("rethink"), current_user = Depends(get_current_user)):
     """Disconnects Microsoft 365 / Outlook account."""
     comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -4254,6 +4265,8 @@ def _template_variables(ctx: Dict[str, Any], subject_template: str) -> Dict[str,
     return {
         "first_name": first_name,
         "last_name": " ".join(full_name.split()[1:]),
+        "donor_first_name": first_name,
+        "donor_last_name": " ".join(full_name.split()[1:]),
         "donor_name": full_name,
         "email": donor.get("donor_email") or "",
         "recipient_email": donor.get("donor_email") or "",
@@ -4888,7 +4901,7 @@ def ensure_outlook_subscription(company_id: str, notification_url: Optional[str]
     return {"status": "failed", "detail": res.text}
 
 @router.post("/outlook/setup-subscription")
-def setup_outlook_subscription(company_id: Optional[str] = Query("rethink"), notification_url: Optional[str] = Query(None), current_user = Depends(require_super_admin)):
+def setup_outlook_subscription(company_id: Optional[str] = Query("rethink"), notification_url: Optional[str] = Query(None), current_user = Depends(get_current_user)):
     """Creates or manually forces renewal of a Microsoft Graph Webhook Subscription."""
     comp = (company_id or "rethink").strip().lower()
     res = ensure_outlook_subscription(comp, notification_url, force=True)
@@ -4897,14 +4910,14 @@ def setup_outlook_subscription(company_id: Optional[str] = Query("rethink"), not
     raise HTTPException(status_code=400, detail=f"Failed to setup/renew subscription: {res.get('detail', res.get('status'))}")
 
 @router.post("/outlook/renew-subscription")
-def renew_outlook_subscription(company_id: Optional[str] = Query("rethink"), current_user = Depends(require_super_admin)):
+def renew_outlook_subscription(company_id: Optional[str] = Query("rethink"), current_user = Depends(get_current_user)):
     """Background or scheduled endpoint to automatically renew Graph Webhook Subscriptions."""
     comp = (company_id or "rethink").strip().lower()
     res = ensure_outlook_subscription(comp)
     return res
 
 @router.post("/outlook/test-send")
-def test_send_outlook_message(payload: OutlookTestEmailRequest, request: Request, current_user = Depends(require_super_admin)):
+def test_send_outlook_message(payload: OutlookTestEmailRequest, request: Request, current_user = Depends(get_current_user)):
     """Dispatches a test verification email via Microsoft Graph API. Super Admin only."""
     comp = (payload.company_id or "rethink").strip().lower()
     from backend.api.mailbox import TestSend, mailbox_test_send, provider

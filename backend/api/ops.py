@@ -20,7 +20,22 @@ from backend.api.auth import require_super_admin
 from config.settings import LOCAL_DB_PATH, GIVEBRITE_CHARITY_IDS
 from core.event_log import log_event, query_axiom, query_local, shipping_status
 
-router = APIRouter(prefix="/api/ops", tags=["Ops Console"], dependencies=[Depends(require_super_admin)])
+async def _ops_access(request: Request) -> Dict[str, Any]:
+    """Super admins: the whole console. People given the activity log (logs.view, granted only by a super admin):
+    the log view only, limited to their charities."""
+    from backend.api.auth import get_current_user
+    from core.rbac import companies_with
+    user = await get_current_user(request, None, None)
+    request.state.api_user = user
+    if user.get("role") == "super_admin":
+        return user
+    endpoint = request.scope.get("endpoint")
+    if getattr(endpoint, "__name__", "") == "ops_logs" and companies_with(user, "logs.view"):
+        return user
+    raise HTTPException(status_code=403, detail="This operation is restricted to Super Admin accounts.")
+
+
+router = APIRouter(prefix="/api/ops", tags=["Ops Console"], dependencies=[Depends(_ops_access)])
 sync_router = APIRouter(prefix="/api/ops/sync-helper", tags=["Ops Sync Helper"])
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -571,10 +586,21 @@ def _backup_status() -> dict:
 
 
 @router.get("/logs")
-def ops_logs(category: Optional[str] = None, level: Optional[str] = None, company_id: Optional[str] = None,
+def ops_logs(request: Request, category: Optional[str] = None, level: Optional[str] = None, company_id: Optional[str] = None,
+             actor: Optional[str] = None,
              search: Optional[str] = None, event: Optional[str] = None, since: Optional[str] = None,
              until: Optional[str] = None, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0),
              source: str = Query("local"), apl: Optional[str] = None, since_hours: int = Query(24, ge=1, le=720)):
+    user = getattr(request.state, "api_user", None) or {}
+    visible_companies = visible_actors = None
+    if user.get("role") != "super_admin":
+        from core.rbac import companies_with
+        visible_companies = sorted(companies_with(user, "logs.view") or [])
+        if source == "axiom":
+            raise HTTPException(status_code=403, detail="Only super admins can query Axiom directly.")
+        if company_id and company_id != "all" and company_id.strip().lower() not in visible_companies:
+            raise HTTPException(status_code=403, detail="You can't see that charity's log.")
+        visible_actors = _staff_of(visible_companies)
     if source == "axiom":
         if not apl:
             raise HTTPException(status_code=400, detail="Provide an APL query for the Axiom source.")
@@ -582,7 +608,21 @@ def ops_logs(category: Optional[str] = None, level: Optional[str] = None, compan
             return {"source": "axiom", "result": query_axiom(apl, since_hours)}
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
-    return {"source": "local", **query_local(category, level, company_id, search, since, until, event, limit, offset)}
+    return {"source": "local", **query_local(category, level, company_id, search, since, until, event, limit, offset,
+                                             actor=actor, visible_companies=visible_companies,
+                                             visible_actors=visible_actors)}
+
+
+def _staff_of(companies: List[str]) -> List[str]:
+    """Emails of the non-super accounts that can open any of these charities (their sign-ins etc. are visible)."""
+    from core.rbac import effective_access
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    try:
+        rows = conn.execute("SELECT id, email FROM users WHERE role != 'super_admin'").fetchall()
+    finally:
+        conn.close()
+    wanted = set(companies)
+    return [em for uid, em in rows if wanted & set(effective_access(uid, False)["companies"])]
 
 
 class SessionUpload(BaseModel):
@@ -802,6 +842,54 @@ def ops_cache_clear(user: dict = Depends(require_super_admin)):
 # ---------------------------------------------------------------------------
 # 1-Click Browser Bookmarklet & Direct CSV Sync Helper Routes
 # ---------------------------------------------------------------------------
+_SYNC_KEY_FILE = os.path.join(BASE_DIR, "data_cache", ".sync_helper_key")
+
+
+def _sync_key() -> str:
+    """The bookmarklet's shared key: LAUNCHGOOD_SYNC_KEY if set, otherwise a random key kept (0600) on the
+    server. Never a value written in the source - the old hard-coded key was in the public JS bundle."""
+    env_key = (os.environ.get("LAUNCHGOOD_SYNC_KEY") or "").strip()
+    if env_key:
+        return env_key
+    try:
+        with open(_SYNC_KEY_FILE, "r", encoding="utf-8") as f:
+            existing = f.read().strip()
+            if existing:
+                return existing
+    except FileNotFoundError:
+        pass
+    import secrets
+    new_key = secrets.token_urlsafe(32)
+    os.makedirs(os.path.dirname(_SYNC_KEY_FILE), exist_ok=True)
+    try:
+        fd = os.open(_SYNC_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:  # the other worker created it first
+        with open(_SYNC_KEY_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(new_key)
+    return new_key
+
+
+def _sync_authorized(request: Request, sent_key: Optional[str]) -> bool:
+    """The sync key, or a signed-in super admin's session. (Previously ANY Authorization header was accepted.)"""
+    import hmac
+    if sent_key and hmac.compare_digest(sent_key.strip().encode(), _sync_key().encode()):
+        return True
+    auth_hdr = (request.headers.get("Authorization") or "").strip()
+    if auth_hdr.lower().startswith("bearer "):
+        from core.auth import user_from_token
+        user = user_from_token(auth_hdr)
+        return bool(user and user.get("role") == "super_admin")
+    return False
+
+
+@router.get("/sync-helper-key")
+def sync_helper_key():
+    """For the Sessions tab's bookmarklet (super admins only, via the router dependency)."""
+    return {"key": _sync_key()}
+
+
 class BookmarkletPayload(BaseModel):
     accessToken: str
     rawCookie: Optional[str] = None
@@ -813,15 +901,13 @@ class BookmarkletPayload(BaseModel):
 @sync_router.post("/{platform}")
 def sync_helper_upload(platform: str, payload: BookmarkletPayload, request: Request):
     """Receives active session tokens pushed by the 1-click LaunchGood browser bookmarklet."""
-    expected_key = os.environ.get("LAUNCHGOOD_SYNC_KEY", "lg_sync_rethink_2026_crm")
-    auth_header = request.headers.get("Authorization", "")
-    is_valid_key = bool(payload.syncKey and payload.syncKey.strip() == expected_key)
-
-    if not is_valid_key and not auth_header:
+    if not _sync_authorized(request, payload.syncKey):
+        log_event("access.sync_helper_refused", category="security", level="warning", path=request.url.path,
+                  message="Refused session upload: wrong or missing sync key")
         raise HTTPException(status_code=401, detail="Invalid sync key or missing authentication")
 
     platform = platform.lower()
-    if platform not in TOKEN_FILES:
+    if platform not in ("launchgood_rethink", "launchgood_iqra"):  # the bookmarklet only carries LaunchGood sessions
         raise HTTPException(status_code=404, detail="Unknown platform")
 
     access = (payload.accessToken or "").strip()
@@ -870,11 +956,18 @@ def sync_helper_upload(platform: str, payload: BookmarkletPayload, request: Requ
 @sync_router.post("/csv/{company_id}")
 async def sync_helper_csv(company_id: str, request: Request):
     """Directly ingests LaunchGood donor export CSV downloaded by browser."""
-    expected_key = os.environ.get("LAUNCHGOOD_SYNC_KEY", "lg_sync_rethink_2026_crm")
-    key_hdr = request.headers.get("X-Sync-Key") or request.query_params.get("sync_key")
-    auth_hdr = request.headers.get("Authorization", "")
-    if key_hdr != expected_key and not auth_hdr:
+    if not _sync_authorized(request, request.headers.get("X-Sync-Key") or request.query_params.get("sync_key")):
+        log_event("access.sync_helper_refused", category="security", level="warning", path=request.url.path,
+                  message="Refused CSV upload: wrong or missing sync key")
         raise HTTPException(status_code=401, detail="Invalid sync key")
+    company_id = (company_id or "").strip().lower()
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    try:
+        known = conn.execute("SELECT 1 FROM companies WHERE LOWER(id) = ?", (company_id,)).fetchone()
+    finally:
+        conn.close()
+    if not known:
+        raise HTTPException(status_code=404, detail="Unknown charity")
 
     body = await request.body()
     csv_text = body.decode("utf-8", errors="replace")

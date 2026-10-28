@@ -1858,7 +1858,7 @@ def get_payout_ledger(
 
 
 class UpdatePayoutClassificationRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     campaign_name: str
     code: str
     company_id: Optional[str] = "rethink"
@@ -1882,11 +1882,6 @@ def update_payout_classification(payload: UpdatePayoutClassificationRequest):
             detail="Modifications are disabled in consolidated 'All Companies' mode. Please select a specific company to update classifications."
         )
 
-    if payload.user_role not in ["super_admin", "admin"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Classification edits are restricted to authorized accounts."
-        )
 
     target_cid = _clean_str(payload.company_id, "rethink").lower()
     plat = _clean_str(payload.platform, "launchgood").lower()
@@ -2255,7 +2250,7 @@ def _paysuite_company(requested: Optional[str]) -> str:
     return comp
 
 
-@router.post("/paysuite/sync", dependencies=[Depends(require_super_admin)])
+@router.post("/paysuite/sync")
 def trigger_paysuite_sync(
     company_id: str = Query(PAYSUITE_COMPANY, description="Must be rethink (the PaySuite account's charity)"),
     is_backfill: bool = Query(False, description="Run full backfill from 2026-01-01"),

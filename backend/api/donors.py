@@ -1,5 +1,7 @@
 from core.cache import cached
+from core import rbac
 import io
+import threading
 import math
 import os
 import sqlite3
@@ -40,7 +42,7 @@ router = APIRouter(prefix="/api/donors", tags=["Donors & Explorer"])
 
 
 class BulkEditDonorsRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     user_identity: Optional[str] = None
     user_email: Optional[str] = None
     target_columns: List[str]
@@ -68,7 +70,7 @@ class BulkEditDonorsRequest(BaseModel):
 
 
 class UpdateSingleDonorRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     user_identity: Optional[str] = None
     user_email: Optional[str] = None
     company_id: Optional[str] = "rethink"
@@ -93,13 +95,6 @@ def update_single_donor_record(
         )
 
     # Verify authorization
-    user_role = current_user.get("role", "admin")
-    can_edit = bool(current_user.get("can_edit_donors") or user_role == "super_admin" or payload.can_edit_donors)
-    if not can_edit:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Editing records is restricted to authorized accounts."
-        )
 
     df_donations = load_data()
     df_payouts = load_payouts_data()
@@ -298,13 +293,6 @@ def bulk_edit_donors(
             detail="Bulk edits are disabled in consolidated 'All Companies' mode. Please select a specific company to edit records."
         )
 
-    user_role = current_user.get("role", "admin")
-    can_edit = bool(current_user.get("can_edit_donors") or user_role == "super_admin" or payload.can_edit_donors)
-    if not can_edit:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Editing records is restricted to authorized accounts."
-        )
 
     is_payout_bulk = bool(payload.filter_source and str(payload.filter_source).strip().lower() in ["launchgood payout", "payout", "payouts"])
     df_raw = load_payouts_data(company_id=payload.company_id) if is_payout_bulk else load_data(company_id=payload.company_id)
@@ -699,9 +687,10 @@ def get_donors_paginated(
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         cursor = conn.cursor()
 
-        # Check if table exists
+        # Check if table exists (people limited to specific fundraisers skip this SQL path: their rows are
+        # filtered by fundraiser attribution below)
         cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{target_table}'")
-        if cursor.fetchone():
+        if cursor.fetchone() and rbac.request_scope(comp) is None:
             # Get available columns
             cursor.execute(f"PRAGMA table_info({target_table})")
             avail_cols = [col[1] for col in cursor.fetchall()]
@@ -918,6 +907,8 @@ def get_donors_paginated(
         print(f"SQL Pagination fallback notice: {e}")
 
     df_raw = load_payouts_data(company_id=comp) if is_payout_query else load_data(company_id=comp)
+    if rbac.request_scope(comp) is not None:  # limited to specific fundraisers: only their donations
+        df_raw = df_raw.iloc[0:0] if is_payout_query else rbac.scope_donations(df_raw, comp)
     if df_raw.empty:
         return {
             "total_records": 0,
@@ -981,7 +972,7 @@ def export_donors(
     end_date: Optional[str] = None
 ):
     """Exports filtered donor rows with date range, multi-Donation ID, and scoped search support."""
-    df_raw = load_data(company_id=company_id)
+    df_raw = rbac.scope_donations(load_data(company_id=company_id), company_id)
     if df_raw.empty:
         raise HTTPException(status_code=400, detail="No donor data available to export.")
 
@@ -1357,7 +1348,8 @@ def get_donor_360_profile(donor_id_or_email: str, company_id: Optional[str] = Qu
 def _donor_360_core(donor_id_or_email: str, company_id: Optional[str] = None):
     """Returns complete 360° Donor Profile payload with all donor details, dual classifications, and full transaction history."""
     comp = str(company_id or "").strip().lower()
-    df = load_data(company_id=comp if comp and comp != "all" else None)
+    scope = rbac.request_scope(comp)
+    df = rbac.scope_donations(load_data(company_id=comp if comp and comp != "all" else None), comp, scope)
     match_mask = _get_donor_matching_mask(df, donor_id_or_email) if not df.empty else pd.Series(False, index=df.index)
     donor_txns = df.loc[match_mask] if not df.empty else pd.DataFrame()
 
@@ -1365,7 +1357,8 @@ def _donor_360_core(donor_id_or_email: str, company_id: Optional[str] = None):
     # (company_id omitted/'all' already searches every charity, and the API guard only allows that
     # for accounts with access to all of them.)
 
-    manual = _manual_for_identity(comp or "all", donor_id_or_email, donor_txns)
+    # tracker sponsorships aren't fundraiser donations: not shown to people limited to specific fundraisers
+    manual = _manual_for_identity(comp or "all", donor_id_or_email, donor_txns) if scope is None else []
     if donor_txns.empty:
         if not manual:
             raise HTTPException(status_code=404, detail=f"Donor '{donor_id_or_email}' not found.")
@@ -1543,8 +1536,8 @@ def _bump_directory(comp: str) -> None:
         bump("tracker", comp)
     except Exception:
         pass
-    _DIRECTORY_CACHE.pop(comp, None)
-    _DIRECTORY_CACHE.pop("all", None)
+    _DIRECTORY_CACHE.pop(comp, None)  # this charity: rebuilt now, so the edit shows straight away
+    # 'all' keeps its copy and refreshes in the background (rebuilding it takes ~20 s)
 
 
 def _manual_donor_records(comp: str) -> List[Dict[str, Any]]:
@@ -1654,13 +1647,52 @@ def _directory_data(comp: str):
     gift (plus manual tracker entries) with the fields segments filter on (date, cause, amount, platform, ...)."""
     from core.cache import version_token
     token = version_token(["donations", "classification", "tracker", "fundraisers"], comp)
-    hit = _DIRECTORY_CACHE.get(comp)
+    scope = rbac.request_scope(comp)  # limited to specific fundraisers: their donations / donors only
+    cache_key = comp if scope is None else f"{comp}|fundraisers:{','.join(sorted(scope))}"
+    hit = _DIRECTORY_CACHE.get(cache_key)
     if hit and hit[0] == token:
         return hit[1], hit[2]
-    df = load_data(company_id=comp if comp != "all" else None)
+    if hit and scope is None:
+        # The data changed (e.g. a new donation from the platform sync): keep answering with the previous copy and
+        # rebuild it in the background, instead of making the visitor wait (~6 s per charity, ~20 s for 'all').
+        with _DIRECTORY_BUILD_LOCK:
+            start = cache_key not in _DIRECTORY_BUILDING
+            _DIRECTORY_BUILDING.add(cache_key)
+        if start:
+            def _rebuild():
+                try:
+                    _build_directory_data(comp, token, None, cache_key)
+                except Exception as e:  # the old copy stays; the next request tries again
+                    print(f"[Directory rebuild notice] {comp}: {e}")
+                finally:
+                    with _DIRECTORY_BUILD_LOCK:
+                        _DIRECTORY_BUILDING.discard(cache_key)
+            threading.Thread(target=_rebuild, daemon=True).start()
+        return hit[1], hit[2]
+    # no copy yet: one build per key - concurrent callers (and the warm-up loop) wait for it instead of duplicating it
+    with _DIRECTORY_BUILD_LOCK:
+        key_lock = _DIRECTORY_KEY_LOCKS.setdefault(cache_key, threading.Lock())
+    with key_lock:
+        hit = _DIRECTORY_CACHE.get(cache_key)
+        if hit and hit[0] == token:
+            return hit[1], hit[2]
+        return _build_directory_data(comp, token, scope, cache_key)
+
+
+_DIRECTORY_BUILDING: set = set()
+_DIRECTORY_BUILD_LOCK = threading.Lock()
+_DIRECTORY_KEY_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def directory_is_built(comp: str) -> bool:
+    return comp in _DIRECTORY_CACHE
+
+
+def _build_directory_data(comp: str, token: str, scope, cache_key: str):
+    df = rbac.scope_donations(load_data(company_id=comp if comp != "all" else None), comp, scope)
     if df is None or df.empty or "Donor ID" not in df.columns:
         frame = pd.DataFrame()
-        _DIRECTORY_CACHE[comp] = (token, frame, pd.DataFrame())
+        _DIRECTORY_CACHE[cache_key] = (token, frame, pd.DataFrame())
         return frame, pd.DataFrame()
     key = df["Donor ID"].astype(str).str.strip().str.lower()
     # Only real placeholders: "name:nan nan" / "name:none" / "name:anonymous …" - never a real name such as
@@ -1789,7 +1821,7 @@ def _directory_data(comp: str):
     for idx, em in frame["email"].items():
         if isinstance(em, str) and em.strip():
             by_email.setdefault(em.strip().lower(), idx)
-    for m in _manual_donor_records(comp):
+    for m in (_manual_donor_records(comp) if scope is None else []):
         k, amt = m["key"], round(float(m.get("total_donated") or 0.0), 2)
         k = k if k in frame.index else by_email.get(k, k)
         sps = m.get("sponsorships") or []
@@ -1903,7 +1935,9 @@ def _directory_data(comp: str):
         dx.attrs["host_platforms"] = learn_host_platforms(df)
     except Exception:
         dx.attrs["host_platforms"] = {}
-    _DIRECTORY_CACHE[comp] = (token, frame, dx)
+    if scope is not None:  # no profile-only / tracker-only people: just the donors of their fundraisers
+        frame = frame[pd.to_numeric(frame["gifts"], errors="coerce").fillna(0) > 0]
+    _DIRECTORY_CACHE[cache_key] = (token, frame, dx)
     return frame, dx
 
 
@@ -2267,7 +2301,8 @@ def get_donation_detail(donation_id: str, company_id: Optional[str] = Query(None
     did = str(donation_id or "").strip()
     if not did:
         raise HTTPException(status_code=400, detail="Donation ID is required.")
-    df = load_data(company_id=comp if comp and comp != "all" else None)
+    scope = rbac.request_scope(comp)
+    df = rbac.scope_donations(load_data(company_id=comp if comp and comp != "all" else None), comp, scope)
     rows = pd.DataFrame()
     if df is not None and not df.empty and "Donation ID" in df.columns:
         ids = df["Donation ID"].astype(str).str.strip()
@@ -2275,7 +2310,7 @@ def get_donation_detail(donation_id: str, company_id: Optional[str] = Query(None
         if rows.empty and did.endswith(".0"):
             rows = df.loc[ids == did[:-2]]
     if rows.empty:
-        manual = [m for m in _manual_donor_records(comp or "all") if str(m["id"]) == did.split(":")[0]]
+        manual = [m for m in _manual_donor_records(comp or "all") if str(m["id"]) == did.split(":")[0]] if scope is None else []
         recs = [r_ for r_ in _manual_history_rows(manual[:1], _DIRECTORY_AMOUNT) if str(r_["Donation ID"]) == did] if manual else []
         if not recs:
             raise HTTPException(status_code=404, detail=f"Donation '{did}' not found.")
@@ -2333,7 +2368,8 @@ def get_donor_history_paginated(
     """Paginated transaction history for a donor to handle large transaction counts smoothly.
     Optional filters (applied before paging): date range, cause heading / sub-heading."""
     comp = str(company_id or "").strip().lower()
-    df = load_data(company_id=comp if comp and comp != "all" else None)
+    scope = rbac.request_scope(comp)
+    df = rbac.scope_donations(load_data(company_id=comp if comp and comp != "all" else None), comp, scope)
     match_mask = _get_donor_matching_mask(df, donor_id) if not df.empty else pd.Series(False, index=df.index)
     donor_txns = df.loc[match_mask] if not df.empty else pd.DataFrame()
 
@@ -2341,7 +2377,7 @@ def get_donor_history_paginated(
     # (company_id omitted/'all' already searches every charity, and the API guard only allows that
     # for accounts with access to all of them.)
 
-    manual = _manual_for_identity(comp or "all", donor_id, donor_txns)
+    manual = _manual_for_identity(comp or "all", donor_id, donor_txns) if scope is None else []
     if donor_txns.empty and not manual:
         return {"total_records": 0, "page": 1, "page_size": page_size, "total_pages": 1, "records": []}
     if donor_txns.empty:
@@ -2431,7 +2467,7 @@ def get_campaigns_list(company_id: Optional[str] = Query("rethink")):
         conn.close()
         return {"campaigns": campaigns}
     except Exception as e:
-        df = load_data(company_id=company_id)
+        df = rbac.scope_donations(load_data(company_id=company_id), company_id)
         if not df.empty and "Campaign Name" in df.columns:
             campaigns = sorted([str(c).strip() for c in df["Campaign Name"].dropna().unique() if str(c).strip()])
             return {"campaigns": campaigns}
@@ -2448,9 +2484,9 @@ FEES_COL = "Total Processing Fees Paid by CC In Settled Currency"
 
 
 def _require_editor(current_user: Dict[str, Any]) -> None:
-    if not (current_user.get("role") == "super_admin" or current_user.get("can_edit_donors")):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Your account can't add or edit donor records (ask a super admin for 'Edit donors').")
+    """Kept for the call sites; the permission (donors.create / edit / delete) is enforced by the router guard
+    from backend/api/permissions.py."""
+    return None
 
 
 def _editable_company(company_id: Optional[str]) -> str:

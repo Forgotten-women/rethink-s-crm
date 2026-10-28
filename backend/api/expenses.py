@@ -139,19 +139,19 @@ class SubmitExpenseRequest(BaseModel):
 
 class ReviewExpenseRequest(BaseModel):
     expense_id: str
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     action: str  # "APPROVED" or "REJECTED"
     review_notes: Optional[str] = ""
     can_edit_donors: Optional[bool] = False
 
 
 class UpdateApprovalEmailRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     approval_email: str
 
 
 class UpdateSmtpSettingsRequest(BaseModel):
-    user_role: Optional[str] = "super_admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     can_edit_donors: Optional[bool] = False
     approval_email: str
     smtp_host: Optional[str] = "smtp.gmail.com"
@@ -163,13 +163,13 @@ class UpdateSmtpSettingsRequest(BaseModel):
 
 
 class TestEmailRequest(BaseModel):
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     can_edit_donors: Optional[bool] = False
 
 
 class DeleteExpenseRequest(BaseModel):
     expense_id: str
-    user_role: str
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     can_edit_donors: Optional[bool] = False
 
 
@@ -179,14 +179,14 @@ class TransferFundsRequest(BaseModel):
     amount: float
     reason: str
     transfer_date: Optional[str] = ""
-    user_role: Optional[str] = "super_admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     can_edit_donors: Optional[bool] = False
     transferred_by: Optional[str] = "Admin User"
     company_id: Optional[str] = "rethink"
 
 
 class VoidTransferRequest(BaseModel):
-    user_role: Optional[str] = "super_admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     can_edit_donors: Optional[bool] = False
 
 
@@ -718,8 +718,15 @@ def export_expense_requests(
         )
 
 
+def _actor(request: Request, fallback: str = None) -> str:
+    """Who did it: the signed-in account (set by the router guard), never a name typed into the request."""
+    user = getattr(request.state, "api_user", None) or {}
+    return user.get("display_name") or user.get("email") or fallback or "unknown"
+
+
 @router.post("/submit")
-def submit_expense(payload: SubmitExpenseRequest):
+def submit_expense(payload: SubmitExpenseRequest, request: Request):
+    payload.requested_by = _actor(request, payload.requested_by)
     """Submits a new project expense request with deduplication guard and dispatches approval notification email."""
     comp = (payload.company_id or "rethink").strip().lower()
     if comp == "all":
@@ -850,13 +857,8 @@ def submit_expense(payload: SubmitExpenseRequest):
 
 
 @router.post("/review")
-def review_expense(payload: ReviewExpenseRequest):
+def review_expense(payload: ReviewExpenseRequest, request: Request):
     """Approve or Reject an expense request from Super Admin UI."""
-    if payload.user_role != "super_admin" and not payload.can_edit_donors:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Approving/Rejecting expense requests is restricted to Super Admins."
-        )
 
     action_status = payload.action.upper()
     if action_status not in ["APPROVED", "REJECTED"]:
@@ -869,7 +871,7 @@ def review_expense(payload: ReviewExpenseRequest):
         UPDATE expense_requests 
         SET status = ?, reviewed_by = ?, review_notes = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-    """, (action_status, payload.user_role, payload.review_notes, payload.expense_id))
+    """, (action_status, _actor(request), payload.review_notes, payload.expense_id))
     
     rows_affected = cursor.rowcount
     conn.commit()
@@ -890,11 +892,6 @@ def review_expense(payload: ReviewExpenseRequest):
 @router.post("/delete")
 def delete_expense(payload: DeleteExpenseRequest):
     """Delete an expense request. Only Super Admins can delete."""
-    if payload.user_role != "super_admin" and not payload.can_edit_donors:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Deleting expense requests is restricted to Super Admins."
-        )
 
     init_expense_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -1105,7 +1102,7 @@ def get_expense_settings(current_user = Depends(get_current_user)):
 
 
 @router.post("/settings")
-def update_expense_settings(payload: UpdateSmtpSettingsRequest, current_user = Depends(require_super_admin)):
+def update_expense_settings(payload: UpdateSmtpSettingsRequest, current_user = Depends(get_current_user)):
     """Updates all SMTP + approval email settings. Super Admin only."""
     init_expense_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
@@ -1146,7 +1143,7 @@ def update_expense_settings(payload: UpdateSmtpSettingsRequest, current_user = D
 
 
 @router.post("/test-email")
-def test_smtp_email(payload: TestEmailRequest, current_user = Depends(require_super_admin)):
+def test_smtp_email(payload: TestEmailRequest, current_user = Depends(get_current_user)):
     """Sends a test email using current SMTP settings. Super Admin only."""
     init_expense_db()
     smtp_cfg = _get_smtp_config()
@@ -1225,7 +1222,8 @@ def get_code_transfers(
 
 
 @router.post("/transfers")
-def create_code_transfer(payload: TransferFundsRequest):
+def create_code_transfer(payload: TransferFundsRequest, request: Request):
+    payload.transferred_by = _actor(request, payload.transferred_by)
     """Transfers funds from one project code to another, validating available balance, single company boundary, and Super Admin permissions."""
     comp = (payload.company_id or "rethink").strip().lower()
     if comp == "all":
@@ -1234,11 +1232,6 @@ def create_code_transfer(payload: TransferFundsRequest):
             detail="Transfers cannot be performed in 'All Companies (Consolidated)' mode. Please select a specific company."
         )
 
-    if payload.user_role not in ["super_admin", "admin"] and not payload.can_edit_donors:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Transferring funds between project codes is restricted to Super Admins."
-        )
 
     src = payload.source_code.strip().upper()
     dst = payload.destination_code.strip().upper()
@@ -1281,7 +1274,7 @@ def create_code_transfer(payload: TransferFundsRequest):
     cursor.execute("""
         INSERT INTO code_transfers (id, transfer_date, source_code, destination_code, amount, reason, transferred_by, company_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (transfer_id, t_date, src, dst, amount, reason, payload.transferred_by or "Super Admin", comp))
+    """, (transfer_id, t_date, src, dst, amount, reason, payload.transferred_by, comp))
     conn.commit()
     conn.close()
 
@@ -1310,11 +1303,6 @@ def create_code_transfer(payload: TransferFundsRequest):
 @router.delete("/transfers/{transfer_id}")
 def void_code_transfer(transfer_id: str, user_role: str = "super_admin", can_edit_donors: bool = False):
     """Voids / deletes an internal fund transfer, restoring the original balances."""
-    if user_role not in ["super_admin", "admin"] and not can_edit_donors:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Voiding fund transfers is restricted to Super Admins."
-        )
 
     init_expense_db()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)

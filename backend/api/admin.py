@@ -5,7 +5,7 @@ import sqlite3
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query, status
+from fastapi import Request, APIRouter, Depends, File, Form, HTTPException, UploadFile, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/admin", tags=["Admin & Database Management"])
 
 
 class CompanyUpsertRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     id: str
     name: str
     short_code: str
@@ -35,7 +35,7 @@ class CompanyUpsertRequest(BaseModel):
 
 
 class UpdateUserPermissionRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     target_email: str
     new_role: str
     can_edit_donors: bool
@@ -46,7 +46,7 @@ class UpdateUserPermissionRequest(BaseModel):
 
 
 class EditUserRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     user_id: int
     email: str
     username: str
@@ -54,24 +54,24 @@ class EditUserRequest(BaseModel):
 
 
 class AssignPresetRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     target_email: str
     preset_name: str  # "super_admin", "admin", "data_editor"
 
 
 class RenameTagRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     old_tag: str
     new_tag: str
 
 
 class DeleteTagRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     tag_name: str
 
 
 class PurgeDataRequest(BaseModel):
-    user_role: Optional[str] = "admin"
+    user_role: Optional[str] = None  # ignored: access comes from the signed-in account
     confirm: bool = False
 
 
@@ -184,7 +184,7 @@ def get_dataset_tags(company_id: Optional[str] = Query(None)):
 @router.post("/tags/rename")
 def rename_dataset_tag(
     payload: RenameTagRequest,
-    current_user: Dict[str, Any] = Depends(require_super_admin)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     if not payload.old_tag or not payload.new_tag.strip():
         raise HTTPException(status_code=400, detail="Old tag and new tag name are required.")
@@ -199,7 +199,7 @@ def rename_dataset_tag(
 @router.post("/tags/delete")
 def delete_dataset_tag(
     payload: DeleteTagRequest,
-    current_user: Dict[str, Any] = Depends(require_super_admin)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     if not payload.tag_name:
         raise HTTPException(status_code=400, detail="Tag name is required.")
@@ -214,7 +214,7 @@ def delete_dataset_tag(
 @router.post("/purge")
 def purge_database(
     payload: PurgeDataRequest,
-    current_user: Dict[str, Any] = Depends(require_super_admin)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="Confirmation is required to purge data.")
@@ -229,7 +229,7 @@ def purge_database(
 @router.post("/purge-payouts")
 def purge_payouts_endpoint(
     payload: PurgeDataRequest,
-    current_user: Dict[str, Any] = Depends(require_super_admin)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="Confirmation is required to purge payout data.")
@@ -251,12 +251,6 @@ def upload_raw_data_file(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Bulk uploads a raw donation dataset (.csv, .xlsx, .xls) for LaunchGood, GiveBrite, Paysuite, or Rethink Website."""
-    role = current_user.get("role", user_role)
-    if role not in ["super_admin", "admin", "data_editor"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Uploading donation datasets requires Data Editor or Admin privileges."
-        )
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded.")
@@ -317,25 +311,26 @@ def upload_raw_data_file(
 # ── Dynamic Multi-Company & Brand Logo Management ──────────────────────────────
 
 @router.get("/companies")
-def list_companies_endpoint():
-    """Returns all registered companies with active status, accent color, and brand logo URL."""
+def list_companies_endpoint(request: Request):
+    """The charities this person can open (all of them for a super admin), with active status, accent colour and
+    logo URL. A charity someone has no access to is not listed at all."""
+    from backend.api.auth import user_company_ids
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT id, name, short_code, accent_color, logo_url, is_active FROM companies ORDER BY created_at ASC")
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
+    user = getattr(request.state, "api_user", None) or {}
+    allowed = user_company_ids(user) if user else set()
+    if allowed is not None:
+        rows = [r for r in rows if str(r["id"]).strip().lower() in allowed]
     return {"status": "success", "companies": rows}
 
 
 @router.post("/companies")
 def upsert_company_endpoint(payload: CompanyUpsertRequest):
     """Allows Super Admins to dynamically create or update companies."""
-    if payload.user_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Managing companies is restricted to Super Admin accounts."
-        )
     cid = payload.id.strip().lower()
     if not cid or cid == "all":
         raise HTTPException(status_code=400, detail="Valid Company ID is required (cannot be 'all').")
@@ -365,12 +360,6 @@ def upload_company_logo_endpoint(
     file: UploadFile = File(...)
 ):
     """Allows Super Admins to upload a custom brand logo image for a company."""
-    eff_role = str(user_role or role_query or "").strip().lower()
-    if eff_role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Uploading company brand logos is restricted to Super Admin accounts."
-        )
     cid = company_id.strip().lower()
     if not cid or cid == "all":
         raise HTTPException(status_code=400, detail="Valid Company ID is required.")
