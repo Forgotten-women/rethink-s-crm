@@ -17,7 +17,7 @@ import datetime
 import json
 import sqlite3
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -184,36 +184,53 @@ def _donor_variables(comp: str, recipient: Dict[str, Any], subject_template: str
     if em:
         allocs = donor_sponsorships(comp, em)
         if allocs:
-            a = allocs[0]  # latest - its links / dates fill the single-value fields
-            days_rem = ""
-            if a.get("end_date"):
-                try:
-                    today = datetime.date.today()
-                    end_d = datetime.datetime.strptime(str(a["end_date"])[:10], "%Y-%m-%d").date()
-                    days_diff = (end_d - today).days
-                    days_rem = f"{days_diff} days" if days_diff >= 0 else f"{-days_diff} days overdue"
-                except Exception:
-                    pass
-            v.update({
-                "beneficiary_name": a.get("beneficiary_name") or "",
-                "beneficiary_first_name": _first_name(a.get("beneficiary_name")),
-                "beneficiary_last_name": _last_name(a.get("beneficiary_name")),
-                "beneficiary_names": _join_names([al.get("beneficiary_name") or "" for al in allocs]),
-                "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
-                "location": a.get("b_location") or "", "project_code": a.get("b_code") or "",
-                "profile_link": a.get("b_profile") or a.get("profile_link") or "", "video_link": a.get("b_video") or "",
-                "report_link": a.get("b_profile") or "", "donor_folder_link": a.get("b_folder") or a.get("b_profile") or "",
-                "folder_link": a.get("b_folder") or a.get("b_profile") or "",
-                "campaign_name": a.get("campaign_name") or "", "community_name": a.get("community_name") or "",
-                "renewal_deadline": str(a.get("end_date") or "")[:10],
-                "days_remaining": days_rem,
-                "sponsorship_year": (str(a.get("start_date") or ""))[:4],
-            })
-            combined = _combined_sponsorship_vars(allocs)
-            if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
-                combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list")}
-            v.update(combined)
+            v.update(_sponsorship_vars(allocs))
     return v
+
+
+def _sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Sponsorship placeholders for these sponsorships (all of a donor's, or the ones picked for this email).
+    One fills the fields with its own values; several are combined ("Ahmed, Fatima and Bilal") and listed in
+    {sponsorships_list}."""
+    a = allocs[0]  # latest - its links / dates fill the single-value fields
+    days_rem = ""
+    if a.get("end_date"):
+        try:
+            days_diff = (datetime.datetime.strptime(str(a["end_date"])[:10], "%Y-%m-%d").date() - datetime.date.today()).days
+            days_rem = f"{days_diff} days" if days_diff >= 0 else f"{-days_diff} days overdue"
+        except Exception:
+            pass
+    v = {
+        "beneficiary_name": a.get("beneficiary_name") or "",
+        "beneficiary_first_name": _first_name(a.get("beneficiary_name")),
+        "beneficiary_last_name": _last_name(a.get("beneficiary_name")),
+        "sponsorship_type": a.get("b_type") or a.get("sponsorship_type") or "",
+        "location": a.get("b_location") or "", "project_code": a.get("b_code") or "",
+        "profile_link": a.get("b_profile") or a.get("profile_link") or "", "video_link": a.get("b_video") or "",
+        "report_link": a.get("b_profile") or "", "donor_folder_link": a.get("b_folder") or a.get("b_profile") or "",
+        "folder_link": a.get("b_folder") or a.get("b_profile") or "",
+        "campaign_name": a.get("campaign_name") or "", "community_name": a.get("community_name") or "",
+        "renewal_deadline": str(a.get("end_date") or "")[:10],
+        "days_remaining": days_rem,
+        "sponsorship_year": (str(a.get("start_date") or ""))[:4],
+    }
+    combined = _combined_sponsorship_vars(allocs)
+    if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
+        combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list")}
+    v.update(combined)
+    return v
+
+
+def _selected_ids(sel: Any) -> List[int]:
+    """The sponsorships picked for one email: an id, a list of ids, or nothing (= all of them)."""
+    items = sel if isinstance(sel, (list, tuple)) else ([sel] if sel not in (None, "") else [])
+    out = []
+    for x in items:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def donor_sponsorships(comp: str, email: str) -> List[Dict[str, Any]]:
@@ -292,7 +309,7 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
 def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str], body_tpl: Optional[str],
             recipient: Dict[str, Any], message_body: Optional[str] = None,
             custom_variables: Optional[Dict[str, str]] = None,
-            selected_allocation_id: Optional[int] = None) -> Dict[str, Any]:
+            selected_allocation_id: Any = None) -> Dict[str, Any]:
     if subject_tpl is None or body_tpl is None:
         conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
         try:
@@ -303,34 +320,15 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
         body_tpl = tpl["body_html"] if body_tpl is None else body_tpl
     variables = _donor_variables(comp, recipient, subject_tpl, message_body)
 
-    # If sender selected a specific beneficiary to feature out of multiple
+    # The sender may pick which of the donor's sponsorships this email is about (one, several or all)
     em = str(recipient.get("email") or "").strip().lower()
     allocs = donor_sponsorships(comp, em) if em else []
-    if selected_allocation_id and allocs:
-        sel_alloc = next((al for al in allocs if al.get("id") == selected_allocation_id), None)
-        if sel_alloc:
-            days_rem = ""
-            if sel_alloc.get("end_date"):
-                try:
-                    today = datetime.date.today()
-                    end_d = datetime.datetime.strptime(str(sel_alloc["end_date"])[:10], "%Y-%m-%d").date()
-                    days_diff = (end_d - today).days
-                    days_rem = f"{days_diff} days" if days_diff >= 0 else f"{-days_diff} days overdue"
-                except Exception:
-                    pass
-            variables.update({
-                "beneficiary_name": sel_alloc.get("beneficiary_name") or "",
-                "beneficiary_first_name": _first_name(sel_alloc.get("beneficiary_name")),
-                "beneficiary_last_name": _last_name(sel_alloc.get("beneficiary_name")),
-                "sponsorship_type": sel_alloc.get("b_type") or sel_alloc.get("sponsorship_type") or "",
-                "location": sel_alloc.get("b_location") or "",
-                "project_code": sel_alloc.get("b_code") or "",
-                "profile_link": sel_alloc.get("b_profile") or sel_alloc.get("profile_link") or "",
-                "video_link": sel_alloc.get("b_video") or "",
-                "donor_folder_link": sel_alloc.get("b_folder") or sel_alloc.get("b_profile") or "",
-                "renewal_deadline": str(sel_alloc.get("end_date") or "")[:10],
-                "days_remaining": days_rem,
-            })
+    picked_ids = _selected_ids(selected_allocation_id)
+    picked = [al for al in allocs if al.get("id") in picked_ids]
+    if picked and len(picked) < len(allocs):
+        for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list"):
+            variables.pop(k, None)
+        variables.update(_sponsorship_vars(picked))
 
     # Apply sender-provided custom variables so missing fields are not skipped
     if custom_variables:
@@ -365,6 +363,7 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
         "unresolved_placeholders": unresolved,
         "variables": variables,
         "sponsorships": sponsorships_data,
+        "selected_allocation_ids": [a["id"] for a in picked] if picked and len(picked) < len(allocs) else [],
         "has_multiple_beneficiaries": len(sponsorships_data) > 1,
         "beneficiaries_count": len(sponsorships_data)
     }
@@ -478,7 +477,7 @@ class PreviewRequest(BaseModel):
     message_body: Optional[str] = None
     recipient: Dict[str, Any]
     custom_variables: Optional[Dict[str, str]] = None
-    selected_allocation_id: Optional[int] = None
+    selected_allocation_id: Optional[Union[int, List[int]]] = None  # one sponsorship, several, or none = all
 
 
 @router.post("/preview")
@@ -504,7 +503,7 @@ class SendRequest(BaseModel):
     dry_run: bool = False
     kind: str = "bulk"  # "single" when written to one person from their donor panel
     custom_variables: Optional[Dict[str, str]] = None
-    selected_allocation_id: Optional[int] = None
+    selected_allocation_id: Optional[Union[int, List[int]]] = None  # one sponsorship, several, or none = all
     recipient_customizations: Optional[Dict[str, Dict[str, Any]]] = None
 
 

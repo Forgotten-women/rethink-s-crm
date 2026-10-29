@@ -39,7 +39,7 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   }, [themeTemplates, templateType, edited]);
 
   useEffect(() => {
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    const onKey = (e) => { if (e.key === 'Escape' && !document.querySelector('[data-preview-full]')) { e.stopPropagation(); onClose(); } }; // Escape closes a full-size preview first
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
   }, [onClose]);
@@ -85,7 +85,7 @@ if (denyUnless('email.send')) return;
   return createPortal(
     <div className="fixed inset-0 z-[85] flex items-center justify-center p-2 sm:p-5" role="dialog" aria-modal="true" aria-label={`Email ${who.name || who.email}`}>
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-7xl h-[94vh] flex flex-col rounded-2xl shadow-2xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+      <div className="relative w-full max-w-[1600px] h-[94vh] flex flex-col rounded-2xl shadow-2xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
         <div className="px-5 py-3 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 bg-gradient-to-br from-sky-500/10 to-transparent">
           <div className="min-w-0">
             <h2 className="text-base font-black flex items-center gap-2 text-slate-900 dark:text-white"><Mail className="w-5 h-5 text-sky-500" /> Email {who.name || who.email}</h2>
@@ -96,7 +96,7 @@ if (denyUnless('email.send')) return;
 
         <div className="flex-1 min-h-0 grid grid-cols-1 xl:grid-cols-12 gap-4 p-4 overflow-y-auto xl:overflow-hidden">
           {/* Write */}
-          <div className="xl:col-span-4 flex flex-col gap-3 xl:overflow-y-auto pr-1">
+          <div className="xl:col-span-3 flex flex-col gap-3 xl:overflow-y-auto pr-1">
             <div className={`${CARD} grid grid-cols-2 gap-2`}>
               <label className={LABEL}>Branding
                 <select value={theme} onChange={e => { setTheme(e.target.value); setEdited(false); }} className={`${FIELD} px-2 py-1.5 text-sm normal-case font-normal tracking-normal`}>
@@ -135,12 +135,12 @@ if (denyUnless('email.send')) return;
           </div>
 
           {/* Live preview */}
-          <div className="xl:col-span-5 flex flex-col gap-2 xl:overflow-y-auto">
+          <div className="xl:col-span-6 flex flex-col gap-2 xl:overflow-y-auto">
             <div className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Live preview - exactly what {who.name ? who.name.split(' ')[0] : 'they'} will get</div>
             <PreviewFrame
               preview={preview}
               busy={busy}
-              height="62vh"
+              height="74vh"
               customVariables={customVariables}
               onCustomVariableChange={(k, v) => setCustomVariables(cv => ({ ...cv, [k]: v }))}
               selectedAllocationId={selectedAllocationId}

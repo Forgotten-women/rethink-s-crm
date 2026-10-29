@@ -107,6 +107,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
       if (document.querySelector('[role="listbox"]')) return; // Escape closes the open filter list first
+      if (document.querySelector('[data-preview-full]')) return; // ...and a full-size preview
       e.stopPropagation(); if (rowPreview) setRowPreview(null); else onClose?.();
     };
     window.addEventListener('keydown', onKey, true);
@@ -406,7 +407,7 @@ if (denyUnless('email.campaigns')) return;
         )}
 
         {step === 2 && (
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-4">
             <div className="flex flex-col gap-3">
               <div className={`${CARD} grid grid-cols-1 sm:grid-cols-2 gap-2`}>
                 <label className={LABEL}>Theme / sender branding
@@ -438,7 +439,7 @@ if (denyUnless('email.campaigns')) return;
               <div className={CARD}>
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">Personalise - click to insert</div>
                 <VariableChips onInsert={insert} />
-                <p className="mt-2 text-[11px] text-slate-500">Each person gets one email. Someone with several sponsorships gets them all: {'{beneficiary_name}'} joins the names, {'{sponsorships_list}'} lists each one. Anyone a template can't fill is skipped, never sent a half-filled email.</p>
+                <p className="mt-2 text-[11px] text-slate-500">Each person gets one email. Someone with several sponsorships gets them all ({'{beneficiary_name}'} joins the names, {'{sponsorships_list}'} lists each one) - or tick in the preview which ones their email is about. Anyone a template can't fill is skipped, never sent a half-filled email.</p>
               </div>
             </div>
             <div className="flex flex-col gap-2 xl:sticky xl:top-0 self-start w-full">
@@ -451,7 +452,7 @@ if (denyUnless('email.campaigns')) return;
               <PreviewFrame
                 preview={live.preview}
                 busy={live.busy}
-                height="64vh"
+                height="80vh"
                 customVariables={combinedPreviewCustomVars}
                 onCustomVariableChange={(p, val) => {
                   setCustomVariables(cv => ({ ...cv, [p]: val }));
@@ -494,7 +495,7 @@ if (denyUnless('email.campaigns')) return;
               <PreviewFrame
                 preview={live.preview}
                 busy={live.busy}
-                height="52vh"
+                height="76vh"
                 customVariables={combinedPreviewCustomVars}
                 onCustomVariableChange={(p, val) => {
                   setCustomVariables(cv => ({ ...cv, [p]: val }));
@@ -622,7 +623,7 @@ if (denyUnless('email.campaigns')) return;
       {rowPreview && createPortal(
         <div className="fixed inset-0 z-[95] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={`Preview for ${rowPreview.name || rowPreview.email}`}>
           <div className="absolute inset-0 bg-black/50" onClick={() => setRowPreview(null)} />
-          <div className="relative w-full max-w-3xl rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-4 flex flex-col gap-2">
+          <div className="relative w-full max-w-5xl rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-4 flex flex-col gap-2">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-bold text-slate-900 dark:text-white">What {rowPreview.name || rowPreview.email} would get <span className="font-normal text-slate-500">· template {templateType.replace(/_/g, ' ')}</span></div>
               <button type="button" onClick={() => setRowPreview(null)} aria-label="Close preview" className="w-7 h-7 rounded-full flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"><X className="w-4 h-4" /></button>
@@ -630,7 +631,7 @@ if (denyUnless('email.campaigns')) return;
             <PreviewFrame
               preview={single.preview}
               busy={single.busy}
-              height="65vh"
+              height="78vh"
               customVariables={singleCustomVars}
               onCustomVariableChange={(p, val) => {
                 setCustomVariables(cv => ({ ...cv, [p]: val }));
