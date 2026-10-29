@@ -332,8 +332,10 @@ function LayoutPanel({ s, onChange }) {
 
 // ------------------------------------------------------------------ the builder
 export default function EmailBuilder({ html, doc: docProp, onChange, variables = [], fallbackTheme }) {
+  // The saved HTML is what gets sent (and what Raw HTML / Live Preview show), so it wins: the stored blocks are used
+  // only while they still render to exactly that HTML. HTML pasted in Raw HTML, or a doc left stale, is re-read.
   const initial = useMemo(() => {
-    if (docProp && docProp.blocks) return docProp;
+    if (docProp && docProp.blocks && (!html || !html.trim() || renderDoc(docProp) === html)) return docProp;
     try { return html && html.trim() ? htmlToDoc(html, fallbackTheme) : { version: 1, settings: defaultSettings(fallbackTheme), blocks: [] }; }
     catch { return { version: 1, settings: defaultSettings(fallbackTheme), blocks: [{ ...newBlock('html'), html: html || '' }] }; }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -344,7 +346,10 @@ export default function EmailBuilder({ html, doc: docProp, onChange, variables =
   const s = { ...defaultSettings(fallbackTheme), ...(doc.settings || {}) };
 
   const commit = (next) => { setDoc(next); onChange?.(next, renderDoc(next)); };
-  useEffect(() => { if (!docProp) onChange?.(initial, renderDoc(initial)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!docProp && !(html && html.trim())) onChange?.(initial, renderDoc(initial));
+    else if (initial !== docProp) onChange?.(initial, html); // keep the HTML exactly as it is until a block is edited
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const blocks = doc.blocks || [];
   const idx = blocks.findIndex(b => b.id === sel);

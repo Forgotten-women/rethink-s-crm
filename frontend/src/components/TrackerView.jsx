@@ -625,20 +625,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const [copiedHtml, setCopiedHtml] = useState(false);
   const rawHtmlTextareaRef = useRef(null);
 
-  const switchEditorMode = (newMode) => {
-    if (templateEditorMode === 'code' && newMode === 'editor') {
-      try {
-        const theme = CHARITY_THEMES_PRESETS[selectedCharityTheme];
-        const parsedDoc = htmlToDoc(templateDraft.body_html || '', theme);
-        if (parsedDoc && Array.isArray(parsedDoc.blocks)) {
-          setTemplateDraft(prev => ({ ...prev, builder_json: parsedDoc }));
-        }
-      } catch (err) {
-        console.warn('Could not re-parse raw HTML into visual blocks:', err);
-      }
-    }
-    setTemplateEditorMode(newMode);
-  };
+  // The builder re-reads body_html whenever its blocks no longer render to it (EmailBuilder), so HTML pasted in
+  // Raw HTML shows up in the builder however you get there.
+  const switchEditorMode = (newMode) => setTemplateEditorMode(newMode);
 
   const handleHtmlKeyDown = (e) => {
     if (e.key === 'Tab') {
@@ -2008,7 +1997,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     const effectiveCompanyId = (selectedCharityTheme === 'sp' && activeCompany === 'rethink') ? 'sp_rethink' : selectedCharityTheme;
     // the new template is a builder document: the theme's own layout (from one of its templates) + blocks
     const themeTpls = emailTemplates.filter(t => (t.charity_theme || t.company_id || 'rethink') === selectedCharityTheme);
-    const docOf = (t) => (t.builder_json && t.builder_json.blocks ? JSON.parse(JSON.stringify(t.builder_json)) : htmlToDoc(t.body_html || ''));
+    const docOf = (t) => (t.builder_json && t.builder_json.blocks && (!t.body_html || renderDoc(t.builder_json) === t.body_html)
+      ? JSON.parse(JSON.stringify(t.builder_json)) : htmlToDoc(t.body_html || ''));
     let newDoc;
     const source = themeTpls.find(t => String(t.id) === String(newTemplateForm.body_html));
     if (source) {
@@ -6075,6 +6065,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     html={templateDraft.body_html}
                     doc={templateDraft.builder_json}
                     variables={AVAILABLE_VARIABLES}
+                    fallbackTheme={CHARITY_THEMES_PRESETS[selectedCharityTheme]}
                     onChange={(doc, html) => setTemplateDraft(prev => ({ ...prev, builder_json: doc, body_html: html }))}
                   />
                 ) : templateEditorMode === 'code' ? (
