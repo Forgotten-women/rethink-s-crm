@@ -56,6 +56,9 @@ const DEFAULT_COMPANIES_FALLBACK = [
   { id: 'iqra', name: 'Iqra', short_code: 'Iqra', accent_color: 'emerald', logo_url: '', is_active: 1 }
 ];
 
+// OAuth codes already sent for exchange (Google / Microsoft sign-in callbacks)
+const handledSignInCodes = new Set();
+
 export default function App() {
   const [user, setUser] = useState(null);
   // page, charity and open donor come from the address first (/rethink/donors?donor=...), see routes.js
@@ -509,6 +512,8 @@ export default function App() {
   useEffect(() => {
     if (!user || window.location.pathname !== '/gmail-callback') return;
     const q = new URLSearchParams(window.location.search);
+    if (handledSignInCodes.has(q.get('code'))) return;
+    handledSignInCodes.add(q.get('code'));
     const state = q.get('state') || '';
     const comp = state.split(':')[1];
     const done = (text) => {
@@ -532,6 +537,9 @@ export default function App() {
   useEffect(() => {
     if (!user || window.location.pathname !== '/sponsorship-tracker') return;
     const q = new URLSearchParams(window.location.search);
+    // a sign-in code works once: the effect runs again when the session refreshes, so use each code only once
+    if (handledSignInCodes.has(q.get('code'))) return;
+    handledSignInCodes.add(q.get('code'));
     const comp = (q.get('state') || '').trim().toLowerCase();
     const done = (text) => {
       window.history.replaceState({}, document.title, '/');
