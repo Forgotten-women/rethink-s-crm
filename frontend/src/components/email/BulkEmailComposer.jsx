@@ -235,7 +235,6 @@ if (denyUnless('email.send')) return;
   const queueCampaign = async () => {
     setError('');
     if (!campaignName.trim()) { setError('Give the campaign a name.'); return; }
-    if (separateAll || Object.values(recipientCustomizations).some(c => c.separate)) { setError('Separate emails per beneficiary work with "Send now", not with a queued campaign - untick it, or send now.'); return; }
     setLoading(true);
     try {
 if (denyUnless('email.campaigns')) return;
@@ -563,7 +562,7 @@ if (denyUnless('email.campaigns')) return;
                 )}
                 {progress && <div className="text-slate-500">{progress.dryRun ? 'Checking' : 'Sending'}… {progress.done}/{progress.total}</div>}
                 {summary && <div><b>{results.dryRun ? 'Check' : 'Done'}:</b> {Object.entries(summary).map(([k, v]) => `${v} ${k === 'ok' ? 'ready' : k}`).join(' · ')}</div>}
-                {results?.campaign && <div className="text-violet-700 dark:text-violet-300">Queued {results.campaign.queued} in the email queue (Campaigns tab).</div>}
+                {results?.campaign && <div className="text-violet-700 dark:text-violet-300">Queued {results.campaign.queued} email{results.campaign.queued === 1 ? '' : 's'}{results.campaign.people && results.campaign.people !== results.campaign.queued ? ` for ${results.campaign.people} people` : ''} in the email queue (Campaigns tab).</div>}
               </div>
               <div className={`${CARD} text-xs flex flex-col gap-2`}>
                 <div className="flex items-center justify-between gap-2">

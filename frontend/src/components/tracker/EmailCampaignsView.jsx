@@ -119,7 +119,7 @@ if (denyUnless('email.send')) return;
                 <tbody>
                   {(messages[c.id] || []).map(m => (
                     <tr key={m.id} className="border-t" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}>
-                      <td className="px-3 py-1.5">{m.recipient_name || '—'}</td><td className="px-3 py-1.5">{m.recipient_email}</td>
+                      <td className="px-3 py-1.5">{m.recipient_name || '—'}{m.about && <span className="ml-1 text-[10px] text-slate-500">· about {m.about}</span>}</td><td className="px-3 py-1.5">{m.recipient_email}</td>
                       <td className="px-3 py-1.5">{m.status}</td><td className="px-3 py-1.5 tabular-nums">{String(m.sent_at || '').slice(0, 16) || '—'}</td>
                       <td className="px-3 py-1.5">{m.open_count ? `${m.open_count}×` : '—'}</td><td className="px-3 py-1.5 text-xs" style={{ color: 'var(--text-muted)' }}>{m.detail || ''}</td>
                     </tr>

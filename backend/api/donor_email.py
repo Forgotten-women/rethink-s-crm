@@ -38,6 +38,44 @@ DEFAULT_MESSAGE = "Thank you for your generous support."
 MAX_RECIPIENTS = 5000
 
 
+MESSAGE_COLS = ("id, company_id, campaign_id, donor_id, recipient_email, recipient_name, subject, body_html, template_type, theme, "
+                "status, detail, tracking_id, sender_email, sent_at, opened_at, open_count, created_at, extra_json, replied_at, kind")
+
+
+def _allow_several_per_person(conn: sqlite3.Connection) -> None:
+    """A queued campaign can hold several emails for one person (one per sponsorship, "part" = its allocation id):
+    the old UNIQUE(campaign_id, recipient_email) becomes UNIQUE(campaign_id, recipient_email, part). SQLite can't
+    change a constraint in place, so the table is rebuilt once, inside one transaction (rows and ids kept)."""
+    sql = (conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'crm_email_messages'").fetchone() or [""])[0]
+    if "part" in sql:
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        sql = (conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'crm_email_messages'").fetchone() or [""])[0]
+        if "part" in sql:  # the other worker did it first
+            conn.rollback()
+            return
+        conn.execute("""CREATE TABLE crm_email_messages_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, company_id TEXT NOT NULL, campaign_id INTEGER, donor_id TEXT,
+            recipient_email TEXT, recipient_name TEXT, subject TEXT, body_html TEXT, template_type TEXT, theme TEXT,
+            status TEXT DEFAULT 'pending', detail TEXT, tracking_id TEXT, sender_email TEXT, sent_at TEXT,
+            opened_at TEXT, open_count INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            extra_json TEXT, replied_at TEXT, kind TEXT, part TEXT NOT NULL DEFAULT '',
+            UNIQUE(campaign_id, recipient_email, part))""")
+        conn.execute(f"INSERT INTO crm_email_messages_new ({MESSAGE_COLS}) SELECT {MESSAGE_COLS} FROM crm_email_messages")
+        before = conn.execute("SELECT COUNT(*) FROM crm_email_messages").fetchone()[0]
+        after = conn.execute("SELECT COUNT(*) FROM crm_email_messages_new").fetchone()[0]
+        if before != after:
+            raise RuntimeError(f"crm_email_messages rebuild copied {after} of {before} rows")
+        conn.execute("DROP TABLE crm_email_messages")
+        conn.execute("ALTER TABLE crm_email_messages_new RENAME TO crm_email_messages")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def init_tables() -> None:
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
     try:
@@ -50,7 +88,8 @@ def init_tables() -> None:
             recipient_email TEXT, recipient_name TEXT, subject TEXT, body_html TEXT, template_type TEXT, theme TEXT,
             status TEXT DEFAULT 'pending', detail TEXT, tracking_id TEXT, sender_email TEXT, sent_at TEXT,
             opened_at TEXT, open_count INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(campaign_id, recipient_email))""")
+            extra_json TEXT, replied_at TEXT, kind TEXT, part TEXT NOT NULL DEFAULT '',
+            UNIQUE(campaign_id, recipient_email, part))""")
         if "message_body" not in {r[1] for r in conn.execute("PRAGMA table_info(crm_email_campaigns)")}:
             conn.execute("ALTER TABLE crm_email_campaigns ADD COLUMN message_body TEXT")
         msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(crm_email_messages)")}
@@ -60,6 +99,7 @@ def init_tables() -> None:
                     conn.execute(f"ALTER TABLE crm_email_messages ADD COLUMN {col} {typ}")
                 except sqlite3.OperationalError:
                     pass  # the other worker added it at the same moment
+        _allow_several_per_person(conn)
         # Replies to emails sent from here (Donors / campaigns / single emails); sponsorship replies live in
         # sponsorship_communications. Filled by the tracker's reply sync (tracker._record_inbound_reply).
         conn.execute("""CREATE TABLE IF NOT EXISTS crm_email_replies (
@@ -573,6 +613,9 @@ class CampaignRequest(BaseModel):
     exclude_emailed_days: Optional[int] = None
     exclude_other_pending: bool = True
     matched: Optional[List[Dict[str, Any]]] = None
+    custom_variables: Optional[Dict[str, str]] = None
+    separate_per_beneficiary: bool = False
+    recipient_customizations: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @router.post("/campaigns")
@@ -616,13 +659,32 @@ def create_campaign(req: CampaignRequest, request: Request):
                                 req.template_type, theme, req.subject_template, req.body_template, req.message_body, user.get("email")))
             cid = cur.lastrowid
             conn.executemany("""INSERT OR IGNORE INTO crm_email_messages (company_id, campaign_id, donor_id, recipient_email, recipient_name,
-                                    template_type, theme, status, extra_json, kind) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'campaign')""",
-                             [(comp, cid, r["donor_id"], r["email"], r["name"], req.template_type, theme,
-                               json.dumps({k: matched.get(r["email"].lower(), {}).get(k, r.get(k)) for k in MATCH_FIELDS}))
-                              for r in rows])
+                                    template_type, theme, status, extra_json, kind, part) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'campaign', ?)""",
+                             [(comp, cid, r["donor_id"], r["email"], r["name"], req.template_type, theme, json.dumps(extra), part)
+                              for r in rows for extra, part in _campaign_parts(comp, r, matched, req)])
+            queued = conn.execute("SELECT COUNT(*) FROM crm_email_messages WHERE campaign_id = ?", (cid,)).fetchone()[0]
     finally:
         conn.close()
-    return {"campaign_id": cid, "queued": len(rows), "excluded": len(skip & {r['email'].lower() for r in rows})}
+    return {"campaign_id": cid, "queued": queued, "people": len(rows), "excluded": len(skip & {r['email'].lower() for r in rows})}
+
+
+def _campaign_parts(comp: str, r: Dict[str, Any], matched: Dict[str, Any], req: "CampaignRequest"):
+    """The queued emails for one person: (extra_json, part) per email. What the sender chose for this person in
+    Compose (sponsorships ticked, separate emails, filled-in values, own message) is kept with each email."""
+    em = r["email"].lower()
+    cust = (req.recipient_customizations or {}).get(em, {})
+    base = {k: matched.get(em, {}).get(k, r.get(k)) for k in MATCH_FIELDS}
+    c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
+    if c_vars:
+        base["custom_variables"] = c_vars
+    if cust.get("message_body"):
+        base["message_body"] = cust["message_body"]
+    sel = cust.get("selected_allocation_id")
+    separate = cust["separate"] if cust.get("separate") is not None else req.separate_per_beneficiary
+    parts = separate and _separate_selections(comp, em, sel)
+    if not parts:
+        return [({**base, "selected_allocation_id": sel} if sel else base, "")]
+    return [({**base, "selected_allocation_id": p}, str(p[0])) for p in parts]
 
 
 def _campaign(conn, comp: str, cid: int) -> Dict[str, Any]:
@@ -667,8 +729,12 @@ def campaign_messages(campaign_id: int, company_id: str = Query(...), status: Op
             where += " AND status = ?"
             params.append(status)
         total = conn.execute(f"SELECT COUNT(*) FROM crm_email_messages WHERE {where}", params).fetchone()[0]
-        rows = [dict(r) for r in conn.execute(f"""SELECT id, donor_id, recipient_email, recipient_name, status, detail, sent_at,
-                    opened_at, open_count FROM crm_email_messages WHERE {where} ORDER BY id LIMIT ? OFFSET ?""",
+        rows = [dict(r) for r in conn.execute(f"""SELECT m.id, m.donor_id, m.recipient_email, m.recipient_name, m.status, m.detail, m.sent_at,
+                    m.opened_at, m.open_count, b.name AS about FROM crm_email_messages m
+                    LEFT JOIN sponsorship_allocations a ON m.part != '' AND a.id = CAST(m.part AS INTEGER)
+                    LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                    WHERE {where.replace('campaign_id', 'm.campaign_id').replace('company_id', 'm.company_id').replace('status', 'm.status')}
+                    ORDER BY m.id LIMIT ? OFFSET ?""",
                                               params + [page_size, (page - 1) * page_size])]
     finally:
         conn.close()
@@ -705,8 +771,12 @@ def send_campaign_batch(campaign_id: int, req: CampaignSendRequest, request: Req
             extra = json.loads(m.get("extra_json") or "{}") or {}
         except ValueError:
             extra = {}
+        c_vars = extra.pop("custom_variables", None)
+        sel = extra.pop("selected_allocation_id", None)
+        msg_body = extra.pop("message_body", None) or c.get("message_body")
         rendered = _render(comp, c["theme"], c["template_type"], c["subject"], c["body_html"],
-                           {**extra, "donor_id": m["donor_id"], "email": m["recipient_email"], "name": m["recipient_name"]}, c.get("message_body"))
+                           {**extra, "donor_id": m["donor_id"], "email": m["recipient_email"], "name": m["recipient_name"]},
+                           msg_body, c_vars, sel)
         if req.dry_run:
             ok = not rendered["unresolved_placeholders"]
             out.append({"recipient_email": m["recipient_email"], "status": "ok" if ok else "skipped",
