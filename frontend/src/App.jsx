@@ -527,6 +527,28 @@ export default function App() {
       .catch(e => done(`Gmail wasn't connected: ${e.message}`));
   }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Microsoft 365 (Outlook) sign-in comes back to /sponsorship-tracker?code=...&state=<charity> (the redirect address
+  // registered in Azure) - finish it here, whatever page was open, then show the charity's Mailbox
+  useEffect(() => {
+    if (!user || window.location.pathname !== '/sponsorship-tracker') return;
+    const q = new URLSearchParams(window.location.search);
+    const comp = (q.get('state') || '').trim().toLowerCase();
+    const done = (text) => {
+      window.history.replaceState({}, document.title, '/');
+      try { sessionStorage.setItem('crm_email_tab', 'mailbox'); } catch { /* ignore */ }
+      if (comp) { setActiveCompany(comp); localStorage.setItem('crm_active_company', comp); }
+      setActiveTab('email');
+      window.alert(text);
+    };
+    if (q.get('error')) { done(`Microsoft sign-in didn't finish: ${q.get('error_description') || q.get('error')}`); return; }
+    if (!q.get('code') || !comp) { done('That Microsoft sign-in link was incomplete - press Connect with Microsoft 365 again.'); return; }
+    fetch(`${API_BASE_URL}/api/tracker/outlook/exchange-token`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company_id: comp, code: q.get('code'), redirect_uri: `${window.location.origin}/sponsorship-tracker` }),
+    }).then(async r => { const d = await r.json().catch(() => ({})); done(r.ok && d.status === 'success' ? `Microsoft 365 connected: ${d.connected_email}` : `Microsoft 365 wasn't connected: ${d.detail || r.status}`); })
+      .catch(e => done(`Microsoft 365 wasn't connected: ${e.message}`));
+  }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!user) {
     return <LoginView theme={theme} onToggleTheme={handleToggleTheme} onLoginSuccess={handleLoginSuccess} />;
   }

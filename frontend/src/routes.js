@@ -1,7 +1,7 @@
 // URL-based routing without a router library: the address is /<charity>/<page>[#donor=<id>], e.g. /rethink/donors.
 // App.jsx keeps it in step with the selected page / charity / donor, and back / forward restore them.
 // The open donor goes in the #fragment: browsers never send it to the server, so donor ids (often an email
-// address) don't end up in server access logs. /gmail-callback, the #ops hash and a page's own query parameters
+// address) don't end up in server access logs. The sign-in callbacks (CALLBACK_PATHS), the #ops hash and a page's own query parameters
 // (e.g. Tracker filters) are left alone.
 
 export const TAB_SLUGS = {
@@ -10,7 +10,9 @@ export const TAB_SLUGS = {
   expenses: 'expenses', admin: 'admin', access: 'access',
 };
 const SLUG_TABS = Object.fromEntries(Object.entries(TAB_SLUGS).map(([tab, slug]) => [slug, tab]));
-const RESERVED = new Set(['gmail-callback', 'assets', 'api', 'ws']);
+// sign-in callbacks (Google, Microsoft 365) carry a one-time ?code= that must reach App untouched
+export const CALLBACK_PATHS = new Set(['/gmail-callback', '/sponsorship-tracker']);
+const RESERVED = new Set(['gmail-callback', 'sponsorship-tracker', 'assets', 'api', 'ws']);
 
 const hashDonor = () => {
   const m = (window.location.hash || '').match(/^#donor=(.+)$/);
@@ -35,7 +37,7 @@ export function routePath(company, tab) {
 /** Puts page / charity / donor into the address. A new page, charity or donor adds a history entry (back works);
  *  the first load from a bare address replaces it. */
 export function writeRoute(company, tab, donor) {
-  if (window.location.pathname === '/gmail-callback') return;
+  if (CALLBACK_PATHS.has(window.location.pathname)) return;
   const path = routePath(company, tab);
   const samePage = window.location.pathname === path;
   const search = samePage ? window.location.search : '';

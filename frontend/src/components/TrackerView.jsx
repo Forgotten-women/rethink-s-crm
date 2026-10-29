@@ -1293,32 +1293,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     }
   }, [selectedTemplateForConfig, selectedCharityTheme, emailTemplates]);
 
-  // Handle Microsoft 365 OAuth Callback code from URL query param if present
-  useEffect(() => {
-    const urlParams = new URLSearchParams(window.location.search);
-    const code = urlParams.get('code');
-    if (code && !(urlParams.get('state') || '').startsWith('gmail:')) { // a Google sign-in is handled by App (gmail-callback)
-      const redirectUri = `${window.location.origin}/sponsorship-tracker`;
-      fetch(getAuthUrl(`${API_BASE_URL}/api/tracker/outlook/exchange-token`), {
-        method: 'POST',
-        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({
-          code,
-          redirect_uri: redirectUri,
-          company_id: activeCompany
-        })
-      })
-        .then(r => r.json())
-        .then(res => {
-          if (res?.status === 'success') {
-            setStatusMessage(`✅ Microsoft 365 connected as ${res.connected_email}`);
-            window.history.replaceState({}, document.title, window.location.pathname);
-            loadBeneficiariesAndAllocations();
-          }
-        })
-        .catch(console.error);
-    }
-  }, []);
+  // The Microsoft 365 sign-in callback (/sponsorship-tracker?code=...) is finished in App.jsx.
 
   // -------------------------------------------------------------
   // BENEFICIARY ACTIONS (CREATE, EDIT, DELETE)

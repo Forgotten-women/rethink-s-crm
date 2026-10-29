@@ -3956,6 +3956,22 @@ def _get_valid_graph_token(company_id: str) -> str:
     }, timeout=15)
 
     if res.status_code != 200:
+        err = res.json() if res.headers.get("content-type", "").startswith("application/json") else {}
+        if err.get("error") == "invalid_grant":
+            # Microsoft revoked the sign-in (password change, sessions revoked, admin action...): it can't recover on
+            # its own, so show the mailbox as not connected instead of failing every send with a raw Graph error
+            mailbox = auth["connected_email"] or "the Microsoft 365 mailbox"
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+            try:
+                conn.execute("UPDATE sponsorship_outlook_auth SET access_token = NULL, refresh_token = NULL, token_expiry = NULL, "
+                             "subscription_id = NULL, subscription_expiration = NULL WHERE company_id = ?", (company_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            log_event("outlook.signed_out", category="outlook", level="error", company_id=company_id, mailbox=mailbox,
+                      message=f"Microsoft signed the CRM out of {mailbox}: {str(err.get('error_description', ''))[:160]}")
+            raise HTTPException(status_code=400, detail=f"Microsoft has signed the CRM out of {mailbox}, so emails can't be sent. "
+                                                        "Reconnect it in Email > Mailbox (Outlook).")
         raise HTTPException(status_code=400, detail=f"Failed to refresh Microsoft Graph access token: {res.text}")
 
     data = res.json()
