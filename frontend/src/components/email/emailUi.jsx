@@ -49,9 +49,10 @@ export function useTemplates(company) {
 /** Rendered email for one recipient, refreshed as the text changes (debounced) - the live preview. */
 export function useLivePreview({
   company, theme, templateType, subject, body, edited, messageBody, recipient,
-  customVariables = null, selectedAllocationId = null, enabled = true
+  customVariables = null, selectedAllocationId = null, separate = false, enabled = true
 }) {
   const [preview, setPreview] = useState(null);
+  const [previewAlloc, setPreviewAlloc] = useState(null); // with "separate": which of the emails is shown
   const [busy, setBusy] = useState(false);
   const seq = useRef(0);
   const recipientKey = recipient ? `${recipient.email}|${recipient.donor_id || ''}` : '';
@@ -65,6 +66,7 @@ export function useLivePreview({
       subject_template: edited ? subject : null, body_template: edited ? body : null, recipient,
       custom_variables: customVariables,
       selected_allocation_id: selectedAllocationId,
+      separate: !!separate, preview_allocation_id: separate ? previewAlloc : null,
     };
     const t = setTimeout(() => {
       // one quiet retry: a busy moment on the server (e.g. donor data refreshing after a new donation) shouldn't
@@ -76,8 +78,8 @@ export function useLivePreview({
         .finally(() => { if (my === seq.current) setBusy(false); });
     }, 450);
     return () => clearTimeout(t);
-  }, [company, theme, templateType, subject, body, edited, messageBody, recipientKey, customVarsKey, selectedAllocationId, enabled]); // eslint-disable-line react-hooks/exhaustive-deps
-  return { preview, busy };
+  }, [company, theme, templateType, subject, body, edited, messageBody, recipientKey, customVarsKey, selectedAllocationId, separate, previewAlloc, enabled]); // eslint-disable-line react-hooks/exhaustive-deps
+  return { preview, busy, setPreviewAlloc };
 }
 
 export function PreviewFrame({
@@ -89,6 +91,9 @@ export function PreviewFrame({
   onCustomVariableChange,
   selectedAllocationId = null,
   onSelectAllocation,
+  separate = false,
+  onSeparateChange,
+  onPreviewAllocation,
 }) {
   const [big, setBig] = useState(false);
   if (!preview) {
@@ -100,6 +105,8 @@ export function PreviewFrame({
   const hasSupplied = customVariables && Object.keys(customVariables).length > 0;
   // the sponsorships picked for this email (none = all of them); older callers pass a single id
   const picked = Array.isArray(selectedAllocationId) ? selectedAllocationId : (selectedAllocationId ? [selectedAllocationId] : []);
+  const sepIds = preview.separate_ids || [];
+  const sepAt = Math.max(0, sepIds.indexOf(preview.previewing_allocation_id));
   const hasMultipleBeneficiaries = preview.has_multiple_beneficiaries || (preview.sponsorships && preview.sponsorships.length > 1);
 
   return (
@@ -171,6 +178,22 @@ export function PreviewFrame({
               );
             })}
           </div>
+          {onSeparateChange && (
+            <div className="flex items-center justify-between gap-2 flex-wrap pt-1 border-t border-violet-200/70 dark:border-violet-800/70">
+              <label className="flex items-center gap-1.5 text-xs font-semibold text-violet-950 dark:text-violet-200 cursor-pointer">
+                <input type="checkbox" checked={!!separate} onChange={e => onSeparateChange(e.target.checked)} className="accent-violet-600" />
+                Send a separate email for each {picked.length ? 'ticked one' : 'beneficiary'}
+                {separate && sepIds.length > 1 && <span className="font-normal text-violet-700 dark:text-violet-300">({sepIds.length} emails)</span>}
+              </label>
+              {separate && sepIds.length > 1 && (
+                <span className="flex items-center gap-1 text-[11px] text-violet-800 dark:text-violet-200">
+                  Previewing email {sepAt + 1} of {sepIds.length}: <b>{(preview.sponsorships.find(x => x.id === sepIds[sepAt]) || {}).beneficiary_name}</b>
+                  <button type="button" disabled={sepAt <= 0} onClick={() => onPreviewAllocation?.(sepIds[sepAt - 1])} className="px-1.5 rounded border border-violet-300 disabled:opacity-30">‹</button>
+                  <button type="button" disabled={sepAt >= sepIds.length - 1} onClick={() => onPreviewAllocation?.(sepIds[sepAt + 1])} className="px-1.5 rounded border border-violet-300 disabled:opacity-30">›</button>
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
 

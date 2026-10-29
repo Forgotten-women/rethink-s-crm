@@ -91,6 +91,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
   const [campaignName, setCampaignName] = useState('');
   const [asCampaign, setAsCampaign] = useState(startAsCampaign);
   const [customVariables, setCustomVariables] = useState({});
+  const [separateAll, setSeparateAll] = useState(false); // everyone with several sponsorships: one email per sponsorship
   const [recipientCustomizations, setRecipientCustomizations] = useState({});
   // Every chosen person's email checked before sending: who would be skipped and why (not only the previewed one)
   const [check, setCheck] = useState(null); // { running, done, total, ok, problems: [] }
@@ -169,6 +170,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     ...(activeRecipientCust.custom_variables || {}),
   }), [customVariables, activeRecipientCust.custom_variables]);
   const activeSelectedAllocationId = activeRecipientCust.selected_allocation_id ?? null;
+  const activeSeparate = activeRecipientCust.separate ?? separateAll;
 
   const live = useLivePreview({
     company, theme, templateType, subject, body, edited,
@@ -176,6 +178,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     recipient: previewRecipient,
     customVariables: combinedPreviewCustomVars,
     selectedAllocationId: activeSelectedAllocationId,
+    separate: activeSeparate,
     enabled: step >= 2,
   });
 
@@ -186,6 +189,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     ...(singleCust.custom_variables || {}),
   }), [customVariables, singleCust.custom_variables]);
   const singleSelectedAllocationId = singleCust.selected_allocation_id ?? null;
+  const singleSeparate = singleCust.separate ?? separateAll;
 
   const single = useLivePreview({
     company, theme, templateType, subject, body, edited,
@@ -193,6 +197,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     recipient: rowPreview,
     customVariables: singleCustomVars,
     selectedAllocationId: singleSelectedAllocationId,
+    separate: singleSeparate,
     enabled: !!rowPreview,
   });
 
@@ -201,6 +206,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     subject_template: edited ? subject : null, body_template: edited ? body : null,
     custom_variables: customVariables,
     recipient_customizations: recipientCustomizations,
+    separate_per_beneficiary: separateAll,
   });
   const insert = (text) => {
     const f = lastField.current;
@@ -229,6 +235,7 @@ if (denyUnless('email.send')) return;
   const queueCampaign = async () => {
     setError('');
     if (!campaignName.trim()) { setError('Give the campaign a name.'); return; }
+    if (separateAll || Object.values(recipientCustomizations).some(c => c.separate)) { setError('Separate emails per beneficiary work with "Send now", not with a queued campaign - untick it, or send now.'); return; }
     setLoading(true);
     try {
 if (denyUnless('email.campaigns')) return;
@@ -439,6 +446,10 @@ if (denyUnless('email.campaigns')) return;
               <div className={CARD}>
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">Personalise - click to insert</div>
                 <VariableChips onInsert={insert} />
+                <label className="mt-2 flex items-start gap-2 text-xs text-slate-700 dark:text-slate-200 cursor-pointer">
+                  <input type="checkbox" checked={separateAll} onChange={e => setSeparateAll(e.target.checked)} className="mt-0.5 accent-sky-600" />
+                  <span><b>Separate email for each beneficiary</b> - someone with several sponsorships gets one email per sponsorship instead of one combined email (you can still change it per person in the preview).</span>
+                </label>
                 <p className="mt-2 text-[11px] text-slate-500">Each person gets one email. Someone with several sponsorships gets them all ({'{beneficiary_name}'} joins the names, {'{sponsorships_list}'} lists each one) - or tick in the preview which ones their email is about. Anyone a template can't fill is skipped, never sent a half-filled email.</p>
               </div>
             </div>
@@ -467,6 +478,9 @@ if (denyUnless('email.campaigns')) return;
                   }
                 }}
                 selectedAllocationId={activeSelectedAllocationId}
+                separate={activeSeparate}
+                onSeparateChange={(v) => { if (activeEmailKey) setRecipientCustomizations(rc => ({ ...rc, [activeEmailKey]: { ...(rc[activeEmailKey] || {}), separate: v } })); }}
+                onPreviewAllocation={live.setPreviewAlloc}
                 onSelectAllocation={(allocId) => {
                   if (activeEmailKey) {
                     setRecipientCustomizations(rc => ({
@@ -510,6 +524,9 @@ if (denyUnless('email.campaigns')) return;
                   }
                 }}
                 selectedAllocationId={activeSelectedAllocationId}
+                separate={activeSeparate}
+                onSeparateChange={(v) => { if (activeEmailKey) setRecipientCustomizations(rc => ({ ...rc, [activeEmailKey]: { ...(rc[activeEmailKey] || {}), separate: v } })); }}
+                onPreviewAllocation={live.setPreviewAlloc}
                 onSelectAllocation={(allocId) => {
                   if (activeEmailKey) {
                     setRecipientCustomizations(rc => ({
@@ -646,6 +663,9 @@ if (denyUnless('email.campaigns')) return;
                 }
               }}
               selectedAllocationId={singleSelectedAllocationId}
+              separate={singleSeparate}
+              onSeparateChange={(v) => { if (singleEmailKey) setRecipientCustomizations(rc => ({ ...rc, [singleEmailKey]: { ...(rc[singleEmailKey] || {}), separate: v } })); }}
+              onPreviewAllocation={single.setPreviewAlloc}
               onSelectAllocation={(allocId) => {
                 if (singleEmailKey) {
                   setRecipientCustomizations(rc => ({

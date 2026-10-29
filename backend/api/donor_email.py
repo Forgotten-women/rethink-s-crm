@@ -233,6 +233,17 @@ def _selected_ids(sel: Any) -> List[int]:
     return out
 
 
+def _separate_selections(comp: str, email: str, sel: Any) -> List[List[int]]:
+    """For "one email per sponsorship": a selection per email - each ticked sponsorship (or each of the donor's
+    sponsorships when none is ticked). Empty when the donor has fewer than two, so they just get the one email."""
+    allocs = donor_sponsorships(comp, email) if email else []
+    if len(allocs) < 2:
+        return []
+    picked = _selected_ids(sel)
+    ids = [a["id"] for a in allocs if not picked or a["id"] in picked]
+    return [[i] for i in ids] if len(ids) > 1 else []
+
+
 def donor_sponsorships(comp: str, email: str) -> List[Dict[str, Any]]:
     """Every sponsorship (allocation) this address is a donor on, latest first, with its beneficiary and status."""
     from backend.api.donors import sponsorship_cycle_status
@@ -478,14 +489,23 @@ class PreviewRequest(BaseModel):
     recipient: Dict[str, Any]
     custom_variables: Optional[Dict[str, str]] = None
     selected_allocation_id: Optional[Union[int, List[int]]] = None  # one sponsorship, several, or none = all
+    separate: bool = False  # one email per (ticked) sponsorship - the preview shows one of them
+    preview_allocation_id: Optional[int] = None  # ...this one
 
 
 @router.post("/preview")
 def preview(req: PreviewRequest):
     comp = _company(req.company_id)
     theme = _resolve_theme(comp, req.theme)
+    em = str(req.recipient.get("email") or "").strip().lower()
+    emails = _separate_selections(comp, em, req.selected_allocation_id) if req.separate and em else None
+    sel = req.selected_allocation_id
+    if emails:
+        sel = next((x for x in emails if x[0] == req.preview_allocation_id), emails[0])
     out = _render(comp, theme, req.template_type, req.subject_template, req.body_template, req.recipient,
-                  req.message_body, req.custom_variables, req.selected_allocation_id)
+                  req.message_body, req.custom_variables, sel)
+    out["separate_ids"] = [x[0] for x in emails] if emails else []
+    out["previewing_allocation_id"] = sel[0] if emails else None
     from backend.api.unsubscribe import add_footer  # show the Unsubscribe button exactly as it will be sent
     out["body_html"] = add_footer(out.get("body_html") or "", comp, out.get("recipient_email") or "")
     out["unsubscribed"] = is_unsubscribed(comp, out.get("recipient_email") or "")
@@ -504,6 +524,7 @@ class SendRequest(BaseModel):
     kind: str = "bulk"  # "single" when written to one person from their donor panel
     custom_variables: Optional[Dict[str, str]] = None
     selected_allocation_id: Optional[Union[int, List[int]]] = None  # one sponsorship, several, or none = all
+    separate_per_beneficiary: bool = False  # everyone with several sponsorships gets one email per sponsorship
     recipient_customizations: Optional[Dict[str, Dict[str, Any]]] = None
 
 
@@ -522,16 +543,18 @@ def send(req: SendRequest, request: Request):
         c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
         msg_body = cust.get("message_body") or req.message_body
         sel_alloc = cust.get("selected_allocation_id") or req.selected_allocation_id
-        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
-                           msg_body, c_vars, sel_alloc)
-        if req.dry_run:
-            ok = "@" in rendered["recipient_email"] and not rendered["unresolved_placeholders"]
-            out.append({"recipient_email": rendered["recipient_email"], "status": "ok" if ok else "skipped",
-                        "detail": "" if ok else ("No email address" if "@" not in rendered["recipient_email"]
-                                                 else "Template needs: " + ", ".join(rendered["unresolved_placeholders"]))})
-            continue
-        out.append(_deliver(comp, theme, req.template_type, rendered, base_url, None, r.get("donor_id"),
-                            kind="single" if req.kind == "single" else "bulk"))
+        separate = cust["separate"] if cust.get("separate") is not None else req.separate_per_beneficiary
+        for sel in (separate and _separate_selections(comp, em, sel_alloc)) or [sel_alloc]:
+            rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
+                               msg_body, c_vars, sel)
+            if req.dry_run:
+                ok = "@" in rendered["recipient_email"] and not rendered["unresolved_placeholders"]
+                out.append({"recipient_email": rendered["recipient_email"], "status": "ok" if ok else "skipped",
+                            "detail": "" if ok else ("No email address" if "@" not in rendered["recipient_email"]
+                                                     else "Template needs: " + ", ".join(rendered["unresolved_placeholders"]))})
+                continue
+            out.append(_deliver(comp, theme, req.template_type, rendered, base_url, None, r.get("donor_id"),
+                                kind="single" if req.kind == "single" else "bulk"))
     summary = {s: sum(1 for x in out if x["status"] == s) for s in ("sent", "ok", "skipped", "failed")}
     return {"results": out, "summary": summary, "dry_run": req.dry_run}
 
@@ -948,6 +971,7 @@ class CheckRequest(BaseModel):
     message_body: Optional[str] = None
     recipients: List[Dict[str, Any]]
     custom_variables: Optional[Dict[str, str]] = None
+    separate_per_beneficiary: bool = False
     recipient_customizations: Optional[Dict[str, Dict[str, Any]]] = None
 
 
@@ -972,10 +996,14 @@ def check_recipients(req: CheckRequest):
         c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
         msg_body = cust.get("message_body") or req.message_body
         sel_alloc = cust.get("selected_allocation_id")
-        rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
-                           msg_body, c_vars, sel_alloc)
-        if rendered["unresolved_placeholders"]:
-            missing = rendered["unresolved_placeholders"]
-            has_spons = bool(donor_sponsorships(comp, em)) if any(m.lower() in SPONSORSHIP_PLACEHOLDERS for m in missing) else True
-            problems.append({"email": em, "name": rendered["recipient_name"], "missing": missing, "issue": _issue_text(missing, has_spons)})
+        separate = cust["separate"] if cust.get("separate") is not None else req.separate_per_beneficiary
+        for sel in (separate and _separate_selections(comp, em.lower(), sel_alloc)) or [sel_alloc]:
+            rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
+                               msg_body, c_vars, sel)
+            if rendered["unresolved_placeholders"]:
+                missing = rendered["unresolved_placeholders"]
+                has_spons = bool(donor_sponsorships(comp, em)) if any(m.lower() in SPONSORSHIP_PLACEHOLDERS for m in missing) else True
+                about = f" (email about {rendered['variables'].get('beneficiary_name') or 'one sponsorship'})" if separate and sel else ""
+                problems.append({"email": em, "name": rendered["recipient_name"], "missing": missing, "issue": _issue_text(missing, has_spons) + about})
+                break
     return {"checked": len(req.recipients), "ok": len(req.recipients) - len(problems), "problems": problems}

@@ -27,6 +27,7 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   const [threadKey, setThreadKey] = useState(0);
   const [customVariables, setCustomVariables] = useState({});
   const [selectedAllocationId, setSelectedAllocationId] = useState(null);
+  const [separate, setSeparate] = useState(false); // one email per (ticked) beneficiary
   const lastField = useRef({ name: 'message', el: null });
 
   useEffect(() => { if (!theme && selected) setTheme(selected); }, [selected, theme]);
@@ -45,10 +46,11 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   }, [onClose]);
 
   const who = useMemo(() => ({ donor_id: recipient.donor_id || recipient.email, email: recipient.email, name: recipient.name || '' }), [recipient]);
-  const { preview, busy } = useLivePreview({
+  const { preview, busy, setPreviewAlloc } = useLivePreview({
     company, theme, templateType, subject, body, edited, messageBody,
-    recipient: who, customVariables, selectedAllocationId
+    recipient: who, customVariables, selectedAllocationId, separate
   });
+  const emailCount = separate && preview?.separate_ids?.length > 1 ? preview.separate_ids.length : 1;
 
   const insert = (text) => {
     const f = lastField.current;
@@ -64,7 +66,7 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
       setError(`Please provide the missing variables (${preview.unresolved_placeholders.map(p => `{${p}}`).join(', ')}) above before sending.`);
       return;
     }
-    if (!window.confirm(`Send this email to ${who.name || who.email}?`)) return;
+    if (!window.confirm(emailCount > 1 ? `Send ${emailCount} separate emails (one per beneficiary) to ${who.name || who.email}?` : `Send this email to ${who.name || who.email}?`)) return;
     setSending(true);
     try {
 if (denyUnless('email.send')) return;
@@ -74,11 +76,14 @@ if (denyUnless('email.send')) return;
         recipients: [who], dry_run: false, kind: 'single',
         custom_variables: customVariables,
         selected_allocation_id: selectedAllocationId,
+        separate_per_beneficiary: separate,
       });
-      const r = d.results?.[0] || {};
-      setResult(r);
+      const rows = d.results || [];
+      const sentN = rows.filter(x => x.status === 'sent').length;
+      const bad = rows.find(x => x.status !== 'sent');
+      setResult(rows.length > 1 ? { status: bad ? (sentN ? 'partly sent' : bad.status) : 'sent', count: rows.length, sent: sentN, detail: bad?.detail || '' } : (rows[0] || {}));
       setThreadKey(k => k + 1);
-      if (r.status === 'sent') onSent?.();
+      if (sentN) onSent?.();
     } catch (e) { setError(e.message); } finally { setSending(false); }
   };
 
@@ -129,7 +134,7 @@ if (denyUnless('email.send')) return;
             {error && <div className="text-xs rounded-lg px-3 py-2 bg-rose-50 text-rose-700 border border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900">{error}</div>}
             {result && (
               <div className={`text-xs rounded-lg px-3 py-2 border flex items-center gap-1.5 ${result.status === 'sent' ? 'bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900' : 'bg-amber-50 text-amber-800 border-amber-200'}`}>
-                {result.status === 'sent' ? <><CheckCircle2 className="w-4 h-4" /> Sent to {who.email}. It's in their thread.</> : <>{result.status}: {result.detail}</>}
+                {result.status === 'sent' ? <><CheckCircle2 className="w-4 h-4" /> {result.count > 1 ? `${result.count} emails sent` : 'Sent'} to {who.email}. {result.count > 1 ? "They're" : "It's"} in their thread.</> : <>{result.status}{result.count > 1 ? ` (${result.sent} of ${result.count} sent)` : ''}: {result.detail}</>}
               </div>
             )}
           </div>
@@ -145,6 +150,9 @@ if (denyUnless('email.send')) return;
               onCustomVariableChange={(k, v) => setCustomVariables(cv => ({ ...cv, [k]: v }))}
               selectedAllocationId={selectedAllocationId}
               onSelectAllocation={setSelectedAllocationId}
+              separate={separate}
+              onSeparateChange={setSeparate}
+              onPreviewAllocation={setPreviewAlloc}
             />
           </div>
 
@@ -159,7 +167,7 @@ if (denyUnless('email.send')) return;
           <button type="button" onClick={onClose} className="px-3 py-2 text-sm rounded-lg font-semibold text-slate-600 dark:text-slate-300">Close</button>
           <button type="button" onClick={send} disabled={sending || !theme || !preview || !!preview?.error}
             className="px-4 py-2 text-sm rounded-lg font-bold bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-40 flex items-center gap-1.5">
-            <Send className="w-4 h-4" /> {sending ? 'Sending…' : `Send to ${who.name ? who.name.split(' ')[0] : who.email}`}
+            <Send className="w-4 h-4" /> {sending ? 'Sending…' : `Send ${emailCount > 1 ? `${emailCount} emails ` : ''}to ${who.name ? who.name.split(' ')[0] : who.email}`}
           </button>
         </div>
       </div>
