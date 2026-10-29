@@ -320,10 +320,15 @@ export function htmlToDoc(html, theme = {}) {
   if (bodySt['font-family']) s.fontFamily = bodySt['font-family'];
 
   const card = body.querySelector('table.card, table.email-card') || Array.from(body.querySelectorAll('table')).find(t => /max-width/.test(t.getAttribute('style') || ''));
+  // the whole email as one custom HTML block - used only if splitting it into blocks would lose any of its words
+  const asOneBlock = (why) => ({ version: DOC_VERSION, settings: { ...s, headerShow: false, footerShow: false, bodyPadding: 0 },
+    blocks: [{ ...newBlock('html'), html: body.innerHTML }], converted: 'raw', notes: [why] });
+  let bodyCell = body;
+  let bst = {};
   if (!card) {
-    // not our usual layout: keep it all as one custom HTML block inside a plain layout
-    return { version: DOC_VERSION, settings: { ...s, headerShow: false, footerShow: false, bodyPadding: 0 }, blocks: [{ ...newBlock('html'), html: body.innerHTML }], converted: 'raw' };
-  }
+    // not our usual layout (no card): a plain layout without header / footer, its content still split into blocks
+    Object.assign(s, { headerShow: false, footerShow: false, bodyPadding: 0 });
+  } else {
   const cst = styleOf(card);
   s.cardWidth = num(cst['max-width'], 600);
   s.cardBg = cst['background-color'] || s.cardBg;
@@ -333,7 +338,7 @@ export function htmlToDoc(html, theme = {}) {
 
   const rows = Array.from(card.querySelectorAll(':scope > tbody > tr, :scope > tr'));
   const cells = rows.map(r => r.querySelector(':scope > td')).filter(Boolean);
-  let bodyCell = cells.find(td => /p-body|email-body/.test(td.className)) || cells.find(td => !td.querySelector('img') || td.querySelectorAll('p').length > 2) || cells[0];
+  bodyCell = cells.find(td => /p-body|email-body/.test(td.className)) || cells.find(td => !td.querySelector('img') || td.querySelectorAll('p').length > 2) || cells[0];
   const bi = cells.indexOf(bodyCell);
   const headerCell = cells.slice(0, bi).find(td => td.querySelector('img'));
   const footerCell = cells.slice(bi + 1).pop();
@@ -367,8 +372,9 @@ export function htmlToDoc(html, theme = {}) {
     s.footerHtml = fh;
   } else s.footerShow = false;
 
-  const bst = styleOf(bodyCell);
+  bst = styleOf(bodyCell);
   s.bodyPadding = num(String(bst.padding || '').split(/\s+/)[1] || String(bst.padding || '').split(/\s+/)[0], 26);
+  }
 
   // heading/text colours from the first heading / paragraph
   const h = bodyCell.querySelector('h1, h2, h3');
@@ -480,7 +486,7 @@ export function htmlToDoc(html, theme = {}) {
               fontSize: 14, paraGap: marginBottom(styleOf(p0), 4), marginBottom: marginBottom(st, 16) });
             return;
           }
-          if (rowCells.length > 1) { blocks.push({ ...newBlock('html'), html: n.outerHTML }); return; }
+          if (rowCells.length > 1) { blocks.push({ ...newBlock('html'), html: n.outerHTML, why: 'a table with several rows or columns' }); return; }
           boxFrom(n, td || n);
           return;
         }
@@ -501,12 +507,32 @@ export function htmlToDoc(html, theme = {}) {
       }
       if (tag === 'ul' || tag === 'ol') { pushText(n.outerHTML, st, inh); return; }
       if (tag === 'style' || tag === 'script' || tag === 'meta' || tag === 'title') return;
-      blocks.push({ ...newBlock('html'), html: n.outerHTML });
+      blocks.push({ ...newBlock('html'), html: n.outerHTML, why: KEPT_AS_HTML[tag] || `a <${tag}> element` });
     });
   };
   walk(bodyCell, bst);
   blocks.forEach(b => { delete b._merge; });
-  return { version: DOC_VERSION, settings: s, blocks };
+  const doc = { version: DOC_VERSION, settings: s, blocks };
+  // every word of the original must still be there (header and footer included), or the email stays as it was
+  const left = {};
+  wordsOf(renderDoc(doc)).forEach(w => { left[w] = (left[w] || 0) + 1; });
+  if (wordsOf(body.outerHTML).some(w => !(left[w]-- > 0))) return asOneBlock('it could not be split into blocks without losing some of its text');
+  const kept = blocks.filter(b => b.type === 'html').map(b => b.why || 'custom HTML');
+  if (kept.length) doc.notes = kept;
+  if (!card) doc.converted = 'plain';
+  return doc;
+}
+
+const KEPT_AS_HTML = { form: 'a form', iframe: 'embedded content (video / map)', video: 'a video', audio: 'an audio clip', object: 'embedded content', embed: 'embedded content', svg: 'a drawing (SVG)', canvas: 'a drawing', input: 'a form field', button: 'a form button', select: 'a form field', textarea: 'a form field', blockquote: 'a quote', pre: 'preformatted text', dl: 'a definition list', figure: 'a figure' };
+
+/** The words of an email's visible text (letters / digits), to check a conversion kept every one. */
+export function wordsOf(html) {
+  const d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+  d.querySelectorAll('style, title, script').forEach(e => e.remove());
+  const parts = [];
+  const tw = d.createTreeWalker(d.body, 4); // text nodes
+  for (let n = tw.nextNode(); n; n = tw.nextNode()) parts.push(n.textContent);
+  return parts.join(' ').match(/[\p{L}\p{N}]+/gu) || [];
 }
 
 /** Visible text of an email (to check a conversion kept every word). */

@@ -81,6 +81,32 @@ function RichText({ html, onChange, className = '', style, placeholder, onFocus 
   );
 }
 
+/** A custom HTML block edited in place: its text can be typed into and formatted, while its tables, spacing and
+ *  styles stay exactly as written. Nothing changes until something is actually typed. */
+function HtmlInPlace({ html, onChange, onFocus }) {
+  const ref = useRef(null);
+  const last = useRef(null);
+  const base = useRef('');
+  useEffect(() => {
+    if (ref.current && html !== last.current) { ref.current.innerHTML = html || ''; last.current = html; base.current = ref.current.innerHTML; }
+  }, [html]);
+  const emit = () => {
+    const v = ref.current.innerHTML;
+    if (v === base.current) return; // only focused / clicked: keep the original markup untouched
+    base.current = v;
+    last.current = v;
+    onChange(v);
+  };
+  return (
+    <div ref={ref} contentEditable suppressContentEditableWarning
+      className="eb-rich outline-none focus:ring-2 focus:ring-indigo-400/50 rounded-sm"
+      onInput={emit} onBlur={emit}
+      onFocus={() => { caret.kind = 'rich'; caret.el = ref.current; onFocus?.(); }}
+      onKeyUp={rememberRange} onMouseUp={rememberRange}
+      onPaste={e => { e.preventDefault(); document.execCommand('insertText', false, e.clipboardData.getData('text/plain')); }} />
+  );
+}
+
 function ColorField({ label, value, onChange, allowEmpty = true, emptyText = 'Theme' }) {
   const v = value || '';
   return (
@@ -167,8 +193,10 @@ function CanvasBlock({ b, s, selected, onSelect, onChange, onMove, onDuplicate, 
     );
   } else if (b.type === 'image' && !b.src) {
     body = <div className="rounded-lg border-2 border-dashed border-slate-300 p-6 text-center text-xs text-slate-500" style={{ marginBottom: `${b.marginBottom ?? 16}px` }}>Image - paste its web address (URL) in the panel on the right</div>;
+  } else if (b.type === 'html') {
+    body = <HtmlInPlace html={b.html} onChange={v => set({ html: v })} onFocus={onSelect} />;
   } else {
-    // button / image / divider / spacer / custom HTML: shown exactly as they'll be sent
+    // button / image / divider / spacer: shown exactly as they'll be sent
     body = <div className="pointer-events-none" dangerouslySetInnerHTML={{ __html: renderBlock(b, s) }} />;
   }
   return (
@@ -190,7 +218,7 @@ function CanvasBlock({ b, s, selected, onSelect, onChange, onMove, onDuplicate, 
 // ------------------------------------------------------------------ properties of the selected block
 function BlockPanel({ b, s, onChange }) {
   const set = (patch) => onChange({ ...b, ...patch });
-  const rich = ['heading', 'text', 'box', 'columns'].includes(b.type);
+  const rich = ['heading', 'text', 'box', 'columns', 'html'].includes(b.type);
   return (
     <div className="flex flex-col gap-3">
       {rich && (
@@ -271,7 +299,7 @@ function BlockPanel({ b, s, onChange }) {
       </>)}
       {b.type === 'spacer' && <Num label="Height" value={b.height} onChange={v => set({ height: v })} min={4} max={120} />}
       {b.type === 'html' && (
-        <label className={LBL}>Custom HTML (kept exactly as written - for things the other blocks can't do)
+        <label className={LBL}>Custom HTML{b.why ? ` - ${b.why}` : ''} (kept exactly as written; you can also click its text in the email and type)
           <textarea value={b.html} onChange={e => set({ html: e.target.value })} rows={10} className={`${INPUT} font-mono text-[11px]`} />
         </label>
       )}
@@ -340,6 +368,8 @@ export default function EmailBuilder({ html, doc: docProp, onChange, variables =
     catch { return { version: 1, settings: defaultSettings(fallbackTheme), blocks: [{ ...newBlock('html'), html: html || '' }] }; }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [doc, setDoc] = useState(initial);
+  // what happened when this HTML was turned into blocks (shown once, after a paste / Raw HTML change)
+  const [note, setNote] = useState(() => (initial !== docProp && initial.notes && initial.notes.length ? initial.notes : null));
   const [sel, setSel] = useState(null); // block id | 'layout'
   const [drag, setDrag] = useState(null);
   const [overIdx, setOverIdx] = useState(null);
@@ -367,6 +397,17 @@ export default function EmailBuilder({ html, doc: docProp, onChange, variables =
   return (
     <div className="flex flex-col gap-3">
       <style>{`.eb-rich:empty:before{content:attr(data-placeholder);color:#94a3b8}.eb-paras p{margin:0 0 var(--eb-gap,12px) 0}.eb-paras p:last-child{margin-bottom:0}.eb-rich a{color:${s.accent};text-decoration:underline}.eb-rich ul{padding-left:1.4em;list-style:disc}.eb-foot p{margin:0 0 4px 0}.eb-foot a{color:${s.footerLinkColor};text-decoration:underline}`}</style>
+      {note && (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+          <Code2 className="w-4 h-4 shrink-0 mt-0.5" />
+          <span className="flex-1">
+            {doc.converted === 'raw'
+              ? <>This email was kept as one Custom HTML block because {note[0]}. Click its text to edit it in place.</>
+              : <>{note.length} part{note.length === 1 ? ' was' : 's were'} kept as Custom HTML ({[...new Set(note)].join(', ')}). Click their text to edit it in place, or select one to change its HTML.</>}
+          </span>
+          <button type="button" onClick={() => setNote(null)} className="font-bold hover:underline shrink-0">Dismiss</button>
+        </div>
+      )}
       {/* add blocks */}
       <div className="flex items-center gap-1.5 flex-wrap rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/60 p-2">
         <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mr-1">Add</span>
