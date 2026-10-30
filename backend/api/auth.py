@@ -13,6 +13,8 @@ from core.auth import (
     create_access_token,
     decode_access_token,
     user_from_token,
+    session_ended_elsewhere,
+    start_single_session,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -142,6 +144,12 @@ async def get_current_user(
         user = user_from_token(token_str)
         if user:
             return user
+        if session_ended_elsewhere(token_str):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="You were signed out because this account signed in somewhere else (one session at a time).",
+                headers={"X-Session-Ended": "elsewhere"},
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session token has expired or is invalid. Please log in again."
@@ -464,10 +472,13 @@ def login_endpoint(payload: LoginRequest):
 
     # Generate JWT Bearer Token
     # Only the identity goes in the token; role and permissions are read from the database on every request.
+    # One active session per account: this sign-in ends the account's other sessions.
+    if user.get("id"):
+        user["token_version"] = start_single_session(user["id"])
     token_claims = {"sub": user["email"], "tv": int(user.get("token_version") or 0)}
     access_token = create_access_token(token_claims)
     log_event("auth.login", category="security", actor=user["email"], role=user["role"],
-              message=f"{user['email']} logged in")
+              message=f"{user['email']} logged in (other sessions of this account were signed out)")
 
     return {
         "status": "success",

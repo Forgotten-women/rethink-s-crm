@@ -347,6 +347,31 @@ def user_from_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
     return user
 
 
+def session_ended_elsewhere(token: Optional[str]) -> bool:
+    """True when a genuine token was refused only because the account has since signed in again (one session per
+    account) or was signed out everywhere - so the screen can say why, instead of 'session expired'."""
+    tok = (token or "").strip()
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    payload = decode_access_token(tok) if tok else None
+    if not payload or not payload.get("sub"):
+        return False
+    user = get_user_by_identity(payload["sub"])
+    return bool(user) and int(payload.get("tv") or 0) != int(user.get("token_version") or 0)
+
+
+def start_single_session(user_id: int) -> int:
+    """One active session per account: signing in ends every other session of this account (their tokens carry the
+    old token_version and are refused from their next request; open browsers are told within seconds)."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
+    try:
+        with conn:
+            conn.execute("UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = ?", (user_id,))
+        return int(conn.execute("SELECT COALESCE(token_version, 0) FROM users WHERE id = ?", (user_id,)).fetchone()[0])
+    finally:
+        conn.close()
+
+
 def send_password_reset_request(email: str):
     """
     Sends password reset email via Supabase Auth API if configured,

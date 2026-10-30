@@ -477,7 +477,14 @@ export default function App() {
       source.addEventListener('access', (e) => {
         let info = {};
         try { info = JSON.parse(e.data); } catch { /* ignore */ }
-        if (info.signed_out) { source.close(); handleSignOut(); return; }
+        if (info.signed_out) {
+          source.close();
+          // signed in again in this browser (another tab): this tab just moves to the new session
+          if (localStorage.getItem('analytics_token') !== sessionToken) { refreshUser(); return; }
+          if (info.elsewhere) localStorage.setItem('signout_reason', 'elsewhere');
+          handleSignOut();
+          return;
+        }
         refreshUser();
       });
       source.onerror = () => {

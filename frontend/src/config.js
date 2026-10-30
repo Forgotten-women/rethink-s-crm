@@ -62,6 +62,8 @@ export const installAuthFetch = () => {
     const response = await nativeFetch(input, { ...init, headers });
     const isLogin = url.includes('/api/auth/login');
     if (response.status === 401 && !isLogin && localStorage.getItem('analytics_user')) {
+      // one session per account: say why on the sign-in screen when another sign-in ended this one
+      if (response.headers.get('X-Session-Ended') === 'elsewhere') localStorage.setItem('signout_reason', 'elsewhere');
       localStorage.removeItem('analytics_user');
       localStorage.removeItem('analytics_token');
       window.location.reload();

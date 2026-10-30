@@ -6,7 +6,12 @@ export default function LoginView({ theme, onToggleTheme, onLoginSuccess }) {
   const [identity, setIdentity] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(() => {
+    // one session per account: shown once after another sign-in to this account ended this session
+    let why = null;
+    try { why = localStorage.getItem('signout_reason'); localStorage.removeItem('signout_reason'); } catch { /* ignore */ }
+    return why === 'elsewhere' ? 'You were signed out because your account was signed in on another device or browser. Only one session per account can be active.' : '';
+  });
   const [isResetting, setIsResetting] = useState(false);
   const [resetSuccess, setResetSuccess] = useState(false);
 

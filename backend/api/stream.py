@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from backend.api.auth import require_company_access
-from core.auth import user_from_token
+from core.auth import session_ended_elsewhere, user_from_token
 from core.rbac import access_stamp
 from core.cache import version_token
 
@@ -94,7 +94,8 @@ async def stream_versions(request: Request, company_id: Optional[str] = Query("r
                     stamp = new_stamp
                     now_user = await asyncio.to_thread(user_from_token, token)
                     if not now_user:
-                        yield f"event: access\ndata: {json.dumps({'signed_out': True})}\n\n"
+                        elsewhere = await asyncio.to_thread(session_ended_elsewhere, token)
+                        yield f"event: access\ndata: {json.dumps({'signed_out': True, 'elsewhere': elsewhere})}\n\n"
                         break
                     try:
                         require_company_access(now_user, comp)
