@@ -28,6 +28,8 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   const [customVariables, setCustomVariables] = useState({});
   const [selectedAllocationId, setSelectedAllocationId] = useState(null);
   const [separate, setSeparate] = useState(false); // one email per (ticked) beneficiary
+  const [emailTemplates, setEmailTemplates] = useState({}); // own template per email (beneficiary id / 'all')
+  const [extraEmails, setExtraEmails] = useState([]); // more emails to this person, any template
   const lastField = useRef({ name: 'message', el: null });
 
   useEffect(() => { if (!theme && selected) setTheme(selected); }, [selected, theme]);
@@ -46,11 +48,11 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
   }, [onClose]);
 
   const who = useMemo(() => ({ donor_id: recipient.donor_id || recipient.email, email: recipient.email, name: recipient.name || '' }), [recipient]);
-  const { preview, busy, setPreviewAlloc } = useLivePreview({
+  const { preview, busy, setPreviewPart } = useLivePreview({
     company, theme, templateType, subject, body, edited, messageBody,
-    recipient: who, customVariables, selectedAllocationId, separate
+    recipient: who, customVariables, selectedAllocationId, separate, templates: emailTemplates, extraEmails,
   });
-  const emailCount = separate && preview?.separate_ids?.length > 1 ? preview.separate_ids.length : 1;
+  const emailCount = preview?.emails?.length || 1;
 
   const insert = (text) => {
     const f = lastField.current;
@@ -66,7 +68,7 @@ export default function SingleEmailComposer({ company, recipient, onClose, onSen
       setError(`Please provide the missing variables (${preview.unresolved_placeholders.map(p => `{${p}}`).join(', ')}) above before sending.`);
       return;
     }
-    if (!window.confirm(emailCount > 1 ? `Send ${emailCount} separate emails (one per beneficiary) to ${who.name || who.email}?` : `Send this email to ${who.name || who.email}?`)) return;
+    if (!window.confirm(emailCount > 1 ? `Send ${emailCount} separate emails to ${who.name || who.email}?` : `Send this email to ${who.name || who.email}?`)) return;
     setSending(true);
     try {
 if (denyUnless('email.send')) return;
@@ -77,6 +79,7 @@ if (denyUnless('email.send')) return;
         custom_variables: customVariables,
         selected_allocation_id: selectedAllocationId,
         separate_per_beneficiary: separate,
+        recipient_customizations: { [who.email.toLowerCase()]: { templates: emailTemplates, extra_emails: extraEmails } },
       });
       const rows = d.results || [];
       const sentN = rows.filter(x => x.status === 'sent').length;
@@ -152,7 +155,12 @@ if (denyUnless('email.send')) return;
               onSelectAllocation={setSelectedAllocationId}
               separate={separate}
               onSeparateChange={setSeparate}
-              onPreviewAllocation={setPreviewAlloc}
+              onPreviewPart={setPreviewPart}
+              templateOptions={themeTemplates}
+              templates={emailTemplates}
+              onTemplatesChange={setEmailTemplates}
+              extraEmails={extraEmails}
+              onExtraEmailsChange={setExtraEmails}
             />
           </div>
 

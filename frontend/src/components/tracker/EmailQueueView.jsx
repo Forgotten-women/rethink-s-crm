@@ -360,7 +360,7 @@ if (denyUnless('email.send')) return;
       {/* PREVIEW MODAL */}
       {preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in" onClick={() => setPreview(null)}>
-          <div className="bg-white dark:bg-slate-900 w-full max-w-3xl max-h-[90vh] rounded-2xl overflow-hidden flex flex-col shadow-2xl border border-slate-200 dark:border-slate-800" onClick={e => e.stopPropagation()}>
+          <div className="bg-white dark:bg-slate-900 w-full max-w-5xl max-h-[94vh] rounded-2xl overflow-hidden flex flex-col shadow-2xl border border-slate-200 dark:border-slate-800" onClick={e => e.stopPropagation()}>
             <div className="px-5 py-3.5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs">
               <div className="flex flex-col gap-0.5">
                 <div className="font-bold text-slate-800 dark:text-slate-100 text-sm md:text-base">
@@ -390,7 +390,7 @@ if (denyUnless('email.send')) return;
                 <span>{preview.error}</span>
               </div>
             )}
-            {preview.data && <iframe title="Queued email preview" sandbox="" srcDoc={preview.data.body_html} className="w-full h-[65vh] bg-white border-0" />}
+            {preview.data && <iframe title="Queued email preview" sandbox="" srcDoc={preview.data.body_html} className="w-full h-[78vh] bg-white border-0" />}
             {preview.data && preview.item.status === 'pending' && (
               <div className="px-5 py-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3 bg-slate-50/60 dark:bg-slate-800/40">
                 <div className="text-xs text-slate-500 flex items-center gap-1.5 flex-wrap">

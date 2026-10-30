@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, CheckCircle2, Maximize2, Users, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Mail, Maximize2, Plus, Users, X } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 
 // Form fields of the email screens: solid background, visible border and a focus ring, in light and dark theme
@@ -49,14 +49,16 @@ export function useTemplates(company) {
 /** Rendered email for one recipient, refreshed as the text changes (debounced) - the live preview. */
 export function useLivePreview({
   company, theme, templateType, subject, body, edited, messageBody, recipient,
-  customVariables = null, selectedAllocationId = null, separate = false, enabled = true
+  customVariables = null, selectedAllocationId = null, separate = false, enabled = true,
+  templates = null, extraEmails = null,
 }) {
   const [preview, setPreview] = useState(null);
-  const [previewAlloc, setPreviewAlloc] = useState(null); // with "separate": which of the emails is shown
+  const [previewPart, setPreviewPart] = useState(null); // which of the person's emails is shown
   const [busy, setBusy] = useState(false);
   const seq = useRef(0);
   const recipientKey = recipient ? `${recipient.email}|${recipient.donor_id || ''}` : '';
   const customVarsKey = customVariables ? JSON.stringify(customVariables) : '';
+  const planKey = JSON.stringify([templates || {}, extraEmails || []]);
   useEffect(() => {
     if (!enabled || !recipient || !theme) { setPreview(null); return undefined; }
     const my = ++seq.current;
@@ -66,7 +68,7 @@ export function useLivePreview({
       subject_template: edited ? subject : null, body_template: edited ? body : null, recipient,
       custom_variables: customVariables,
       selected_allocation_id: selectedAllocationId,
-      separate: !!separate, preview_allocation_id: separate ? previewAlloc : null,
+      separate: !!separate, templates: templates || null, extra_emails: extraEmails || null, preview_part: previewPart,
     };
     const t = setTimeout(() => {
       // one quiet retry: a busy moment on the server (e.g. donor data refreshing after a new donation) shouldn't
@@ -78,8 +80,8 @@ export function useLivePreview({
         .finally(() => { if (my === seq.current) setBusy(false); });
     }, 450);
     return () => clearTimeout(t);
-  }, [company, theme, templateType, subject, body, edited, messageBody, recipientKey, customVarsKey, selectedAllocationId, separate, previewAlloc, enabled]); // eslint-disable-line react-hooks/exhaustive-deps
-  return { preview, busy, setPreviewAlloc };
+  }, [company, theme, templateType, subject, body, edited, messageBody, recipientKey, customVarsKey, selectedAllocationId, separate, previewPart, planKey, enabled]); // eslint-disable-line react-hooks/exhaustive-deps
+  return { preview, busy, setPreviewPart, setPreviewAlloc: (id) => setPreviewPart(id == null ? null : String(id)) };
 }
 
 export function PreviewFrame({
@@ -94,6 +96,13 @@ export function PreviewFrame({
   separate = false,
   onSeparateChange,
   onPreviewAllocation,
+  // every email this person gets, each with its own template, plus extra emails (the "Emails to this person" list)
+  templateOptions = null,
+  templates = {},
+  onTemplatesChange,
+  extraEmails = [],
+  onExtraEmailsChange,
+  onPreviewPart,
 }) {
   const [big, setBig] = useState(false);
   if (!preview) {
@@ -185,7 +194,7 @@ export function PreviewFrame({
                 Send a separate email for each {picked.length ? 'ticked one' : 'beneficiary'}
                 {separate && sepIds.length > 1 && <span className="font-normal text-violet-700 dark:text-violet-300">({sepIds.length} emails)</span>}
               </label>
-              {separate && sepIds.length > 1 && (
+              {separate && sepIds.length > 1 && !onExtraEmailsChange && (
                 <span className="flex items-center gap-1 text-[11px] text-violet-800 dark:text-violet-200">
                   Previewing email {sepAt + 1} of {sepIds.length}: <b>{(preview.sponsorships.find(x => x.id === sepIds[sepAt]) || {}).beneficiary_name}</b>
                   <button type="button" disabled={sepAt <= 0} onClick={() => onPreviewAllocation?.(sepIds[sepAt - 1])} className="px-1.5 rounded border border-violet-300 disabled:opacity-30">‹</button>
@@ -195,6 +204,11 @@ export function PreviewFrame({
             </div>
           )}
         </div>
+      )}
+
+      {onExtraEmailsChange && templateOptions && (
+        <EmailPlan preview={preview} templateOptions={templateOptions} templates={templates} onTemplatesChange={onTemplatesChange}
+          extraEmails={extraEmails} onExtraEmailsChange={onExtraEmailsChange} onPreviewPart={onPreviewPart} />
       )}
 
       {/* Missing Variables Prompts */}
@@ -274,6 +288,60 @@ export function PreviewFrame({
         </div>,
         document.body,
       )}
+    </div>
+  );
+}
+
+/**
+ * The emails one person gets: the main one (or one per beneficiary when "separate" is on), each with its own
+ * template, plus any extra emails added (any template - e.g. a general update on top of the beneficiary emails).
+ * Click an email to preview it.
+ */
+function EmailPlan({ preview, templateOptions, templates, onTemplatesChange, extraEmails, onExtraEmailsChange, onPreviewPart }) {
+  const emails = preview.emails || [];
+  const spons = preview.sponsorships || [];
+  const sel = 'rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-950 text-slate-800 dark:text-slate-100 px-1.5 py-1 text-[11px] max-w-[15rem]';
+  const extraIdx = (part) => Number(part.slice(5)) - 1;
+  const setTemplate = (e, v) => {
+    if (e.part.startsWith('extra')) onExtraEmailsChange(extraEmails.map((x, i) => (i === extraIdx(e.part) ? { ...x, template_type: v } : x)));
+    else onTemplatesChange?.({ ...(templates || {}), [e.part || 'all']: v });
+  };
+  const add = () => {
+    onExtraEmailsChange([...(extraEmails || []), { template_type: preview.template_type || templateOptions[0]?.template_type, selected_allocation_id: null }]);
+    onPreviewPart?.(`extra${(extraEmails || []).length + 1}`);
+  };
+  return (
+    <div className="p-3 bg-sky-50/80 dark:bg-sky-950/30 border-b border-sky-200 dark:border-sky-900 flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 text-xs font-bold text-sky-950 dark:text-sky-200"><Mail className="w-4 h-4 text-sky-600" /> Emails to this person: {emails.length}</span>
+        <button type="button" onClick={add} className="flex items-center gap-1 px-2 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-bold"><Plus className="w-3 h-3" /> Add another email</button>
+      </div>
+      {emails.map((e, n) => {
+        const extra = e.part.startsWith('extra');
+        const active = e.part === preview.previewing_part;
+        return (
+          <div key={e.part || 'main'} className={`flex items-center gap-2 flex-wrap rounded-lg px-2 py-1.5 border ${active ? 'border-sky-500 bg-white dark:bg-slate-900 shadow-xs' : 'border-transparent hover:border-sky-300'}`}>
+            <button type="button" onClick={() => onPreviewPart?.(e.part)} title="Preview this email"
+              className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${active ? 'bg-sky-600 text-white' : 'bg-sky-100 text-sky-800 dark:bg-sky-900/50 dark:text-sky-200'}`}>
+              Email {n + 1}{active ? ' · previewing' : ''}
+            </button>
+            <select value={e.template_type} onChange={ev => setTemplate(e, ev.target.value)} className={sel} title="Template for this email">
+              {templateOptions.map(t => <option key={t.template_type} value={t.template_type}>{t.template_type.replace(/_/g, ' ')}</option>)}
+            </select>
+            {extra && spons.length > 0 ? (
+              <select value={extraEmails[extraIdx(e.part)]?.selected_allocation_id ?? ''} className={sel} title="Which sponsorship this email is about"
+                onChange={ev => onExtraEmailsChange(extraEmails.map((x, i) => (i === extraIdx(e.part) ? { ...x, selected_allocation_id: ev.target.value ? Number(ev.target.value) : null } : x)))}>
+                <option value="">About: all their sponsorships</option>
+                {spons.map(s => <option key={s.id} value={s.id}>About: {s.beneficiary_name}{s.sponsorship_type ? ` (${s.sponsorship_type})` : ''}</option>)}
+              </select>
+            ) : e.about ? <span className="text-[11px] text-slate-600 dark:text-slate-300 truncate">about <b>{e.about}</b></span> : null}
+            {extra && (
+              <button type="button" title="Remove this email" onClick={() => { onExtraEmailsChange(extraEmails.filter((_, i) => i !== extraIdx(e.part))); onPreviewPart?.(null); }}
+                className="ml-auto text-slate-400 hover:text-rose-600"><X className="w-3.5 h-3.5" /></button>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

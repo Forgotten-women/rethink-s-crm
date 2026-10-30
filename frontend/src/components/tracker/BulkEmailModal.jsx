@@ -160,7 +160,7 @@ if (denyUnless('email.send')) return;
 
   return (
     <div className="fixed inset-0 z-[60] bg-slate-900/50 flex items-center justify-center p-3" role="dialog" aria-modal="true" aria-label="Bulk email">
-      <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl w-full max-w-6xl h-[92vh] flex flex-col border border-slate-200 dark:border-slate-800 text-xs">
+      <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl w-full max-w-[1600px] h-[94vh] flex flex-col border border-slate-200 dark:border-slate-800 text-xs">
         {/* Header + steps */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100 dark:border-slate-800 gap-3 flex-wrap">
           <div>
@@ -325,7 +325,7 @@ if (denyUnless('email.send')) return;
                     {preview.subject !== undefined && <>
                       <div><span className="text-slate-500">To:</span> {preview.recipient_name} &lt;{preview.recipient_email}&gt;</div>
                       <div><span className="text-slate-500">Subject:</span> <b>{preview.subject}</b></div>
-                      <iframe title="Email preview" sandbox="" srcDoc={preview.body_html} className="w-full min-h-[420px] rounded-lg border border-slate-200 dark:border-slate-700 bg-white" />
+                      <iframe title="Email preview" sandbox="" srcDoc={preview.body_html} className="w-full h-[72vh] min-h-[420px] rounded-lg border border-slate-200 dark:border-slate-700 bg-white" />
                     </>}
                   </div>
                 )}

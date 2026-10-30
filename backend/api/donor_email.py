@@ -284,6 +284,27 @@ def _separate_selections(comp: str, email: str, sel: Any) -> List[List[int]]:
     return [[i] for i in ids] if len(ids) > 1 else []
 
 
+def _person_emails(comp: str, email: str, cust: Dict[str, Any], template_type: str, subject_tpl: Optional[str],
+                   body_tpl: Optional[str], separate_default: bool = False) -> List[Dict[str, Any]]:
+    """Every email one person gets, in order: the main one (or one per sponsorship when "separate"), then any extra
+    emails the sender added. Each can use its own template: cust["templates"] maps a sponsorship id ("all" for the
+    combined email) to a template, cust["extra_emails"] is [{template_type, selected_allocation_id}].
+    part identifies the email within a campaign ('' / allocation id / 'extra1', ...)."""
+    def tpl(t: Optional[str]):  # the composer's (possibly edited) text applies only to its own template
+        t = t or template_type
+        return (t, subject_tpl, body_tpl) if t == template_type else (t, None, None)
+    sel = cust.get("selected_allocation_id")
+    separate = cust["separate"] if cust.get("separate") is not None else separate_default
+    templates = {str(k): v for k, v in (cust.get("templates") or {}).items() if v}
+    parts = separate and _separate_selections(comp, email, sel)
+    out = ([{"template": tpl(templates.get(str(p[0]))), "sel": p, "part": str(p[0])} for p in parts] if parts
+           else [{"template": tpl(templates.get("all")), "sel": sel, "part": ""}])
+    for i, x in enumerate(cust.get("extra_emails") or []):
+        if isinstance(x, dict):
+            out.append({"template": tpl(x.get("template_type")), "sel": x.get("selected_allocation_id"), "part": f"extra{i + 1}"})
+    return out
+
+
 def donor_sponsorships(comp: str, email: str) -> List[Dict[str, Any]]:
     """Every sponsorship (allocation) this address is a donor on, latest first, with its beneficiary and status."""
     from backend.api.donors import sponsorship_cycle_status
@@ -531,6 +552,9 @@ class PreviewRequest(BaseModel):
     selected_allocation_id: Optional[Union[int, List[int]]] = None  # one sponsorship, several, or none = all
     separate: bool = False  # one email per (ticked) sponsorship - the preview shows one of them
     preview_allocation_id: Optional[int] = None  # ...this one
+    templates: Optional[Dict[str, str]] = None  # own template per email (sponsorship id, or "all" for the combined one)
+    extra_emails: Optional[List[Dict[str, Any]]] = None  # more emails to the same person, any template
+    preview_part: Optional[str] = None  # which of the person's emails to show
 
 
 @router.post("/preview")
@@ -538,14 +562,21 @@ def preview(req: PreviewRequest):
     comp = _company(req.company_id)
     theme = _resolve_theme(comp, req.theme)
     em = str(req.recipient.get("email") or "").strip().lower()
-    emails = _separate_selections(comp, em, req.selected_allocation_id) if req.separate and em else None
-    sel = req.selected_allocation_id
-    if emails:
-        sel = next((x for x in emails if x[0] == req.preview_allocation_id), emails[0])
-    out = _render(comp, theme, req.template_type, req.subject_template, req.body_template, req.recipient,
-                  req.message_body, req.custom_variables, sel)
-    out["separate_ids"] = [x[0] for x in emails] if emails else []
-    out["previewing_allocation_id"] = sel[0] if emails else None
+    plan = _person_emails(comp, em, {"selected_allocation_id": req.selected_allocation_id, "separate": req.separate,
+                                     "templates": req.templates, "extra_emails": req.extra_emails},
+                          req.template_type, req.subject_template, req.body_template)
+    want = req.preview_part if req.preview_part is not None else (str(req.preview_allocation_id) if req.preview_allocation_id else None)
+    item = next((x for x in plan if x["part"] == want), plan[0])
+    t, s_tpl, b_tpl = item["template"]
+    out = _render(comp, theme, t, s_tpl, b_tpl, req.recipient, req.message_body, req.custom_variables, item["sel"])
+    names = {a["id"]: a["beneficiary_name"] for a in out["sponsorships"]}
+    out["emails"] = [{"part": x["part"], "template_type": x["template"][0],
+                      "about": ", ".join(names.get(i, "") for i in _selected_ids(x["sel"]) if names.get(i)) or ("all their sponsorships" if names else "")}
+                     for x in plan]
+    out["previewing_part"] = item["part"]
+    out["template_type"] = t
+    out["separate_ids"] = [int(x["part"]) for x in plan if x["part"].isdigit()]
+    out["previewing_allocation_id"] = int(item["part"]) if item["part"].isdigit() else None
     from backend.api.unsubscribe import add_footer  # show the Unsubscribe button exactly as it will be sent
     out["body_html"] = add_footer(out.get("body_html") or "", comp, out.get("recipient_email") or "")
     out["unsubscribed"] = is_unsubscribed(comp, out.get("recipient_email") or "")
@@ -582,18 +613,18 @@ def send(req: SendRequest, request: Request):
         cust = (req.recipient_customizations or {}).get(em, {})
         c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
         msg_body = cust.get("message_body") or req.message_body
-        sel_alloc = cust.get("selected_allocation_id") or req.selected_allocation_id
-        separate = cust["separate"] if cust.get("separate") is not None else req.separate_per_beneficiary
-        for sel in (separate and _separate_selections(comp, em, sel_alloc)) or [sel_alloc]:
-            rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
-                               msg_body, c_vars, sel)
+        plan = _person_emails(comp, em, {**cust, "selected_allocation_id": cust.get("selected_allocation_id") or req.selected_allocation_id},
+                              req.template_type, req.subject_template, req.body_template, req.separate_per_beneficiary)
+        for item in plan:
+            t, s_tpl, b_tpl = item["template"]
+            rendered = _render(comp, theme, t, s_tpl, b_tpl, r, msg_body, c_vars, item["sel"])
             if req.dry_run:
                 ok = "@" in rendered["recipient_email"] and not rendered["unresolved_placeholders"]
                 out.append({"recipient_email": rendered["recipient_email"], "status": "ok" if ok else "skipped",
                             "detail": "" if ok else ("No email address" if "@" not in rendered["recipient_email"]
                                                      else "Template needs: " + ", ".join(rendered["unresolved_placeholders"]))})
                 continue
-            out.append(_deliver(comp, theme, req.template_type, rendered, base_url, None, r.get("donor_id"),
+            out.append(_deliver(comp, theme, t, rendered, base_url, None, r.get("donor_id"),
                                 kind="single" if req.kind == "single" else "bulk"))
     summary = {s: sum(1 for x in out if x["status"] == s) for s in ("sent", "ok", "skipped", "failed")}
     return {"results": out, "summary": summary, "dry_run": req.dry_run}
@@ -660,7 +691,7 @@ def create_campaign(req: CampaignRequest, request: Request):
             cid = cur.lastrowid
             conn.executemany("""INSERT OR IGNORE INTO crm_email_messages (company_id, campaign_id, donor_id, recipient_email, recipient_name,
                                     template_type, theme, status, extra_json, kind, part) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'campaign', ?)""",
-                             [(comp, cid, r["donor_id"], r["email"], r["name"], req.template_type, theme, json.dumps(extra), part)
+                             [(comp, cid, r["donor_id"], r["email"], r["name"], extra.get("template_type") or req.template_type, theme, json.dumps(extra), part)
                               for r in rows for extra, part in _campaign_parts(comp, r, matched, req)])
             queued = conn.execute("SELECT COUNT(*) FROM crm_email_messages WHERE campaign_id = ?", (cid,)).fetchone()[0]
     finally:
@@ -679,12 +710,13 @@ def _campaign_parts(comp: str, r: Dict[str, Any], matched: Dict[str, Any], req: 
         base["custom_variables"] = c_vars
     if cust.get("message_body"):
         base["message_body"] = cust["message_body"]
-    sel = cust.get("selected_allocation_id")
-    separate = cust["separate"] if cust.get("separate") is not None else req.separate_per_beneficiary
-    parts = separate and _separate_selections(comp, em, sel)
-    if not parts:
-        return [({**base, "selected_allocation_id": sel} if sel else base, "")]
-    return [({**base, "selected_allocation_id": p}, str(p[0])) for p in parts]
+    out = []
+    for item in _person_emails(comp, em, cust, req.template_type, None, None, req.separate_per_beneficiary):
+        extra = {**base, **({"selected_allocation_id": item["sel"]} if item["sel"] else {})}
+        if item["template"][0] != req.template_type:  # this email uses its own (saved) template
+            extra["template_type"] = item["template"][0]
+        out.append((extra, item["part"]))
+    return out
 
 
 def _campaign(conn, comp: str, cid: int) -> Dict[str, Any]:
@@ -730,7 +762,7 @@ def campaign_messages(campaign_id: int, company_id: str = Query(...), status: Op
             params.append(status)
         total = conn.execute(f"SELECT COUNT(*) FROM crm_email_messages WHERE {where}", params).fetchone()[0]
         rows = [dict(r) for r in conn.execute(f"""SELECT m.id, m.donor_id, m.recipient_email, m.recipient_name, m.status, m.detail, m.sent_at,
-                    m.opened_at, m.open_count, b.name AS about FROM crm_email_messages m
+                    m.opened_at, m.open_count, m.template_type, b.name AS about FROM crm_email_messages m
                     LEFT JOIN sponsorship_allocations a ON m.part != '' AND a.id = CAST(m.part AS INTEGER)
                     LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
                     WHERE {where.replace('campaign_id', 'm.campaign_id').replace('company_id', 'm.company_id').replace('status', 'm.status')}
@@ -774,7 +806,9 @@ def send_campaign_batch(campaign_id: int, req: CampaignSendRequest, request: Req
         c_vars = extra.pop("custom_variables", None)
         sel = extra.pop("selected_allocation_id", None)
         msg_body = extra.pop("message_body", None) or c.get("message_body")
-        rendered = _render(comp, c["theme"], c["template_type"], c["subject"], c["body_html"],
+        own_t = extra.pop("template_type", None)
+        t = own_t or c["template_type"]
+        rendered = _render(comp, c["theme"], t, None if own_t else c["subject"], None if own_t else c["body_html"],
                            {**extra, "donor_id": m["donor_id"], "email": m["recipient_email"], "name": m["recipient_name"]},
                            msg_body, c_vars, sel)
         if req.dry_run:
@@ -782,7 +816,7 @@ def send_campaign_batch(campaign_id: int, req: CampaignSendRequest, request: Req
             out.append({"recipient_email": m["recipient_email"], "status": "ok" if ok else "skipped",
                         "detail": "" if ok else "Template needs: " + ", ".join(rendered["unresolved_placeholders"])})
             continue
-        out.append(_deliver(comp, c["theme"], c["template_type"], rendered, base_url, campaign_id, m["donor_id"], m["id"], kind="campaign"))
+        out.append(_deliver(comp, c["theme"], t, rendered, base_url, campaign_id, m["donor_id"], m["id"], kind="campaign"))
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
     try:
         left = conn.execute("SELECT COUNT(*) FROM crm_email_messages WHERE campaign_id = ? AND status = 'pending'", (campaign_id,)).fetchone()[0]
@@ -1065,15 +1099,16 @@ def check_recipients(req: CheckRequest):
         cust = (req.recipient_customizations or {}).get(em.lower(), {})
         c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
         msg_body = cust.get("message_body") or req.message_body
-        sel_alloc = cust.get("selected_allocation_id")
-        separate = cust["separate"] if cust.get("separate") is not None else req.separate_per_beneficiary
-        for sel in (separate and _separate_selections(comp, em.lower(), sel_alloc)) or [sel_alloc]:
-            rendered = _render(comp, theme, req.template_type, req.subject_template, req.body_template, r,
-                               msg_body, c_vars, sel)
+        plan = _person_emails(comp, em.lower(), cust, req.template_type, req.subject_template, req.body_template,
+                              req.separate_per_beneficiary)
+        for item in plan:
+            t, s_tpl, b_tpl = item["template"]
+            rendered = _render(comp, theme, t, s_tpl, b_tpl, r, msg_body, c_vars, item["sel"])
             if rendered["unresolved_placeholders"]:
                 missing = rendered["unresolved_placeholders"]
                 has_spons = bool(donor_sponsorships(comp, em)) if any(m.lower() in SPONSORSHIP_PLACEHOLDERS for m in missing) else True
-                about = f" (email about {rendered['variables'].get('beneficiary_name') or 'one sponsorship'})" if separate and sel else ""
+                about = (f" ({t.replace('_', ' ')} email)" if item["part"].startswith("extra") else
+                         f" (email about {rendered['variables'].get('beneficiary_name') or 'one sponsorship'})" if item["part"] else "")
                 problems.append({"email": em, "name": rendered["recipient_name"], "missing": missing, "issue": _issue_text(missing, has_spons) + about})
                 break
     return {"checked": len(req.recipients), "ok": len(req.recipients) - len(problems), "problems": problems}

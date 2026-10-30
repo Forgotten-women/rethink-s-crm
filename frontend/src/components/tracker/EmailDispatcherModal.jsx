@@ -126,7 +126,7 @@ if (denyUnless('email.send')) return;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
-      <div className="bg-white dark:bg-slate-900 w-full max-w-4xl max-h-[92vh] rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-150">
+      <div className="bg-white dark:bg-slate-900 w-full max-w-7xl max-h-[94vh] rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-150">
         <div className="px-6 py-4 flex items-center justify-between border-b border-slate-100 dark:border-slate-800">
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="p-2 rounded-lg bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400"><Mail className="w-5 h-5" /></div>
@@ -268,7 +268,7 @@ if (denyUnless('email.send')) return;
                 )}
                 <div className="relative rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-white">
                   {loadingPreview && <div className="absolute inset-0 bg-white/60 flex items-center justify-center"><Loader2 className="w-5 h-5 animate-spin text-slate-400" /></div>}
-                  <iframe title="Email preview" sandbox="" srcDoc={preview?.body_html || ''} className="w-full h-[420px]" />
+                  <iframe title="Email preview" sandbox="" srcDoc={preview?.body_html || ''} className="w-full h-[72vh] min-h-[420px]" />
                 </div>
               </div>
             )}

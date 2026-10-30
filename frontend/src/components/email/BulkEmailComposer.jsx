@@ -179,6 +179,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     customVariables: combinedPreviewCustomVars,
     selectedAllocationId: activeSelectedAllocationId,
     separate: activeSeparate,
+    templates: activeRecipientCust.templates, extraEmails: activeRecipientCust.extra_emails,
     enabled: step >= 2,
   });
 
@@ -198,6 +199,7 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     customVariables: singleCustomVars,
     selectedAllocationId: singleSelectedAllocationId,
     separate: singleSeparate,
+    templates: singleCust.templates, extraEmails: singleCust.extra_emails,
     enabled: !!rowPreview,
   });
 
@@ -207,6 +209,15 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     custom_variables: customVariables,
     recipient_customizations: recipientCustomizations,
     separate_per_beneficiary: separateAll,
+  });
+  const setCust = (key, patch) => { if (key) setRecipientCustomizations(rc => ({ ...rc, [key]: { ...(rc[key] || {}), ...patch } })); };
+  const planProps = (key, cust, hook) => ({
+    onPreviewPart: hook.setPreviewPart,
+    templateOptions: themeTemplates,
+    templates: cust.templates || {},
+    onTemplatesChange: (v) => setCust(key, { templates: v }),
+    extraEmails: cust.extra_emails || [],
+    onExtraEmailsChange: (v) => setCust(key, { extra_emails: v }),
   });
   const insert = (text) => {
     const f = lastField.current;
@@ -479,7 +490,7 @@ if (denyUnless('email.campaigns')) return;
                 selectedAllocationId={activeSelectedAllocationId}
                 separate={activeSeparate}
                 onSeparateChange={(v) => { if (activeEmailKey) setRecipientCustomizations(rc => ({ ...rc, [activeEmailKey]: { ...(rc[activeEmailKey] || {}), separate: v } })); }}
-                onPreviewAllocation={live.setPreviewAlloc}
+                {...planProps(activeEmailKey, activeRecipientCust, live)}
                 onSelectAllocation={(allocId) => {
                   if (activeEmailKey) {
                     setRecipientCustomizations(rc => ({
@@ -525,7 +536,7 @@ if (denyUnless('email.campaigns')) return;
                 selectedAllocationId={activeSelectedAllocationId}
                 separate={activeSeparate}
                 onSeparateChange={(v) => { if (activeEmailKey) setRecipientCustomizations(rc => ({ ...rc, [activeEmailKey]: { ...(rc[activeEmailKey] || {}), separate: v } })); }}
-                onPreviewAllocation={live.setPreviewAlloc}
+                {...planProps(activeEmailKey, activeRecipientCust, live)}
                 onSelectAllocation={(allocId) => {
                   if (activeEmailKey) {
                     setRecipientCustomizations(rc => ({
@@ -664,7 +675,7 @@ if (denyUnless('email.campaigns')) return;
               selectedAllocationId={singleSelectedAllocationId}
               separate={singleSeparate}
               onSeparateChange={(v) => { if (singleEmailKey) setRecipientCustomizations(rc => ({ ...rc, [singleEmailKey]: { ...(rc[singleEmailKey] || {}), separate: v } })); }}
-              onPreviewAllocation={single.setPreviewAlloc}
+              {...planProps(singleEmailKey, singleCust, single)}
               onSelectAllocation={(allocId) => {
                 if (singleEmailKey) {
                   setRecipientCustomizations(rc => ({
