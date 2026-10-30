@@ -2063,7 +2063,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         if (data?.auth_url) {
           window.location.href = data.auth_url;
         } else {
-          alert('Please enter and save your Microsoft Azure Client ID & Secret first.');
+          alert(data?.detail || 'Please enter and save your Microsoft Azure Client ID & Secret first.');
         }
       })
       .catch(err => alert(err.message));
@@ -5460,7 +5460,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               </div>
             </div>
 
-            <div className="flex items-center gap-3">
+            {can(user, 'mailbox.configure', activeCompany) && <div className="flex items-center gap-3">
               {outlookStatus?.connected ? (
                 <div className="flex items-center gap-2">
                   <button
@@ -5495,11 +5495,11 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   Connect with Microsoft 365
                 </button>
               )}
-            </div>
+            </div>}
           </div>
 
           {/* Credentials & Webhook Subscription Grid */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {can(user, 'mailbox.configure', activeCompany) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Microsoft Azure App Credentials */}
             <form onSubmit={handleSaveOutlookCredentials} className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm flex flex-col gap-4">
               <h4 className="font-bold text-slate-800 dark:text-slate-100 text-sm flex items-center gap-2">
@@ -5659,7 +5659,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                 )}
               </div>
             </div>
-          </div>
+          </div>}
         </div>
       )}
 

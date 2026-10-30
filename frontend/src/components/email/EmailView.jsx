@@ -198,6 +198,11 @@ export default function EmailView({ user, activeCompany, onSelectDonor, preset }
     return () => window.removeEventListener(OPEN_UNSUBSCRIBES_EVENT, open);
   }, []);
 
+  // Connecting / switching / disconnecting the charity's mailbox is for people with mailbox.configure only
+  const canMailbox = can(user, 'mailbox.configure', activeCompany);
+  const tabs = TABS.filter(([id]) => id !== 'mailbox' || canMailbox);
+  if (tab === 'mailbox' && !canMailbox) setTimeout(() => setTab('compose'), 0);
+
   if (!activeCompany || activeCompany === 'all') {
     return <div className="p-6 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm text-slate-500">Choose Rethink or Iqra to email from that charity's mailbox.</div>;
   }
@@ -212,7 +217,7 @@ export default function EmailView({ user, activeCompany, onSelectDonor, preset }
           </div>
         </div>
         <div className="flex flex-wrap items-center bg-slate-100 dark:bg-slate-800/80 p-1 rounded-xl border border-slate-200 dark:border-slate-700 gap-1">
-          {TABS.map(([id, label0, Icon]) => { const label = id === 'mailbox' ? (mailProvider === 'gmail' ? 'Mailbox (Gmail)' : 'Mailbox (Outlook)') : label0; return (
+          {tabs.map(([id, label0, Icon]) => { const label = id === 'mailbox' ? (mailProvider === 'gmail' ? 'Mailbox (Gmail)' : 'Mailbox (Outlook)') : label0; return (
             <button key={id} type="button" onClick={() => setTab(id)}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 ${tab === id ? 'bg-white dark:bg-slate-900 text-sky-600 dark:text-sky-400 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}>
               <Icon className="w-3.5 h-3.5" />{label}
@@ -226,8 +231,8 @@ export default function EmailView({ user, activeCompany, onSelectDonor, preset }
       {tab === 'queue' && <TrackerView key={`queue-${activeCompany}`} embeddedTab="queue" user={user} activeCompany={activeCompany} onSelectDonor={onSelectDonor} />}
       {tab === 'templates' && <TrackerView key={`tpl-${activeCompany}`} embeddedTab="templates" user={user} activeCompany={activeCompany} onSelectDonor={onSelectDonor} />}
       {tab === 'unsubscribed' && <UnsubscribedList company={activeCompany} user={user} onSelectDonor={onSelectDonor} />}
-      {tab === 'mailbox' && mailProvider === 'gmail' && <GmailMailbox company={activeCompany} user={user} />}
-      {tab === 'mailbox' && mailProvider && mailProvider !== 'gmail' && <TrackerView key={`mail-${activeCompany}`} embeddedTab="outlook" user={user} activeCompany={activeCompany} onSelectDonor={onSelectDonor} />}
+      {tab === 'mailbox' && canMailbox && mailProvider === 'gmail' && <GmailMailbox company={activeCompany} user={user} />}
+      {tab === 'mailbox' && canMailbox && mailProvider && mailProvider !== 'gmail' && <TrackerView key={`mail-${activeCompany}`} embeddedTab="outlook" user={user} activeCompany={activeCompany} onSelectDonor={onSelectDonor} />}
     </div>
   );
 }
