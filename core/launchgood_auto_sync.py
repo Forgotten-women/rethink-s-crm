@@ -82,13 +82,13 @@ def _download_report(client, start: str, end: str) -> pd.DataFrame:
         try:
             body = {"account_id": str(client.account_id), "fmt": "csv", "type": rtype, "start": start, "end": end,
                     "settled_donations": False}
-            r = requests.post("https://www.launchgood.com/api/reports/v4_reports", headers=client._get_headers(), json=body, timeout=client.timeout)
+            r = client._post("https://www.launchgood.com/api/reports/v4_reports", json=body, timeout=client.timeout)
             j = r.json() if "json" in (r.headers.get("content-type") or "") else {}
             res = j.get("result") if isinstance(j.get("result"), dict) else {}
             ident = res.get("identifier")
             if not ident:
                 raise RuntimeError(f"report '{rtype}': {j.get('message') or r.status_code}")
-            act = lambda verb: requests.post("https://www.launchgood.com/api/reports/action", headers=client._get_headers(),
+            act = lambda verb: client._post("https://www.launchgood.com/api/reports/action",
                                              json={"verb": verb, "format": "csv", "identifier": ident}, timeout=60)
             act("generate")
             url = None

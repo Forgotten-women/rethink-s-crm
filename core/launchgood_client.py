@@ -17,6 +17,11 @@ import time
 from typing import Any, Dict, List, Optional
 import requests
 
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
+
 from core.launchgood_accounts import get_account_config, get_account_id, get_session, is_connected
 
 logger = logging.getLogger("launchgood_client")
@@ -69,8 +74,12 @@ class LaunchGoodClient:
         if not cookie_val and self._session_data.get("cookies"):
             cookie_val = "; ".join(f"{c['name']}={c.get('value', '')}" for c in self._session_data["cookies"] if isinstance(c, dict) and c.get("name"))
         if cookie_val:
+            # Strip stale Cloudflare clearance/bot-management cookies that cause 403 challenges
+            parts = [p.strip() for p in cookie_val.split(";") if p.strip()]
+            clean_parts = [p for p in parts if not p.lower().startswith(("cf_clearance=", "__cf_bm=", "_cfuvid="))]
             headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
-            headers["Cookie"] = cookie_val
+            if clean_parts:
+                headers["Cookie"] = "; ".join(clean_parts)
 
         # Standard browser headers required by Cloudflare WAF
         headers.setdefault("Accept", "application/json, text/plain, */*")
@@ -79,10 +88,30 @@ class LaunchGoodClient:
         headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         return headers
 
+    def _post(self, url: str, json: Optional[Dict[str, Any]] = None, timeout: Optional[int] = None) -> Any:
+        timeout = timeout or self.timeout
+        headers = self._get_headers()
+        if cffi_requests is not None:
+            try:
+                return cffi_requests.post(url, headers=headers, json=json or {}, impersonate="safari17_0", timeout=timeout)
+            except Exception as e:
+                logger.warning(f"curl_cffi POST to {url} failed, attempting standard requests fallback: {e}")
+        return requests.post(url, headers=headers, json=json or {}, timeout=timeout)
+
+    def _get(self, url: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[int] = None) -> Any:
+        timeout = timeout or self.timeout
+        headers = self._get_headers() if self.is_configured() else {}
+        if cffi_requests is not None:
+            try:
+                return cffi_requests.get(url, headers=headers, params=params or {}, impersonate="safari17_0", timeout=timeout)
+            except Exception as e:
+                logger.warning(f"curl_cffi GET to {url} failed, attempting standard requests fallback: {e}")
+        return requests.get(url, headers=headers, params=params or {}, timeout=timeout)
+
     def get_current_user(self) -> Dict[str, Any]:
         """Calls /api/user/currentUser to verify authentication and fetch corporate subaccounts."""
         url = f"{API_BASE}/user/currentUser"
-        r = requests.post(url, headers=self._get_headers(), json={}, timeout=self.timeout)
+        r = self._post(url, json={}, timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"LaunchGood /user/currentUser failed ({r.status_code}): {r.text[:200]}")
         return r.json()
@@ -100,7 +129,7 @@ class LaunchGoodClient:
         payload = {"account_id": target_account}
         logger.info(f"Fetching LaunchGood transfers for {self.company_id} (Account: {target_account})...")
 
-        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=self.timeout)
+        r = self._post(url, json=payload, timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"LaunchGood /account/transfers failed ({r.status_code}): {r.text[:200]}")
 
@@ -141,7 +170,7 @@ class LaunchGoodClient:
         if end_date:
             payload["end"] = end_date
 
-        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=self.timeout)
+        r = self._post(url, json=payload, timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"LaunchGood report creation failed ({r.status_code}): {r.text[:200]}")
         return r.json()
@@ -154,7 +183,7 @@ class LaunchGoodClient:
             "format": "csv",
             "identifier": identifier
         }
-        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=self.timeout)
+        r = self._post(url, json=payload, timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"LaunchGood report generation failed ({r.status_code}): {r.text[:200]}")
         return r.json()
@@ -166,7 +195,7 @@ class LaunchGoodClient:
             "verb": "download",
             "identifier": identifier
         }
-        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
+        r = self._post(url, json=payload, timeout=60)
         if r.status_code != 200:
             raise RuntimeError(f"LaunchGood report download failed ({r.status_code}): {r.text[:200]}")
         return r.text
@@ -178,7 +207,7 @@ class LaunchGoodClient:
         if self.account_id:
             params["account_id"] = self.account_id
 
-        r = requests.get(url, params=params, timeout=15)
+        r = self._get(url, params=params, timeout=15)
         if r.status_code != 200:
             return []
         data = r.json()

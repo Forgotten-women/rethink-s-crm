@@ -19,9 +19,22 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
+
 from core.launchgood_accounts import get_token_file_path
 
 logger = logging.getLogger("launchgood_session")
+
+def _post_json(url: str, headers: Dict[str, str], json_data: Dict[str, Any], timeout: int = 20):
+    if cffi_requests is not None:
+        try:
+            return cffi_requests.post(url, headers=headers, json=json_data, impersonate="safari17_0", timeout=timeout)
+        except Exception as e:
+            logger.warning(f"curl_cffi POST failed for {url}, falling back to requests: {e}")
+    return requests.post(url, headers=headers, json=json_data, timeout=timeout)
 
 REFRESH_URL = os.environ.get("LAUNCHGOOD_REFRESH_URL", "https://api.launchgood.com/v4/auth/refresh")
 RENEW_WHEN_LEFT_S = 5 * 60
@@ -81,7 +94,7 @@ def renew_with_refresh_token(refresh: str, headers: Optional[Dict[str, str]] = N
     for wait in (0, 3, 7):  # Cloudflare sometimes holds a request for a few seconds: two quick retries
         if wait:
             time.sleep(wait)
-        r = requests.post(REFRESH_URL, headers=h, json={"refreshToken": refresh.replace("Bearer ", "").strip()}, timeout=20)
+        r = _post_json(REFRESH_URL, headers=h, json_data={"refreshToken": refresh.replace("Bearer ", "").strip()}, timeout=20)
         if "json" in (r.headers.get("content-type") or ""):
             break
     try:
@@ -120,8 +133,8 @@ def ensure_fresh_session(company_id: str, force: bool = False) -> Tuple[bool, st
                             "Origin": "https://www.launchgood.com", "Referer": "https://www.launchgood.com/"})
             headers.setdefault("user-agent", DEFAULT_UA)
             try:
-                r = requests.post(REFRESH_URL, headers=headers, json={"refreshToken": refresh}, timeout=20)
-            except requests.RequestException as e:
+                r = _post_json(REFRESH_URL, headers=headers, json_data={"refreshToken": refresh}, timeout=20)
+            except Exception as e:
                 return left > 0, f"renewal request failed ({str(e)[:120]}) - will retry"
             body: Dict[str, Any] = {}
             try:

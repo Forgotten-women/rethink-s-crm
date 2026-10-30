@@ -7,7 +7,7 @@ launchgood_donations.db*
 *.sqlite
 __pycache__/
 *.pyc
-
+config/launchgood_tokens_rethink.json
 scratch/
 node_modules/
 *.csv
@@ -71,3 +71,4 @@ data_cache/backups/
 
 # Server-held key for the LaunchGood session bookmarklet (backend/api/ops.py) - secret
 data_cache/.sync_helper_key
+config/launchgood_tokens_rethink.json

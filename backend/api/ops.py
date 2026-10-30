@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional
 
 import re
 import requests
+
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -692,10 +697,24 @@ def _launchgood_check(candidate: Dict[str, Any]) -> Dict[str, Any]:
     headers = dict(candidate.get("headers") or {})
     headers.setdefault("Accept", "application/json, text/plain, */*")
     headers.setdefault("Origin", "https://www.launchgood.com")
+    headers.setdefault("Referer", "https://www.launchgood.com/v4/fundraising/dashboard")
     headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    
+    # Strip stale Cloudflare clearance/bot-management cookies that cause 403 challenges
+    cookie_val = headers.get("cookie") or headers.get("Cookie") or candidate.get("rawCookie") or ""
+    if cookie_val:
+        parts = [p.strip() for p in cookie_val.split(";") if p.strip()]
+        clean_parts = [p for p in parts if not p.lower().startswith(("cf_clearance=", "__cf_bm=", "_cfuvid="))]
+        headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+        if clean_parts:
+            headers["Cookie"] = "; ".join(clean_parts)
+
     try:
-        r = requests.post("https://www.launchgood.com/api/user/currentUser", headers=headers, json={}, timeout=20)
-    except requests.RequestException as e:
+        if cffi_requests is not None:
+            r = cffi_requests.post("https://www.launchgood.com/api/user/currentUser", headers=headers, json={}, impersonate="safari17_0", timeout=20)
+        else:
+            r = requests.post("https://www.launchgood.com/api/user/currentUser", headers=headers, json={}, timeout=20)
+    except Exception as e:
         return {"ok": False, "detail": str(e)[:160]}
     if r.status_code != 200:
         return {"ok": False, "http_status": r.status_code, "detail": r.text[:160]}
