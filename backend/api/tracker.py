@@ -6294,9 +6294,10 @@ def email_tracking_pixel(tracking_id: str, request: Request):
     Tracking pixel hit by email client when donor opens the email.
     Records delivery_status = 'opened', increments open_count, and sets opened_at.
     """
-    client_ip = request.client.host if request.client else ""
+    # the site sits behind Cloudflare, so request.client is a Cloudflare edge; it passes the opener's address on
+    client_ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "")
     user_agent = request.headers.get("user-agent", "")
-    
+
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
