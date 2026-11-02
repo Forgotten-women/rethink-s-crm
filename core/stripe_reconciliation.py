@@ -442,6 +442,57 @@ def _match_crm_classification(
             _register_unassigned_stripe_name(cursor, comp, clean_name)
         return _unassigned_meta()
 
+    return _meta_for_code(resolved_code, classified_by, cursor)
+
+
+# Lines that are money going back out for an earlier charge: they belong to that charge's project
+REVERSAL_CATEGORIES = ("refund", "refund_failure", "dispute", "dispute_reversal")
+
+
+def _original_charge_meta(cursor, company_id: str, charge_id: str) -> Optional[Dict[str, Any]]:
+    """Classification (and project/donor) of the charge a refund or dispute reverses, so the reversal comes off
+    the same project as the gift. Looks at that charge's own payout line, then its CRM donation, then the
+    ledger's project name. None if the charge isn't known (the line then stays Unassigned for a person)."""
+    if not cursor or not charge_id:
+        return None
+    comp = str(company_id or "rethink").lower().strip()
+    cursor.execute(f"""
+        SELECT i.code, i.project_name, i.donor_name, i.donor_email
+        FROM stripe_payout_items i JOIN stripe_payout_reports r ON r.payout_id = i.payout_id
+        WHERE i.charge_id = ? AND LOWER(COALESCE(r.company_id, 'rethink')) = ?
+          AND i.source_type NOT IN ({','.join('?' * len(REVERSAL_CATEGORIES))}) AND i.gross > 0
+          AND UPPER(TRIM(COALESCE(i.code, ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+        ORDER BY i.created_at LIMIT 1
+    """, (charge_id, comp, *REVERSAL_CATEGORIES))
+    row = cursor.fetchone()
+    if not row:
+        # The CRM gift for the charge (Stripe-created rows carry charge_id; refund rows have negative amounts)
+        cursor.execute("""
+            SELECT [Code], [Campaign Name], TRIM(COALESCE([First Name],'') || ' ' || COALESCE([Last Name],'')), [Email]
+            FROM donations
+            WHERE LOWER(company_id) = ? AND charge_id = ? AND CAST(Amount AS REAL) > 0
+              AND UPPER(TRIM(COALESCE([Code], ''))) NOT IN ('', 'UNASSIGNED', 'NONE', 'NAN', 'N/A', 'NULL')
+            LIMIT 1
+        """, (comp, charge_id))
+        row = cursor.fetchone()
+    if row:
+        meta = _meta_for_code(row[0].strip(), "original_charge", cursor)
+        return {"meta": meta, "project_name": row[1] or "", "donor_name": row[2] or "", "donor_email": row[3] or ""}
+    # Last resort: the project name the ledger read from the charge's metadata (never registers a new name)
+    cursor.execute("""SELECT project_name, donor_name, donor_email FROM stripe_balance_transactions
+                      WHERE company_id = ? AND charge_id = ? AND amount > 0 AND COALESCE(project_name, '') != ''
+                      LIMIT 1""", (comp, charge_id))
+    led = cursor.fetchone()
+    if led:
+        meta = _match_crm_classification(led[0], company_id=comp, cursor=cursor, register_unknown=False)
+        if meta.get("code") != UNASSIGNED:
+            meta["classified_by"] = "original_charge"
+            return {"meta": meta, "project_name": led[0], "donor_name": led[1] or "", "donor_email": led[2] or ""}
+    return None
+
+
+def _meta_for_code(resolved_code: str, classified_by: str, cursor: Optional[Any] = None) -> Dict[str, str]:
+    """Full classification for a project code, from master_project_codes."""
     meta = {
         "classified_by": classified_by,
         "code": resolved_code,
@@ -516,7 +567,10 @@ def _payout_rows_from_api(payout_id: str, company_id: str = STRIPE_COMPANY) -> L
     (same keys as REPORT_COLUMNS), read with GET /v1/balance_transactions?payout=…&expand[]=data.source."""
     rows: List[Dict[str, Any]] = []
     # The PaymentIntent is expanded too: its metadata is what Stripe's report calls "payment_metadata"
-    params: Dict[str, Any] = {"payout": payout_id, "limit": 100, "expand[]": ["data.source", "data.source.payment_intent"]}
+    # A refund or dispute points at the original charge, so that (and its PaymentIntent) is expanded as well
+    params: Dict[str, Any] = {"payout": payout_id, "limit": 100,
+                              "expand[]": ["data.source", "data.source.payment_intent",
+                                           "data.source.charge", "data.source.charge.payment_intent"]}
     while True:
         r = requests.get(f"{STRIPE_API_BASE}/balance_transactions", headers=_stripe_headers(company_id), params=params, timeout=30)
         if r.status_code != 200:
@@ -527,10 +581,12 @@ def _payout_rows_from_api(payout_id: str, company_id: str = STRIPE_COMPANY) -> L
                 continue  # the payout itself, not a line in it
             src = bt.get("source") if isinstance(bt.get("source"), dict) else {}
             charge = src
-            if src.get("object") == "refund":
+            if src.get("object") in ("refund", "dispute"):
                 charge = src.get("charge") if isinstance(src.get("charge"), dict) else {"id": src.get("charge") or ""}
             billing = charge.get("billing_details") or {}
             pi = charge.get("payment_intent") if isinstance(charge.get("payment_intent"), dict) else {}
+            if not pi and src is not charge and isinstance(src.get("payment_intent"), dict):
+                pi = src["payment_intent"]
             # Same precedence as Stripe's report: the PaymentIntent's metadata, else the charge's (or refund's)
             meta = {k: v for k, v in (charge.get("metadata") or {}).items() if v}
             if src is not charge:
@@ -606,6 +662,9 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
     unassigned_lines = 0
     review_lines = 0
 
+    # Charges first, so a refund in the same payout can take its charge's classification
+    raw_rows.sort(key=lambda r: (r.get("reporting_category") or "") in REVERSAL_CATEGORIES)
+
     try:
         for row in raw_rows:
             gross = float(row.get("gross") or 0.0)
@@ -637,8 +696,18 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
             source_type = "website"
             donation_id = ""
 
+            original = _original_charge_meta(cursor, company_id, ch_id) if cat in REVERSAL_CATEGORIES else None
+
+            # Case 0: a refund/dispute comes off the project of the gift it reverses
+            if original:
+                meta = original["meta"]
+                proj_name = proj_name or original["project_name"] or desc
+                donor_name = donor_name or original["donor_name"]
+                donor_email = donor_email or original["donor_email"]
+                enriched_count += 1
+
             # Check Case 1: Stripe System Fee
-            if cat == "fee" or "billing - usage fee" in desc.lower() or "per auth fee" in desc.lower() or "stripe fee" in desc.lower():
+            elif cat == "fee" or "billing - usage fee" in desc.lower() or "per auth fee" in desc.lower() or "stripe fee" in desc.lower():
                 source_type = "fee"
                 donor_name = "[Stripe Platform Fee]"
                 proj_name = desc or "Billing - Usage Fee"
@@ -693,7 +762,8 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                 donor_email = donor_email or "in-person@terminal"
                 clean_desc = desc.replace("Payment via Sign Pay", "Sign Pay - General").replace("Sign Pay - ", "").strip()
                 proj_name = clean_desc.split("/")[0].strip() or "Sign Pay Campaign"
-                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor)
+                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor,
+                                                 register_unknown=cat not in REVERSAL_CATEGORIES)
                 enriched_count += 1
 
             # Check Case 4: Recurring Subscriptions / Invoices where project name was omitted
@@ -788,7 +858,8 @@ def reconcile_stripe_payout(payout_id: str, company_id: str = "rethink") -> Dict
                 elif pl_id:
                     source_type = "payment_link"
                 proj_name = proj_name or desc or "General Website Donation"
-                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor, payment_link_id=pl_id)
+                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor, payment_link_id=pl_id,
+                                                 register_unknown=cat not in REVERSAL_CATEGORIES)
                 if guessed_from_history and meta.get("code") != UNASSIGNED:
                     meta["classified_by"] = "donor_history"
                 enriched_count += 1
@@ -987,8 +1058,13 @@ def resync_payout_with_crm(payout_id: str, company_id: str = "rethink") -> Dict[
                 updated_count += 1
                 continue
 
+            original = _original_charge_meta(cursor, company_id, ch_id) if src_type in REVERSAL_CATEGORIES else None
+            if original:
+                meta = original["meta"]
+            elif src_type in REVERSAL_CATEGORIES:
+                meta = _match_crm_classification(proj_name, company_id=company_id, cursor=cursor, register_unknown=False)
             # If GiveBrite, check donations table directly
-            if src_type == "givebrite" and d_id:
+            elif src_type == "givebrite" and d_id:
                 cursor.execute("""
                     SELECT [Code], [Department], [Office], [Portfolio], [Country], [Programme Fund], [Fund Code], [Zakat Eligibility]
                     FROM donations WHERE LOWER(company_id) = ? AND [Donation ID] = ? LIMIT 1
