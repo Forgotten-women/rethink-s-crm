@@ -421,11 +421,15 @@ def enforce_route_permission(request: Request, user: Dict[str, Any], companies: 
         ok = all(holds(p) for p in perms) if isinstance(req, AllOf) else any(holds(p) for p in perms)
     if ok and not is_super and req not in (SUPER,):
         _enforce_record_scope(request, user, companies, endpoint)
-        from backend.api.permissions import CONTACT_EXPORTS
-        if endpoint is not None and endpoint_key(endpoint) in CONTACT_EXPORTS:
+        from backend.api.permissions import CONTACT_EXPORTS, CONTACT_STRIPPED_EXPORTS
+        key = endpoint_key(endpoint) if endpoint is not None else None
+        if key in CONTACT_EXPORTS or key in CONTACT_STRIPPED_EXPORTS:
             comps = sorted({str(c).strip().lower() for c in companies if str(c).strip()})
             if not comps or not all(user_has(user, "donors.contact", c) for c in comps):
-                ok, req = False, "donors.contact"  # the file holds emails / phones / addresses
+                if key in CONTACT_STRIPPED_EXPORTS:
+                    request.state.strip_contacts = True  # the file goes out without emails / phones / addresses
+                else:
+                    ok, req = False, "donors.contact"  # the file holds emails / phones / addresses
     if not ok:
         what = "this action" if req is None else describe(req)
         where = ", ".join(sorted({str(c).strip().lower() for c in companies if str(c).strip()})) or "any charity"

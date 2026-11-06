@@ -8,7 +8,8 @@ leaves the server:
   * phone numbers and street addresses / postcodes are blanked.
 Requests are translated back: a "dk_..." id in the path, query string or JSON body is replaced by the address it
 stands for (only ids this server issued, kept in rbac_masked_ids), so opening a donor still works.
-File exports that contain contact details need donors.contact as well (backend/api/permissions.py CONTACT_EXPORTS).
+File exports that contain contact details need donors.contact as well (backend/api/permissions.py CONTACT_EXPORTS);
+payout files (CONTACT_STRIPPED_EXPORTS) go out with their email / phone / address columns blanked instead.
 Staff screens (sign-in, Users & Access, mailbox connections, ops) are never rewritten.
 """
 import gzip
@@ -109,6 +110,57 @@ def resolve_tokens(text: str, url_encoded: bool = False) -> str:
                         if m.group(0) in rows else m.group(0), text)
 
 
+CONTACT_HEADER = re.compile(r"e-?mail|phone|mobile|\btel\b|telephone|address|street|post ?code|\bzip\b", re.I)
+HIDDEN = "(hidden)"
+
+
+def _strip_rows(rows: list) -> list:
+    """Blanks contact columns (by their header) and any email address left in another cell."""
+    cols: set = set()
+    out = []
+    for row in rows:
+        filled = [c for c in row if c not in (None, "")]
+        # a header row is all text labels (data rows carry amounts / dates) and never holds an address itself
+        is_labels = len(filled) >= 2 and all(isinstance(c, str) and "@" not in c and len(c) < 60 for c in filled)
+        hits = {i for i, c in enumerate(row) if isinstance(c, str) and CONTACT_HEADER.search(c)} if is_labels else set()
+        if hits:
+            cols = hits  # a header row: these columns hold contact details until the next header
+            out.append(list(row))
+            continue
+        new = []
+        for i, c in enumerate(row):
+            if i in cols and c not in (None, ""):
+                c = HIDDEN
+            elif isinstance(c, str) and "@" in c:
+                c = EMAIL_RE.sub(HIDDEN, c)
+            new.append(c)
+        out.append(new)
+    return out
+
+
+def strip_contacts_from_file(body: bytes, content_type: bytes) -> bytes:
+    """An .xlsx or .csv export without donor emails / phones / addresses."""
+    import io
+    if b"spreadsheetml" in content_type:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(body))
+        for ws in wb.worksheets:
+            cells = [list(r) for r in ws.iter_rows()]
+            stripped = _strip_rows([[c.value for c in r] for r in cells])
+            for r_cells, r_vals in zip(cells, stripped):
+                for cell, val in zip(r_cells, r_vals):
+                    if cell.value != val and not type(cell).__name__ == "MergedCell":
+                        cell.value = val
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
+    import csv
+    text = body.decode("utf-8-sig")
+    buf = io.StringIO()
+    csv.writer(buf).writerows(_strip_rows(list(csv.reader(io.StringIO(text)))))
+    return buf.getvalue().encode("utf-8")
+
+
 def _must_mask(user: Optional[Dict[str, Any]], company: Optional[str]) -> bool:
     if not user or user.get("role") == "super_admin":
         return False
@@ -173,16 +225,39 @@ class ContactMaskMiddleware:
                     buffering = True
                     start.update(message)
                     return
+                if (scope.get("state") or {}).get("strip_contacts") and (b"spreadsheetml" in ctype or b"text/csv" in ctype):
+                    buffering = "file"
+                    start.update(message)
+                    return
                 return await send(message)
             if message["type"] == "http.response.body" and buffering:
                 chunks.append(message.get("body", b""))
                 if message.get("more_body", False):
                     return
-                await self._finish(scope, start, b"".join(chunks), send)
+                if buffering == "file":
+                    await self._finish_file(start, b"".join(chunks), send)
+                else:
+                    await self._finish(scope, start, b"".join(chunks), send)
                 return
             return await send(message)
 
         await self.app(scope, receive, send_wrapper)
+
+    async def _finish_file(self, start, body: bytes, send):
+        import asyncio
+        headers = [(k, v) for k, v in (start.get("headers") or [])]
+        try:
+            body = await asyncio.to_thread(strip_contacts_from_file, body, dict(headers).get(b"content-type", b""))
+        except Exception:
+            # never let the unstripped file out
+            body = b'{"detail": "This export could not be prepared without contact details."}'
+            headers = [(k, v) for k, v in headers if k not in (b"content-type", b"content-disposition")]
+            headers.append((b"content-type", b"application/json"))
+            start = dict(start, status=500)
+        headers = [(k, v) for k, v in headers if k not in (b"content-length", b"content-encoding", b"etag")]
+        headers.append((b"content-length", str(len(body)).encode()))
+        await send(dict(start, headers=headers))
+        await send({"type": "http.response.body", "body": body, "more_body": False})
 
     async def _finish(self, scope, start, body: bytes, send):
         import asyncio

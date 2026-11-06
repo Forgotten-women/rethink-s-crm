@@ -299,9 +299,12 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
 }
 
 
-# File exports that contain donor contact details (they can't be masked like JSON): need donors.contact too.
-CONTACT_EXPORTS = {"donors.export_donors", "payouts.export_payouts_excel", "stripe_payouts.download_enriched_csv",
-                   "stripe_payouts.export_stripe_payouts_excel"}
+# File exports that are mostly donor contact details: need donors.contact too.
+CONTACT_EXPORTS = {"donors.export_donors"}
+# Payout files: allowed without donors.contact, with the email / phone / address columns blanked in the file
+# (backend/api/contact_mask.py strip_contacts_from_file)
+CONTACT_STRIPPED_EXPORTS = {"payouts.export_payouts_excel", "stripe_payouts.download_enriched_csv",
+                            "stripe_payouts.export_stripe_payouts_excel"}
 
 # Endpoints that apply a person's fundraiser limit (core.rbac.scope_donations / request_scope). In a charity where
 # someone is limited to specific fundraisers, every other endpoint is refused - pages such as the dashboard or

@@ -645,7 +645,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       if (isStripe) {
         const companyParam = `&company_id=${encodeURIComponent(activeCompany)}`;
         const res = await fetch(`${API_BASE_URL}/api/payouts/stripe/export?currency=${currency}${companyParam}`);
-        if (!res.ok) throw new Error('Failed to generate Stripe export file');
+        if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Failed to generate Stripe export file');
         
         const blob = await res.blob();
         const url = window.URL.createObjectURL(blob);
@@ -664,7 +664,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
       const codeParam = donorCodeFilter && donorCodeFilter !== 'ALL' ? `&code=${encodeURIComponent(donorCodeFilter)}` : '';
       const companyParam = `&company_id=${encodeURIComponent(activeCompany)}`;
       const res = await fetch(`${API_BASE_URL}/api/payouts/export?platform=${selectedPlatform}&currency=${currency}${batchParam}${statusParam}${searchParam}${codeParam}${companyParam}`);
-      if (!res.ok) throw new Error('Failed to generate export file');
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Failed to generate export file');
       
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
@@ -959,11 +959,6 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
         // Fallback helper to determine payout month from batch record
         const getBatchMonth = (b) => {
           if (b.month_label) return b.month_label;
-          const tid = String(b.transfer_id || '').replace('.0', '');
-          if (tid === '35646') return 'October 26';
-          if (['35438', '35409', '35110'].includes(tid)) return 'September 26';
-          if (tid === '34579') return 'August 26';
-          
           const dStr = b.payout_date || b.created_date;
           if (dStr && dStr !== 'N/A') {
             const d = new Date(dStr);
@@ -971,6 +966,7 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               return d.toLocaleDateString('en-GB', { month: 'long', year: '2-digit' });
             }
           }
+          const tid = String(b.transfer_id || '').replace('.0', '');
           return `Batch #${tid}`;
         };
 
@@ -984,12 +980,13 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
           const mMap = {};
           validBatches.forEach(b => {
             const mLabel = getBatchMonth(b);
-            const mKey = mLabel.toLowerCase().replace(/\s+/g, '-');
+            const mKey = b.month_key || mLabel.toLowerCase().replace(/\s+/g, '-');
             if (!mMap[mLabel]) {
               mMap[mLabel] = {
                 transfer_id: mLabel,
                 month_label: mLabel,
                 month_key: mKey,
+                payout_date: b.payout_date || b.created_date || '',
                 transfer_amount: 0,
                 donations_count: 0,
                 sub_batches: []
@@ -999,11 +996,10 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
             mMap[mLabel].donations_count += Number(b.donations_count || 0);
             mMap[mLabel].sub_batches.push(b);
           });
-          const MONTH_ORDER = { 'october 26': 1, 'september 26': 2, 'august 26': 3 };
           monthlyBatchesList = Object.values(mMap).sort((a, b) => {
-            const oA = MONTH_ORDER[a.month_label.toLowerCase()] || 99;
-            const oB = MONTH_ORDER[b.month_label.toLowerCase()] || 99;
-            return oA - oB;
+            const keyA = a.month_key || a.payout_date || a.month_label || '';
+            const keyB = b.month_key || b.payout_date || b.month_label || '';
+            return keyB.localeCompare(keyA);
           });
         }
 
