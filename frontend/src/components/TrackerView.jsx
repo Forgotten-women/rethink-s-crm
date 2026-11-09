@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
+import OutlookMailboxCard from './email/OutlookMailboxCard';
 import { 
   Target, ShieldAlert, CheckCircle2, AlertCircle, Edit3, Save, 
   UserCheck, Flame, HeartHandshake, Plus, Search, Filter, 
@@ -5441,8 +5442,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               <div>
                 <div className="flex items-center gap-2">
                   <h3 className="text-lg font-black text-slate-800 dark:text-white">
-                    Microsoft 365 / Outlook Integration (Graph API)
+                    {activeCompany === 'rethink' ? 'Rethink mailbox' : 'Microsoft 365 / Outlook Integration (Graph API)'}
                   </h3>
+                  {activeCompany === 'rethink' && <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/50 dark:text-sky-300 dark:border-sky-800">Microsoft 365 · Rethink emails</span>}
                   <span className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
                     outlookStatus?.connected
                       ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800'
@@ -5454,7 +5456,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
                 <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 mt-1">
                   {outlookStatus?.connected
-                    ? `Authenticated as ${outlookStatus.connected_email}. Real-time Microsoft Graph two-way sync enabled.`
+                    ? `Authenticated as ${outlookStatus.connected_email}. ${activeCompany === 'rethink' ? "Sends every Rethink email (not Sisters' Project ones). " : ''}Real-time Microsoft Graph two-way sync enabled.`
                     : 'Connect your Microsoft 365 / Outlook organization account to dispatch updates and listen to donor replies.'}
                 </p>
               </div>
@@ -5497,6 +5499,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               )}
             </div>}
           </div>
+
+          {/* Sisters' Project has its own Microsoft 365 account: SP template emails go from it, never from Rethink's */}
+          {activeCompany === 'rethink' && <OutlookMailboxCard mailbox="sp_rethink" label="Sisters' Project" company="rethink" user={user} />}
 
           {/* Credentials & Webhook Subscription Grid */}
           {can(user, 'mailbox.configure', activeCompany) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -8057,7 +8062,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       }`}
                     >
                       <div className="flex items-center justify-between text-[10px] font-bold opacity-80 gap-3">
-                        <span>{isInbound ? `💬 Inbound from ${m.sender_email}` : `📤 Outbound via Microsoft 365`}</span>
+                        <span>{isInbound ? `💬 Inbound from ${m.sender_email}${m.recipient_email ? ` to ${m.recipient_email}` : ''}` : `📤 Sent from ${m.sender_email && m.sender_email !== 'me' ? m.sender_email : 'the charity mailbox'}`}</span>
                         <span>{new Date(m.sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                       </div>
 

@@ -508,6 +508,11 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
     return out
 
 
+def _mailbox_company(key) -> str:
+    from backend.api.mailbox import mailbox_company  # 'sp_rethink' (Sisters' Project's mailbox) belongs to Rethink
+    return mailbox_company(str(key or "").lower())
+
+
 def _outlook_status() -> List[Dict[str, Any]]:
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
@@ -574,7 +579,7 @@ def ops_status(request: Request, live: bool = Query(False)):
         "platforms": platforms,
         "services": services,
         "sync_heartbeat": (sync.get("meta") or {}).get("last_synced_at"),
-        "outlook": [o for o in _outlook_status() if visible is None or str(o.get("company_id") or "").lower() in visible],
+        "outlook": [o for o in _outlook_status() if visible is None or _mailbox_company(o.get("company_id")) in visible],
         "logging": {**shipping_status(), "errors_last_24h": errors_24h},
         "backup": _backup_status(),
     }

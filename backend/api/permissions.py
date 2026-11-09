@@ -238,6 +238,7 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     # --- direct donor email --------------------------------------------------------------------------------
     "donor_email.recipients": "email.view",
     "donor_email.preview": "email.view",
+    "donor_email.get_sending_from": "email.view",
     "donor_email.check_recipients": "email.view",
     "donor_email.recipient_gifts": "email.view",
     "donor_email.donor_email_history": "email.view",

@@ -3915,9 +3915,29 @@ def _get_outlook_auth_row(company_id: str):
     try:
         cur = conn.cursor()
         cur.execute("SELECT * FROM sponsorship_outlook_auth WHERE company_id = ?", (company_id,))
-        return cur.fetchone()
+        row = cur.fetchone()
+        from backend.api.mailbox import SEPARATE_MAILBOXES
+        owner = SEPARATE_MAILBOXES.get(company_id)
+        if owner and (not row or not row["client_id"]):
+            # A separate mailbox (e.g. Sisters' Project) signs in through its charity's Azure app: copy the app
+            # credentials only - never the charity's sign-in, so the two accounts stay apart
+            cur.execute("""INSERT INTO sponsorship_outlook_auth (company_id, client_id, client_secret, tenant_id)
+                           SELECT ?, client_id, client_secret, tenant_id FROM sponsorship_outlook_auth
+                           WHERE company_id = ? AND COALESCE(client_id, '') != ''
+                           ON CONFLICT(company_id) DO UPDATE SET client_id = excluded.client_id,
+                               client_secret = excluded.client_secret, tenant_id = excluded.tenant_id""", (company_id, owner))
+            conn.commit()
+            cur.execute("SELECT * FROM sponsorship_outlook_auth WHERE company_id = ?", (company_id,))
+            row = cur.fetchone()
+        return row
     finally:
         conn.close()
+
+
+def _outlook_key(company_id: Optional[str]) -> str:
+    """Which Outlook connection an /outlook/* call is about: 'sp_rethink' (Sisters' Project's own mailbox) or a charity."""
+    from backend.api.mailbox import _mbx
+    return _mbx(company_id or "rethink")
 
 def _get_valid_graph_token(company_id: str) -> str:
     """Returns a valid Microsoft Graph access token, refreshing if necessary."""
@@ -3997,10 +4017,10 @@ def _get_valid_graph_token(company_id: str) -> str:
 @router.get("/outlook/status")
 def get_outlook_status(company_id: Optional[str] = Query("rethink")):
     """Returns Microsoft 365 / Outlook connection status, connected email, and subscription state."""
-    comp = (company_id or "rethink").strip().lower()
-    from backend.api.mailbox import _owner, provider, is_connected, sender_address
-    if provider(_owner(comp)) == "gmail":  # this charity sends with Gmail: same shape, so every screen's "connected" check works
-        return {"provider": "gmail", "connected": is_connected(_owner(comp)), "connected_email": sender_address(_owner(comp)),
+    comp = _outlook_key(company_id)
+    from backend.api.mailbox import provider, is_connected, sender_address
+    if provider(comp) == "gmail":  # this charity sends with Gmail: same shape, so every screen's "connected" check works
+        return {"provider": "gmail", "connected": is_connected(comp), "connected_email": sender_address(comp),
                 "client_id_set": True, "tenant_id": None, "subscription_active": False, "subscription_expiration": None}
     auth = _get_outlook_auth_row(comp)
     if not auth:
@@ -4062,7 +4082,7 @@ def save_outlook_credentials(payload: OutlookCredentialsRequest, current_user = 
 @router.get("/outlook/auth-url")
 def get_outlook_auth_url(company_id: Optional[str] = Query("rethink"), redirect_uri: Optional[str] = Query(None), current_user = Depends(get_current_user)):
     """Generates the Microsoft 365 OAuth 2.0 authorization URL."""
-    comp = (company_id or "rethink").strip().lower()
+    comp = _outlook_key(company_id)
     auth = _get_outlook_auth_row(comp)
     if not auth or not auth["client_id"]:
         raise HTTPException(status_code=400, detail="Microsoft Azure Client ID not configured. Please save credentials first.")
@@ -4086,7 +4106,7 @@ def get_outlook_auth_url(company_id: Optional[str] = Query("rethink"), redirect_
 @router.post("/outlook/exchange-token")
 def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = Depends(get_current_user)):
     """Exchanges authorization code for tokens and retrieves connected Microsoft 365 email."""
-    comp = (payload.company_id or "rethink").strip().lower()
+    comp = _outlook_key(payload.company_id)
     auth = _get_outlook_auth_row(comp)
     if not auth or not auth["client_id"] or not auth["client_secret"]:
         raise HTTPException(status_code=400, detail="Microsoft Azure credentials missing.")
@@ -4149,7 +4169,7 @@ def exchange_outlook_token(payload: OutlookExchangeTokenRequest, current_user = 
 @router.post("/outlook/disconnect")
 def disconnect_outlook(company_id: Optional[str] = Query("rethink"), current_user = Depends(get_current_user)):
     """Disconnects Microsoft 365 / Outlook account."""
-    comp = (company_id or "rethink").strip().lower()
+    comp = _outlook_key(company_id)
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     try:
         cur = conn.cursor()
@@ -4180,6 +4200,8 @@ _STATUS_FOR_TEMPLATE = {"video_update": "Video Sent", "end_year_feedback": "Feed
 
 def _resolve_theme(allocation_company: str, requested_theme: Optional[str]) -> str:
     theme = (requested_theme or "").strip().lower() or _DEFAULT_THEME_FOR_COMPANY.get(allocation_company, allocation_company)
+    if theme == "sp" and allocation_company == "rethink":
+        theme = "sp_rethink"  # the theme pickers list Rethink's SP theme as "sp" (as trackerUtils.themeStorageKey)
     if _owner_company(theme) != allocation_company:
         raise HTTPException(status_code=400, detail=f"Theme '{theme}' cannot be used for a {allocation_company} sponsorship.")
     return theme
@@ -4400,6 +4422,9 @@ def preview_email(payload: EmailPreviewRequest):
             from backend.api.unsubscribe import add_footer, is_unsubscribed  # the Unsubscribe button, as sent
             out["body_html"] = add_footer(out["body_html"], out.get("company_id") or payload.company_id, out["recipient_email"])
             out["unsubscribed"] = is_unsubscribed(out.get("company_id") or payload.company_id, out["recipient_email"])
+        if isinstance(out, dict) and out.get("company_id"):
+            from backend.api.mailbox import sending_from
+            out["sending_from"] = sending_from(out["company_id"], out.get("theme"))
         return out
     finally:
         conn.close()
@@ -4454,13 +4479,14 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
         return {"allocation_donor_id": rendered["allocation_donor_id"], "recipient_email": to_email,
                 "recipient_name": rendered.get("recipient_name", ""), "status": "skipped",
                 "detail": "Unsubscribed from emails"}
-    from backend.api.mailbox import is_connected, provider, send_email
-    if not is_connected(comp):
-        raise HTTPException(status_code=400, detail=f"{comp.title()}'s {'Gmail' if provider(comp) == 'gmail' else 'Microsoft 365'} mailbox isn't connected - connect it in Email > Mailbox.")
+    from backend.api.mailbox import is_connected, mailbox_for, mailbox_label, provider, send_email
+    mbx = mailbox_for(comp, rendered["theme"])  # Sisters' Project emails from SP's own mailbox, never Rethink's
+    if not is_connected(mbx):
+        raise HTTPException(status_code=400, detail=f"{mailbox_label(mbx)}'s {'Gmail' if provider(mbx) == 'gmail' else 'Microsoft 365'} mailbox isn't connected - connect it in the Outlook tab / Email > Mailbox.")
     tracking_id = str(uuid.uuid4())
     html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}",
                                   comp, to_email, tracking_id)
-    sent = send_email(comp, [(to_email, rendered["recipient_name"])], rendered["subject"].strip(), html)
+    sent = send_email(mbx, [(to_email, rendered["recipient_name"])], rendered["subject"].strip(), html)
     sender_email = sent.get("sender") or "me"
     if not sent["ok"]:
         log_event("email.failed", level="error", message=f"Send failed ({sent.get('http_status')}) to {to_email}",
@@ -4495,7 +4521,8 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
     log_event("email.sent", message=f"Sent '{rendered['subject']}' to {to_email} from {sender_email}",
               mailbox=sender_email, tracking_id=tracking_id, communication_id=comm_id, **log_ctx)
     return {"allocation_donor_id": rendered["allocation_donor_id"], "status": "sent",
-            "recipient_email": to_email, "tracking_id": tracking_id, "communication_id": comm_id}
+            "recipient_email": to_email, "tracking_id": tracking_id, "communication_id": comm_id,
+            "sender_email": sender_email, "mailbox": mbx, "mailbox_label": mailbox_label(mbx)}
 
 
 def _send_per_donor(payload: OutlookSendRequest, request: Request) -> Dict[str, Any]:
@@ -4623,6 +4650,7 @@ def _render_bulk_item(cur, payload: BulkEmailRequest, item: BulkEmailItem) -> Di
 def preview_bulk_email(payload: BulkEmailRequest):
     """Exactly what each selected donor would receive (same rendering as sending). Nothing is sent."""
     items = _bulk_items_for_company(payload, BULK_PREVIEW_LIMIT)
+    from backend.api.mailbox import sending_from
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     out = []
     try:
@@ -4635,6 +4663,7 @@ def preview_bulk_email(payload: BulkEmailRequest):
                 out.append({"allocation_id": item.allocation_id, "allocation_donor_id": item.allocation_donor_id,
                             "recipient_email": r["recipient_email"], "recipient_name": r["recipient_name"],
                             "subject": r["subject"], "body_html": r["body_html"], "theme": r["theme"],
+                            "sending_from": sending_from(r["company_id"], r["theme"]),
                             "personalised": item.subject_template is not None or item.body_template is not None,
                             "ready": problem is None, "problem": problem})
             except HTTPException as e:
@@ -4701,10 +4730,11 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
     theme_owner = _owner_company(payload.company_id) if payload.company_id else comp
     if theme_owner != comp:
         raise HTTPException(status_code=400, detail=f"Theme '{payload.company_id}' cannot be used for a {comp} sponsorship.")
-    from backend.api.mailbox import is_connected, sender_address, send_email
-    if not is_connected(comp):
-        raise HTTPException(status_code=400, detail=f"{comp.title()}'s mailbox isn't connected - connect it in Email > Mailbox.")
-    sender_email = sender_address(comp) or "me"
+    from backend.api.mailbox import is_connected, mailbox_for, mailbox_label, sender_address, send_email
+    mbx = mailbox_for(comp, payload.company_id)
+    if not is_connected(mbx):
+        raise HTTPException(status_code=400, detail=f"{mailbox_label(mbx)}'s mailbox isn't connected - connect it in Email > Mailbox.")
+    sender_email = sender_address(mbx) or "me"
 
     recipients_raw = payload.recipient_email.replace(";", ",").split(",")
     to_recipients_list = []
@@ -4758,7 +4788,7 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
     else:
         email_body_with_pixel = f"{raw_body}{tracking_pixel_html}"
 
-    sent = send_email(comp, [(r["emailAddress"]["address"], r["emailAddress"].get("name")) for r in to_recipients_list],
+    sent = send_email(mbx, [(r["emailAddress"]["address"], r["emailAddress"].get("name")) for r in to_recipients_list],
                       payload.subject.strip(), email_body_with_pixel)
     if not sent["ok"]:
         log_event("email.failed", category="email", level="error", company_id=comp, allocation_id=payload.allocation_id,
@@ -4919,7 +4949,7 @@ def ensure_outlook_subscription(company_id: str, notification_url: Optional[str]
 @router.post("/outlook/setup-subscription")
 def setup_outlook_subscription(company_id: Optional[str] = Query("rethink"), notification_url: Optional[str] = Query(None), current_user = Depends(get_current_user)):
     """Creates or manually forces renewal of a Microsoft Graph Webhook Subscription."""
-    comp = (company_id or "rethink").strip().lower()
+    comp = _outlook_key(company_id)
     res = ensure_outlook_subscription(comp, notification_url, force=True)
     if res.get("status") in ("active", "renewed", "created"):
         return {"status": "success", "subscriptionId": res.get("subscriptionId"), "expiration": res.get("expiration")}
@@ -4935,7 +4965,7 @@ def renew_outlook_subscription(company_id: Optional[str] = Query("rethink"), cur
 @router.post("/outlook/test-send")
 def test_send_outlook_message(payload: OutlookTestEmailRequest, request: Request, current_user = Depends(get_current_user)):
     """Dispatches a test verification email via Microsoft Graph API. Super Admin only."""
-    comp = (payload.company_id or "rethink").strip().lower()
+    comp = _outlook_key(payload.company_id)
     from backend.api.mailbox import TestSend, mailbox_test_send, provider
     if provider(comp) == "gmail":
         return mailbox_test_send(TestSend(company_id=comp, recipient_email=payload.recipient_email or ""), current_user)
@@ -5046,12 +5076,13 @@ async def outlook_graph_webhook(request: Request):
                 body_preview = msg_data.get("bodyPreview", "")
                 conv_id = msg_data.get("conversationId", "")
 
+                from backend.api.mailbox import mailbox_company
                 conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
                 try:
                     cur = conn.cursor()
                     auth_row = _get_outlook_auth_row(company_id)
                     mailbox = (auth_row["connected_email"] if auth_row and auth_row["connected_email"] else company_id)
-                    if _record_inbound_reply(cur, company_id, msg_id, conv_id, subject, body_preview,
+                    if _record_inbound_reply(cur, mailbox_company(company_id), msg_id, conv_id, subject, body_preview,
                                              from_email, mailbox, msg_data.get("receivedDateTime")):
                         conn.commit()
                 finally:
@@ -5112,13 +5143,25 @@ def _backfill_conversation_ids(company_id: str) -> Dict[str, Any]:
     """Graph's sendMail returns no message id, so after sending we find each email in Sent Items (same recipient,
     same subject, sent within 10 minutes) and store its conversationId. Replies are then matched exactly."""
     comp = (company_id or "").strip().lower()
+    from backend.api.mailbox import SEPARATE_MAILBOXES, mailbox_company, sender_address
+    # each mailbox only looks for the emails it sent itself (SP's and Rethink's sends share the charity's rows)
+    me = (sender_address(comp) or "").strip().lower()
+    others = [a for a in ((sender_address(k) or "").strip().lower() for k, c in SEPARATE_MAILBOXES.items()
+                          if c == mailbox_company(comp) and k != comp) if a]
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     try:
-        pending = [dict(r) for r in conn.execute("""
-            SELECT id, recipient_email, subject, sent_at FROM sponsorship_communications
-            WHERE company_id = ? AND direction = 'outbound' AND COALESCE(thread_id, '') = ''
-              AND sent_at >= datetime('now', '-3 days')""", (comp,))]
+        sql = """SELECT id, recipient_email, subject, sent_at FROM sponsorship_communications
+                 WHERE company_id = ? AND direction = 'outbound' AND COALESCE(thread_id, '') = ''
+                   AND sent_at >= datetime('now', '-3 days')"""
+        args = [mailbox_company(comp)]
+        if comp in SEPARATE_MAILBOXES:
+            sql += " AND LOWER(sender_email) = ?"
+            args.append(me)
+        elif others:
+            sql += f" AND LOWER(COALESCE(sender_email, '')) NOT IN ({','.join('?' * len(others))})"
+            args += others
+        pending = [dict(r) for r in conn.execute(sql, args)]
     finally:
         conn.close()
     if not pending:
@@ -5248,6 +5291,7 @@ def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
     Acts as an instant real-time sync mechanism alongside Webhooks.
     """
     comp = (company_id or "rethink").strip().lower()
+    from backend.api.mailbox import mailbox_company  # replies to the SP mailbox are recorded under Rethink
     auth = _get_outlook_auth_row(comp)
     if not auth or not auth["refresh_token"]:
         return {"status": "not_connected"}
@@ -5273,7 +5317,7 @@ def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
                 sender_email = (from_info.get("address") or "").strip().lower()
                 if not sender_email or sender_email == connected_email:
                     continue
-                if _record_inbound_reply(cur, comp, m.get("id"), m.get("conversationId", ""), m.get("subject", ""),
+                if _record_inbound_reply(cur, mailbox_company(comp), m.get("id"), m.get("conversationId", ""), m.get("subject", ""),
                                          m.get("bodyPreview", ""), sender_email, connected_email,
                                          m.get("receivedDateTime")):
                     new_synced += 1

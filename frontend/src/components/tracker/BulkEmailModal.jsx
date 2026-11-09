@@ -3,6 +3,7 @@ import { X, Send, Search, Loader2, CheckCircle2, AlertTriangle, Eye, Users, PenL
 import { API_BASE_URL } from '../../config';
 import { themeStorageKey } from './trackerUtils';
 import { denyUnless } from '../../access';
+import { SendingFromBadge } from '../email/emailUi';
 
 const BATCH = 25;  // matches BULK_SEND_BATCH_LIMIT in backend/api/tracker.py
 const LIFECYCLES = [['all', 'All cycles'], ['active', 'Active'], ['due', 'Due (30d)'], ['grace', 'Grace (30d)'], ['lapsed', 'Lapsed']];
@@ -323,6 +324,7 @@ if (denyUnless('email.send')) return;
                   <div className="flex flex-col gap-2">
                     {!preview.ready && <div className="flex items-center gap-2 text-rose-700 bg-rose-50 dark:bg-rose-900/20 rounded-lg px-3 py-2"><AlertTriangle className="w-4 h-4" /> Won't be sent: {preview.problem}</div>}
                     {preview.subject !== undefined && <>
+                      <SendingFromBadge info={preview.sending_from} />
                       <div><span className="text-slate-500">To:</span> {preview.recipient_name} &lt;{preview.recipient_email}&gt;</div>
                       <div><span className="text-slate-500">Subject:</span> <b>{preview.subject}</b></div>
                       <iframe title="Email preview" sandbox="" srcDoc={preview.body_html} className="w-full h-[72vh] min-h-[420px] rounded-lg border border-slate-200 dark:border-slate-700 bg-white" />

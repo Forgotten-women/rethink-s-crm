@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ArrowDownLeft, ArrowUpRight, ChevronDown, Eye, MailOpen, MessageSquareReply, RefreshCw } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
+import { MailboxTag } from './emailUi';
 
 const subjectKey = (s) => String(s || '').replace(/^\s*((re|fw|fwd)\s*:\s*)+/i, '').trim().toLowerCase();
 // Stored times are UTC; show them in the viewer's own time zone (an email sent at 14:10 shows as 14:10)
@@ -78,6 +79,8 @@ export default function EmailThread({ company, email, reloadKey = 0, compact = f
                       {out ? <ArrowUpRight className="w-3.5 h-3.5 text-sky-500 shrink-0" /> : <ArrowDownLeft className="w-3.5 h-3.5 text-emerald-600 shrink-0" />}
                       <span className="font-semibold text-slate-800 dark:text-slate-100 shrink-0">{out ? 'Sent' : 'Reply'}</span>
                       <span className="text-slate-500 truncate">{i.source}{i.template_type && out ? ` · ${String(i.template_type).replace(/_/g, ' ')}` : ''}</span>
+                      {out && (i.mailbox_label || (i.from && i.from !== 'me' && !i.from.startsWith('dk_'))) && <MailboxTag label={i.mailbox_label} separate={i.mailbox_separate} address={i.mailbox_email || i.from} />}
+                      {!out && i.mailbox_label && <MailboxTag label={`to ${i.mailbox_label}`} separate={i.mailbox_separate} address={i.mailbox_email} />}
                     </span>
                     <span className="flex items-center gap-2 shrink-0 text-slate-500">
                       {out && i.status && i.status !== 'sent' && <span className={`px-1.5 rounded ${i.status === 'failed' ? 'bg-rose-100 text-rose-700' : i.status === 'replied' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>{i.status}</span>}

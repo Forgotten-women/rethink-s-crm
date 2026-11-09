@@ -457,17 +457,20 @@ def _deliver(comp: str, theme: str, template_type: str, rendered: Dict[str, Any]
         result.update(status="skipped", detail="Unsubscribed from emails")
     tracking_id, sender = None, None
     if result["status"] == "sent":
-        from backend.api.mailbox import is_connected, provider, send_email  # this charity's own mailbox (Gmail or Microsoft 365)
-        if not is_connected(comp):  # stop the whole send, as before, rather than failing every person
-            raise HTTPException(status_code=400, detail=f"{comp.title()}'s {'Gmail' if provider(comp) == 'gmail' else 'Microsoft 365'} mailbox isn't connected - connect it in Email > Mailbox.")
+        # this charity's own mailbox (Gmail or Microsoft 365); Sisters' Project templates go from SP's own mailbox
+        from backend.api.mailbox import is_connected, mailbox_for, mailbox_label, provider, send_email
+        mbx = mailbox_for(comp, theme)
+        if not is_connected(mbx):  # stop the whole send, as before, rather than failing every person
+            raise HTTPException(status_code=400, detail=f"{mailbox_label(mbx)}'s {'Gmail' if provider(mbx) == 'gmail' else 'Microsoft 365'} mailbox isn't connected - connect it in Email > Mailbox.")
         tracking_id = str(uuid.uuid4())
         html = _prepare_outgoing_html(rendered["body_html"], f"{base_url}/api/tracker/email-tracking/pixel/{tracking_id}",
                                       comp, to, tracking_id)
         try:
-            res = send_email(comp, [(to, rendered["recipient_name"])], rendered["subject"].strip(), html)
+            res = send_email(mbx, [(to, rendered["recipient_name"])], rendered["subject"].strip(), html)
         except HTTPException as e:
             res = {"ok": False, "detail": str(e.detail)}
         sender = res.get("sender")
+        result["sender_email"] = sender
         if not res["ok"]:
             result.update(status="failed", detail=res["detail"][:300])
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
@@ -580,7 +583,17 @@ def preview(req: PreviewRequest):
     from backend.api.unsubscribe import add_footer  # show the Unsubscribe button exactly as it will be sent
     out["body_html"] = add_footer(out.get("body_html") or "", comp, out.get("recipient_email") or "")
     out["unsubscribed"] = is_unsubscribed(comp, out.get("recipient_email") or "")
+    from backend.api.mailbox import sending_from
+    out["sending_from"] = sending_from(comp, theme)
     return out
+
+
+@router.get("/sending-from")
+def get_sending_from(company_id: str = Query(...), theme: Optional[str] = Query(None)):
+    """Which account an email with this theme is sent from (shown on every compose screen)."""
+    comp = _company(company_id)
+    from backend.api.mailbox import sending_from
+    return sending_from(comp, _resolve_theme(comp, theme))
 
 
 class SendRequest(BaseModel):
@@ -964,11 +977,20 @@ def donor_email_thread(company_id: str = Query(...), email: str = Query(...)):
                               "subject": r["subject"], ("body_html" if out else "body_text"): r["body"],
                               "status": (r["delivery_status"] or "sent") if out else None,
                               "opened_at": r["opened_at"], "open_count": r["open_count"] or 0, "replied_at": r["replied_at"],
-                              "template_type": r["template_type"], "conversation": r["thread_id"], "from": r["sender_email"]})
+                              "template_type": r["template_type"], "conversation": r["thread_id"], "from": r["sender_email"],
+                              **({} if out else {"to": r["recipient_email"]})})
         except sqlite3.OperationalError:
             pass
     finally:
         conn.close()
+
+    # which of the charity's accounts each email went through / came into (e.g. Rethink or Sisters' Project)
+    from backend.api.mailbox import mailbox_labels_by_address
+    boxes = mailbox_labels_by_address(comp)
+    for i in items:
+        addr = str(i.get("from") if i["direction"] == "out" else i.get("to") or "").strip().lower()
+        if addr in boxes:
+            i["mailbox_label"], i["mailbox_separate"], i["mailbox_email"] = boxes[addr]["label"], boxes[addr]["separate"], addr
 
     def when(i):
         return str(i.get("at") or "").replace("T", " ")[:19]

@@ -3,6 +3,7 @@ import { Mail, X, Code, Eye, Send, Loader2, CheckCircle2, AlertTriangle, Users, 
 import { API_BASE_URL } from '../../config';
 import { themeStorageKey } from './trackerUtils';
 import { denyUnless } from '../../access';
+import { SendingFromBadge } from '../email/emailUi';
 
 const PER_DONOR_VARIABLES = [
   { tag: '{contribution_amount}', label: "This donor's share of the sponsorship (e.g. 160)" },
@@ -266,6 +267,7 @@ if (denyUnless('email.send')) return;
                     )}
                   </>
                 )}
+                <SendingFromBadge info={preview?.sending_from} />
                 <div className="relative rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-white">
                   {loadingPreview && <div className="absolute inset-0 bg-white/60 flex items-center justify-center"><Loader2 className="w-5 h-5 animate-spin text-slate-400" /></div>}
                   <iframe title="Email preview" sandbox="" srcDoc={preview?.body_html || ''} className="w-full h-[72vh] min-h-[420px]" />

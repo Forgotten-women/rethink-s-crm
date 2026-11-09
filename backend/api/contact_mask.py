@@ -28,7 +28,8 @@ TOKEN_RE = re.compile(r"dk_[a-z2-7]{20}")
 PHONE_KEY = re.compile(r"phone|mobile|\btel\b|telephone", re.I)
 ADDRESS_KEY = re.compile(r"address|street|post_?code|\bzip\b|billing_zip|shipping_zip", re.I)
 # keys whose value is the charity's own wording (templates), never donor data
-SKIP_KEYS = {"subject_template", "body_template", "body_html_template"}
+# the charity's own sending mailbox address (set by the server, never a donor's): shown as is
+SKIP_KEYS = {"subject_template", "body_template", "body_html_template", "mailbox_email"}
 
 EXCLUDED_PREFIXES = ("/api/auth/", "/api/rbac/", "/api/ops/", "/api/mailbox/", "/api/admin/users", "/api/admin/companies",
                      "/api/tracker/outlook/status", "/api/stream/", "/api/webhooks/", "/api/email-unsubscribe/",

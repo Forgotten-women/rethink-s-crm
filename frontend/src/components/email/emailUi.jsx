@@ -11,6 +11,42 @@ export const FIELD = 'w-full rounded-lg border bg-white text-slate-900 border-sl
 export const LABEL = 'flex flex-col gap-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300';
 export const CARD = 'rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-900/60 p-3';
 
+// Which account an email goes out from. Sisters' Project has its own Microsoft 365 mailbox in Rethink's workspace,
+// so every compose screen says plainly which one it is (rose = Sisters' Project, sky = the charity's own).
+export function SendingFromBadge({ info, className = '' }) {
+  if (!info) return null;
+  const sp = !!info.separate;
+  const tone = !info.connected
+    ? 'bg-rose-50 border-rose-300 text-rose-800 dark:bg-rose-950/50 dark:border-rose-700 dark:text-rose-200'
+    : sp ? 'bg-pink-50 border-pink-300 text-pink-900 dark:bg-pink-950/40 dark:border-pink-700 dark:text-pink-100'
+      : 'bg-sky-50 border-sky-300 text-sky-900 dark:bg-sky-950/40 dark:border-sky-700 dark:text-sky-100';
+  return (
+    <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs ${tone} ${className}`} role="status">
+      <Mail className="w-4 h-4 shrink-0" />
+      <span className="min-w-0">
+        <span className="font-bold uppercase tracking-wider text-[10px] opacity-80">Sending from</span>{' '}
+        <b>{info.label} mailbox</b>
+        {info.connected
+          ? <> · <span className="font-mono">{info.mailbox_email}</span></>
+          : <> · <b>not connected</b> - connect the {info.label} mailbox in Email &gt; Mailbox before sending</>}
+      </span>
+    </div>
+  );
+}
+
+// Small tag on a sent / received email: the account it went through
+export function MailboxTag({ label, separate, address }) {
+  if (!label && !address) return null;
+  return (
+    <span title={address ? `${label ? label + ' mailbox: ' : ''}${address}` : undefined}
+      className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${separate
+        ? 'bg-pink-50 text-pink-800 border-pink-200 dark:bg-pink-950/40 dark:text-pink-200 dark:border-pink-800'
+        : 'bg-sky-50 text-sky-800 border-sky-200 dark:bg-sky-950/40 dark:text-sky-200 dark:border-sky-800'}`}>
+      {label || address}
+    </span>
+  );
+}
+
 export const VARIABLES = [
   ['donor_first_name', 'Donor first name'], ['donor_last_name', 'Donor last name'], ['donor_name', 'Donor full name'],
   ['first_name', 'First name (same as donor first name)'], ['last_name', 'Last name (same as donor last name)'], ['total_given', 'Lifetime given'], ['gifts_count', 'Number of gifts'],
@@ -130,6 +166,8 @@ export function PreviewFrame({
           </button>
         </span>
       </div>
+
+      {preview.sending_from && <SendingFromBadge info={preview.sending_from} className="rounded-none border-x-0 border-t-0" />}
 
       {/* Multiple Beneficiaries Detected */}
       {hasMultipleBeneficiaries && (
@@ -283,6 +321,7 @@ export function PreviewFrame({
               <span className="min-w-0 truncate"><b>{preview.subject || '(no subject)'}</b> <span className="text-slate-500">→ {preview.recipient_email}</span></span>
               <button type="button" autoFocus onClick={() => setBig(false)} aria-label="Close full-size preview" className="w-7 h-7 rounded-full flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"><X className="w-4 h-4" /></button>
             </div>
+            {preview.sending_from && <SendingFromBadge info={preview.sending_from} className="rounded-none border-x-0 border-t-0" />}
             <iframe title="Email preview, full size" sandbox="" srcDoc={preview.body_html} className="w-full flex-1 bg-white" />
           </div>
         </div>,

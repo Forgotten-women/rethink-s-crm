@@ -4,6 +4,7 @@ import { API_BASE_URL } from '../../config';
 import TrackerFilterBar from './TrackerFilterBar';
 import { readFiltersFromUrl, writeFiltersToUrl, filtersToParams, donorKeyFor } from './trackerUtils';
 import { denyUnless } from '../../access';
+import { SendingFromBadge } from '../email/emailUi';
 
 const TEMPLATE_LABELS = {
   profile_intro: 'Profile introduction',
@@ -390,6 +391,7 @@ if (denyUnless('email.send')) return;
                 <span>{preview.error}</span>
               </div>
             )}
+            {preview.data?.sending_from && <SendingFromBadge info={preview.data.sending_from} className="mx-4 mt-3" />}
             {preview.data && <iframe title="Queued email preview" sandbox="" srcDoc={preview.data.body_html} className="w-full h-[78vh] bg-white border-0" />}
             {preview.data && preview.item.status === 'pending' && (
               <div className="px-5 py-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3 bg-slate-50/60 dark:bg-slate-800/40">

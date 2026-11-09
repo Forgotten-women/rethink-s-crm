@@ -551,7 +551,9 @@ export default function App() {
     const done = (text) => {
       window.history.replaceState({}, document.title, '/');
       try { sessionStorage.setItem('crm_email_tab', 'mailbox'); } catch { /* ignore */ }
-      if (comp) { setActiveCompany(comp); localStorage.setItem('crm_active_company', comp); }
+      // 'sp_rethink' is Sisters' Project's own mailbox in Rethink's workspace: go back to Rethink
+      const charity = comp === 'sp_rethink' ? 'rethink' : comp;
+      if (charity) { setActiveCompany(charity); localStorage.setItem('crm_active_company', charity); }
       setActiveTab('email');
       window.alert(text);
     };

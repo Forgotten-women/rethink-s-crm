@@ -43,8 +43,12 @@ GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 GOOGLE_REVOKE = "https://oauth2.googleapis.com/revoke"
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GMAIL_SCOPES = "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly"
-DEFAULT_PROVIDER = {"iqra": "gmail", "rethink": "outlook"}
+DEFAULT_PROVIDER = {"iqra": "gmail", "rethink": "outlook", "sp_rethink": "outlook"}
 PROVIDERS = ("gmail", "outlook")
+# Mailboxes of their own inside a charity: Sisters' Project emails (the SP theme) in Rethink's workspace are sent
+# from SP's Microsoft 365 account, never Rethink's (and Rethink's emails never from SP's). Key -> owning charity.
+SEPARATE_MAILBOXES = {"sp_rethink": "rethink"}
+MAILBOX_LABELS = {"rethink": "Rethink", "iqra": "Iqra", "sp_rethink": "Sisters' Project"}
 
 
 def _db() -> sqlite3.Connection:
@@ -70,6 +74,56 @@ def _owner(company_id: Optional[str]) -> str:
     return "iqra" if c in ("iqra", "sp") else ("rethink" if c in ("rethink", "sp_rethink") else c)
 
 
+def _mbx(key: Optional[str]) -> str:
+    """Mailbox key: a separate mailbox (e.g. 'sp_rethink') stays itself; anything else is the charity's own."""
+    k = str(key or "").strip().lower()
+    return k if k in SEPARATE_MAILBOXES else _owner(k)
+
+
+def mailbox_for(company_id: Optional[str], theme: Optional[str] = None) -> str:
+    """The mailbox an email goes out from: the theme's own mailbox if it has one in this charity, else the charity's."""
+    t = str(theme or "").strip().lower()
+    comp = _owner(company_id)
+    return t if SEPARATE_MAILBOXES.get(t) == comp else comp
+
+
+def mailbox_company(key: Optional[str]) -> str:
+    """The charity a mailbox belongs to (where its sent emails and replies are recorded)."""
+    k = str(key or "").strip().lower()
+    return SEPARATE_MAILBOXES.get(k) or _owner(k)
+
+
+def mailbox_label(key: Optional[str]) -> str:
+    k = _mbx(key)
+    return MAILBOX_LABELS.get(k, k.title())
+
+
+def mailbox_keys(company_id: Optional[str]) -> List[str]:
+    """The charity's main mailbox first, then its separate ones."""
+    comp = _owner(company_id)
+    return [comp] + [k for k, c in SEPARATE_MAILBOXES.items() if c == comp]
+
+
+def sending_from(company_id: Optional[str], theme: Optional[str] = None) -> Dict[str, Any]:
+    """What a compose screen shows: which account this email will be sent from."""
+    key = mailbox_for(company_id, theme)
+    return {"mailbox": key, "label": mailbox_label(key), "mailbox_email": sender_address(key), "connected": is_connected(key),
+            "provider": provider(key), "separate": key in SEPARATE_MAILBOXES}
+
+
+def mailbox_labels_by_address(company_id: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    """Connected address -> {label, mailbox, separate}, to tag history with the account each email went through."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for k in mailbox_keys(company_id):
+        try:
+            addr = (sender_address(k) or "").strip().lower()
+        except Exception:
+            addr = ""
+        if addr:
+            out[addr] = {"label": mailbox_label(k), "mailbox": k, "separate": k in SEPARATE_MAILBOXES}
+    return out
+
+
 def _get_env_google_creds(comp: str) -> Dict[str, Optional[str]]:
     prefix = comp.upper()
     return {
@@ -82,7 +136,7 @@ def _get_env_google_creds(comp: str) -> Dict[str, Optional[str]]:
 
 
 def provider(company_id: str) -> str:
-    comp = _owner(company_id)
+    comp = _mbx(company_id)
     conn = _db()
     try:
         r = conn.execute("SELECT provider FROM mailbox_settings WHERE company_id = ?", (comp,)).fetchone()
@@ -129,7 +183,7 @@ def _gmail_row(comp: str) -> Optional[sqlite3.Row]:
 
 
 def is_connected(company_id: str) -> bool:
-    comp = _owner(company_id)
+    comp = _mbx(company_id)
     if provider(comp) == "gmail":
         r = _gmail_row(comp)
         return bool(r and r["refresh_token"])
@@ -139,7 +193,7 @@ def is_connected(company_id: str) -> bool:
 
 
 def sender_address(company_id: str) -> Optional[str]:
-    comp = _owner(company_id)
+    comp = _mbx(company_id)
     if provider(comp) == "gmail":
         r = _gmail_row(comp)
         if r and r["connected_email"]:
@@ -202,7 +256,7 @@ def _plain_text(html: str) -> str:
 def send_email(company_id: str, to: List[Tuple[str, Optional[str]]], subject: str, html: str) -> Dict[str, Any]:
     """Sends one email from the charity's own mailbox. Returns ok, http_status, detail, message_id, thread_id, sender
     (message/thread ids only for Gmail - Microsoft's sendMail doesn't return them)."""
-    comp = _owner(company_id)
+    comp = _mbx(company_id)
     to = [(a.strip(), n) for a, n in to if a and "@" in a]
     if not to:
         return {"ok": False, "http_status": None, "detail": "No valid recipient"}
@@ -307,7 +361,7 @@ def sync_gmail_replies(company_id: str) -> Dict[str, Any]:
 
 
 def sync_replies(company_id: str) -> Dict[str, Any]:
-    comp = _owner(company_id)
+    comp = _mbx(company_id)
     if provider(comp) == "gmail":
         return sync_gmail_replies(comp)
     from backend.api.tracker import sync_inbound_outlook_replies
@@ -352,6 +406,9 @@ def mailbox_status(company_id: str = Query(...), user: Dict[str, Any] = Depends(
     comp = _company(user, company_id)
     prov = provider(comp)
     out: Dict[str, Any] = {"company_id": comp, "provider": prov, "connected": is_connected(comp), "connected_email": sender_address(comp)}
+    # every mailbox of this charity (its own + separate ones such as Sisters' Project), for the screens that show them
+    out["mailboxes"] = [{"mailbox": k, "label": mailbox_label(k), "provider": provider(k), "connected": is_connected(k),
+                         "connected_email": sender_address(k), "separate": k in SEPARATE_MAILBOXES} for k in mailbox_keys(comp)]
     if prov == "gmail":
         r = _gmail_row(comp)
         env_creds = _get_env_google_creds(comp)
