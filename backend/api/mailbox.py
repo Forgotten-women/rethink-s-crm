@@ -368,6 +368,23 @@ def sync_replies(company_id: str) -> Dict[str, Any]:
     return sync_inbound_outlook_replies(comp)
 
 
+def sync_all_replies(company_id: str) -> Dict[str, Any]:
+    """New replies from every mailbox of the charity (its own and separate ones such as Sisters' Project)."""
+    total, per = 0, {}
+    for k in mailbox_keys(company_id):
+        if not is_connected(k):
+            per[k] = "not_connected"
+            continue
+        try:
+            r = sync_replies(k)
+        except Exception as e:
+            r = {"status": f"error: {e}"}
+        per[k] = r.get("status")
+        total += int(r.get("synced_new_replies") or 0)
+    return {"status": "success" if any(v == "success" for v in per.values()) else next(iter(per.values()), "not_connected"),
+            "synced_new_replies": total, "mailboxes": per}
+
+
 def gmail_companies() -> List[str]:
     conn = _db()
     try:
@@ -584,4 +601,4 @@ def mailbox_test_send(payload: TestSend, user: Dict[str, Any] = Depends(get_curr
 @router.post("/sync-replies")
 def mailbox_sync_replies(company_id: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
     comp = _company(user, company_id)
-    return sync_replies(comp)
+    return sync_all_replies(comp)

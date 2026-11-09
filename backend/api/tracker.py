@@ -5093,7 +5093,8 @@ async def outlook_graph_webhook(request: Request):
     return Response(status_code=202)
 
 
-def _match_reply_sender(cur, company_id: str, sender_email: str, conv_id: str = "", received_at: Optional[str] = None):
+def _match_reply_sender(cur, company_id: str, sender_email: str, conv_id: str = "", received_at: Optional[str] = None,
+                        mailbox: str = ""):
     """(allocation_id, allocation_donor_id) the reply belongs to, most precise evidence first:
       1. the Outlook conversation of an email we sent (exact sponsorship + donor);
       2. the most recent email we sent to this address before the reply arrived;
@@ -5108,11 +5109,13 @@ def _match_reply_sender(cur, company_id: str, sender_email: str, conv_id: str = 
             return row[0], row[1] or _donor_row_for_email(cur, row[0], sender)
     if not sender:
         return None, None
+    # an email sent from the mailbox the reply came into first (Rethink and Sisters' Project have their own)
     row = cur.execute("""
         SELECT allocation_id, allocation_donor_id FROM sponsorship_communications
         WHERE company_id = ? AND direction = 'outbound' AND LOWER(TRIM(recipient_email)) = ?
           AND sent_at <= COALESCE(REPLACE(REPLACE(?, 'T', ' '), 'Z', ''), CURRENT_TIMESTAMP)
-        ORDER BY sent_at DESC LIMIT 1""", (company_id, sender, received_at)).fetchone()
+        ORDER BY (LOWER(COALESCE(sender_email, '')) = ?) DESC, sent_at DESC LIMIT 1""",
+                      (company_id, sender, received_at, (mailbox or "").strip().lower())).fetchone()
     if row:
         return row[0], row[1] or _donor_row_for_email(cur, row[0], sender)
     row = cur.execute("""
@@ -5202,7 +5205,7 @@ def _backfill_conversation_ids(company_id: str) -> Dict[str, Any]:
 
 
 def _record_direct_reply(cur, company_id: str, msg_id: str, conv_id: str, subject: str, body_preview: str,
-                         sender_email: str, received_at: Optional[str]) -> bool:
+                         sender_email: str, received_at: Optional[str], mailbox: str = "") -> bool:
     """A reply to an email sent from the Email section / Donors (crm_email_messages) rather than a sponsorship
     email: recorded in crm_email_replies so the donor's thread is complete. It belongs to the direct email when
     that is the latest thing we sent this person before the reply and the reply isn't in a sponsorship
@@ -5217,19 +5220,26 @@ def _record_direct_reply(cur, company_id: str, msg_id: str, conv_id: str, subjec
         if conv_id and cur.execute("""SELECT 1 FROM sponsorship_communications WHERE company_id = ? AND direction = 'outbound'
                                       AND thread_id = ? LIMIT 1""", (company_id, conv_id)).fetchone():
             return False  # a reply in a sponsorship email's conversation
-        direct = cur.execute("""SELECT id, REPLACE(sent_at, 'T', ' ') FROM crm_email_messages
+        mbx = (mailbox or "").strip().lower()  # the mailbox the reply came into: its own emails first
+        direct = cur.execute("""SELECT id, REPLACE(sent_at, 'T', ' '), LOWER(COALESCE(sender_email, '')) FROM crm_email_messages
                                 WHERE company_id = ? AND LOWER(recipient_email) = ? AND status = 'sent'
-                                  AND REPLACE(sent_at, 'T', ' ') <= ? ORDER BY sent_at DESC LIMIT 1""",
-                             (company_id, sender, when)).fetchone()
+                                  AND REPLACE(sent_at, 'T', ' ') <= ?
+                                ORDER BY (LOWER(COALESCE(sender_email, '')) = ?) DESC, sent_at DESC LIMIT 1""",
+                             (company_id, sender, when, mbx)).fetchone()
     except sqlite3.OperationalError:
         return False
     if not direct:
         return False
-    spons = cur.execute("""SELECT MAX(REPLACE(sent_at, 'T', ' ')) FROM sponsorship_communications WHERE company_id = ?
-                           AND direction = 'outbound' AND LOWER(TRIM(recipient_email)) = ? AND REPLACE(sent_at, 'T', ' ') <= ?""",
-                        (company_id, sender, when)).fetchone()[0]
+    direct_from_mbx = bool(mbx) and direct[2] == mbx
+    spons_sql = """SELECT MAX(REPLACE(sent_at, 'T', ' ')) FROM sponsorship_communications WHERE company_id = ?
+                   AND direction = 'outbound' AND LOWER(TRIM(recipient_email)) = ? AND REPLACE(sent_at, 'T', ' ') <= ?"""
+    if mbx and not direct_from_mbx and cur.execute(spons_sql + " AND LOWER(COALESCE(sender_email, '')) = ?",
+                                                    (company_id, sender, when, mbx)).fetchone()[0]:
+        return False  # this mailbox sent them a sponsorship email, but no direct email: it's a sponsorship reply
+    spons = cur.execute(spons_sql + (" AND LOWER(COALESCE(sender_email, '')) = ?" if direct_from_mbx else ""),
+                        (company_id, sender, when, *([mbx] if direct_from_mbx else []))).fetchone()[0]
     if spons and spons > direct[1]:
-        return False  # the latest email they got was a sponsorship one
+        return False  # the latest email they got (from this mailbox) was a sponsorship one
     cur.execute("""INSERT OR IGNORE INTO crm_email_replies (company_id, message_id, conversation_id, reply_to_id, sender_email,
                                                        subject, body_preview, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (company_id, msg_id, conv_id, direct[0], sender, subject, body_preview, when))
@@ -5246,10 +5256,11 @@ def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subje
     if cur.execute("SELECT 1 FROM sponsorship_communications WHERE message_id = ? AND company_id = ?",
                    (msg_id, company_id)).fetchone():
         return False
-    direct = _record_direct_reply(cur, company_id, msg_id, conv_id, subject, body_preview, sender_email, received_at)
+    direct = _record_direct_reply(cur, company_id, msg_id, conv_id, subject, body_preview, sender_email, received_at,
+                                  recipient_email)
     if direct:
         return direct is True
-    alloc_id, alloc_donor_id = _match_reply_sender(cur, company_id, sender_email, conv_id, received_at)
+    alloc_id, alloc_donor_id = _match_reply_sender(cur, company_id, sender_email, conv_id, received_at, recipient_email)
     if not alloc_id:
         return False
     cur.execute("""
@@ -5275,8 +5286,9 @@ def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subje
         WHERE allocation_id = ? AND direction = 'outbound'
           AND (allocation_donor_id = ? OR LOWER(TRIM(recipient_email)) = ? OR LOWER(recipient_email) LIKE ?)
           AND sent_at <= COALESCE(REPLACE(REPLACE(?, 'T', ' '), 'Z', ''), CURRENT_TIMESTAMP)
-        ORDER BY sent_at DESC LIMIT 1
-    """, (alloc_id, alloc_donor_id, (sender_email or '').strip().lower(), f"%{(sender_email or '').strip().lower()}%", received_at)).fetchone()
+        ORDER BY (LOWER(COALESCE(sender_email, '')) = ?) DESC, sent_at DESC LIMIT 1
+    """, (alloc_id, alloc_donor_id, (sender_email or '').strip().lower(), f"%{(sender_email or '').strip().lower()}%", received_at,
+          (recipient_email or '').strip().lower())).fetchone()
     if target:
         cur.execute("""
             UPDATE sponsorship_communications SET delivery_status = 'replied',
@@ -5371,8 +5383,8 @@ def run_mailbox_maintenance() -> Dict[str, Any]:
 def trigger_sync_replies(company_id: Optional[str] = Query("rethink"), current_user = Depends(get_current_user)):
     """On-demand sync of recent donor replies from the charity's mailbox (Microsoft 365 or Gmail)."""
     comp = (company_id or "rethink").strip().lower()
-    from backend.api.mailbox import sync_replies
-    return sync_replies(comp)
+    from backend.api.mailbox import SEPARATE_MAILBOXES, sync_all_replies, sync_replies
+    return sync_replies(comp) if comp in SEPARATE_MAILBOXES else sync_all_replies(comp)
 # ==========================================
 # 9. TEMPLATES & COMMUNICATIONS HISTORY
 # ==========================================
@@ -6310,7 +6322,8 @@ def get_allocation_communications(allocation_id: int):
         cur.execute("SELECT company_id FROM sponsorship_allocations WHERE id = ?", (allocation_id,))
         a_row = cur.fetchone()
         if a_row:
-            sync_inbound_outlook_replies(a_row["company_id"])
+            from backend.api.mailbox import sync_all_replies
+            sync_all_replies(a_row["company_id"])  # the charity's mailbox and Sisters' Project's
 
         cur.execute("""
             SELECT c.id, c.allocation_id, c.company_id, c.direction, c.message_id,
