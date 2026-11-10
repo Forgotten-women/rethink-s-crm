@@ -82,7 +82,11 @@ if (denyUnless('email.send')) return;
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-sm font-black" style={{ color: 'var(--text-main)' }}>{c.name}</span>
                 <span className={`text-[11px] px-2 py-0.5 rounded-full font-bold ${STATUS_TONE[c.status] || ''}`}>{c.status}</span>
-                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{c.template_type?.replace(/_/g, ' ')} · {c.theme} · {String(c.created_at || '').slice(0, 16)} {c.created_by ? `· ${c.created_by}` : ''}</span>
+                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  {c.template_type?.replace(/_/g, ' ')} · {c.theme} · {String(c.created_at || '').slice(0, 16)}
+                  {c.sender_email ? ` · from ${c.sender_email}` : ''}
+                  {c.created_by ? ` · by ${c.created_by}` : ''}
+                </span>
               </div>
               {c.segment && <div className="text-[11px] mt-1" style={{ color: 'var(--text-muted)' }}>{segmentChips(c.segment).map(x => x.text).join(' · ')}</div>}
               <div className="flex gap-4 mt-2 text-sm tabular-nums" style={{ color: 'var(--text-main)' }}>

@@ -387,6 +387,7 @@ class BeneficiaryCreateRequest(BaseModel):
     profile_link: Optional[str] = ""
     video_link: Optional[str] = ""
     status: Optional[str] = "Unallocated"
+    team: Optional[str] = "RT"
     company_id: Optional[str] = "rethink"
 
 class BeneficiaryUpdateRequest(BaseModel):
@@ -398,6 +399,14 @@ class BeneficiaryUpdateRequest(BaseModel):
     profile_link: Optional[str] = None
     video_link: Optional[str] = None
     status: Optional[str] = None
+    team: Optional[str] = None
+
+class BeneficiaryStatusUpdateRequest(BaseModel):
+    communication_status: Optional[str] = None
+    status: Optional[str] = None
+    team: Optional[str] = None
+    admin_notes: Optional[str] = None
+    company_id: Optional[str] = "rethink"
 
 class AllocationDonorInput(BaseModel):
     donor_id: Optional[str] = ""
@@ -952,8 +961,13 @@ def get_beneficiaries(
     location: Optional[str] = Query(None),
     funded_status: Optional[str] = Query(None),
     needs_review: Optional[bool] = Query(None),
+    team: Optional[str] = Query(None),
+    communication_status: Optional[str] = Query(None),
+    contact_status: Optional[str] = Query(None),
+    media_status: Optional[str] = Query(None),
+    renewal_status: Optional[str] = Query(None),
 ):
-    """Returns list of beneficiaries with allocation status and feedback counts."""
+    """Returns list of beneficiaries with allocation status, team badges, media assets, and feedback counts."""
     comp = (company_id or "rethink").strip().lower()
     conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
@@ -971,13 +985,22 @@ def get_beneficiaries(
                 b.profile_link,
                 b.video_link,
                 b.status,
+                COALESCE(b.team, a.community_name, 'RT') AS team,
                 b.created_at,
                 b.updated_at,
                 a.id AS allocation_id,
                 a.donor_name,
                 a.donor_email,
                 a.donor_id,
+                a.donor_phone,
                 a.allocated_amount,
+                a.allocation_type,
+                a.campaign_name,
+                a.community_name,
+                a.renewal_status,
+                a.renewal_count,
+                a.start_date,
+                a.end_date,
                 a.communication_status,
                 a.last_contacted_at,
                 a.last_replied_at,
@@ -1003,6 +1026,51 @@ def get_beneficiaries(
             else:
                 query += " AND b.status = ?"
                 params.append(status)
+        if team and team.lower() != "all":
+            t_clean = team.strip().upper()
+            query += " AND (UPPER(COALESCE(b.team, a.community_name, 'RT')) = ? OR UPPER(a.community_name) = ?)"
+            params.extend([t_clean, t_clean])
+        if communication_status and communication_status.lower() != "all":
+            cs = communication_status.lower().strip()
+            if cs in ("pending", "profile pending", "not mailed", "never mailed", "unmailed"):
+                query += " AND (a.communication_status IS NULL OR a.communication_status IN ('Pending', 'Profile Pending', 'pending', '') OR a.last_contacted_at IS NULL)"
+            elif cs in ("first mailed", "first_mailed", "profile sent", "welcome sent"):
+                query += " AND a.communication_status IN ('First Mailed', 'Profile Sent', 'Welcome Sent')"
+            elif cs in ("update sent", "update_sent", "video sent"):
+                query += " AND a.communication_status IN ('Update Sent', 'Video Sent')"
+            elif cs in ("feedback sent", "feedback_sent", "report sent"):
+                query += " AND a.communication_status IN ('Feedback Sent', 'Annual Report Sent')"
+            elif cs in ("renewal sent", "renewal_sent"):
+                query += " AND a.communication_status IN ('Renewal Sent', 'Renewal Active')"
+            elif cs in ("replied", "donor replied"):
+                query += " AND a.communication_status = 'Donor Replied'"
+            else:
+                query += " AND LOWER(a.communication_status) = ?"
+                params.append(cs)
+        if contact_status and contact_status.lower() != "all":
+            if contact_status.lower() == "contacted":
+                query += " AND (a.last_contacted_at IS NOT NULL OR EXISTS (SELECT 1 FROM sponsorship_communications sc WHERE sc.allocation_id = a.id))"
+            elif contact_status.lower() == "not_contacted":
+                query += " AND (a.last_contacted_at IS NULL AND NOT EXISTS (SELECT 1 FROM sponsorship_communications sc WHERE sc.allocation_id = a.id))"
+        if media_status and media_status.lower() != "all":
+            ms = media_status.lower().strip()
+            if ms == "has_video":
+                query += " AND b.video_link IS NOT NULL AND b.video_link != ''"
+            elif ms == "missing_video":
+                query += " AND (b.video_link IS NULL OR b.video_link = '')"
+            elif ms == "has_profile":
+                query += " AND b.profile_link IS NOT NULL AND b.profile_link != ''"
+            elif ms == "missing_profile":
+                query += " AND (b.profile_link IS NULL OR b.profile_link = '')"
+            elif ms == "has_folder":
+                query += " AND b.donor_folder_link IS NOT NULL AND b.donor_folder_link != ''"
+            elif ms == "missing_folder":
+                query += " AND (b.donor_folder_link IS NULL OR b.donor_folder_link = '')"
+        if renewal_status and renewal_status.lower() != "all":
+            if renewal_status.lower() == "renewal":
+                query += " AND a.renewal_status = 'renewal'"
+            elif renewal_status.lower() == "active":
+                query += " AND (a.renewal_status = 'active' OR a.renewal_status IS NULL)"
         if search:
             query += (" AND (b.name LIKE ? OR b.project_code LIKE ? OR b.location LIKE ? OR a.donor_name LIKE ? OR a.donor_email LIKE ?"
                       " OR EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
@@ -1023,6 +1091,10 @@ def get_beneficiaries(
         query += " ORDER BY b.created_at DESC"
         cur.execute(query, params)
         rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["team"] = r.get("team") or r.get("community_name") or "RT"
+            if not r.get("communication_status"):
+                r["communication_status"] = "Pending Profile" if r.get("allocation_id") else ""
         _attach_donors_and_funding(cur, rows, alloc_key="allocation_id")
         if funded_status and funded_status != "all":
             rows = [r for r in rows if r["funding_status"] == funded_status]
@@ -1308,6 +1380,9 @@ def update_beneficiary(beneficiary_id: int, payload: BeneficiaryUpdateRequest):
         if payload.status is not None:
             fields.append("status = ?")
             values.append(payload.status.strip())
+        if payload.team is not None:
+            fields.append("team = ?")
+            values.append(payload.team.strip().upper())
 
         if fields:
             fields.append("updated_at = CURRENT_TIMESTAMP")
@@ -1316,6 +1391,165 @@ def update_beneficiary(beneficiary_id: int, payload: BeneficiaryUpdateRequest):
             conn.commit()
 
         return {"status": "success", "message": "Beneficiary updated successfully."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@router.get("/beneficiaries/{beneficiary_id}")
+def get_beneficiary_details(beneficiary_id: int):
+    """Returns single beneficiary with full allocation, donors list, and feedback history."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                b.id,
+                b.company_id,
+                b.sponsorship_type,
+                b.name,
+                b.location,
+                b.project_code,
+                b.donor_folder_link,
+                b.profile_link,
+                b.video_link,
+                b.status,
+                COALESCE(b.team, a.community_name, 'RT') AS team,
+                b.created_at,
+                b.updated_at,
+                a.id AS allocation_id,
+                a.donor_name,
+                a.donor_email,
+                a.donor_id,
+                a.donor_phone,
+                a.allocated_amount,
+                a.allocation_type,
+                a.campaign_name,
+                a.community_name,
+                a.renewal_status,
+                a.renewal_count,
+                a.start_date,
+                a.end_date,
+                a.communication_status,
+                a.last_contacted_at,
+                a.last_replied_at,
+                a.admin_notes
+            FROM sponsorship_beneficiaries b
+            LEFT JOIN sponsorship_allocations a ON b.id = a.beneficiary_id
+            WHERE b.id = ?
+        """, (beneficiary_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Beneficiary not found.")
+        
+        b_dict = dict(row)
+        b_dict["team"] = b_dict.get("team") or b_dict.get("community_name") or "RT"
+        if not b_dict.get("communication_status"):
+            b_dict["communication_status"] = "Pending Profile" if b_dict.get("allocation_id") else ""
+
+        # Feedbacks
+        cur.execute("""
+            SELECT id, feedback_title, feedback_date, year_label, report_link, video_link, donor_folder_link, notes, progress_summary, created_at
+            FROM sponsorship_feedbacks
+            WHERE beneficiary_id = ?
+            ORDER BY feedback_date DESC, created_at DESC
+        """, (beneficiary_id,))
+        b_dict["feedbacks"] = [dict(f) for f in cur.fetchall()]
+
+        # Collective Donors
+        alloc_id = b_dict.get("allocation_id")
+        if alloc_id:
+            cur.execute("""
+                SELECT id, role, donor_id, donor_name, donor_email, donor_phone, contribution_amount, is_primary, is_manual, source, needs_review, review_note
+                FROM sponsorship_allocation_donors
+                WHERE allocation_id = ?
+                ORDER BY is_primary DESC, id ASC
+            """, (alloc_id,))
+            b_dict["donors"] = [dict(d) for d in cur.fetchall()]
+
+            # Communications
+            cur.execute("""
+                SELECT id, template_type, direction, subject, sender_email, recipient_email, delivery_status, sent_at
+                FROM sponsorship_communications
+                WHERE allocation_id = ?
+                ORDER BY sent_at DESC
+                LIMIT 20
+            """, (alloc_id,))
+            b_dict["communications"] = [dict(c) for c in cur.fetchall()]
+        else:
+            b_dict["donors"] = []
+            b_dict["communications"] = []
+
+        return b_dict
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@router.patch("/beneficiaries/{beneficiary_id}/status")
+def patch_beneficiary_status(beneficiary_id: int, payload: BeneficiaryStatusUpdateRequest):
+    """Manually updates communication_status, allocation status, team, or notes for a beneficiary."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, company_id, name, status, team FROM sponsorship_beneficiaries WHERE id = ?", (beneficiary_id,))
+        ben = cur.fetchone()
+        if not ben:
+            raise HTTPException(status_code=404, detail="Beneficiary not found.")
+
+        # Update beneficiary table
+        b_fields = []
+        b_values = []
+        if payload.status is not None:
+            b_fields.append("status = ?")
+            b_values.append(payload.status.strip())
+        if payload.team is not None:
+            b_fields.append("team = ?")
+            b_values.append(payload.team.strip().upper())
+        if b_fields:
+            b_fields.append("updated_at = CURRENT_TIMESTAMP")
+            b_values.append(beneficiary_id)
+            cur.execute(f"UPDATE sponsorship_beneficiaries SET {', '.join(b_fields)} WHERE id = ?", b_values)
+
+        # Update allocation table if allocation exists
+        cur.execute("SELECT id, communication_status FROM sponsorship_allocations WHERE beneficiary_id = ?", (beneficiary_id,))
+        alloc_row = cur.fetchone()
+        if alloc_row:
+            alloc_id = alloc_row[0]
+            a_fields = []
+            a_values = []
+            if payload.communication_status is not None:
+                cs_clean = payload.communication_status.strip()
+                a_fields.append("communication_status = ?")
+                a_values.append(cs_clean)
+                if any(k in cs_clean.lower() for k in ["mailed", "sent", "replied"]):
+                    a_fields.append("last_contacted_at = COALESCE(last_contacted_at, CURRENT_TIMESTAMP)")
+            if payload.team is not None:
+                a_fields.append("community_name = ?")
+                a_values.append(payload.team.strip().upper())
+            if payload.admin_notes is not None:
+                a_fields.append("admin_notes = ?")
+                a_values.append(payload.admin_notes.strip())
+            if a_fields:
+                a_fields.append("updated_at = CURRENT_TIMESTAMP")
+                a_values.append(alloc_id)
+                cur.execute(f"UPDATE sponsorship_allocations SET {', '.join(a_fields)} WHERE id = ?", a_values)
+
+        conn.commit()
+        return {
+            "status": "success",
+            "message": "Status updated successfully.",
+            "beneficiary_id": beneficiary_id,
+            "communication_status": payload.communication_status,
+            "team": payload.team,
+            "allocation_status": payload.status
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -4195,7 +4429,14 @@ def disconnect_outlook(company_id: Optional[str] = Query("rethink"), current_use
 # ==========================================
 
 _DEFAULT_THEME_FOR_COMPANY = {"rethink": "rethink", "iqra": "iqra"}
-_STATUS_FOR_TEMPLATE = {"video_update": "Video Sent", "end_year_feedback": "Feedback Sent"}
+_STATUS_FOR_TEMPLATE = {
+    "profile_intro": "First Mailed",
+    "video_update": "Update Sent",
+    "end_year_feedback": "Feedback Sent",
+    "campaign_update": "Update Sent",
+    "renewal_notice": "Renewal Sent",
+    "general_custom": "Update Sent",
+}
 
 
 def _resolve_theme(allocation_company: str, requested_theme: Optional[str]) -> str:
@@ -4510,7 +4751,7 @@ def deliver_rendered_email(rendered: Dict[str, Any], allocation_id: int, base_ur
         cur.execute("""
             UPDATE sponsorship_allocations SET communication_status = ?, last_contacted_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        """, (_STATUS_FOR_TEMPLATE.get(rendered["template_type"], "Profile Sent"), allocation_id))
+        """, (_STATUS_FOR_TEMPLATE.get(rendered["template_type"], "First Mailed"), allocation_id))
         cur.execute("""
             UPDATE sponsorship_email_queue SET status = 'sent', sent_comm_id = ?, updated_at = CURRENT_TIMESTAMP
             WHERE allocation_donor_id = ? AND template_type = ? AND status = 'pending'
@@ -4821,11 +5062,7 @@ def send_outlook_message(payload: OutlookSendRequest, request: Request, current_
             tracking_id
         ))
 
-        new_status = "Profile Sent"
-        if payload.template_type == "video_update":
-            new_status = "Video Sent"
-        elif payload.template_type == "end_year_feedback":
-            new_status = "Feedback Sent"
+        new_status = _STATUS_FOR_TEMPLATE.get(payload.template_type, "First Mailed")
 
         cur.execute("""
             UPDATE sponsorship_allocations SET
@@ -5399,27 +5636,29 @@ if not _PUBLIC_APP_BASE.startswith("http"):
 # Publicly hosted, fast, email-client compliant HTTPS logo URLs (prevents Gmail 102KB clipping & raw text leaks)
 _RETHINK_EMAIL_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/rethink_email_logo.png"
 _RETHINK_LOGO_URI = _RETHINK_EMAIL_LOGO_URI
+_RETHINK_BLACK_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/rethink_black_logo.png"
 _IQRA_EMAIL_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/iqra_email_logo.png"
 _IQRA_LOGO_URI = _IQRA_EMAIL_LOGO_URI
 _SP_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/sp_logo.png"
+_SP_RETHINK_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/sp_rethink_logo.png"
 
 # SP Single Unified Header: "Powered by" + Sisters' Project logo ✕ Rethink Charity logo
 _SP_COLLAB_HEADER = f'''
 <table border="0" cellpadding="0" cellspacing="0" width="100%">
   <tr>
     <td align="center" style="padding: 4px 0;">
-      <p style="margin: 0 0 12px 0; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: rgba(255,255,255,0.85); font-family: 'Segoe UI', Arial, sans-serif;">Powered by</p>
+      <p style="margin: 0 0 12px 0; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: #881337; font-family: 'Segoe UI', Arial, sans-serif;">Powered by</p>
       <table border="0" cellpadding="0" cellspacing="0" style="display: inline-table; margin: 0 auto;">
         <tr>
           <td align="center" valign="middle" style="padding: 0 10px;">
-            <img src="{_SP_LOGO_URI}" alt="Sisters' Project" width="115" height="auto"
+            <img src="{_SP_RETHINK_LOGO_URI}" alt="Sisters' Project" width="115" height="auto"
               style="display: block; width: 115px; max-width: 115px; border: 0;" />
           </td>
           <td align="center" valign="middle" style="padding: 0 6px;">
-            <div style="display: inline-block; width: 26px; height: 26px; background: rgba(255,255,255,0.22); border-radius: 50%; text-align: center; line-height: 26px; font-size: 14px; font-weight: 900; color: #FFFFFF; font-family: Arial, sans-serif;">&#215;</div>
+            <div style="display: inline-block; width: 26px; height: 26px; background: rgba(136,19,55,0.12); border-radius: 50%; text-align: center; line-height: 26px; font-size: 14px; font-weight: 900; color: #881337; font-family: Arial, sans-serif;">&#215;</div>
           </td>
           <td align="center" valign="middle" style="padding: 0 10px;">
-            <img src="{_RETHINK_EMAIL_LOGO_URI}" alt="Rethink Charity" width="130" height="auto"
+            <img src="{_RETHINK_BLACK_LOGO_URI}" alt="Rethink Charity" width="130" height="auto"
               style="display: block; width: 130px; max-width: 130px; border: 0;" />
           </td>
         </tr>
@@ -5526,22 +5765,22 @@ CHARITY_THEMES_CONFIG = {
         "card_bg_dark": "#881337",
         "card_border": "#FECDD3",
         "card_border_dark": "#9F1239",
-        "head_bg": "#881337",
-        "head_bg_dark": "#70092B",
+        "head_bg": "#EFE2D0",
+        "head_bg_dark": "#EFE2D0",
         "accent_color": "#BE123C",
         "accent_text": "#9F1239",
         "title_color": "#881337",
         "body_color": "#334155",
-        "detail_box_bg": "#FFF1F2",
-        "detail_box_border": "#FECDD3",
+        "detail_box_bg": "#EFE2D0",
+        "detail_box_border": "#DFD3C3",
         "logo_img_tag": _SP_COLLAB_HEADER,
         "team_name": "The Sisters' Project Team",
         "contact_email": "info@sistersproject.co.uk",
         "website_url": "https://www.sistersproject.co.uk",
         "website_display": "www.sistersproject.co.uk",
         "privacy_url": "https://www.sistersproject.co.uk/privacy-policy",
-        "footer_link_color": "#FFFFFF",
-        "footer_text_color": "#FECDD3"
+        "footer_link_color": "#881337",
+        "footer_text_color": "#881337"
     }
 }
 
@@ -5957,7 +6196,7 @@ DEFAULT_TEMPLATES_BY_CHARITY = {
             "body_html": _wrap_email_html_template(
                 "Sponsorship Welcome: Meet {beneficiary_name}",
                 """<p style="margin: 0 0 12px 0;">Thank you for your heartfelt support and sisterhood. We are delighted to share the profile of the beneficiary you are uplifting:</p>
-<div style="background-color: #FFF1F2; border: 1px solid #FECDD3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
+<div style="background-color: #EFE2D0; border: 1px solid #DFD3C3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Beneficiary Name:</strong> {beneficiary_name}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Sponsorship Type:</strong> {sponsorship_type}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Location:</strong> {location}</p>
@@ -5980,7 +6219,7 @@ DEFAULT_TEMPLATES_BY_CHARITY = {
             "body_html": _wrap_email_html_template(
                 "New Video Update for {beneficiary_name}",
                 """<p style="margin: 0 0 12px 0;">We are thrilled to share an exclusive video update regarding <strong>{beneficiary_name}</strong> ({project_code})!</p>
-<div style="background-color: #FFF1F2; border: 1px solid #FECDD3; border-radius: 8px; padding: 16px; margin: 14px 0; text-align: center;">
+<div style="background-color: #EFE2D0; border: 1px solid #DFD3C3; border-radius: 8px; padding: 16px; margin: 14px 0; text-align: center;">
   <p style="margin: 0 0 10px 0; font-size: 14px; font-weight: 600; color: #9F1239;">New Video Footage Available</p>
   <a href="{video_link}" target="_blank" style="display: inline-block; padding: 10px 22px; background-color: #BE123C; color: #FFFFFF; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 13.5px;">&#9658; Watch Video Update</a>
 </div>
@@ -5994,7 +6233,7 @@ DEFAULT_TEMPLATES_BY_CHARITY = {
             "body_html": _wrap_email_html_template(
                 "Annual Progress & Impact Report for {beneficiary_name}",
                 """<p style="margin: 0 0 12px 0;">We are pleased to present the annual progress report and well-being review for <strong>{beneficiary_name}</strong> ({location}).</p>
-<div style="background-color: #FFF1F2; border: 1px solid #FECDD3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
+<div style="background-color: #EFE2D0; border: 1px solid #DFD3C3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Beneficiary:</strong> {beneficiary_name}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Location:</strong> {location}</p>
   <p style="margin: 0 0 10px 0; font-size: 14px;"><strong>Cycle:</strong> {sponsorship_year}</p>
@@ -6010,7 +6249,7 @@ DEFAULT_TEMPLATES_BY_CHARITY = {
             "body_html": _wrap_email_html_template(
                 "Campaign Sponsorship Update: {beneficiary_name} ({campaign_name})",
                 """<p style="margin: 0 0 12px 0;">We are delighted to share a sponsorship milestone allocated under your campaign <strong>{campaign_name}</strong>!</p>
-<div style="background-color: #FFF1F2; border: 1px solid #FECDD3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
+<div style="background-color: #EFE2D0; border: 1px solid #DFD3C3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Assigned Beneficiary:</strong> {beneficiary_name}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Type:</strong> {sponsorship_type}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Location:</strong> {location}</p>
@@ -6034,7 +6273,7 @@ DEFAULT_TEMPLATES_BY_CHARITY = {
                 "Upcoming Sponsorship Renewal for {beneficiary_name} ({sponsorship_year})",
                 """<p style="margin: 0 0 12px 0;">As we approach the completion of this 12-month sponsorship period, we wanted to express our heartfelt gratitude for supporting <strong>{beneficiary_name}</strong> ({project_code}).</p>
 <p style="margin: 0 0 12px 0;">Your generosity has provided essential care, security, and empowerment over this past year.</p>
-<div style="background-color: #FFF1F2; border: 1px solid #FECDD3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
+<div style="background-color: #EFE2D0; border: 1px solid #DFD3C3; border-radius: 8px; padding: 14px 16px; margin: 14px 0;">
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Beneficiary:</strong> {beneficiary_name}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Sponsorship Year:</strong> {sponsorship_year}</p>
   <p style="margin: 0 0 6px 0; font-size: 14px;"><strong>Renewal Deadline:</strong> {renewal_deadline}</p>

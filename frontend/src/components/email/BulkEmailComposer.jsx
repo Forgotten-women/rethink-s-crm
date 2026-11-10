@@ -69,6 +69,11 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
   const [picked, setPicked] = useState([]);
   const [pickQuery, setPickQuery] = useState('');
   const [pickResults, setPickResults] = useState([]);
+  const [addMode, setAddMode] = useState('single'); // 'single' | 'multiple'
+  const [multipleEmailsText, setMultipleEmailsText] = useState('');
+  const [multipleLookupLoading, setMultipleLookupLoading] = useState(false);
+  const [multipleLookupResult, setMultipleLookupResult] = useState(null);
+  const [copiedMissing, setCopiedMissing] = useState(false);
   const [recipients, setRecipients] = useState(null);
   const [selected, setSelected] = useState(new Set());
   const [expanded, setExpanded] = useState(null);
@@ -139,6 +144,63 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
     return () => clearTimeout(t);
   }, [pickQuery, company]);
 
+  const handleBatchLookup = async (textToLookup) => {
+    const raw = (textToLookup ?? multipleEmailsText).trim();
+    if (!raw) return;
+    setMultipleLookupLoading(true);
+    try {
+      const res = await post('/api/tracker/direct-email/lookup-emails', {
+        company_id: company,
+        emails: raw,
+      });
+      setMultipleLookupResult(res);
+      if (res.matched && res.matched.length > 0) {
+        setPicked(prev => {
+          const existing = new Set(prev.map(p => (p.email || '').toLowerCase()));
+          const toAdd = res.matched
+            .filter(m => !existing.has((m.email || '').toLowerCase()))
+            .map(m => ({
+              donor_id: m.donor_id,
+              email: m.email,
+              name: m.name,
+              total: m.total,
+              gifts: m.gifts,
+              allocations: m.allocations,
+            }));
+          return [...prev, ...toAdd];
+        });
+
+        if (recipients?.recipients) {
+          const matchedSet = new Set(res.matched.map(m => (m.email || '').toLowerCase()));
+          setSelected(prev => {
+            const next = new Set(prev);
+            recipients.recipients.forEach(r => {
+              if (matchedSet.has((r.email || '').toLowerCase())) {
+                next.add(r.email);
+              }
+            });
+            return next;
+          });
+        }
+      }
+    } catch (err) {
+      setError(err.message || 'Failed to lookup emails');
+    } finally {
+      setMultipleLookupLoading(false);
+    }
+  };
+
+  const handlePickQueryChange = (val) => {
+    if (val.includes(',') || val.includes(';') || val.includes('\n')) {
+      setAddMode('multiple');
+      setMultipleEmailsText(val);
+      handleBatchLookup(val);
+      setPickQuery('');
+    } else {
+      setPickQuery(val);
+    }
+  };
+
   const extra = useMemo(() => extraText.split(/[\s,;]+/).map(s => s.trim()).filter(s => s.includes('@')).map(email => ({ email, name: '' })), [extraText]);
   const seg = useMemo(() => cleanSegment(segment), [segment]);
   const segActive = Object.keys(seg).length > 0;
@@ -158,7 +220,16 @@ export default function BulkEmailComposer({ company, initialSegment = {}, initia
 
   const chosen = useMemo(() => (recipients?.recipients || []).filter(r => selected.has(r.email)), [recipients, selected]);
   const shownList = useMemo(() => {
-    const q = listFilter.trim().toLowerCase();
+    const raw = listFilter.trim();
+    if (!raw) return (recipients?.recipients || []);
+    if (raw.includes(',') || raw.includes(';')) {
+      const parts = raw.split(/[,;]+/).map(p => p.trim().toLowerCase()).filter(Boolean);
+      return (recipients?.recipients || []).filter(r => {
+        const text = `${r.name} ${r.email} ${r.matched_causes} ${r.sponsorship_types}`.toLowerCase();
+        return parts.some(p => text.includes(p) || r.email.toLowerCase() === p);
+      });
+    }
+    const q = raw.toLowerCase();
     return (recipients?.recipients || []).filter(r => !q || `${r.name} ${r.email} ${r.matched_causes} ${r.sponsorship_types}`.toLowerCase().includes(q));
   }, [recipients, listFilter]);
 
@@ -325,24 +396,171 @@ if (denyUnless('email.campaigns')) return;
             <SegmentBuilder company={company} value={segment} onChange={setSegment} defaultOpen />
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
               <div className={`${CARD} flex flex-col gap-2`}>
-                <div className="text-xs font-bold text-slate-800 dark:text-slate-100">Add people by name</div>
-                <span className="relative">
-                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <input value={pickQuery} onChange={e => setPickQuery(e.target.value)} placeholder="Search name, email or phone" className={`${FIELD} pl-8 pr-2 py-1.5 text-xs`} />
-                </span>
-                {pickResults.map(d => (
-                  <button key={d.donor_id} type="button" disabled={!d.email} onClick={() => { setPicked(p => (p.some(x => x.email === d.email) ? p : [...p, { donor_id: d.donor_id, email: d.email, name: d.name }])); setPickQuery(''); }}
-                    className="text-left text-xs px-2 py-1.5 rounded-lg hover:bg-sky-500/10 disabled:opacity-40 flex justify-between gap-2 text-slate-800 dark:text-slate-100">
-                    <span className="truncate">{d.name || d.email} <span className="text-slate-500">{d.email || '(no email)'}</span></span><Plus className="w-3.5 h-3.5 shrink-0" />
-                  </button>
-                ))}
-                <div className="flex flex-wrap gap-1">
+                <div className="flex items-center justify-between gap-1 flex-wrap">
+                  <div className="text-xs font-bold text-slate-800 dark:text-slate-100">Add people</div>
+                  <div className="inline-flex rounded-lg bg-slate-100 dark:bg-slate-800 p-0.5 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => setAddMode('single')}
+                      className={`px-2 py-0.5 rounded-md font-semibold transition-all ${addMode === 'single' ? 'bg-white dark:bg-slate-700 text-sky-600 dark:text-sky-300 shadow-sm' : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'}`}
+                    >
+                      Search
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAddMode('multiple')}
+                      className={`px-2 py-0.5 rounded-md font-semibold transition-all flex items-center gap-1 ${addMode === 'multiple' ? 'bg-white dark:bg-slate-700 text-sky-600 dark:text-sky-300 shadow-sm' : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'}`}
+                    >
+                      <ListChecks className="w-3 h-3" /> Multiple emails
+                    </button>
+                  </div>
+                </div>
+
+                {addMode === 'single' ? (
+                  <>
+                    <span className="relative">
+                      <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                      <input
+                        value={pickQuery}
+                        onChange={e => handlePickQueryChange(e.target.value)}
+                        placeholder="Search name, email or phone (or paste comma list)"
+                        className={`${FIELD} pl-8 pr-2 py-1.5 text-xs`}
+                      />
+                    </span>
+                    {pickResults.map(d => (
+                      <button
+                        key={d.donor_id}
+                        type="button"
+                        disabled={!d.email}
+                        onClick={() => {
+                          setPicked(p => (p.some(x => x.email === d.email) ? p : [...p, { donor_id: d.donor_id, email: d.email, name: d.name }]));
+                          setPickQuery('');
+                        }}
+                        className="text-left text-xs px-2 py-1.5 rounded-lg hover:bg-sky-500/10 disabled:opacity-40 flex justify-between gap-2 text-slate-800 dark:text-slate-100"
+                      >
+                        <span className="truncate">{d.name || d.email} <span className="text-slate-500">{d.email || '(no email)'}</span></span>
+                        <Plus className="w-3.5 h-3.5 shrink-0" />
+                      </button>
+                    ))}
+                  </>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <textarea
+                      value={multipleEmailsText}
+                      onChange={e => setMultipleEmailsText(e.target.value)}
+                      rows={3}
+                      placeholder="Paste comma-separated emails, e.g.:&#10;donor1@gmail.com, donor2@example.com, donor3@org.uk"
+                      className={`${FIELD} px-2 py-1.5 text-xs font-mono`}
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] text-slate-500">
+                        {multipleEmailsText.trim() ? `${(multipleEmailsText.match(/@/g) || []).length} address(es) typed` : 'Separate with commas, spaces or lines'}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={multipleLookupLoading || !multipleEmailsText.trim()}
+                        onClick={() => handleBatchLookup()}
+                        className="px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs disabled:opacity-40 flex items-center gap-1 shadow-sm"
+                      >
+                        {multipleLookupLoading ? <RefreshCw className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                        {multipleLookupLoading ? 'Checking…' : 'Match & Select'}
+                      </button>
+                    </div>
+
+                    {/* Results / Breakdown */}
+                    {multipleLookupResult && (
+                      <div className="flex flex-col gap-1.5 p-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs">
+                        {/* Summary Pills */}
+                        <div className="flex flex-wrap items-center gap-1 text-[11px]">
+                          <span className="px-2 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 flex items-center gap-1">
+                            ✓ {multipleLookupResult.matched_count} Selected in CRM
+                          </span>
+                          {multipleLookupResult.missing_count > 0 && (
+                            <span className="px-2 py-0.5 rounded-full font-bold bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 flex items-center gap-1">
+                              ⚠ {multipleLookupResult.missing_count} Missing from CRM
+                            </span>
+                          )}
+                          {multipleLookupResult.invalid_count > 0 && (
+                            <span className="px-2 py-0.5 rounded-full font-bold bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 flex items-center gap-1">
+                              ✕ {multipleLookupResult.invalid_count} Invalid
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Missing breakdown */}
+                        {multipleLookupResult.missing_count > 0 && (
+                          <div className="mt-1 pt-1 border-t border-slate-200 dark:border-slate-700/60">
+                            <div className="flex items-center justify-between text-[11px] text-amber-700 dark:text-amber-400 font-semibold mb-1">
+                              <span>Missing from CRM database:</span>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(multipleLookupResult.missing.map(m => m.email).join(', '));
+                                    setCopiedMissing(true);
+                                    setTimeout(() => setCopiedMissing(false), 2000);
+                                  }}
+                                  className="px-1.5 py-0.5 rounded text-[10px] bg-amber-200/60 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200 hover:bg-amber-200"
+                                >
+                                  {copiedMissing ? '✓ Copied' : 'Copy missing'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const missingStr = multipleLookupResult.missing.map(m => m.email).join(', ');
+                                    setExtraText(prev => (prev ? `${prev}, ${missingStr}` : missingStr));
+                                  }}
+                                  className="px-1.5 py-0.5 rounded text-[10px] bg-sky-100 text-sky-800 dark:bg-sky-900/50 dark:text-sky-200 hover:bg-sky-200 font-semibold"
+                                >
+                                  + Add to send list anyway
+                                </button>
+                              </div>
+                            </div>
+                            <div className="max-h-20 overflow-y-auto flex flex-wrap gap-1">
+                              {multipleLookupResult.missing.map(m => (
+                                <span key={m.email} className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 text-[10px] border border-amber-200 dark:border-amber-800/50" title={m.reason}>
+                                  {m.email}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Invalid breakdown */}
+                        {multipleLookupResult.invalid_count > 0 && (
+                          <div className="mt-1 pt-1 border-t border-slate-200 dark:border-slate-700/60">
+                            <span className="text-[11px] text-rose-700 dark:text-rose-400 font-semibold block mb-1">
+                              Problematic / Invalid format:
+                            </span>
+                            <div className="max-h-16 overflow-y-auto flex flex-wrap gap-1">
+                              {multipleLookupResult.invalid.map((inv, idx) => (
+                                <span key={idx} className="px-1.5 py-0.5 rounded bg-rose-100 dark:bg-rose-950/60 text-rose-800 dark:text-rose-300 text-[10px] border border-rose-200 dark:border-rose-800/50" title={inv.reason}>
+                                  {inv.raw || '(blank)'}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Picked people chips */}
+                <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto mt-1">
                   {picked.map(p => (
-                    <span key={p.email} className="text-[11px] px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200 flex items-center gap-1">
-                      {p.name || p.email}<button type="button" onClick={() => setPicked(x => x.filter(y => y.email !== p.email))}><X className="w-3 h-3" /></button>
+                    <span key={p.email} className="text-[11px] px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200 flex items-center gap-1 shadow-sm">
+                      {p.name || p.email}
+                      <button type="button" onClick={() => setPicked(x => x.filter(y => y.email !== p.email))} className="hover:text-rose-600"><X className="w-3 h-3" /></button>
                     </span>
                   ))}
                 </div>
+                {picked.length > 0 && (
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100 dark:border-slate-800">
+                    <span><b>{picked.length}</b> person(s) picked</span>
+                    <button type="button" onClick={() => setPicked([])} className="text-rose-600 hover:underline">Clear all</button>
+                  </div>
+                )}
               </div>
               <div className={`${CARD} flex flex-col gap-2`}>
                 <div className="text-xs font-bold text-slate-800 dark:text-slate-100">Or type email addresses</div>
@@ -369,9 +587,14 @@ if (denyUnless('email.campaigns')) return;
                     {recipients.excluded_recently_emailed ? ` · ${recipients.excluded_recently_emailed} skipped (emailed recently)` : ''}
                   </span>
                   <span className="flex items-center gap-2">
-                    <input value={listFilter} onChange={e => setListFilter(e.target.value)} placeholder="Filter list" className={`${FIELD} !w-40 px-2 py-1 text-xs`} />
+                    <input value={listFilter} onChange={e => setListFilter(e.target.value)} placeholder="Filter name or comma emails" className={`${FIELD} !w-48 px-2 py-1 text-xs`} />
                     <button type="button" onClick={() => setSelected(new Set(recipients.recipients.map(r => r.email)))} className="text-xs font-semibold text-sky-600">All</button>
                     <button type="button" onClick={() => setSelected(new Set())} className="text-xs font-semibold text-sky-600">None</button>
+                    {listFilter.trim() && (
+                      <button type="button" onClick={() => setSelected(prev => new Set([...prev, ...shownList.map(r => r.email)]))} className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+                        Select filtered ({shownList.length})
+                      </button>
+                    )}
                   </span>
                 </div>
                 {recipients.count === 0 && <div className="px-3 py-6 text-center text-xs text-slate-500">Nobody with an email address matches these filters.</div>}

@@ -15,6 +15,7 @@ History lives in crm_email_campaigns / crm_email_messages; opens are tracked by 
 """
 import datetime
 import json
+import re
 import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -538,6 +539,125 @@ def recipients(req: RecipientsRequest):
     return {"count": len(rows), "excluded_recently_emailed": excluded, "recipients": rows}
 
 
+class EmailLookupRequest(BaseModel):
+    company_id: str
+    emails: Union[List[str], str]
+
+
+@router.post("/lookup-emails")
+def lookup_emails(req: EmailLookupRequest):
+    """Batch parses comma/newline/space-separated emails, checks them against CRM donors/sponsorships,
+    and returns matched donors, missing emails, and malformed/problem entries."""
+    comp = _company(req.company_id)
+    raw_tokens = []
+    if isinstance(req.emails, str):
+        raw_tokens = re.split(r"[\s,;\n\r]+", req.emails)
+    elif isinstance(req.emails, list):
+        for item in req.emails:
+            raw_tokens.extend(re.split(r"[\s,;\n\r]+", str(item or "")))
+
+    cleaned_tokens = [t.strip() for t in raw_tokens if t and t.strip()]
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_tokens = []
+    for t in cleaned_tokens:
+        lower = t.lower()
+        if lower not in seen:
+            seen.add(lower)
+            unique_tokens.append(t)
+
+    valid_emails = []
+    invalid_items = []
+
+    for t in unique_tokens:
+        # Check basic email validity
+        if "@" in t and "." in t.split("@")[-1] and len(t) >= 5:
+            if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", t):
+                valid_emails.append(t)
+            else:
+                invalid_items.append({"raw": t, "reason": "Invalid email format"})
+        else:
+            invalid_items.append({"raw": t, "reason": "Invalid email syntax"})
+
+    from backend.api.donors import _directory_data
+    frame, dx = _directory_data(comp)
+
+    matched = []
+    missing = []
+    matched_emails_lower = set()
+
+    if frame is not None and not frame.empty and valid_emails:
+        norm_map = {e.lower(): e for e in valid_emails}
+        hits = frame[frame["email"].fillna("").str.lower().isin(norm_map.keys())]
+        for r in hits.to_dict(orient="records"):
+            em = str(r.get("email") or "").strip()
+            em_lower = em.lower()
+            if em_lower in norm_map and em_lower not in matched_emails_lower:
+                matched_emails_lower.add(em_lower)
+                matched.append({
+                    "donor_id": _clean(r.get("donor_id")),
+                    "email": norm_map[em_lower],
+                    "name": _clean(r.get("name")) or "",
+                    "phone": _clean(r.get("phone")) or "",
+                    "total": _clean(r.get("total")),
+                    "gifts": _clean(r.get("gifts")),
+                    "allocations": _clean(r.get("allocations")) or 0,
+                    "sponsorship_types": _clean(r.get("sponsorship_types")) or "",
+                    "last_gift": str(_clean(r.get("last_gift")) or "")[:10]
+                })
+
+    # Check database sponsorship_allocations fallback if any are still missing
+    still_missing = [e for e in valid_emails if e.lower() not in matched_emails_lower]
+    if still_missing:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            placeholders = ",".join("?" for _ in still_missing)
+            cur = conn.execute(
+                f"""SELECT donor_id, donor_name, donor_email, donor_phone, COUNT(*) as alloc_count
+                    FROM sponsorship_allocations
+                    WHERE LOWER(donor_email) IN ({placeholders})
+                    GROUP BY LOWER(donor_email)""",
+                [e.lower() for e in still_missing]
+            )
+            for row in cur.fetchall():
+                em = row["donor_email"]
+                em_lower = em.lower()
+                if em_lower not in matched_emails_lower:
+                    matched_emails_lower.add(em_lower)
+                    matched.append({
+                        "donor_id": row["donor_id"] or em,
+                        "email": em,
+                        "name": row["donor_name"] or "",
+                        "phone": row["donor_phone"] or "",
+                        "total": None,
+                        "gifts": None,
+                        "allocations": row["alloc_count"],
+                        "sponsorship_types": "Sponsorship",
+                        "last_gift": ""
+                    })
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    # Remaining valid emails are missing from CRM
+    for e in valid_emails:
+        if e.lower() not in matched_emails_lower:
+            missing.append({"email": e, "reason": "Not found in CRM database"})
+
+    return {
+        "total": len(unique_tokens),
+        "matched_count": len(matched),
+        "missing_count": len(missing),
+        "invalid_count": len(invalid_items),
+        "matched": matched,
+        "missing": missing,
+        "invalid": invalid_items
+    }
+
+
 class PreviewRequest(BaseModel):
     company_id: str
     theme: Optional[str] = None
@@ -748,6 +868,7 @@ def list_campaigns(company_id: str = Query(...)):
     try:
         rows = [dict(r) for r in conn.execute("""
             SELECT c.id, c.name, c.template_type, c.theme, c.status, c.created_by, c.created_at, c.segment_json,
+                   MAX(m.sender_email) AS sender_email,
                    SUM(m.status = 'pending') AS pending, SUM(m.status = 'sent') AS sent, SUM(m.status = 'failed') AS failed,
                    SUM(m.status = 'skipped') AS skipped, SUM(COALESCE(m.open_count, 0) > 0) AS opened, COUNT(m.id) AS total
             FROM crm_email_campaigns c LEFT JOIN crm_email_messages m ON m.campaign_id = c.id

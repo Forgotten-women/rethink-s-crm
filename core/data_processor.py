@@ -2942,6 +2942,17 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
             }, inplace=True)
             df = deduplicate_dataframe_columns(df)
 
+            # Ensure Settlement Currency is always present, clean, and uppercase
+            if "Settlement Currency" not in df.columns:
+                for c in df.columns:
+                    if str(c).strip().lower() in ["settlement currency", "settlement_currency", "currency"]:
+                        df["Settlement Currency"] = df[c]
+                        break
+            if "Settlement Currency" in df.columns:
+                df["Settlement Currency"] = df["Settlement Currency"].fillna("GBP").astype(str).str.strip().str.upper()
+            else:
+                df["Settlement Currency"] = "GBP"
+
             if "Created Date" in df.columns:
                 parsed_d = pd.to_datetime(df["Created Date"], errors="coerce")
                 df["Created Date (UTC)"] = parsed_d.dt.date.astype(str)
@@ -2955,7 +2966,14 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
                 df["Donation ID"] = df["Donation ID"].fillna("").astype(str).str.strip()
                 invalid_id_mask = df["Donation ID"].isin(["", "nan", "none", "n/a", "<na>", "0", "0.0"])
                 if invalid_id_mask.any():
-                    tid_s = df.get("Transfer ID", pd.Series("34579", index=df.index)).fillna("34579").astype(str).str.replace(".0", "", regex=False)
+                    valid_tid = None
+                    if "Transfer ID" in df.columns:
+                        v_s = df["Transfer ID"].dropna().astype(str).str.replace(".0", "", regex=False).str.strip()
+                        v_s = v_s[~v_s.str.lower().isin(["", "nan", "none", "n/a", "0", "0.0"])]
+                        if not v_s.empty:
+                            valid_tid = v_s.iloc[0]
+                    fallback_tid = valid_tid or "BATCH"
+                    tid_s = df.get("Transfer ID", pd.Series(fallback_tid, index=df.index)).fillna(fallback_tid).astype(str).str.replace(".0", "", regex=False)
                     synthetic_ids = ["PAYOUT-" + str(tid_s.iloc[idx]) + "-" + str(idx + 1) for idx, is_invalid in enumerate(invalid_id_mask) if is_invalid]
                     df.loc[invalid_id_mask, "Donation ID"] = synthetic_ids
 

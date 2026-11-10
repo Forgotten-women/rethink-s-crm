@@ -22,6 +22,7 @@ import EmailQueueView from './tracker/EmailQueueView';
 import EmailCampaignsView from './tracker/EmailCampaignsView';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
 import BeneficiaryImportModal from './tracker/BeneficiaryImportModal';
+import BeneficiaryDetailsModal from './tracker/BeneficiaryDetailsModal';
 import BulkEmailModal from './tracker/BulkEmailModal';
 import TrackerFilterBar from './tracker/TrackerFilterBar';
 import { toDraftDonor, donorKeyFor, readFiltersFromUrl, writeFiltersToUrl, filtersToParams } from './tracker/trackerUtils';
@@ -271,6 +272,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTypeFilter, setSelectedTypeFilter] = useState('All');
   const [selectedStatusFilter, setSelectedStatusFilter] = useState('All');
+  const [selectedTeamFilter, setSelectedTeamFilter] = useState('All'); // 'All' | 'SP' | 'RT'
+  const [selectedBeneficiaryForDetails, setSelectedBeneficiaryForDetails] = useState(null);
   const [selectedDonorType, setSelectedDonorType] = useState('Orphan');
   // Allocations Matrix: donors & capacity and active allocations are two full-width tabs (the side-by-side split
   // was too cramped). Both stay mounted so their searches, filters and pages are kept when switching.
@@ -2168,13 +2171,53 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   useEffect(() => {
     setBeneficiaryPage(1);
-  }, [searchQuery, selectedTypeFilter, selectedStatusFilter, beneficiaries.length]);
+  }, [searchQuery, selectedTypeFilter, selectedStatusFilter, selectedTeamFilter, benFilters, beneficiaries.length]);
 
   const filteredBeneficiaries = useMemo(() => {
     return beneficiaries.filter(b => {
       if (selectedTypeFilter !== 'All' && b.sponsorship_type !== selectedTypeFilter) return false;
       if (selectedStatusFilter === 'Allocated' && !b.allocation_id) return false;
       if (selectedStatusFilter === 'Unallocated' && b.allocation_id) return false;
+
+      // Team filter (SP vs RT)
+      const bTeam = (b.team || b.community_name || 'RT').toUpperCase();
+      if (selectedTeamFilter !== 'All' && bTeam !== selectedTeamFilter.toUpperCase()) return false;
+      if (benFilters.team && benFilters.team !== 'all' && bTeam !== benFilters.team.toUpperCase()) return false;
+
+      // Communication status filter
+      if (benFilters.communication_status && benFilters.communication_status !== 'all') {
+        const cs = (b.communication_status || (b.allocation_id ? 'Pending Profile' : '')).toLowerCase().trim();
+        const targetCs = benFilters.communication_status.toLowerCase().trim();
+        if (targetCs === 'pending') {
+          if (!['pending', 'pending profile', 'profile pending', ''].includes(cs) && b.last_contacted_at) return false;
+        } else if (targetCs === 'first_mailed' || targetCs === 'first mailed') {
+          if (!['first mailed', 'profile sent', 'welcome sent'].includes(cs)) return false;
+        } else if (targetCs === 'update_sent' || targetCs === 'update sent') {
+          if (!['update sent', 'video sent'].includes(cs)) return false;
+        } else if (targetCs === 'feedback_sent' || targetCs === 'feedback sent') {
+          if (!['feedback sent', 'annual report sent'].includes(cs)) return false;
+        } else if (targetCs === 'renewal_sent' || targetCs === 'renewal sent') {
+          if (!['renewal sent', 'renewal active'].includes(cs)) return false;
+        } else if (targetCs === 'replied' || targetCs === 'donor replied') {
+          if (cs !== 'donor replied') return false;
+        }
+      }
+
+      // Contact status filter
+      if (benFilters.contact_status && benFilters.contact_status !== 'all') {
+        const isContacted = Boolean(b.last_contacted_at || (b.communication_status && !['pending', 'pending profile', ''].includes((b.communication_status || '').toLowerCase().trim())));
+        if (benFilters.contact_status === 'contacted' && !isContacted) return false;
+        if (benFilters.contact_status === 'not_contacted' && isContacted) return false;
+      }
+
+      // Media status filter
+      if (benFilters.media_status && benFilters.media_status !== 'all') {
+        if (benFilters.media_status === 'has_video' && !b.video_link) return false;
+        if (benFilters.media_status === 'missing_video' && b.video_link) return false;
+        if (benFilters.media_status === 'has_profile' && !b.profile_link) return false;
+        if (benFilters.media_status === 'missing_profile' && b.profile_link) return false;
+      }
+
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
         const matchesName = (b.name || '').toLowerCase().includes(q);
@@ -2186,7 +2229,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       }
       return true;
     });
-  }, [beneficiaries, selectedTypeFilter, selectedStatusFilter, searchQuery]);
+  }, [beneficiaries, selectedTypeFilter, selectedStatusFilter, selectedTeamFilter, benFilters, searchQuery]);
 
   const totalBeneficiaryPages = Math.max(1, Math.ceil(filteredBeneficiaries.length / beneficiaryPageSize));
   const paginatedBeneficiaries = useMemo(() => {
@@ -2448,11 +2491,37 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
       {activeTab === 'beneficiaries' && (
         <div className="flex flex-col gap-5">
-          <TrackerFilterBar values={benFilters} onChange={setBenFilters} resultCount={beneficiaries.length}
+          <TrackerFilterBar values={benFilters} onChange={setBenFilters} resultCount={filteredBeneficiaries.length}
             fields={[
               { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone' },
               { key: 'campaign', label: 'Campaign', placeholder: 'Campaign name' },
               { key: 'location', label: 'Location', placeholder: 'e.g. Gaza' },
+              { key: 'team', label: 'Team / Cohort', type: 'select', options: [
+                { value: 'all', label: 'All Teams' },
+                { value: 'SP', label: "Sisters' Project (SP)" },
+                { value: 'RT', label: 'Rethink (RT)' }
+              ]},
+              { key: 'communication_status', label: 'Outreach Status', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'All Outreach Statuses' },
+                { value: 'pending', label: '⏳ Pending Profile (Not Mailed)' },
+                { value: 'first_mailed', label: '✉️ First Mailed (Profile Intro)' },
+                { value: 'update_sent', label: '📹 Update Sent (Video / Progress)' },
+                { value: 'feedback_sent', label: '📋 Feedback Sent (Annual Report)' },
+                { value: 'renewal_sent', label: '🔄 Renewal Sent' },
+                { value: 'replied', label: '💬 Donor Replied' }
+              ]},
+              { key: 'contact_status', label: 'Contact Status', type: 'select', section: 'comms', options: [
+                { value: 'all', label: 'All Contact Statuses' },
+                { value: 'contacted', label: '✅ Contacted (≥1 Email Sent)' },
+                { value: 'not_contacted', label: '❌ Not Contacted Yet' }
+              ]},
+              { key: 'media_status', label: 'Media Assets', type: 'select', options: [
+                { value: 'all', label: 'All Media Assets' },
+                { value: 'has_video', label: '📹 Has Video Update' },
+                { value: 'missing_video', label: '⚠️ Missing Video' },
+                { value: 'has_profile', label: '📄 Has Profile PDF' },
+                { value: 'missing_profile', label: '⚠️ Missing Profile PDF' }
+              ]},
               { key: 'funded_status', label: 'Funding', type: 'select', options: [
                 { value: 'all', label: 'Any funding' }, { value: 'unfunded', label: 'Unfunded' },
                 { value: 'partial', label: 'Partly funded' }, { value: 'full', label: 'Fully funded' }] },
@@ -2541,6 +2610,43 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           <span className="inline-block w-2 h-2 rounded-full bg-slate-400 dark:bg-slate-500 animate-pulse align-middle" />
                         ) : (
                           count
+                        )}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Team Filter Pills (SP vs RT) */}
+              <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs">
+                {['All', 'SP', 'RT'].map((tm) => {
+                  const tmCount = tm === 'All'
+                    ? beneficiaries.length
+                    : beneficiaries.filter(b => (b.team || b.community_name || 'RT').toUpperCase() === tm).length;
+                  return (
+                    <button
+                      key={tm}
+                      onClick={() => setSelectedTeamFilter(tm)}
+                      className={`px-2.5 py-1 rounded-md font-semibold transition-all flex items-center gap-1.5 ${
+                        selectedTeamFilter === tm
+                          ? tm === 'SP'
+                            ? 'bg-rose-500 text-white shadow-xs font-bold'
+                            : tm === 'RT'
+                            ? 'bg-purple-600 text-white shadow-xs font-bold'
+                            : 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-xs font-bold'
+                          : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      <span>{tm === 'All' ? 'All Teams' : tm === 'SP' ? "Sisters' (SP)" : 'Rethink (RT)'}</span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold min-w-[18px] text-center ${
+                        selectedTeamFilter === tm
+                          ? 'bg-white/20 text-white'
+                          : 'bg-slate-200/70 dark:bg-slate-700/70 text-slate-600 dark:text-slate-400'
+                      }`}>
+                        {loadingData ? (
+                          <span className="inline-block w-2 h-2 rounded-full bg-slate-400 animate-pulse" />
+                        ) : (
+                          tmCount
                         )}
                       </span>
                     </button>
@@ -2669,15 +2775,28 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       const IconComp = typeMeta.icon;
 
                       return (
-                        <tr key={b.id} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/40 transition-colors">
+                        <tr 
+                          key={b.id} 
+                          onClick={() => setSelectedBeneficiaryForDetails(b)}
+                          className="hover:bg-blue-50/40 dark:hover:bg-blue-950/20 transition-colors cursor-pointer group"
+                        >
                           {/* Beneficiary Name & Type */}
                           <td className="py-3.5 px-4">
                             <div className="flex items-center gap-2.5">
-                              <div className={`p-2 rounded-lg ${typeMeta.bg} border`}>
+                              <div className={`p-2 rounded-lg ${typeMeta.bg} border shrink-0`}>
                                 <IconComp className="w-4 h-4" />
                               </div>
                               <div>
-                                <div className="font-bold text-slate-800 dark:text-slate-100">{b.name}</div>
+                                <div className="font-bold text-slate-800 dark:text-slate-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors flex items-center gap-1.5">
+                                  <span>{b.name}</span>
+                                  <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold border ${
+                                    (b.team || b.community_name || 'RT').toUpperCase() === 'SP'
+                                      ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/60 dark:text-rose-300 dark:border-rose-800'
+                                      : 'bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-950/60 dark:text-purple-300 dark:border-purple-800'
+                                  }`}>
+                                    {(b.team || b.community_name || 'RT').toUpperCase() === 'SP' ? 'SP' : 'RT'}
+                                  </span>
+                                </div>
                                 <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
                                   {b.sponsorship_type}
                                 </span>
@@ -2702,7 +2821,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             <div className="flex items-center gap-1.5 flex-wrap">
                               {b.profile_link ? (
                                 <button
-                                  onClick={() => setPreviewMedia({ type: 'pdf', url: getEmbeddableDocUrl(b.profile_link), rawUrl: b.profile_link, title: `Profile: ${b.name} (${b.project_code})` })}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setPreviewMedia({ type: 'pdf', url: getEmbeddableDocUrl(b.profile_link), rawUrl: b.profile_link, title: `Profile: ${b.name} (${b.project_code})` });
+                                  }}
                                   className="px-2.5 py-1 rounded-md bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400 border border-blue-200/60 dark:border-blue-800/60 font-semibold text-xs flex items-center gap-1 hover:bg-blue-100 transition-all"
                                   title="View In-App PDF Stream"
                                 >
@@ -2715,7 +2837,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
                               {b.video_link && (
                                 <button
-                                  onClick={() => setPreviewMedia({ type: 'video', url: b.video_link, title: `Video: ${b.name}` })}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setPreviewMedia({ type: 'video', url: b.video_link, title: `Video: ${b.name}` });
+                                  }}
                                   className="p-1 rounded-md bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border border-rose-200/60 dark:border-rose-800/60 hover:bg-rose-100 transition-all"
                                   title="Watch Video Update"
                                 >
@@ -2728,6 +2853,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                   href={b.donor_folder_link}
                                   target="_blank"
                                   rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
                                   className="p-1 rounded-md bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 border border-amber-200/60 dark:border-amber-800/60 hover:bg-amber-100 transition-all"
                                   title="Open Donor Folder"
                                 >
@@ -2737,15 +2863,22 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             </div>
                           </td>
 
-                          {/* Allocation Status */}
+                          {/* Allocation Status & Quick Outreach Selector */}
                           <td className="py-3.5 px-4">
                             {b.allocation_id ? (
-                              <div className="flex flex-col gap-1">
+                              <div className="flex flex-col gap-1.5">
                                 <div className="flex items-center gap-1 flex-wrap max-w-[220px]">
                                   {(b.donors && b.donors.length ? b.donors : [{ id: 'legacy', donor_name: b.donor_name, donor_email: b.donor_email, donor_id: b.donor_id }]).map(d => (
-                                    <button key={d.id} type="button" onClick={() => openDonor(donorKeyFor(d))}
+                                    <button 
+                                      key={d.id} 
+                                      type="button" 
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openDonor(donorKeyFor(d));
+                                      }}
                                       title={d.donor_email || ''}
-                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 hover:border-blue-400 hover:text-blue-600">
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 hover:border-blue-400 hover:text-blue-600"
+                                    >
                                       <Check className="w-3 h-3" />
                                       {d.donor_name || d.donor_email || 'Allocated'}
                                     </button>
@@ -2760,19 +2893,51 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                     {b.donor_email}
                                   </span>
                                 )}
-                                {b.communication_status && (
-                                  <span className={`text-[10px] font-bold ${
-                                    b.communication_status === 'Donor Replied' 
-                                      ? 'text-cyan-600 dark:text-cyan-400 font-extrabold flex items-center gap-0.5' 
-                                      : 'text-slate-500'
-                                  }`}>
-                                    {b.communication_status === 'Donor Replied' ? '💬 Donor Replied' : b.communication_status}
-                                  </span>
-                                )}
+
+                                {/* Interactive Manual Communication Status Selector */}
+                                <div onClick={(e) => e.stopPropagation()} className="mt-0.5">
+                                  <select
+                                    value={b.communication_status || 'Pending Profile'}
+                                    onChange={async (e) => {
+                                      const newStatus = e.target.value;
+                                      try {
+                                        await fetch(`${API_BASE_URL}/api/tracker/beneficiaries/${b.id}/status`, {
+                                          method: 'PATCH',
+                                          headers: { 'Content-Type': 'application/json' },
+                                          body: JSON.stringify({ communication_status: newStatus })
+                                        });
+                                        setBeneficiaries(prev => prev.map(item => item.id === b.id ? { ...item, communication_status: newStatus, last_contacted_at: new Date().toISOString() } : item));
+                                      } catch (err) {
+                                        console.error('Failed to update status:', err);
+                                      }
+                                    }}
+                                    className={`text-[10px] font-bold px-2 py-0.5 rounded-full border cursor-pointer focus:outline-none focus:ring-1 focus:ring-blue-500 ${
+                                      b.communication_status === 'Donor Replied'
+                                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800'
+                                        : b.communication_status === 'Update Sent'
+                                        ? 'bg-indigo-50 text-indigo-700 border-indigo-300 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800'
+                                        : b.communication_status === 'First Mailed'
+                                        ? 'bg-blue-50 text-blue-700 border-blue-300 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-800'
+                                        : b.communication_status === 'Feedback Sent'
+                                        ? 'bg-purple-50 text-purple-700 border-purple-300 dark:bg-purple-950/60 dark:text-purple-300 dark:border-purple-800'
+                                        : b.communication_status === 'Renewal Sent'
+                                        ? 'bg-orange-50 text-orange-700 border-orange-300 dark:bg-orange-950/60 dark:text-orange-300 dark:border-orange-800'
+                                        : 'bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800'
+                                    }`}
+                                  >
+                                    <option value="Pending Profile">⏳ Pending Profile</option>
+                                    <option value="First Mailed">✉️ First Mailed</option>
+                                    <option value="Update Sent">📹 Update Sent</option>
+                                    <option value="Feedback Sent">📋 Feedback Sent</option>
+                                    <option value="Renewal Sent">🔄 Renewal Sent</option>
+                                    <option value="Donor Replied">💬 Donor Replied</option>
+                                  </select>
+                                </div>
                               </div>
                             ) : (
                                 <button
-                                  onClick={() => {
+                                  onClick={(e) => {
+                                    e.stopPropagation();
                                     setIsAllocateModalOpen(true);
                                     setAllocateModalBeneficiary(b);
                                     handleSelectDonorForAllocation(null);
@@ -2794,7 +2959,10 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                           {/* Annual Feedbacks Timeline */}
                           <td className="py-3.5 px-4">
                             <button
-                              onClick={() => openFeedbackTimeline(b)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openFeedbackTimeline(b);
+                              }}
                               className="px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 font-semibold text-xs flex items-center gap-1.5 transition-all"
                             >
                               <Calendar className="w-3.5 h-3.5 text-blue-500" />
@@ -2807,16 +2975,19 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                             <div className="flex items-center justify-end gap-1.5">
                               {b.allocation_id && (
                                 <button
-                                  onClick={() => openEmailDispatcher({
-                                    id: b.allocation_id,
-                                    donor_name: b.donor_name,
-                                    donor_email: b.donor_email,
-                                    beneficiary_name: b.name,
-                                    location: b.location,
-                                    project_code: b.project_code,
-                                    profile_link: b.profile_link,
-                                    video_link: b.video_link
-                                  })}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openEmailDispatcher({
+                                      id: b.allocation_id,
+                                      donor_name: b.donor_name,
+                                      donor_email: b.donor_email,
+                                      beneficiary_name: b.name,
+                                      location: b.location,
+                                      project_code: b.project_code,
+                                      profile_link: b.profile_link,
+                                      video_link: b.video_link
+                                    });
+                                  }}
                                   className="p-1.5 rounded-lg bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800 hover:bg-blue-100 transition-all"
                                   title="Send Email via Outlook"
                                 >
@@ -2825,7 +2996,8 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                               )}
 
                               <button
-                                onClick={() => {
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   setEditingBeneficiary(b);
                                   setBeneficiaryForm({
                                     sponsorship_type: b.sponsorship_type,
@@ -2846,14 +3018,17 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                               </button>
 
                               {can(user, 'tracker.delete', activeCompany) && (
-<button
-                                onClick={() => handleDeleteBeneficiary(b.id, b.name)}
-                                className="p-1.5 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-all"
-                                title="Delete Beneficiary"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-)}
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteBeneficiary(b.id, b.name);
+                                  }}
+                                  className="p-1.5 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-all"
+                                  title="Delete Beneficiary"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -8441,6 +8616,51 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             </div>
           </div>
         </div>
+      )}
+      {/* BENEFICIARY DETAILS MODAL */}
+      {selectedBeneficiaryForDetails && (
+        <BeneficiaryDetailsModal
+          beneficiary={selectedBeneficiaryForDetails}
+          isOpen={Boolean(selectedBeneficiaryForDetails)}
+          onClose={() => setSelectedBeneficiaryForDetails(null)}
+          onStatusUpdated={(updated) => {
+            setBeneficiaries(prev => prev.map(b => b.id === updated.id ? { ...b, ...updated } : b));
+          }}
+          onEditBeneficiary={(b) => {
+            setEditingBeneficiary(b);
+            setBeneficiaryForm({
+              sponsorship_type: b.sponsorship_type || 'Orphan',
+              name: b.name || '',
+              location: b.location || '',
+              project_code: b.project_code || '',
+              donor_folder_link: b.donor_folder_link || '',
+              profile_link: b.profile_link || '',
+              video_link: b.video_link || '',
+              status: b.status || 'Unallocated'
+            });
+            setShowAddBeneficiaryModal(true);
+          }}
+          onSendEmail={(alloc) => {
+            setDispatcher({
+              allocation: alloc,
+              templateType: 'profile_intro',
+              theme: (alloc.company_id || 'rethink') === 'rethink' ? 'sp' : 'iqra'
+            });
+          }}
+          onPreviewMedia={(media) => setPreviewMedia(media)}
+          onOpenDonor={(donorKey) => openDonor(donorKey)}
+          onAllocate={(b) => {
+            setIsAllocateModalOpen(true);
+            setAllocateModalBeneficiary(b);
+            handleSelectDonorForAllocation(null);
+            setSelectedCampaignForAllocation(null);
+            setAllocationMode('donor');
+            setSelectedDonorType(b.sponsorship_type);
+            setBeneficiarySearchQuery('');
+            setBeneficiaryTypeFilter('All');
+            setIsBeneficiaryDropdownOpen(false);
+          }}
+        />
       )}
     </div>
   );

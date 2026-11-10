@@ -634,6 +634,13 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
 def _generate_disbursement_summary(df_curr: pd.DataFrame, currency_name: str, platform: str = "launchgood") -> Dict[str, Any]:
     """Generates exact Disbursement Summary matching the Finance Team ledger format."""
     p_clean = platform.lower()
+    c_up = str(currency_name or "").strip().upper()
+
+    # Defensive guardrail: strictly enforce single-currency isolation when a specific currency is requested
+    if c_up and c_up != "ALL" and df_curr is not None and not df_curr.empty:
+        curr_col = next((c for c in ["settlement_currency", "Settlement Currency"] if c in df_curr.columns), None)
+        if curr_col:
+            df_curr = df_curr[df_curr[curr_col].astype(str).str.strip().str.upper() == c_up]
     
     if p_clean == "paysuite":
         paid_df = df_curr[df_curr["status"] == "Paid"]
@@ -744,7 +751,14 @@ def _generate_disbursement_summary(df_curr: pd.DataFrame, currency_name: str, pl
     }
 
 
-def _generate_ledger_breakdown(df: pd.DataFrame, platform: str = "launchgood") -> List[Dict[str, Any]]:
+def _generate_ledger_breakdown(df: pd.DataFrame, platform: str = "launchgood", currency_name: str = "GBP") -> List[Dict[str, Any]]:
+    # Defensive guardrail: strictly enforce single-currency isolation when a specific currency is requested
+    c_up = str(currency_name or "").strip().upper()
+    if c_up and c_up != "ALL" and df is not None and not df.empty:
+        curr_col = next((c for c in ["settlement_currency", "Settlement Currency"] if c in df.columns), None)
+        if curr_col:
+            df = df[df[curr_col].astype(str).str.strip().str.upper() == c_up]
+
     if platform.lower() == "paysuite":
         if df is None or df.empty:
             return []
@@ -813,6 +827,8 @@ def _filter_by_batch_or_month(df: pd.DataFrame, target_batch: str) -> pd.DataFra
 
     # Direct mapping for LaunchGood settlement months and transfer IDs
     MONTH_TIDS = {
+        "november 26": ["35970"],
+        "2026-11": ["35970"],
         "october 26": ["35646"],
         "2026-10": ["35646"],
         "september 26": ["35438", "35409", "35110"],
@@ -846,7 +862,30 @@ def _filter_by_batch_or_month(df: pd.DataFrame, target_batch: str) -> pd.DataFra
         if m_mkey.any():
             return df[m_mkey]
 
-    # 5. Partial month match
+    # 5. Dynamic date / month parsing for any future month (e.g. "December 2026", "2026-12", "January 2027", "Jan 27")
+    try:
+        parsed_dt = pd.to_datetime(target_clean, errors="coerce")
+        if pd.notna(parsed_dt):
+            d_mkey = parsed_dt.strftime("%Y-%m")
+            d_mlabel = parsed_dt.strftime("%B %y").lower()
+            if "payout_month_key" in df.columns:
+                m_dt = df["payout_month_key"].astype(str).str.strip().str.lower() == d_mkey
+                if m_dt.any():
+                    return df[m_dt]
+            if "payout_month" in df.columns:
+                m_dt = df["payout_month"].astype(str).str.strip().str.lower() == d_mlabel
+                if m_dt.any():
+                    return df[m_dt]
+    except Exception:
+        pass
+
+    # 6. Match Batch Label directly (e.g. for Paysuite or custom labeled batches)
+    if "batch_label" in df.columns:
+        m_blabel = df["batch_label"].astype(str).str.strip().str.lower() == target_clean
+        if m_blabel.any():
+            return df[m_blabel]
+
+    # 7. Partial month match
     if "payout_month" in df.columns:
         m_part = df["payout_month"].astype(str).str.strip().str.lower().str.startswith(target_clean)
         if m_part.any():
@@ -898,7 +937,9 @@ def get_payouts_summary(
         # Batch / Transfer ID / Month Filter
         if target_batch and target_batch.upper() != "ALL":
             df = _filter_by_batch_or_month(df, target_batch)
-        elif curr_selected in ["GBP", "USD"]:
+
+        # Settlement Currency Filter
+        if curr_selected and curr_selected != "ALL":
             df = df[df["settlement_currency"] == curr_selected]
         else:
             curr_selected = "ALL"
@@ -974,10 +1015,9 @@ def get_payouts_summary(
         total_fees = float(df["fee_amt"].sum())
         total_reserves = float(abs(reserves_df["net_amt"].sum()))
         
-        net_payout = float(abs(payouts_df["net_amt"].sum())) if not payouts_df.empty else float(donations_df["net_amt"].sum() - total_fees)
-        
         disbursement_summary = _generate_disbursement_summary(df, curr_selected, platform=plat)
-        ledger_breakdown = _generate_ledger_breakdown(df, platform=plat)
+        ledger_breakdown = _generate_ledger_breakdown(df, platform=plat, currency_name=curr_selected)
+        net_payout = float(abs(payouts_df["net_amt"].sum())) if not payouts_df.empty else float(disbursement_summary.get("total_disbursement", donations_df["net_amt"].sum() - total_fees))
 
         return {
             "platform": plat,
@@ -1049,7 +1089,7 @@ def get_payout_batches(
         if df.empty:
             return {"platform": plat, "total_batches": 0, "page": p_val, "page_size": ps_val, "batches": [], "currency": curr_selected}
 
-        if curr_selected in ["GBP", "USD"]:
+        if curr_selected and curr_selected != "ALL":
             df = df[df["settlement_currency"] == curr_selected]
 
         df = df[~df["transfer_id"].astype(str).str.lower().isin(["n/a", "nan", "none", ""])].copy()
@@ -1095,7 +1135,9 @@ def get_payout_batches(
             batch_records.sort(key=_batch_day, reverse=True)
         else:
             monthly_batches = []
-            for t_id, g in df.groupby("transfer_id"):
+            group_keys = ["transfer_id", "settlement_currency"] if (curr_selected == "ALL" and "settlement_currency" in df.columns and df["settlement_currency"].nunique() > 1) else "transfer_id"
+            for grp_key, g in df.groupby(group_keys):
+                t_id = grp_key[0] if isinstance(grp_key, tuple) else grp_key
                 c_date = str(g["Created Date (UTC)"].dropna().min() or "N/A")
                 p_rows = g[g["row_type"] == "payout"]
                 if not p_rows.empty and p_rows["Created Date (UTC)"].dropna().any():
@@ -1239,8 +1281,12 @@ def get_campaign_payout_breakdown(
 
         if target_batch and target_batch.upper() != "ALL":
             df = _filter_by_batch_or_month(df, target_batch)
-        elif curr_selected in ["GBP", "USD"]:
+
+        # Settlement Currency Filter
+        if curr_selected and curr_selected != "ALL":
             df = df[df["settlement_currency"] == curr_selected]
+        else:
+            curr_selected = "ALL"
 
         # Status filter
         if status_filter in ["Paid", "Unpaid"]:
@@ -1589,8 +1635,12 @@ def get_payout_donors(
         # Batch / Transfer ID / Month Filter
         if target_batch and target_batch.upper() != "ALL":
             df = _filter_by_batch_or_month(df, target_batch)
-        elif curr_selected in ["GBP", "USD"]:
+
+        # Settlement Currency Filter
+        if curr_selected and curr_selected != "ALL":
             df = df[df["settlement_currency"] == curr_selected]
+        else:
+            curr_selected = "ALL"
 
         # Status Filter
         if status_filter in ["Paid", "Unpaid"]:
@@ -1795,12 +1845,13 @@ def get_payout_ledger(
         if df.empty:
             return {"platform": plat, "total_records": 0, "page": p_val, "page_size": ps_val, "total_pages": 1, "records": []}
 
-        if curr_selected in ["GBP", "USD"]:
+        if curr_selected and curr_selected != "ALL":
             df = df[df["settlement_currency"] == curr_selected]
+        else:
+            curr_selected = "ALL"
 
         if target_batch and target_batch.upper() != "ALL":
-            target_clean = target_batch.replace(".0", "").replace("#", "").strip().lower()
-            df = df[df["transfer_id"].astype(str).str.replace(".0", "").str.strip().str.lower() == target_clean]
+            df = _filter_by_batch_or_month(df, target_batch)
 
         if status_filter in ["Paid", "Unpaid"]:
             df = df[df["status"] == status_filter]
@@ -2012,7 +2063,7 @@ def export_payouts_excel(
 ):
     """Generates and exports a comprehensive multi-sheet Excel (.xlsx) reconciliation report respecting all active filters."""
     plat = _clean_str(platform, "launchgood").lower()
-    curr_selected = str(currency).strip().upper() if isinstance(currency, str) else "ALL"
+    curr_selected = _clean_str(currency, "GBP").upper()
     target_batch = str(batch or "ALL").strip()
     status_filter = str(status or "ALL").strip()
     search_val = _clean_str(search)
