@@ -1148,9 +1148,9 @@ def resolve_best_donor_name(donor_txns, first_row):
     for _, row in donor_txns.iterrows():
         fn = str(row.get("First Name") or "").strip()
         ln = str(row.get("Last Name") or "").strip()
-        if fn.lower() in ["nan", "none", "null", "anonymous", "kind soul", "n/a", ""]:
+        if fn.lower() in ["nan", "none", "null", "undefined", "anonymous", "kind soul", "n/a", ""]:
             fn = ""
-        if ln.lower() in ["nan", "none", "null", "anonymous", "kind soul", "n/a", ""]:
+        if ln.lower() in ["nan", "none", "null", "undefined", "anonymous", "kind soul", "n/a", ""]:
             ln = ""
         
         full = f"{fn} {ln}".strip()
@@ -1798,8 +1798,21 @@ def _build_directory_data(comp: str, token: str, scope, cache_key: str):
                    .reset_index(name="n").sort_values("n", ascending=False).drop_duplicates("key").set_index("key")["heading"])
     platforms = _joined_values(w, "platform")
     stypes = _joined_values(w[w["stype"] != ""], "stype")
+    # Name: the most complete real name across the donor's gifts (same rule as the donor profile, so emails greet
+    # "Waheed Khan" rather than a later "W u khan"); ties go to the most recent gift.
+    nm = w["name"].fillna("").astype(str).str.strip()
+    nm_l = nm.str.lower()
+    bad = (nm_l.isin(ANON_PLACEHOLDERS) | nm_l.isin(NON_NAME_PHRASES) | nm_l.str.match(r"^(nan|none|null|n/a|undefined)( (nan|none|null|n/a|undefined))?$")
+           | nm_l.str.contains("towards the|in memory of|for orphans", regex=True))
+    score = nm.str.replace(r"\s+", "", regex=True).str.len().where(~bad, -1)
+    best_pos = (pd.DataFrame({"key": w["key"].values, "score": score.values, "pos": range(len(w))})
+                .sort_values(["key", "score", "pos"], ascending=[True, False, False]).drop_duplicates("key")
+                .set_index("key"))
+    best_name = pd.Series(w["name"].values[best_pos["pos"].values], index=best_pos.index)
+    best_name = best_name.where(best_pos["score"] >= 3)
     frame = pd.DataFrame({
-        "name": g["name"].last(), "email": g["email"].last(), "phone": g["phone"].last(),
+        "name": best_name.reindex(g["name"].last().index).fillna(g["name"].last()),
+        "email": g["email"].last(), "phone": g["phone"].last(),
         "city": g["city"].last(), "country": g["country"].last(),
         "total": g["amount"].sum().round(2), "gifts": g["amount"].size(),
         "first_gift": g["date"].min(), "last_gift": g["date"].max(),
