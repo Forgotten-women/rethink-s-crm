@@ -683,7 +683,7 @@ if (denyUnless('email.campaigns')) return;
                   <input type="checkbox" checked={separateAll} onChange={e => setSeparateAll(e.target.checked)} className="mt-0.5 accent-sky-600" />
                   <span><b>Separate email for each beneficiary</b> - someone with several sponsorships gets one email per sponsorship instead of one combined email (you can still change it per person in the preview).</span>
                 </label>
-                <p className="mt-2 text-[11px] text-slate-500">Each person gets one email. Someone with several sponsorships gets them all ({'{beneficiary_name}'} joins the names, {'{sponsorships_list}'} lists each one) - or tick in the preview which ones their email is about. Anyone a template can't fill is skipped, never sent a half-filled email.</p>
+                <p className="mt-2 text-[11px] text-slate-500">Each person gets one email. Someone with several sponsorships gets them all ({'{beneficiary_name}'} joins the names, {'{sponsorships_list}'} lists each with View Profile · Watch Video links, {'{video_buttons}'} adds a watch-video button per beneficiary) - or tick in the preview which ones their email is about. Anyone a template can't fill is skipped, never sent a half-filled email.</p>
               </div>
             </div>
             <div className="flex flex-col gap-2 xl:sticky xl:top-0 self-start w-full">

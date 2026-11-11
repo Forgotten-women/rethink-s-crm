@@ -254,6 +254,8 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "donor_email.create_campaign": "email.campaigns",
     "donor_email.send_campaign_batch": AllOf("email.campaigns", "email.send"),
     "donor_email.cancel_campaign": "email.campaigns",
+    "donor_email.rename_campaign": "email.campaigns",
+    "donor_email.mark_campaign_sponsorships": "tracker.edit",
     "donor_email.delete_campaign": "email.campaigns",
     # --- unsubscribes / mailbox ----------------------------------------------------------------------------
     "unsubscribe.unsubscribe_page": PUBLIC,           # HMAC-signed link

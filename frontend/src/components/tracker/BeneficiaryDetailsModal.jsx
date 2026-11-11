@@ -20,8 +20,12 @@ const getEmbeddableDocUrl = (url) => {
 const COMMUNICATION_STATUS_OPTIONS = [
   { value: 'Pending Profile', label: '⏳ Pending Profile (Not Mailed)', badgeBg: 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800' },
   { value: 'First Mailed', label: '✉️ First Mailed (Profile Intro)', badgeBg: 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800' },
+  { value: 'Profile Sent', label: '📄 Profile Sent', badgeBg: 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800' },
+  { value: 'Welcome Sent', label: '👋 Welcome Sent', badgeBg: 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800' },
   { value: 'Update Sent', label: '📹 Update Sent (Video / Progress)', badgeBg: 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800' },
+  { value: 'Video Sent', label: '🎬 Video Feedback Sent', badgeBg: 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800' },
   { value: 'Feedback Sent', label: '📋 Feedback Sent (Annual Report)', badgeBg: 'bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800' },
+  { value: 'Annual Report Sent', label: '📊 Annual Report Sent', badgeBg: 'bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800' },
   { value: 'Renewal Sent', label: '🔄 Renewal Sent', badgeBg: 'bg-orange-50 dark:bg-orange-950/60 text-orange-700 dark:text-orange-300 border-orange-200 dark:border-orange-800' },
   { value: 'Donor Replied', label: '💬 Donor Replied', badgeBg: 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800' },
 ];

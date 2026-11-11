@@ -56,7 +56,7 @@ export const VARIABLES = [
   ['matching_causes', 'Matching causes'], ['matching_sponsorships', 'Matching sponsorships'], ['sponsorship_types', 'Sponsorship types'],
   ['beneficiary_name', 'Beneficiary (all, joined)'], ['beneficiary_first_name', 'Beneficiary first name'], ['beneficiary_last_name', 'Beneficiary last name'], ['sponsorships_list', 'List of all their sponsorships'],
   ['sponsorships_count', 'Number of sponsorships'], ['sponsorship_type', 'Sponsorship type'], ['location', 'Location'],
-  ['profile_link', 'Profile link'], ['video_link', 'Video link'], ['renewal_deadline', 'Renewal date'],
+  ['profile_link', 'Profile link'], ['video_link', 'Video link'], ['video_buttons', 'Watch-video button per beneficiary'], ['renewal_deadline', 'Renewal date'],
   ['days_remaining', 'Days remaining'], ['message_body', 'Your message'],
 ];
 

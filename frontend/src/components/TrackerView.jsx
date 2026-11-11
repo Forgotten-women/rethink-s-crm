@@ -2927,8 +2927,12 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                   >
                                     <option value="Pending Profile">⏳ Pending Profile</option>
                                     <option value="First Mailed">✉️ First Mailed</option>
+                                    <option value="Profile Sent">📄 Profile Sent</option>
+                                    <option value="Welcome Sent">👋 Welcome Sent</option>
                                     <option value="Update Sent">📹 Update Sent</option>
+                                    <option value="Video Sent">🎬 Video Sent</option>
                                     <option value="Feedback Sent">📋 Feedback Sent</option>
+                                    <option value="Annual Report Sent">📊 Annual Report Sent</option>
                                     <option value="Renewal Sent">🔄 Renewal Sent</option>
                                     <option value="Donor Replied">💬 Donor Replied</option>
                                   </select>

@@ -1,9 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { Mail, Plus, Send, XCircle, Trash2, ChevronDown, ChevronUp, RefreshCw, Users } from 'lucide-react';
+import { Mail, Plus, Send, XCircle, Trash2, ChevronDown, ChevronUp, RefreshCw, Users, Pencil, Tags } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 import EmailComposer from '../EmailComposer';
 import { segmentChips } from '../SegmentBuilder';
 import { denyUnless } from '../../access';
+
+// Outreach statuses the campaign's sponsorships can be marked as (mirrors CAMPAIGN_MARK_STATUSES in the backend)
+const MARK_STATUSES = ['First Mailed', 'Profile Sent', 'Welcome Sent', 'Update Sent', 'Video Sent',
+  'Feedback Sent', 'Annual Report Sent', 'Renewal Sent', 'Donor Replied'];
 
 const STATUS_TONE = {
   queued: 'bg-amber-500/15 text-amber-700 dark:text-amber-300', sending: 'bg-sky-500/15 text-sky-700 dark:text-sky-300',
@@ -30,6 +34,27 @@ export default function EmailCampaignsView({ companyId }) {
   const [open, setOpen] = useState(null);
   const [messages, setMessages] = useState({});
   const [sending, setSending] = useState(null);
+  const [notice, setNotice] = useState('');
+
+  const rename = async (c) => {
+    if (denyUnless('email.campaigns')) return;
+    const name = window.prompt('New name for this campaign:', c.name);
+    if (!name || !name.trim() || name.trim() === c.name) return;
+    setError('');
+    try { await call('PATCH', `/api/tracker/direct-email/campaigns/${c.id}`, { company_id: companyId, name: name.trim() }); load(); }
+    catch (e) { setError(e.message); }
+  };
+
+  const markSponsorships = async (c, status) => {
+    if (!status || denyUnless('tracker.edit')) return;
+    if (!window.confirm(`Mark the sponsorships of everyone "${c.name}" was SENT to as "${status}"?\n\nThis sets their outreach status in the Sponsorship Tracker.`)) return;
+    setError(''); setNotice('');
+    try {
+      const d = await call('POST', `/api/tracker/direct-email/campaigns/${c.id}/mark-sponsorships`, { company_id: companyId, communication_status: status });
+      setNotice(`"${c.name}": ${d.sponsorships_marked} sponsorship(s) across ${d.donors_covered} donor(s) marked "${status}"`
+        + (d.donors_without_sponsorships?.length ? ` — ${d.donors_without_sponsorships.length} recipient(s) have no sponsorship: ${d.donors_without_sponsorships.slice(0, 5).join(', ')}${d.donors_without_sponsorships.length > 5 ? '…' : ''}` : ''));
+    } catch (e) { setError(e.message); }
+  };
 
   const load = async () => {
     setLoading(true); setError('');
@@ -74,6 +99,7 @@ if (denyUnless('email.send')) return;
         </div>
       </div>
       {error && <div className="text-sm rounded-lg px-3 py-2 bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/25">{error}</div>}
+      {notice && <div className="text-sm rounded-lg px-3 py-2 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/25">{notice}</div>}
       {!loading && campaigns.length === 0 && <div className="glass-panel p-8 text-center text-sm" style={{ color: 'var(--text-muted)' }}>No campaigns yet. Use “New campaign / email” to pick a group of donors and a template.</div>}
       {campaigns.map(c => (
         <div key={c.id} className="glass-panel overflow-hidden">
@@ -81,6 +107,8 @@ if (denyUnless('email.send')) return;
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-sm font-black" style={{ color: 'var(--text-main)' }}>{c.name}</span>
+                <button type="button" onClick={() => rename(c)} title="Rename campaign" aria-label="Rename campaign"
+                  className="p-1 rounded hover:bg-sky-500/10" style={{ color: 'var(--text-muted)' }}><Pencil className="w-3.5 h-3.5" /></button>
                 <span className={`text-[11px] px-2 py-0.5 rounded-full font-bold ${STATUS_TONE[c.status] || ''}`}>{c.status}</span>
                 <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
                   {c.template_type?.replace(/_/g, ' ')} · {c.theme} · {String(c.created_at || '').slice(0, 16)}
@@ -99,7 +127,17 @@ if (denyUnless('email.send')) return;
               </div>
               {sending?.id === c.id && <div className="text-xs mt-1 text-sky-600">Sending… {sending.done}/{sending.total}</div>}
             </div>
-            <div className="flex gap-2 flex-wrap">
+            <div className="flex gap-2 flex-wrap items-start">
+              {(c.sent || 0) > 0 && (
+                <label className="flex items-center gap-1 text-sm rounded-lg border px-2 py-1" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-sub)' }} title="Set the outreach status on the sponsorships of everyone this campaign was sent to">
+                  <Tags className="w-4 h-4 text-indigo-500" />
+                  <select value="" onChange={e => { markSponsorships(c, e.target.value); e.target.value = ''; }}
+                    className="bg-transparent text-sm focus:outline-none cursor-pointer" style={{ color: 'var(--text-sub)' }}>
+                    <option value="" disabled>Mark sponsorships…</option>
+                    {MARK_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </label>
+              )}
               {c.pending > 0 && ['queued', 'sending'].includes(c.status) && (
                 <button type="button" disabled={!!sending} onClick={() => sendAll(c)} className="px-3 py-1.5 text-sm rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold disabled:opacity-40 flex items-center gap-1"><Send className="w-4 h-4" /> Send {c.pending}</button>
               )}

@@ -257,7 +257,7 @@ def _sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
     }
     combined = _combined_sponsorship_vars(allocs)
     if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
-        combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list")}
+        combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list", "video_buttons")}
     v.update(combined)
     return v
 
@@ -352,17 +352,26 @@ def _join_names(names: List[str]) -> str:
 
 def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
     import html as _html
-    items = []
+    items, buttons = [], []
     for a in allocs:
         name = a.get("beneficiary_name") or a.get("campaign_name") or "Sponsorship"
         bits = [b for b in (a.get("b_type") or a.get("sponsorship_type"), a.get("b_location")) if b]
         link = a.get("b_profile") or a.get("profile_link") or ""
+        video = a.get("b_video") or ""
         line = f"<b>{_html.escape(name)}</b>" + (f" - {_html.escape(', '.join(bits))}" if bits else "")
         if a.get("end_date"):
             line += f" (renewal {_html.escape(str(a['end_date'])[:10])})"
-        if link:
-            line += f' - <a href="{_html.escape(link, quote=True)}">profile</a>'
-        items.append(f"<li>{line}</li>")
+        links = ([f'<a href="{_html.escape(link, quote=True)}">View Profile</a>'] if link else []) + \
+                ([f'<a href="{_html.escape(video, quote=True)}">Watch Video</a>'] if video else [])
+        if links:
+            line += f" ({' &middot; '.join(links)})"
+        items.append(f'<li style="margin: 4px 0;">{line}</li>')
+        if video:
+            label = _first_name(a.get("beneficiary_name")) or name
+            buttons.append(
+                f'<a href="{_html.escape(video, quote=True)}" target="_blank" style="display: inline-block; margin: 4px 8px 4px 0; '
+                'padding: 10px 22px; background-color: #0284C7; color: #FFFFFF; text-decoration: none; border-radius: 6px; '
+                f'font-weight: bold; font-size: 13.5px;">&#9658; Watch {_html.escape(label)}\'s Video</a>')
     return {
         "beneficiary_name": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
         "beneficiary_names": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
@@ -372,7 +381,9 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
         "sponsorship_type": _join_names([a.get("b_type") or a.get("sponsorship_type") or "" for a in allocs]),
         "location": _join_names([a.get("b_location") or "" for a in allocs]),
         "sponsorships_count": str(len(allocs)),
-        "sponsorships_list": f"<ul>{''.join(items)}</ul>",
+        "sponsorships_list": f'<ul style="margin: 8px 0; padding-left: 20px;">{"".join(items)}</ul>',
+        # One "Watch ...'s Video" button per beneficiary that has a video (empty = the send is held, like {video_link})
+        "video_buttons": f'<div style="margin: 10px 0;">{"".join(buttons)}</div>' if buttons else "",
         "profile_link": allocs[0].get("b_profile") or allocs[0].get("profile_link") or "",
         "video_link": allocs[0].get("b_video") or "",
         "renewal_deadline": min((str(a.get("end_date"))[:10] for a in allocs if a.get("end_date")), default=""),
@@ -399,7 +410,7 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
     picked_ids = _selected_ids(selected_allocation_id)
     picked = [al for al in allocs if al.get("id") in picked_ids]
     if picked and len(picked) < len(allocs):
-        for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list"):
+        for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list", "video_buttons"):
             variables.pop(k, None)
         variables.update(_sponsorship_vars(picked))
 
@@ -966,6 +977,89 @@ class CampaignActionRequest(BaseModel):
     company_id: str
 
 
+class CampaignRenameRequest(BaseModel):
+    company_id: str
+    name: str
+
+
+@router.patch("/campaigns/{campaign_id}")
+def rename_campaign(campaign_id: int, req: CampaignRenameRequest):
+    """Renames a campaign (any time, sent or not - only the label changes)."""
+    comp = _company(req.company_id)
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the campaign a name.")
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
+    try:
+        _campaign(conn, comp, campaign_id)
+        with conn:
+            conn.execute("UPDATE crm_email_campaigns SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND company_id = ?",
+                         (name, campaign_id, comp))
+    finally:
+        conn.close()
+    return {"campaign_id": campaign_id, "name": name}
+
+
+# What a campaign's sponsorships can be marked as (same values the Sponsorship Tracker's filters group on)
+CAMPAIGN_MARK_STATUSES = ["First Mailed", "Profile Sent", "Welcome Sent", "Update Sent", "Video Sent",
+                          "Feedback Sent", "Annual Report Sent", "Renewal Sent", "Donor Replied"]
+
+
+class CampaignMarkRequest(BaseModel):
+    company_id: str
+    communication_status: str
+
+
+@router.post("/campaigns/{campaign_id}/mark-sponsorships")
+def mark_campaign_sponsorships(campaign_id: int, req: CampaignMarkRequest):
+    """Sets the outreach status (e.g. "Video Sent") on every sponsorship this campaign's SENT emails were about:
+    the sponsorship an email was sent for when one was picked, otherwise all of that donor's sponsorships."""
+    comp = _company(req.company_id)
+    status = (req.communication_status or "").strip()
+    if status not in CAMPAIGN_MARK_STATUSES:
+        raise HTTPException(status_code=400, detail="Pick a status from: " + ", ".join(CAMPAIGN_MARK_STATUSES))
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=15.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        _campaign(conn, comp, campaign_id)
+        sent = [dict(r) for r in conn.execute(
+            "SELECT recipient_email, part, extra_json FROM crm_email_messages WHERE campaign_id = ? AND company_id = ? AND status = 'sent'",
+            (campaign_id, comp))]
+        if not sent:
+            raise HTTPException(status_code=400, detail="This campaign hasn't sent any emails yet.")
+        alloc_ids, no_spons, donors = set(), set(), set()
+        for m in sent:
+            em = str(m["recipient_email"] or "").strip().lower()
+            donors.add(em)
+            try:
+                extra = json.loads(m.get("extra_json") or "{}") or {}
+            except ValueError:
+                extra = {}
+            picked = _selected_ids(m.get("part") if str(m.get("part") or "").isdigit() else extra.get("selected_allocation_id"))
+            theirs = {a["id"] for a in donor_sponsorships(comp, em)}
+            ids = (set(picked) & theirs) or theirs  # only sponsorships that are really this donor's, in this charity
+            if ids:
+                alloc_ids |= ids
+            else:
+                no_spons.add(em)
+        if alloc_ids:
+            with conn:
+                conn.execute(f"""UPDATE sponsorship_allocations SET communication_status = ?,
+                                 last_contacted_at = COALESCE(last_contacted_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
+                                 WHERE company_id = ? AND id IN ({','.join('?' * len(alloc_ids))})""",
+                             (status, comp, *sorted(alloc_ids)))
+    finally:
+        conn.close()
+    try:
+        from core.event_log import log_event
+        log_event("campaign.sponsorships_marked", category="email", company_id=comp, campaign_id=campaign_id,
+                  message=f"Campaign {campaign_id}: {len(alloc_ids)} sponsorship(s) marked '{status}'")
+    except Exception:
+        pass
+    return {"campaign_id": campaign_id, "communication_status": status, "sponsorships_marked": len(alloc_ids),
+            "donors_covered": len(donors) - len(no_spons), "donors_without_sponsorships": sorted(no_spons)}
+
+
 @router.post("/campaigns/{campaign_id}/cancel")
 def cancel_campaign(campaign_id: int, req: CampaignActionRequest):
     comp = _company(req.company_id)
@@ -1186,7 +1280,7 @@ def email_activity(company_id: str = Query(...), direction: Optional[str] = Quer
 
 SPONSORSHIP_PLACEHOLDERS = {"beneficiary_name", "beneficiary_names", "beneficiary_first_name", "beneficiary_first_names", "beneficiary_last_name", "sponsorship_type", "location", "project_code", "profile_link",
                             "video_link", "report_link", "donor_folder_link", "folder_link", "renewal_deadline", "sponsorship_year",
-                            "sponsorships_list", "sponsorships_count", "campaign_name", "community_name"}
+                            "sponsorships_list", "sponsorships_count", "video_buttons", "campaign_name", "community_name"}
 LINK_PLACEHOLDERS = {"profile_link", "video_link", "report_link", "donor_folder_link", "folder_link"}
 
 
