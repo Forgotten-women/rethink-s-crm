@@ -350,6 +350,20 @@ def _join_names(names: List[str]) -> str:
     return names[0] if len(names) == 1 else (", ".join(names[:-1]) + " and " + names[-1]) if names else ""
 
 
+def _join_lines(names: List[str]) -> str:
+    """Each distinct value on its own line (email HTML). In a subject line the breaks become ', ' (see _unbreak)."""
+    names = [n for n in dict.fromkeys(n.strip() for n in names if n and n.strip())]
+    return "<br>".join(names)
+
+
+_BR_RE = re.compile(r"\s*<br\s*/?>\s*", re.I)
+
+
+def _unbreak(v: Any) -> Any:
+    """Line-broken values flattened for places that can't show HTML (the subject line)."""
+    return _BR_RE.sub(", ", v) if isinstance(v, str) and "<br" in v.lower() else v
+
+
 def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
     import html as _html
     items, buttons = [], []
@@ -374,14 +388,15 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
                 'text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 13.5px; line-height: 1.2;">'
                 f'&#9658; Watch {_html.escape(label)}\'s Video</a>')
     return {
-        "beneficiary_name": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
-        "beneficiary_names": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
+        # Full names / types / locations / IDs: one per line (the info box); first names stay joined for sentences
+        "beneficiary_name": _join_lines([a.get("beneficiary_name") or "" for a in allocs]),
+        "beneficiary_names": _join_lines([a.get("beneficiary_name") or "" for a in allocs]),
         "beneficiary_first_name": _join_names([_first_name(a.get("beneficiary_name")) for a in allocs]),
         "beneficiary_first_names": _join_names([_first_name(a.get("beneficiary_name")) for a in allocs]),
         "beneficiary_last_name": _join_names([_last_name(a.get("beneficiary_name")) for a in allocs]),
-        "sponsorship_type": _join_names([a.get("b_type") or a.get("sponsorship_type") or "" for a in allocs]),
-        "location": _join_names([a.get("b_location") or "" for a in allocs]),
-        "project_code": _join_names([a.get("b_code") or "" for a in allocs]),
+        "sponsorship_type": _join_lines([a.get("b_type") or a.get("sponsorship_type") or "" for a in allocs]),
+        "location": _join_lines([a.get("b_location") or "" for a in allocs]),
+        "project_code": _join_lines([a.get("b_code") or "" for a in allocs]),
         "sponsorships_count": str(len(allocs)),
         "sponsorships_list": f'<ul style="margin: 8px 0; padding-left: 20px;">{"".join(items)}</ul>',
         # One "Watch ...'s Video" button per beneficiary that has a video (empty = the send is held, like {video_link})
@@ -492,7 +507,7 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
             if val is not None and str(val).strip() != "":
                 variables[k.lower()] = str(val).strip()
 
-    subject = _render_text(subject_tpl, variables)
+    subject = _render_text(subject_tpl, {k: _unbreak(v) for k, v in variables.items()})
     variables["subject"] = subject
     unresolved = sorted({m.group(1) for m in _PLACEHOLDER_RE.finditer(subject_tpl + body_tpl)
                          if m.group(1).lower() not in {k.lower() for k, val in variables.items() if val not in (None, "")}})
