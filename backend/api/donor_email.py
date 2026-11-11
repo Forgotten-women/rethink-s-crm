@@ -394,40 +394,68 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
 
 _LINK_BUTTON_PLACEHOLDERS = (("profile_link", ("b_profile", "profile_link")), ("video_link", ("b_video",)),
                              ("donor_folder_link", ("b_folder",)), ("folder_link", ("b_folder",)))
-_LINK_BUTTON_RES = {ph: re.compile(r"<a\b[^>]*\{\s*" + ph + r"\s*\}[^>]*>(.*?)</a>", re.I | re.S)
+# {name} or {{name}}, as _render_text accepts both
+def _ph_re(ph: str) -> str:
+    return r"\{\{?\s*" + ph + r"\s*\}?\}"
+
+
+_LINK_BUTTON_RES = {ph: re.compile(r"<a\b[^>]*" + _ph_re(ph) + r"[^>]*>(.*?)</a>", re.I | re.S)
                     for ph, _ in _LINK_BUTTON_PLACEHOLDERS}
+# The template's whole button block: the innermost <table> that holds the placeholder anchor (buttons in these
+# templates are a coloured <td> around the <a>, so the copy must include it to keep its own rounded background)
+_LINK_BUTTON_TABLE_RES = {ph: re.compile(r"<table\b(?:(?!</?table\b)[\s\S])*?" + _ph_re(ph) + r"(?:(?!</?table\b)[\s\S])*?</table>", re.I)
+                          for ph, _ in _LINK_BUTTON_PLACEHOLDERS}
 
 
 def _button_rows(buttons: List[str]) -> str:
-    """Stacks buttons with real spacing in email clients: td padding survives where div/anchor margins are
+    """Stacks buttons with real spacing in email clients: td padding survives where div/table margins are
     stripped (Outlook), so the buttons don't fuse into one solid block."""
-    rows = "".join(f'<tr><td style="padding: 5px 0;" align="left">{b}</td></tr>' for b in buttons)
-    return f'<table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin: 4px 0; border-collapse: collapse;">{rows}</table>'
+    rows = "".join(f'<tr><td style="padding: 6px 0;" align="left">{b}</td></tr>' for b in buttons)
+    return f'<table role="presentation" border="0" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">{rows}</table>'
+
+
+def _beneficiary_links(allocs: List[Dict[str, Any]], keys) -> List[tuple]:
+    links = []
+    for a in allocs:
+        link = str(next((a.get(k) for k in keys if a.get(k)), "") or "").strip()
+        if link:
+            links.append((link, _first_name(a.get("beneficiary_name")) or str(a.get("beneficiary_name") or "")))
+    return links
 
 
 def _multiply_link_buttons(body: str, allocs: List[Dict[str, Any]]) -> str:
-    """A combined email about several beneficiaries: a button/link whose href is {profile_link}, {video_link} or
+    """A combined email about several beneficiaries: the button/link whose href is {profile_link}, {video_link} or
     {donor_folder_link}/{folder_link} becomes one per beneficiary ("View Profile Document – Joudi"), each with that
-    beneficiary's own link. Beneficiaries without that link are left out; with fewer than two links (e.g. everyone
-    shares one folder) the template is left alone."""
+    beneficiary's own link and its own styling. With fewer than two distinct links (e.g. everyone shares one video
+    or folder) the template is left alone and the single link fills as before."""
     import html as _html
+
+    def anchor_copy(m, ph, link, who):
+        head = m.group(0)[:m.start(1) - m.start(0)]
+        return (re.sub(_ph_re(ph), _html.escape(link, quote=True), head)
+                + m.group(1).strip() + (f" &ndash; {_html.escape(who)}" if who else "") + "</a>")
+
     for ph, keys in _LINK_BUTTON_PLACEHOLDERS:
-        def repl(m, ph=ph, keys=keys):
-            links = []
-            for a in allocs:
-                link = str(next((a.get(k) for k in keys if a.get(k)), "") or "").strip()
-                if link:
-                    links.append((link, _first_name(a.get("beneficiary_name")) or str(a.get("beneficiary_name") or "")))
-            if len(links) < 2 or len({l for l, _ in links}) < 2:  # none/one/all-the-same: keep the single link
-                return m.group(0)
-            head = m.group(0)[:m.start(1) - m.start(0)]
-            label = m.group(1).strip()
-            out = []
-            for link, who in links:
-                out.append(re.sub(r"\{\s*" + ph + r"\s*\}", _html.escape(link, quote=True), head)
-                           + label + (f" &ndash; {_html.escape(who)}" if who else "") + "</a>")
-            return _button_rows(out)
-        body = _LINK_BUTTON_RES[ph].sub(repl, body)
+        links = _beneficiary_links(allocs, keys)
+        if len(links) < 2 or len({l for l, _ in links}) < 2:  # none/one/all-the-same: keep the single link
+            continue
+
+        def table_repl(tm, ph=ph):
+            t = tm.group(0)
+            am = _LINK_BUTTON_RES[ph].search(t)
+            if not am:  # placeholder in this table but not inside an <a> (e.g. plain text) - leave it
+                return t
+            open_tag = re.match(r"<table\b[^>]*>", t).group(0)
+            # the copies stack in our own rows: drop the float/margins from the template's button table
+            neutral = re.sub(r'\s(?:align|width)="[^"]*"', "", open_tag)
+            neutral = re.sub(r'(style="[^"]*?)margin[^;"]*;?', r"\1", neutral)
+            copies = [neutral + t[len(open_tag):am.start()] + anchor_copy(am, ph, link, who) + t[am.end():]
+                      for link, who in links]
+            return _button_rows(copies)
+
+        new = _LINK_BUTTON_TABLE_RES[ph].sub(table_repl, body)
+        # a placeholder link outside any table (e.g. the underlined folder link) duplicates as plain stacked links
+        body = _LINK_BUTTON_RES[ph].sub(lambda m, ph=ph: _button_rows([anchor_copy(m, ph, l, w) for l, w in links]), new)
     return body
 
 
