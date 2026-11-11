@@ -463,7 +463,9 @@ def _multiply_link_buttons(body: str, allocs: List[Dict[str, Any]]) -> str:
             open_tag = re.match(r"<table\b[^>]*>", t).group(0)
             # the copies stack in our own rows: drop the float/margins from the template's button table
             neutral = re.sub(r'\s(?:align|width)="[^"]*"', "", open_tag)
-            neutral = re.sub(r'(style="[^"]*?)margin[^;"]*;?', r"\1", neutral)
+            neutral = re.sub(r'(style=")([^"]*)"',
+                             lambda sm: sm.group(1) + re.sub(r"margin[^;\"]*;?\s*", "", sm.group(2)) + '"',
+                             neutral, count=1)
             copies = [neutral + t[len(open_tag):am.start()] + anchor_copy(am, ph, link, who) + t[am.end():]
                       for link, who in links]
             return _button_rows(copies)
