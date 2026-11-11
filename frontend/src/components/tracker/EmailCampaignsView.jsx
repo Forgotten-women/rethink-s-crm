@@ -139,7 +139,8 @@ if (denyUnless('email.send')) return;
               <div className="flex gap-4 mt-2 text-sm tabular-nums" style={{ color: 'var(--text-main)' }}>
                 <span><Users className="w-3.5 h-3.5 inline" /> {c.total}</span>
                 <span className="text-emerald-600">sent {c.sent || 0}</span>
-                <span className="text-sky-600">opened {c.opened || 0}</span>
+                <span className="text-sky-600">opened {c.opened || 0}{c.sent > 0 && c.opened > 0 ? ` (${Math.round((c.opened / c.sent) * 100)}%)` : ''}</span>
+                <span className="text-violet-600">replied {c.replied || 0}</span>
                 <span className="text-amber-600">pending {c.pending || 0}</span>
                 {c.skipped > 0 && <span style={{ color: 'var(--text-muted)' }}>skipped {c.skipped}</span>}
                 {c.failed > 0 && <span className="text-rose-600">failed {c.failed}</span>}

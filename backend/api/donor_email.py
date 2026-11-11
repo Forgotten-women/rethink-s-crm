@@ -257,7 +257,7 @@ def _sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
     }
     combined = _combined_sponsorship_vars(allocs)
     if len(allocs) == 1:  # one sponsorship: keep its own values, add the list/count
-        combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list", "video_buttons")}
+        combined = {k: combined[k] for k in ("beneficiary_names", "beneficiary_first_names", "beneficiary_names_with_types", "sponsorships_count", "sponsorships_list", "video_buttons")}
     v.update(combined)
     return v
 
@@ -390,6 +390,9 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
     return {
         # Full names / types / locations / IDs: one per line (the info box); first names stay joined for sentences
         "beneficiary_name": _join_lines([a.get("beneficiary_name") or "" for a in allocs]),
+        "beneficiary_names_with_types": _join_lines([
+            ((a.get("beneficiary_name") or "") + (f" - {a.get('b_type') or a.get('sponsorship_type')}" if (a.get("b_type") or a.get("sponsorship_type")) else "")).strip()
+            for a in allocs]),
         "beneficiary_names": _join_lines([a.get("beneficiary_name") or "" for a in allocs]),
         "beneficiary_first_name": _join_names([_first_name(a.get("beneficiary_name")) for a in allocs]),
         "beneficiary_first_names": _join_names([_first_name(a.get("beneficiary_name")) for a in allocs]),
@@ -496,7 +499,7 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
     picked_ids = _selected_ids(selected_allocation_id)
     picked = [al for al in allocs if al.get("id") in picked_ids]
     if picked and len(picked) < len(allocs):
-        for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list", "video_buttons"):
+        for k in ("beneficiary_names", "beneficiary_first_names", "beneficiary_names_with_types", "sponsorships_count", "sponsorships_list", "video_buttons"):
             variables.pop(k, None)
         variables.update(_sponsorship_vars(picked))
     about = picked if picked and len(picked) < len(allocs) else allocs
@@ -970,7 +973,8 @@ def list_campaigns(company_id: str = Query(...)):
             SELECT c.id, c.name, c.template_type, c.theme, c.status, c.created_by, c.created_at, c.segment_json,
                    MAX(m.sender_email) AS sender_email,
                    SUM(m.status = 'pending') AS pending, SUM(m.status = 'sent') AS sent, SUM(m.status = 'failed') AS failed,
-                   SUM(m.status = 'skipped') AS skipped, SUM(COALESCE(m.open_count, 0) > 0) AS opened, COUNT(m.id) AS total
+                   SUM(m.status = 'skipped') AS skipped, SUM(COALESCE(m.open_count, 0) > 0) AS opened,
+                   SUM(m.replied_at IS NOT NULL) AS replied, COUNT(m.id) AS total
             FROM crm_email_campaigns c LEFT JOIN crm_email_messages m ON m.campaign_id = c.id
             WHERE c.company_id = ? GROUP BY c.id ORDER BY c.id DESC LIMIT 200""", (comp,))]
     finally:
@@ -1369,7 +1373,7 @@ def email_activity(company_id: str = Query(...), direction: Optional[str] = Quer
 
 SPONSORSHIP_PLACEHOLDERS = {"beneficiary_name", "beneficiary_names", "beneficiary_first_name", "beneficiary_first_names", "beneficiary_last_name", "sponsorship_type", "location", "project_code", "profile_link",
                             "video_link", "report_link", "donor_folder_link", "folder_link", "renewal_deadline", "sponsorship_year",
-                            "sponsorships_list", "sponsorships_count", "video_buttons", "campaign_name", "community_name"}
+                            "sponsorships_list", "sponsorships_count", "video_buttons", "beneficiary_names_with_types", "campaign_name", "community_name"}
 LINK_PLACEHOLDERS = {"profile_link", "video_link", "report_link", "donor_folder_link", "folder_link"}
 
 

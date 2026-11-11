@@ -5303,14 +5303,15 @@ async def outlook_graph_webhook(request: Request):
         try:
             access_token = _get_valid_graph_token(company_id)
             m_res = requests.get(f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}", headers={
-                "Authorization": f"Bearer {access_token}"
+                "Authorization": f"Bearer {access_token}",
+                "Prefer": 'outlook.body-content-type="text"',
             }, timeout=10)
 
             if m_res.status_code == 200:
                 msg_data = m_res.json()
                 from_email = msg_data.get("from", {}).get("emailAddress", {}).get("address", "")
                 subject = msg_data.get("subject", "")
-                body_preview = msg_data.get("bodyPreview", "")
+                body_preview = _graph_body_text(msg_data)
                 conv_id = msg_data.get("conversationId", "")
 
                 from backend.api.mailbox import mailbox_company
@@ -5486,10 +5487,36 @@ def _record_direct_reply(cur, company_id: str, msg_id: str, conv_id: str, subjec
     return True
 
 
+def _graph_body_text(m: Dict[str, Any]) -> str:
+    """The full reply text from a Graph message: its complete body (HTML flattened to text) rather than
+    Microsoft's bodyPreview, which is cut off at ~255 characters."""
+    body = m.get("body") or {}
+    content = (body.get("content") or "").strip()
+    if content and (body.get("contentType") or "").lower() == "html":
+        import html as _h
+        content = re.sub(r"<(script|style)\b[\s\S]*?</\1\s*>", " ", content, flags=re.I)
+        content = re.sub(r"<br\s*/?>|</p\s*>|</div\s*>|</tr\s*>", "\n", content, flags=re.I)
+        content = _h.unescape(re.sub(r"<[^>]+>", " ", content))
+        content = re.sub(r"[ \t\xa0]+", " ", content)
+        content = re.sub(r" ?\n ?", "\n", content)
+        content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    return (content or m.get("bodyPreview") or "").strip()[:20000]
+
+
 def _record_inbound_reply(cur, company_id: str, msg_id: str, conv_id: str, subject: str, body_preview: str,
                           sender_email: str, recipient_email: str, received_at: Optional[str]) -> bool:
     """Logs one inbound reply (once per message id) and marks only the outbound email that donor
     was answering as replied - not every email on the sponsorship."""
+    full = (body_preview or "").strip()
+    if full:  # a fuller body for a reply we already have (older ones were cut at Microsoft's ~255-char preview)
+        for table, col in (("sponsorship_communications", "body"), ("crm_email_replies", "body_preview")):
+            try:
+                row = cur.execute(f"SELECT id, LENGTH(COALESCE({col}, '')) FROM {table} WHERE message_id = ? AND company_id = ?",
+                                  (msg_id, company_id)).fetchone()
+                if row and len(full) > (row[1] or 0):
+                    cur.execute(f"UPDATE {table} SET {col} = ? WHERE id = ?", (full, row[0]))
+            except sqlite3.OperationalError:
+                pass
     if cur.execute("SELECT 1 FROM sponsorship_communications WHERE message_id = ? AND company_id = ?",
                    (msg_id, company_id)).fetchone():
         return False
@@ -5550,8 +5577,10 @@ def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
         connected_email = (auth["connected_email"] or "").strip().lower()
 
         # Query top 30 recent messages from Inbox
-        url = "https://graph.microsoft.com/v1.0/me/mailFolders('Inbox')/messages?$top=30&$orderby=receivedDateTime desc"
-        res = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        url = ("https://graph.microsoft.com/v1.0/me/mailFolders('Inbox')/messages?$top=30&$orderby=receivedDateTime desc"
+               "&$select=id,conversationId,subject,bodyPreview,body,from,receivedDateTime")
+        res = requests.get(url, headers={"Authorization": f"Bearer {access_token}",
+                                         "Prefer": 'outlook.body-content-type="text"'}, timeout=15)
         if res.status_code != 200:
             return {"status": "fetch_failed", "detail": res.text}
 
@@ -5567,7 +5596,7 @@ def sync_inbound_outlook_replies(company_id: str) -> Dict[str, Any]:
                 if not sender_email or sender_email == connected_email:
                     continue
                 if _record_inbound_reply(cur, mailbox_company(comp), m.get("id"), m.get("conversationId", ""), m.get("subject", ""),
-                                         m.get("bodyPreview", ""), sender_email, connected_email,
+                                         _graph_body_text(m), sender_email, connected_email,
                                          m.get("receivedDateTime")):
                     new_synced += 1
 
