@@ -369,9 +369,10 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
         if video:
             label = _first_name(a.get("beneficiary_name")) or name
             buttons.append(
-                f'<a href="{_html.escape(video, quote=True)}" target="_blank" style="display: inline-block; margin: 4px 8px 4px 0; '
-                'padding: 10px 22px; background-color: #0284C7; color: #FFFFFF; text-decoration: none; border-radius: 6px; '
-                f'font-weight: bold; font-size: 13.5px;">&#9658; Watch {_html.escape(label)}\'s Video</a>')
+                f'<a href="{_html.escape(video, quote=True)}" target="_blank" style="display: inline-block; '
+                'padding: 10px 22px; background-color: #0284C7; color: #FFFFFF; font-family: Arial,Helvetica,sans-serif; '
+                'text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 13.5px; line-height: 1.2;">'
+                f'&#9658; Watch {_html.escape(label)}\'s Video</a>')
     return {
         "beneficiary_name": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
         "beneficiary_names": _join_names([a.get("beneficiary_name") or "" for a in allocs]),
@@ -384,39 +385,48 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
         "sponsorships_count": str(len(allocs)),
         "sponsorships_list": f'<ul style="margin: 8px 0; padding-left: 20px;">{"".join(items)}</ul>',
         # One "Watch ...'s Video" button per beneficiary that has a video (empty = the send is held, like {video_link})
-        "video_buttons": f'<div style="margin: 10px 0;">{"".join(buttons)}</div>' if buttons else "",
+        "video_buttons": _button_rows(buttons) if buttons else "",
         "profile_link": allocs[0].get("b_profile") or allocs[0].get("profile_link") or "",
         "video_link": allocs[0].get("b_video") or "",
         "renewal_deadline": min((str(a.get("end_date"))[:10] for a in allocs if a.get("end_date")), default=""),
     }
 
 
+_LINK_BUTTON_PLACEHOLDERS = (("profile_link", ("b_profile", "profile_link")), ("video_link", ("b_video",)),
+                             ("donor_folder_link", ("b_folder",)), ("folder_link", ("b_folder",)))
 _LINK_BUTTON_RES = {ph: re.compile(r"<a\b[^>]*\{\s*" + ph + r"\s*\}[^>]*>(.*?)</a>", re.I | re.S)
-                    for ph in ("profile_link", "video_link")}
+                    for ph, _ in _LINK_BUTTON_PLACEHOLDERS}
+
+
+def _button_rows(buttons: List[str]) -> str:
+    """Stacks buttons with real spacing in email clients: td padding survives where div/anchor margins are
+    stripped (Outlook), so the buttons don't fuse into one solid block."""
+    rows = "".join(f'<tr><td style="padding: 5px 0;" align="left">{b}</td></tr>' for b in buttons)
+    return f'<table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin: 4px 0; border-collapse: collapse;">{rows}</table>'
 
 
 def _multiply_link_buttons(body: str, allocs: List[Dict[str, Any]]) -> str:
-    """A combined email about several beneficiaries: a button/link whose href is {profile_link} or {video_link}
-    becomes one per beneficiary ("View Profile Document – Joudi"), each with that beneficiary's own link.
-    Beneficiaries without that link are left out; with fewer than two links the template is left alone."""
+    """A combined email about several beneficiaries: a button/link whose href is {profile_link}, {video_link} or
+    {donor_folder_link}/{folder_link} becomes one per beneficiary ("View Profile Document – Joudi"), each with that
+    beneficiary's own link. Beneficiaries without that link are left out; with fewer than two links (e.g. everyone
+    shares one folder) the template is left alone."""
     import html as _html
-    for ph, keys in (("profile_link", ("b_profile", "profile_link")), ("video_link", ("b_video",))):
+    for ph, keys in _LINK_BUTTON_PLACEHOLDERS:
         def repl(m, ph=ph, keys=keys):
             links = []
             for a in allocs:
-                link = next((a.get(k) for k in keys if a.get(k)), "")
+                link = str(next((a.get(k) for k in keys if a.get(k)), "") or "").strip()
                 if link:
-                    links.append((str(link), _first_name(a.get("beneficiary_name")) or str(a.get("beneficiary_name") or "")))
-            if len(links) < 2:
+                    links.append((link, _first_name(a.get("beneficiary_name")) or str(a.get("beneficiary_name") or "")))
+            if len(links) < 2 or len({l for l, _ in links}) < 2:  # none/one/all-the-same: keep the single link
                 return m.group(0)
             head = m.group(0)[:m.start(1) - m.start(0)]
-            label = m.group(1)
+            label = m.group(1).strip()
             out = []
             for link, who in links:
-                btn = (re.sub(r"\{\s*" + ph + r"\s*\}", _html.escape(link, quote=True), head)
-                       + label + (f" &ndash; {_html.escape(who)}" if who else "") + "</a>")
-                out.append(f'<div style="margin: 6px 0;">{btn}</div>')
-            return "".join(out)
+                out.append(re.sub(r"\{\s*" + ph + r"\s*\}", _html.escape(link, quote=True), head)
+                           + label + (f" &ndash; {_html.escape(who)}" if who else "") + "</a>")
+            return _button_rows(out)
         body = _LINK_BUTTON_RES[ph].sub(repl, body)
     return body
 
