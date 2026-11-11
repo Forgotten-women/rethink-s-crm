@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Mail, Plus, Send, XCircle, Trash2, ChevronDown, ChevronUp, RefreshCw, Users, Pencil, Tags } from 'lucide-react';
+import { Mail, Plus, Send, XCircle, Trash2, ChevronDown, ChevronUp, RefreshCw, Users, Pencil, Tags, RotateCcw } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 import EmailComposer from '../EmailComposer';
 import { segmentChips } from '../SegmentBuilder';
@@ -35,6 +35,7 @@ export default function EmailCampaignsView({ companyId }) {
   const [messages, setMessages] = useState({});
   const [sending, setSending] = useState(null);
   const [notice, setNotice] = useState('');
+  const [composerDonors, setComposerDonors] = useState(null);
 
   const rename = async (c) => {
     if (denyUnless('email.campaigns')) return;
@@ -43,6 +44,24 @@ export default function EmailCampaignsView({ companyId }) {
     setError('');
     try { await call('PATCH', `/api/tracker/direct-email/campaigns/${c.id}`, { company_id: companyId, name: name.trim() }); load(); }
     catch (e) { setError(e.message); }
+  };
+
+  // "Email again": reuse this campaign's recipients in the composer - pick any template / message, and the send
+  // becomes a NEW campaign of its own (separate name, counts and tracking).
+  const emailAgain = async (c) => {
+    if (denyUnless('email.campaigns')) return;
+    setError(''); setNotice('');
+    try {
+      const ids = new Set();
+      for (let page = 1; page <= 20; page += 1) {
+        const d = await call('GET', `/api/tracker/direct-email/campaigns/${c.id}/messages?company_id=${encodeURIComponent(companyId)}&status=sent&page=${page}&page_size=500`);
+        (d.messages || []).forEach(m => { const k = m.donor_id || m.recipient_email; if (k) ids.add(k); });
+        if (page * 500 >= (d.total || 0)) break;
+      }
+      if (!ids.size) { setError('This campaign has no sent emails yet, so there is nobody to email again.'); return; }
+      setComposerDonors([...ids]);
+      setComposer(true);
+    } catch (e) { setError(e.message); }
   };
 
   const markSponsorships = async (c, status) => {
@@ -129,6 +148,12 @@ if (denyUnless('email.send')) return;
             </div>
             <div className="flex gap-2 flex-wrap items-start">
               {(c.sent || 0) > 0 && (
+                <button type="button" disabled={!!sending} onClick={() => emailAgain(c)} title="Reuse everyone this campaign was sent to in a new campaign - pick any template; it is tracked as its own campaign"
+                  className="px-3 py-1.5 text-sm rounded-lg border font-bold flex items-center gap-1 disabled:opacity-40" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-sub)' }}>
+                  <RotateCcw className="w-4 h-4 text-sky-500" /> Email again
+                </button>
+              )}
+              {(c.sent || 0) > 0 && (
                 <label className="flex items-center gap-1 text-sm rounded-lg border px-2 py-1" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-sub)' }} title="Set the outreach status on the sponsorships of everyone this campaign was sent to">
                   <Tags className="w-4 h-4 text-indigo-500" />
                   <select value="" onChange={e => { markSponsorships(c, e.target.value); e.target.value = ''; }}
@@ -172,7 +197,8 @@ if (denyUnless('email.send')) return;
           )}
         </div>
       ))}
-      {composer && <EmailComposer company={companyId} startAsCampaign onClose={() => setComposer(false)} onDone={load} />}
+      {composer && <EmailComposer company={companyId} startAsCampaign initialDonorIds={composerDonors || []}
+        onClose={() => { setComposer(false); setComposerDonors(null); }} onDone={load} />}
     </div>
   );
 }

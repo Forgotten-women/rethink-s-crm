@@ -380,6 +380,7 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
         "beneficiary_last_name": _join_names([_last_name(a.get("beneficiary_name")) for a in allocs]),
         "sponsorship_type": _join_names([a.get("b_type") or a.get("sponsorship_type") or "" for a in allocs]),
         "location": _join_names([a.get("b_location") or "" for a in allocs]),
+        "project_code": _join_names([a.get("b_code") or "" for a in allocs]),
         "sponsorships_count": str(len(allocs)),
         "sponsorships_list": f'<ul style="margin: 8px 0; padding-left: 20px;">{"".join(items)}</ul>',
         # One "Watch ...'s Video" button per beneficiary that has a video (empty = the send is held, like {video_link})
@@ -388,6 +389,36 @@ def _combined_sponsorship_vars(allocs: List[Dict[str, Any]]) -> Dict[str, str]:
         "video_link": allocs[0].get("b_video") or "",
         "renewal_deadline": min((str(a.get("end_date"))[:10] for a in allocs if a.get("end_date")), default=""),
     }
+
+
+_LINK_BUTTON_RES = {ph: re.compile(r"<a\b[^>]*\{\s*" + ph + r"\s*\}[^>]*>(.*?)</a>", re.I | re.S)
+                    for ph in ("profile_link", "video_link")}
+
+
+def _multiply_link_buttons(body: str, allocs: List[Dict[str, Any]]) -> str:
+    """A combined email about several beneficiaries: a button/link whose href is {profile_link} or {video_link}
+    becomes one per beneficiary ("View Profile Document – Joudi"), each with that beneficiary's own link.
+    Beneficiaries without that link are left out; with fewer than two links the template is left alone."""
+    import html as _html
+    for ph, keys in (("profile_link", ("b_profile", "profile_link")), ("video_link", ("b_video",))):
+        def repl(m, ph=ph, keys=keys):
+            links = []
+            for a in allocs:
+                link = next((a.get(k) for k in keys if a.get(k)), "")
+                if link:
+                    links.append((str(link), _first_name(a.get("beneficiary_name")) or str(a.get("beneficiary_name") or "")))
+            if len(links) < 2:
+                return m.group(0)
+            head = m.group(0)[:m.start(1) - m.start(0)]
+            label = m.group(1)
+            out = []
+            for link, who in links:
+                btn = (re.sub(r"\{\s*" + ph + r"\s*\}", _html.escape(link, quote=True), head)
+                       + label + (f" &ndash; {_html.escape(who)}" if who else "") + "</a>")
+                out.append(f'<div style="margin: 6px 0;">{btn}</div>')
+            return "".join(out)
+        body = _LINK_BUTTON_RES[ph].sub(repl, body)
+    return body
 
 
 def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str], body_tpl: Optional[str],
@@ -413,6 +444,9 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
         for k in ("beneficiary_names", "beneficiary_first_names", "sponsorships_count", "sponsorships_list", "video_buttons"):
             variables.pop(k, None)
         variables.update(_sponsorship_vars(picked))
+    about = picked if picked and len(picked) < len(allocs) else allocs
+    if len(about) > 1:  # one profile / video button per beneficiary instead of one shared one
+        body_tpl = _multiply_link_buttons(body_tpl, about)
 
     # Apply sender-provided custom variables so missing fields are not skipped
     if custom_variables:
