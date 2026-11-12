@@ -3952,6 +3952,7 @@ def update_allocation(allocation_id: int, payload: AllocationUpdateRequest):
                 cur.execute(f"UPDATE sponsorship_allocation_donors SET {', '.join(d_fields)}, updated_at = CURRENT_TIMESTAMP "
                             "WHERE allocation_id = ? AND is_primary = 1", d_values)
             conn.commit()
+        invalidate_overdue_cache(_allocation_company(allocation_id))
         return {"status": "success", "message": "Allocation updated successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3996,6 +3997,7 @@ def renew_allocation(allocation_id: int):
             WHERE id = ?
         """, (new_end, new_count, allocation_id))
         conn.commit()
+        invalidate_overdue_cache(_allocation_company(allocation_id))
         return {
             "status": "success",
             "message": f"Sponsorship successfully renewed for Year {new_count + 1} (expires {new_end})!",
@@ -4024,6 +4026,7 @@ def update_allocation_dates(allocation_id: int, payload: AllocationDatesUpdateRe
             WHERE id = ?
         """, (payload.start_date.strip(), payload.end_date.strip(), payload.renewal_status, allocation_id))
         conn.commit()
+        invalidate_overdue_cache(_allocation_company(allocation_id))
         return {"status": "success", "message": "Allocation dates updated successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -6738,6 +6741,20 @@ def invalidate_overdue_cache(company_id: Optional[str] = None):
         conn.close()
     except Exception as e:
         logger.warning(f"Error clearing sqlite overdue cache: {e}")
+
+    try:
+        from backend.api.donors import _bump_directory, _DIRECTORY_CACHE
+        if company_id:
+            cid = str(company_id).strip().lower()
+            _bump_directory(cid)
+            _bump_directory("all")
+        else:
+            _bump_directory("rethink")
+            _bump_directory("iqra")
+            _bump_directory("all")
+            _DIRECTORY_CACHE.clear()
+    except Exception as e:
+        logger.warning(f"Error invalidating directory cache: {e}")
 
 
 def get_all_overdue_data(company_id: str = "rethink", force_refresh: bool = False):

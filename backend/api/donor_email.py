@@ -178,6 +178,94 @@ def _resolve_recipients(comp: str, segment: Optional[Dict[str, Any]], donor_ids:
                         "allocations": _clean(r.get("allocations")) or 0,
                         "sponsorship_statuses": _clean(r.get("sponsorship_statuses")) or "",
                         "sponsorship_types": _clean(r.get("sponsorship_types"))})
+    # Ensure any donor_ids not found in frame are also resolved from sponsorship allocations
+    missing_ids = [str(d).strip() for d in (donor_ids or []) if str(d).strip().lower() not in seen]
+    if missing_ids:
+        conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            placeholders = ",".join("?" for _ in missing_ids)
+            lower_ids = [d.lower() for d in missing_ids]
+            rows = conn.execute(f"""
+                SELECT DISTINCT
+                    LOWER(TRIM(COALESCE(d.donor_email, a.donor_email, ''))) AS email,
+                    COALESCE(d.donor_name, a.donor_name, '') AS name,
+                    COALESCE(d.donor_phone, a.donor_phone, '') AS phone,
+                    COALESCE(d.donor_id, a.donor_id, d.donor_email) AS donor_id,
+                    COALESCE(b.sponsorship_type, 'Sponsorship') AS sponsorship_type,
+                    COALESCE(d.contribution_amount, a.allocated_amount, 0) AS amount
+                FROM sponsorship_allocations a
+                LEFT JOIN sponsorship_allocation_donors d ON d.allocation_id = a.id
+                LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                WHERE (LOWER(a.company_id) = ? OR ? = 'all') AND (
+                    LOWER(TRIM(COALESCE(d.donor_email, ''))) IN ({placeholders}) OR
+                    LOWER(TRIM(COALESCE(a.donor_email, ''))) IN ({placeholders}) OR
+                    LOWER(TRIM(COALESCE(d.donor_id, ''))) IN ({placeholders}) OR
+                    LOWER(TRIM(COALESCE(a.donor_id, ''))) IN ({placeholders})
+                )
+            """, [comp, comp] + lower_ids * 4).fetchall()
+            for r in rows:
+                em = str(r["email"] or "").strip()
+                if "@" in em and em.lower() not in seen:
+                    seen.add(em.lower())
+                    out.append({
+                        "donor_id": r["donor_id"] or em,
+                        "email": em,
+                        "name": r["name"] or "",
+                        "phone": r["phone"] or "",
+                        "total": float(r["amount"] or 0),
+                        "gifts": 0,
+                        "tier": "Sponsorship",
+                        "last_gift": "",
+                        "matched_gifts": None,
+                        "matched_total": None,
+                        "matched_causes": "Sponsorship",
+                        "matched_sponsorships": r["sponsorship_type"],
+                        "matched_last": "",
+                        "allocations": 1,
+                        "sponsorship_statuses": "active",
+                        "sponsorship_types": r["sponsorship_type"]
+                    })
+
+            # Check sponsorship_manual_donors if any missing IDs remain
+            still_missing_ids = [d for d in lower_ids if d not in seen]
+            if still_missing_ids:
+                m_placeholders = ",".join("?" for _ in still_missing_ids)
+                m_rows = conn.execute(f"""
+                    SELECT id, donor_name, donor_email, donor_phone, total_donated, sponsorship_type
+                    FROM sponsorship_manual_donors
+                    WHERE (LOWER(company_id) = ? OR ? = 'all') AND (
+                        LOWER(TRIM(COALESCE(donor_email, ''))) IN ({m_placeholders}) OR
+                        LOWER(TRIM(COALESCE(id, ''))) IN ({m_placeholders})
+                    )
+                """, [comp, comp] + still_missing_ids * 2).fetchall()
+                for mr in m_rows:
+                    em = str(mr["donor_email"] or "").strip()
+                    if "@" in em and em.lower() not in seen:
+                        seen.add(em.lower())
+                        out.append({
+                            "donor_id": mr["id"] or em,
+                            "email": em,
+                            "name": mr["donor_name"] or "",
+                            "phone": mr["donor_phone"] or "",
+                            "total": float(mr["total_donated"] or 0),
+                            "gifts": 1,
+                            "tier": "Sponsorship",
+                            "last_gift": "",
+                            "matched_gifts": None,
+                            "matched_total": None,
+                            "matched_causes": "Sponsorship",
+                            "matched_sponsorships": mr["sponsorship_type"] or "Sponsorship",
+                            "matched_last": "",
+                            "allocations": 1,
+                            "sponsorship_statuses": "active",
+                            "sponsorship_types": mr["sponsorship_type"] or "Sponsorship"
+                        })
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
     for e in extra or []:
         em = str((e or {}).get("email") or "").strip()
         if "@" in em and em.lower() not in seen:
@@ -728,36 +816,79 @@ def lookup_emails(req: EmailLookupRequest):
                     "last_gift": str(_clean(r.get("last_gift")) or "")[:10]
                 })
 
-    # Check database sponsorship_allocations fallback if any are still missing
+    # Check database sponsorship_allocations / allocation donors fallback if any are still missing
     still_missing = [e for e in valid_emails if e.lower() not in matched_emails_lower]
     if still_missing:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
-            placeholders = ",".join("?" for _ in still_missing)
+            lower_missing = [e.lower() for e in still_missing]
+            placeholders = ",".join("?" for _ in lower_missing)
+            # 1. Search allocations + allocation donors
             cur = conn.execute(
-                f"""SELECT donor_id, donor_name, donor_email, donor_phone, COUNT(*) as alloc_count
-                    FROM sponsorship_allocations
-                    WHERE LOWER(donor_email) IN ({placeholders})
-                    GROUP BY LOWER(donor_email)""",
-                [e.lower() for e in still_missing]
+                f"""SELECT DISTINCT
+                        LOWER(TRIM(COALESCE(d.donor_email, a.donor_email, ''))) AS email,
+                        COALESCE(d.donor_name, a.donor_name, '') AS name,
+                        COALESCE(d.donor_phone, a.donor_phone, '') AS phone,
+                        COALESCE(d.donor_id, a.donor_id, d.donor_email, a.donor_email) AS donor_id,
+                        COALESCE(b.sponsorship_type, 'Sponsorship') AS sponsorship_type,
+                        COUNT(DISTINCT a.id) as alloc_count,
+                        MAX(COALESCE(d.contribution_amount, a.allocated_amount, 0)) as amount
+                    FROM sponsorship_allocations a
+                    LEFT JOIN sponsorship_allocation_donors d ON d.allocation_id = a.id
+                    LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                    WHERE (LOWER(a.company_id) = ? OR ? = 'all')
+                      AND (
+                          LOWER(TRIM(COALESCE(d.donor_email, ''))) IN ({placeholders}) OR
+                          LOWER(TRIM(COALESCE(a.donor_email, ''))) IN ({placeholders})
+                      )
+                    GROUP BY LOWER(TRIM(COALESCE(d.donor_email, a.donor_email, '')))""",
+                [comp, comp] + lower_missing * 2
             )
             for row in cur.fetchall():
-                em = row["donor_email"]
+                em = str(row["email"] or "").strip()
                 em_lower = em.lower()
                 if em_lower not in matched_emails_lower:
                     matched_emails_lower.add(em_lower)
                     matched.append({
                         "donor_id": row["donor_id"] or em,
                         "email": em,
-                        "name": row["donor_name"] or "",
-                        "phone": row["donor_phone"] or "",
-                        "total": None,
+                        "name": row["name"] or "",
+                        "phone": row["phone"] or "",
+                        "total": float(row["amount"] or 0),
                         "gifts": None,
                         "allocations": row["alloc_count"],
-                        "sponsorship_types": "Sponsorship",
+                        "sponsorship_types": row["sponsorship_type"],
                         "last_gift": ""
                     })
+
+            # 2. Check sponsorship_manual_donors if any still not matched
+            rem_missing = [e for e in valid_emails if e.lower() not in matched_emails_lower]
+            if rem_missing:
+                m_placeholders = ",".join("?" for _ in rem_missing)
+                cur_m = conn.execute(
+                    f"""SELECT id, donor_name, donor_email, donor_phone, total_donated, sponsorship_type
+                        FROM sponsorship_manual_donors
+                        WHERE (LOWER(company_id) = ? OR ? = 'all')
+                          AND LOWER(TRIM(COALESCE(donor_email, ''))) IN ({m_placeholders})""",
+                    [comp, comp] + [e.lower() for e in rem_missing]
+                )
+                for mr in cur_m.fetchall():
+                    em = str(mr["donor_email"] or "").strip()
+                    em_lower = em.lower()
+                    if em_lower not in matched_emails_lower:
+                        matched_emails_lower.add(em_lower)
+                        matched.append({
+                            "donor_id": str(mr["id"]),
+                            "email": em,
+                            "name": mr["donor_name"] or "",
+                            "phone": mr["donor_phone"] or "",
+                            "total": float(mr["total_donated"] or 0),
+                            "gifts": 1,
+                            "allocations": 1,
+                            "sponsorship_types": mr["sponsorship_type"] or "Sponsorship",
+                            "last_gift": ""
+                        })
         except Exception:
             pass
         finally:

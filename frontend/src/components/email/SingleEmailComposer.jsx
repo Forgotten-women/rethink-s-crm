@@ -79,7 +79,12 @@ if (denyUnless('email.send')) return;
         custom_variables: customVariables,
         selected_allocation_id: selectedAllocationId,
         separate_per_beneficiary: separate,
-        recipient_customizations: { [who.email.toLowerCase()]: { templates: emailTemplates, extra_emails: extraEmails } },
+        recipient_customizations: { [who.email.toLowerCase()]: {
+          selected_allocation_id: selectedAllocationId,
+          separate: separate,
+          templates: emailTemplates,
+          extra_emails: extraEmails
+        } },
       });
       const rows = d.results || [];
       const sentN = rows.filter(x => x.status === 'sent').length;

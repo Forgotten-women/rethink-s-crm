@@ -1536,8 +1536,13 @@ def _bump_directory(comp: str) -> None:
         bump("tracker", comp)
     except Exception:
         pass
-    _DIRECTORY_CACHE.pop(comp, None)  # this charity: rebuilt now, so the edit shows straight away
-    # 'all' keeps its copy and refreshes in the background (rebuilding it takes ~20 s)
+    c = str(comp or "").strip().lower()
+    if c == "all" or not c:
+        _DIRECTORY_CACHE.clear()
+    else:
+        keys_to_remove = [k for k in list(_DIRECTORY_CACHE.keys()) if k == c or str(k).startswith(f"{c}|")]
+        for k in keys_to_remove:
+            _DIRECTORY_CACHE.pop(k, None)
 
 
 def _manual_donor_records(comp: str) -> List[Dict[str, Any]]:
@@ -1874,6 +1879,119 @@ def _build_directory_data(comp: str, token: str, scope, cache_key: str):
             }
     if manual_rows:
         dx = pd.concat([dx, pd.DataFrame(manual_rows)], ignore_index=True)
+
+    # Also include all sponsorship tracker donors (allocations / allocation donors) not in frame
+    if scope is None:
+        try:
+            conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+            try:
+                alloc_donors_query = """
+                    SELECT DISTINCT * FROM (
+                        SELECT
+                            LOWER(TRIM(d.donor_email)) AS email,
+                            COALESCE(d.donor_name, '') AS name,
+                            COALESCE(d.donor_phone, '') AS phone,
+                            COALESCE(d.contribution_amount, a.allocated_amount, 0) AS amount,
+                            a.id AS allocation_id,
+                            a.start_date,
+                            a.community_name,
+                            COALESCE(b.sponsorship_type, 'Sponsorship') AS sponsorship_type,
+                            b.name AS child,
+                            b.project_code
+                        FROM sponsorship_allocation_donors d
+                        JOIN sponsorship_allocations a ON a.id = d.allocation_id
+                        LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                        WHERE (LOWER(a.company_id) = ? OR ? = 'all')
+                          AND (d.donor_email LIKE '%@%')
+                        UNION
+                        SELECT
+                            LOWER(TRIM(a.donor_email)) AS email,
+                            COALESCE(a.donor_name, '') AS name,
+                            COALESCE(a.donor_phone, '') AS phone,
+                            COALESCE(a.allocated_amount, 0) AS amount,
+                            a.id AS allocation_id,
+                            a.start_date,
+                            a.community_name,
+                            COALESCE(b.sponsorship_type, 'Sponsorship') AS sponsorship_type,
+                            b.name AS child,
+                            b.project_code
+                        FROM sponsorship_allocations a
+                        LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                        WHERE (LOWER(a.company_id) = ? OR ? = 'all')
+                          AND (a.donor_email LIKE '%@%')
+                    )
+                """
+                alloc_donor_rows = conn.execute(alloc_donors_query, (comp, comp, comp, comp)).fetchall()
+            finally:
+                conn.close()
+
+            tracker_rows = []
+            for em_, name_, phone_, amt_, aid_, sdate_, comm_, stype_, child_, code_ in alloc_donor_rows:
+                k = em_
+                k = k if k in frame.index else by_email.get(k, k)
+                amt_val = round(float(amt_ or 0.0), 2)
+                dt_val = pd.to_datetime(sdate_, errors="coerce")
+                types = [stype_] if stype_ in SPONSORSHIP_TYPES else (["Sponsorship"] if stype_ else [])
+                tracker_rows.append({
+                    "key": k,
+                    "date": dt_val,
+                    "amount": amt_val,
+                    "heading": "Sponsorship",
+                    "subheading": stype_ or "Sponsorship",
+                    "code": code_,
+                    "campaign": f"{stype_ or 'Sponsorship'} sponsorship" + (f" - {child_}" if child_ else " (tracker)"),
+                    "platform": MANUAL_PLATFORM,
+                    "recurring": False,
+                    "gift_aid": False,
+                    "stype": stype_ if stype_ in SPONSORSHIP_TYPES else "",
+                    "sp": (str(comm_ or "").upper() == "SP"),
+                    "zakat": False,
+                    "fundraiser": None,
+                    "donation_id": f"alloc:{aid_}",
+                    "giving_level": child_
+                })
+                if k in frame.index:
+                    if amt_val > 0 and k not in by_email:
+                        frame.at[k, "manual_total"] += amt_val
+                        frame.at[k, "total"] = round(frame.at[k, "total"] + amt_val, 2)
+                    frame.at[k, "manual_records"] = int(frame.at[k, "manual_records"] or 0) + 1
+                    if MANUAL_PLATFORM not in str(frame.at[k, "platforms"] or ""):
+                        frame.at[k, "platforms"] = ", ".join(p for p in [frame.at[k, "platforms"], MANUAL_PLATFORM] if isinstance(p, str) and p)
+                    have = {t.strip() for t in str(frame.at[k, "sponsorship_types"] or "").split(",") if t.strip()}
+                    if set(types) - have:
+                        frame.at[k, "sponsorship_types"] = ", ".join(sorted(have | set(types)))
+                    if pd.notna(dt_val):
+                        for col_, fn in (("first_gift", min), ("last_gift", max)):
+                            cur_ = pd.to_datetime(frame.at[k, col_], errors="coerce")
+                            frame.at[k, col_] = fn([d for d in [cur_, dt_val] if pd.notna(d)])
+                else:
+                    frame.loc[k] = {
+                        "name": str(name_).strip() or None,
+                        "email": em_,
+                        "phone": str(phone_).strip() or None,
+                        "city": None, "country": None,
+                        "total": amt_val,
+                        "gifts": 0,
+                        "first_gift": dt_val,
+                        "last_gift": dt_val,
+                        "gift_aid": False,
+                        "marketing_consent": None,
+                        "recurring_gifts": 0,
+                        "sp": (str(comm_ or "").upper() == "SP"),
+                        "platforms": MANUAL_PLATFORM,
+                        "top_heading": "Sponsorship",
+                        "sponsorship_types": ", ".join(types) or "Sponsorship",
+                        "platform_total": 0.0,
+                        "manual_total": amt_val,
+                        "manual_records": 1,
+                    }
+                    by_email[em_] = k
+
+            if tracker_rows:
+                dx = pd.concat([dx, pd.DataFrame(tracker_rows)], ignore_index=True)
+        except Exception as e:
+            print(f"[donor directory] allocation donors addition skipped: {e}")
+
     # Donor profiles: agent / group (SA ...) / interests on any donor, and manual donors who have no gifts yet
     frame["agent"] = None
     frame["donor_group"] = None
@@ -1917,11 +2035,17 @@ def _build_directory_data(comp: str, token: str, scope, cache_key: str):
     try:
         conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
         try:
-            alloc_rows = conn.execute("""SELECT LOWER(TRIM(d.donor_email)), a.id, a.start_date, a.end_date,
-                                                COALESCE(b.sponsorship_type, '')
-                                         FROM sponsorship_allocation_donors d JOIN sponsorship_allocations a ON a.id = d.allocation_id
-                                         LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
-                                         WHERE LOWER(a.company_id) = ? AND COALESCE(d.donor_email, '') LIKE '%@%'""", (comp,)).fetchall()
+            alloc_rows = conn.execute("""
+                SELECT LOWER(TRIM(d.donor_email)), a.id, a.start_date, a.end_date, COALESCE(b.sponsorship_type, '')
+                FROM sponsorship_allocation_donors d JOIN sponsorship_allocations a ON a.id = d.allocation_id
+                LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                WHERE (LOWER(a.company_id) = ? OR ? = 'all') AND COALESCE(d.donor_email, '') LIKE '%@%'
+                UNION
+                SELECT LOWER(TRIM(a.donor_email)), a.id, a.start_date, a.end_date, COALESCE(b.sponsorship_type, '')
+                FROM sponsorship_allocations a
+                LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+                WHERE (LOWER(a.company_id) = ? OR ? = 'all') AND COALESCE(a.donor_email, '') LIKE '%@%'
+            """, (comp, comp, comp, comp)).fetchall()
         finally:
             conn.close()
         alloc_ids: Dict[str, set] = {}
@@ -2206,6 +2330,165 @@ def _fundraiser_options(comp: str, dx: pd.DataFrame) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda o: -o["count"])
 
 
+def _search_live_tracker_donors(comp: str, q: str, digits: str, existing_ids: set) -> List[Dict[str, Any]]:
+    """Live search on sponsorship tables for any newly added or modified tracker donors
+    matching the query that may not yet be in the cached directory frame."""
+    if not q and not digits:
+        return []
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    results = []
+    seen = set(str(k).lower() for k in existing_ids if k)
+    try:
+        like_q = f"%{q}%"
+        like_d = f"%{digits}%" if len(digits) >= 5 else None
+
+        phone_clause = " OR d.donor_phone LIKE ? OR a.donor_phone LIKE ?" if like_d else ""
+        phone_params = [like_d, like_d] if like_d else []
+        alloc_query = f"""
+            SELECT DISTINCT
+                LOWER(TRIM(COALESCE(d.donor_email, a.donor_email, ''))) AS email,
+                COALESCE(d.donor_name, a.donor_name, '') AS name,
+                COALESCE(d.donor_phone, a.donor_phone, '') AS phone,
+                COALESCE(d.donor_id, a.donor_id, d.donor_email, a.donor_email) AS donor_id,
+                COALESCE(d.contribution_amount, a.allocated_amount, 0) AS amount,
+                a.id AS allocation_id,
+                a.start_date,
+                a.end_date,
+                a.community_name,
+                COALESCE(b.sponsorship_type, 'Sponsorship') AS sponsorship_type,
+                b.name AS child
+            FROM sponsorship_allocations a
+            LEFT JOIN sponsorship_allocation_donors d ON d.allocation_id = a.id
+            LEFT JOIN sponsorship_beneficiaries b ON b.id = a.beneficiary_id
+            WHERE (LOWER(a.company_id) = ? OR ? = 'all')
+              AND (
+                  LOWER(COALESCE(d.donor_email, '')) LIKE ? OR
+                  LOWER(COALESCE(a.donor_email, '')) LIKE ? OR
+                  LOWER(COALESCE(d.donor_name, '')) LIKE ? OR
+                  LOWER(COALESCE(a.donor_name, '')) LIKE ? OR
+                  LOWER(COALESCE(d.donor_id, '')) LIKE ? OR
+                  LOWER(COALESCE(a.donor_id, '')) LIKE ?
+                  {phone_clause}
+              )
+        """
+        params = [comp, comp, like_q, like_q, like_q, like_q, like_q, like_q] + phone_params
+        rows = conn.execute(alloc_query, params).fetchall()
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            em = str(r["email"] or "").strip().lower()
+            did = str(r["donor_id"] or em).strip()
+            key = em or did.lower()
+            if not key or key in seen:
+                continue
+            if key not in grouped:
+                grouped[key] = {
+                    "donor_id": did,
+                    "name": r["name"] or "",
+                    "email": em or None,
+                    "phone": r["phone"] or None,
+                    "total": 0.0,
+                    "gifts": 0,
+                    "allocations": set(),
+                    "statuses": set(),
+                    "stypes": set(),
+                    "first_gift": r["start_date"],
+                    "last_gift": r["start_date"],
+                    "sp": (str(r["community_name"] or "").upper() == "SP"),
+                }
+            g = grouped[key]
+            g["total"] += float(r["amount"] or 0)
+            g["allocations"].add(r["allocation_id"])
+            g["statuses"].add(sponsorship_cycle_status(r["start_date"], r["end_date"]))
+            if r["sponsorship_type"]:
+                g["stypes"].add(str(r["sponsorship_type"]).strip())
+            if r["start_date"]:
+                if not g["first_gift"] or r["start_date"] < g["first_gift"]:
+                    g["first_gift"] = r["start_date"]
+                if not g["last_gift"] or r["start_date"] > g["last_gift"]:
+                    g["last_gift"] = r["start_date"]
+
+        m_phone_clause = " OR donor_phone LIKE ?" if like_d else ""
+        m_phone_params = [like_d] if like_d else []
+        m_query = f"""
+            SELECT id, donor_name, donor_email, donor_phone, total_donated, sponsorship_type, created_at
+            FROM sponsorship_manual_donors
+            WHERE (LOWER(company_id) = ? OR ? = 'all')
+              AND (
+                  LOWER(COALESCE(donor_email, '')) LIKE ? OR
+                  LOWER(COALESCE(donor_name, '')) LIKE ? OR
+                  LOWER(COALESCE(id, '')) LIKE ?
+                  {m_phone_clause}
+              )
+        """
+        m_rows = conn.execute(m_query, [comp, comp, like_q, like_q, like_q] + m_phone_params).fetchall()
+        for r in m_rows:
+            em = str(r["donor_email"] or "").strip().lower()
+            did = f"manual:{r['id']}" if not em else em
+            key = em or did.lower()
+            if not key or key in seen or key in grouped:
+                continue
+            grouped[key] = {
+                "donor_id": str(r["id"]),
+                "name": r["donor_name"] or "",
+                "email": em or None,
+                "phone": r["donor_phone"] or None,
+                "total": float(r["total_donated"] or 0),
+                "gifts": 0,
+                "allocations": {r["id"]},
+                "statuses": {"active"},
+                "stypes": {r["sponsorship_type"]} if r["sponsorship_type"] else set(),
+                "first_gift": str(r["created_at"] or "")[:10] or None,
+                "last_gift": str(r["created_at"] or "")[:10] or None,
+                "sp": False,
+            }
+
+        for k, g in grouped.items():
+            tot = round(g["total"], 2)
+            tier = "Major" if tot >= 5000 else "High" if tot >= 1000 else "Medium" if tot >= 500 else "Medium Low" if tot >= 200 else "Low"
+            stypes_str = ", ".join(sorted(g["stypes"])) or "Sponsorship"
+            results.append({
+                "donor_id": g["donor_id"],
+                "name": g["name"] or None,
+                "email": g["email"],
+                "phone": g["phone"],
+                "city": None,
+                "country": None,
+                "total": tot,
+                "gifts": 0,
+                "first_gift": pd.to_datetime(g["first_gift"], errors="coerce"),
+                "last_gift": pd.to_datetime(g["last_gift"], errors="coerce"),
+                "gift_aid": False,
+                "marketing_consent": None,
+                "recurring_gifts": 0,
+                "sp": g["sp"],
+                "platforms": MANUAL_PLATFORM,
+                "top_heading": "Sponsorship",
+                "sponsorship_types": stypes_str,
+                "platform_total": 0.0,
+                "manual_total": tot,
+                "manual_records": len(g["allocations"]),
+                "agent": None,
+                "donor_group": None,
+                "interests": None,
+                "manual_donor": True,
+                "sa": False,
+                "avg_gift": 0.0,
+                "recurring": False,
+                "tier": tier,
+                "allocations": len(g["allocations"]),
+                "sponsorship_statuses": ",".join(sorted(g["statuses"])),
+                "sponsored_types": stypes_str,
+                "search": f"{g['donor_id']} {(g['name'] or '').lower()} {g['email'] or ''} {g['phone'] or ''}"
+            })
+    except Exception as e:
+        print(f"[donor directory] live tracker search error: {e}")
+    finally:
+        conn.close()
+    return results
+
+
 @router.get("/directory")
 def get_donor_directory(
     company_id: Optional[str] = Query("rethink"),
@@ -2228,6 +2511,25 @@ def get_donor_directory(
     page_size: int = Query(50, ge=1, le=200),
 ):
     """One row per donor with lifetime totals; clicking a donor uses donor_id with /profile and /history."""
+    company_id = company_id if isinstance(company_id, str) else "rethink"
+    search = search if isinstance(search, str) else None
+    platform = platform if isinstance(platform, str) else None
+    gift_aid = gift_aid if isinstance(gift_aid, str) else None
+    source = source if isinstance(source, str) else None
+    min_total = min_total if isinstance(min_total, (int, float)) else None
+    last_gift_from = last_gift_from if isinstance(last_gift_from, str) else None
+    last_gift_to = last_gift_to if isinstance(last_gift_to, str) else None
+    tier = tier if isinstance(tier, str) else None
+    recurring = recurring if isinstance(recurring, str) else None
+    sp = sp if isinstance(sp, str) else None
+    sa = sa if isinstance(sa, str) else None
+    agent = agent if isinstance(agent, str) else None
+    segment = segment if isinstance(segment, str) else None
+    sort_by = sort_by if isinstance(sort_by, str) else "total"
+    sort_dir = sort_dir if isinstance(sort_dir, str) else "desc"
+    page = page if isinstance(page, int) else 1
+    page_size = page_size if isinstance(page_size, int) else 50
+
     comp = str(company_id or "rethink").strip().lower()
     frame, dx = _directory_data(comp)
     if frame.empty:
@@ -2253,6 +2555,17 @@ def get_donor_directory(
         if len(digits) >= 5:
             m |= f["search"].str.contains(digits, na=False)
         f = f[m]
+
+        # Live fallback: ensure any later-added tracker donors or allocations are immediately searchable
+        try:
+            existing = set(f["donor_id"].dropna().astype(str).str.lower())
+            if "email" in f.columns:
+                existing |= set(f["email"].dropna().astype(str).str.lower())
+            live_hits = _search_live_tracker_donors(comp, q, digits, existing)
+            if live_hits:
+                f = pd.concat([f, pd.DataFrame(live_hits)], ignore_index=True)
+        except Exception as e:
+            print(f"[donor directory] live search append error: {e}")
     if platform and platform.lower() != "all":
         f = f[f["platforms"].fillna("").str.lower().str.contains(re.escape(platform.lower()))]
     if source == "manual":
@@ -2284,7 +2597,7 @@ def get_donor_directory(
     page = min(page, pages)
     rows = f.iloc[(page - 1) * page_size: page * page_size].drop(columns=["search"]).copy()
     for c in ("first_gift", "last_gift"):
-        rows[c] = rows[c].dt.strftime("%Y-%m-%d")
+        rows[c] = pd.to_datetime(rows[c], errors="coerce").dt.strftime("%Y-%m-%d")
     rows = rows.astype(object).where(rows.notna(), None)
     # Unfiltered view: include gifts that have no donor details, so the total equals the CRM's total raised.
     unfiltered = f is frame or len(f) == len(frame)
