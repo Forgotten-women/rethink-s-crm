@@ -156,9 +156,16 @@ class PlatformSyncService:
                 ("givebrite_rethink", "rethink"),
                 ("launchgood_iqra", "iqra"),
                 ("launchgood_rethink", "rethink"),
+                ("rethink_website", "rethink"),
             ):
                 if plat in self.health and (not self.health[plat].get("last_ingested_at") or str(self.health[plat].get("last_ingested_at")).lower() in ("nan", "none", "")):
-                    if plat.startswith("launchgood"):
+                    if plat == "rethink_website":
+                        cur.execute("""
+                            SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
+                            FROM donations
+                            WHERE Platform = 'Rethink Website' AND "Created Date (UTC)" LIKE '20%'
+                        """)
+                    elif plat.startswith("launchgood"):
                         cur.execute("""
                             SELECT MAX("Created Date (UTC)" || 'T' || "Created Time (UTC)" || 'Z')
                             FROM donations
@@ -799,6 +806,29 @@ class PlatformSyncService:
             logger.error(f"LaunchGood sync failure: {ex}")
             launchgood_data = {"platform": "launchgood", "error": str(ex)}
 
+        # Rethink Website (rethinkcharity.org.uk): Livewire/Filament payments sync
+        rethink_website_data = {"platform": "rethink_website", "company_id": "rethink", "status": "waiting"}
+        try:
+            from core.rethink_website_ingestion import run_website_sync_cycle
+            rw_res = run_website_sync_cycle()
+            rethink_website_data.update(rw_res)
+            if rw_res.get("ok"):
+                rethink_website_data["status"] = "ok"
+                self._record_cycle("rethink_website", True, 200, None,
+                                   ingested=rw_res.get("inserted", 0), fetched=rw_res.get("fetched", 0))
+                logger.info(f"[Rethink Website] Synced {rw_res.get('fetched', 0)} payments | Ingested: {rw_res.get('inserted', 0)} | Skipped: {rw_res.get('skipped', 0)}")
+            else:
+                err = rw_res.get("error", "Unknown error")
+                rethink_website_data["status"] = "error"
+                http_status = 401 if "expired" in err.lower() or "login" in err.lower() else None
+                self._record_cycle("rethink_website", False, http_status, err)
+                logger.warning(f"[Rethink Website] Sync notice: {err}")
+        except Exception as ex:
+            logger.error(f"Rethink Website sync failure: {ex}")
+            rethink_website_data["status"] = "error"
+            rethink_website_data["error"] = str(ex)
+            self._record_cycle("rethink_website", False, None, f"Sync crashed: {ex}")
+
         # Campaign ID catalogue (classification by campaign / giving-level ID): refresh once a day with new campaigns
         try:
             if now - getattr(self, "_last_catalogue_run", 0) > 24 * 3600:
@@ -832,6 +862,7 @@ class PlatformSyncService:
                     "givebrite_rethink_new_ingested": givebrite_rethink_data.get("donations_ingested", 0),
                     "givebrite_rethink_total_donations": givebrite_rethink_data.get("total_donations_count", 0),
                     "paysuite_new_payments": paysuite_data.get("new_payments", 0),
+                    "rethink_website_new_ingested": rethink_website_data.get("inserted", 0),
                 },
                 "madinah": madinah_data,
                 "givebrite": givebrite_iqra_data,
@@ -840,6 +871,7 @@ class PlatformSyncService:
                 "stripe": stripe_data,
                 "paysuite": paysuite_data,
                 "launchgood": launchgood_data,
+                "rethink_website": rethink_website_data,
             }
 
             atomic_write_json(MASTER_SYNC_FILE, master_data)

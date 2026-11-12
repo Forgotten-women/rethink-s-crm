@@ -56,8 +56,15 @@ def _is_recurring(row: Dict[str, Any]) -> bool:
 
 
 def _split_name(name: str):
-    parts = (name or "").strip().split()
-    return (parts[0], " ".join(parts[1:])) if parts else ("", "")
+    clean = (name or "").strip()
+    if clean.lower() in ("undefined", "undefined undefined", "nan", "none", "null"):
+        return ("", "")
+    parts = clean.split()
+    if not parts:
+        return ("", "")
+    if parts[0].lower() in ('mr', 'mrs', 'ms', 'dr') and len(parts) > 2:
+        return (parts[1], " ".join(parts[2:]))
+    return (parts[0], " ".join(parts[1:]))
 
 
 def _project_for(conn, row: Dict[str, Any], meta: Dict[str, str], company: str) -> str:
@@ -87,8 +94,19 @@ def _new_record(conn, row: Dict[str, Any], meta: Dict[str, str], table_cols: Lis
     ref = (meta.get("Payment Reference Code") or "").strip()
     project = _project_for(conn, row, meta, company)
     cls = _match_crm_classification(project, company_id=company, cursor=conn.cursor(), register_unknown=register)
-    first, last = _split_name(meta.get("Donor Name") or row.get("donor_name") or "")
     email = (meta.get("Donor Email") or row.get("donor_email") or "").strip()
+    raw_name = (meta.get("Donor Name") or row.get("donor_name") or "").strip()
+    if raw_name.lower() in ("undefined", "undefined undefined", "nan", "null", "none"):
+        raw_name = ""
+    if not raw_name and row.get("charge_id"):
+        hit = conn.execute("SELECT donor_name FROM stripe_payout_items WHERE charge_id = ? AND donor_name != '' AND donor_name NOT LIKE '%undefined%'", (row["charge_id"],)).fetchone()
+        if hit and hit[0]:
+            raw_name = hit[0]
+    if not raw_name and email:
+        hit = conn.execute('SELECT [Display Name], [First Name], [Last Name] FROM donations WHERE LOWER(Email) = ? AND [First Name] != "" AND [First Name] NOT LIKE "%undefined%" LIMIT 1', (email.lower(),)).fetchone()
+        if hit:
+            raw_name = (hit[0] or f"{hit[1]} {hit[2]}").strip()
+    first, last = _split_name(raw_name)
     gift_aid = "Yes" if str(meta.get("Gift Aid?") or "").strip().lower() in ("yes", "true", "1") else "No"
     zakat_word = str(meta.get("Zakat?") or "").strip().lower()
     is_zakat = zakat_word in ("zakat", "yes", "true")
@@ -180,15 +198,18 @@ def build_plan(conn, register: bool = False, company: str = "rethink") -> Dict[s
                     plan["givebrite_net_mismatch"].append(change)
                 continue
             ref = (meta.get("Payment Reference Code") or "").strip()
+            ref_parts = [p.strip() for p in ref.split(",") if p.strip()] if "," in ref else ([ref] if ref else [])
             existing = (by_charge.get(row["charge_id"]) if row["charge_id"] else None) or (by_id.get(ref) if ref else None) \
+                or (by_id.get(ref_parts[0]) if ref_parts and by_id.get(ref_parts[0]) else None) \
                 or by_id.get(row["charge_id"] or "")
-            if existing:
-                gift_id_for_charge[row["charge_id"]] = existing[0]
-                if existing[1] == row["charge_id"]:
+            if existing or (ref_parts and any(p in by_id for p in ref_parts)):
+                target_did = existing[0] if existing else ref_parts[0]
+                gift_id_for_charge[row["charge_id"]] = target_did
+                if existing and existing[1] == row["charge_id"]:
                     plan["already_linked"].append(row)
                 else:
-                    plan["link"].append({"row": row, "donation_id": existing[0], "crm_net": existing[5],
-                                         "fill_date": not existing[3]})
+                    plan["link"].append({"row": row, "donation_id": target_did, "crm_net": existing[5] if existing else 0,
+                                         "fill_date": not (existing[3] if existing else True)})
             else:
                 rec = _new_record(conn, row, meta, table_cols, register, company)
                 gift_id_for_charge[row["charge_id"]] = rec["Donation ID"]

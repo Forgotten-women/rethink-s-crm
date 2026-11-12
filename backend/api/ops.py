@@ -107,7 +107,18 @@ def _age_minutes(iso: Optional[str]) -> Optional[float]:
 
 
 def _token_info(platform: str) -> Dict[str, Any]:
-    data = _read_json(TOKEN_FILES[platform])
+    if platform == "rethink_website":
+        from core.rethink_website_ingestion import get_stored_website_session
+        sess = get_stored_website_session()
+        present = bool(sess and sess.get("scooda_session"))
+        return {
+            "present": present,
+            "retrieved_at": sess.get("updated_at") if sess else None,
+            "captured_by": "Session Cookie (scooda_session)",
+            "status_text": "Active" if present else "Missing",
+            "has_refresh": False
+        }
+    data = _read_json(TOKEN_FILES.get(platform, ""))
     has_cookies = bool(data.get("rawCookie") or data.get("cookies") or data.get("authCookies"))
     info: Dict[str, Any] = {
         "present": bool(data.get("accessToken") or data.get("bearerToken")),
@@ -155,6 +166,22 @@ def _live_check(platform: str, token: Optional[str] = None) -> Dict[str, Any]:
                 return {"ok": False, "http_status": 401, "detail": "LaunchGood answered as a signed-out guest - the saved session has expired"}
             name = (user_info.get("result") or {}).get("name") or "Connected"
             return {"ok": True, "http_status": 200, "detail": f"LaunchGood API answered normally ({name})"}
+        except Exception as e:
+            return {"ok": False, "detail": str(e)[:200]}
+
+    if platform == "rethink_website":
+        try:
+            from core.rethink_website_ingestion import get_stored_website_session, _build_session_headers, PAYMENTS_RESOURCE_URL
+            session = get_stored_website_session()
+            if not session or not session.get("scooda_session"):
+                return {"ok": False, "detail": "No website session cookies stored"}
+            import urllib.request
+            headers = _build_session_headers(session)
+            req = urllib.request.Request(PAYMENTS_RESOURCE_URL, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if "login" in resp.geturl().lower():
+                    return {"ok": False, "http_status": 401, "detail": "Session has expired (redirected to /login)"}
+                return {"ok": True, "http_status": 200, "detail": "Rethink Website portal answered normally (200 OK)"}
         except Exception as e:
             return {"ok": False, "detail": str(e)[:200]}
 
@@ -438,6 +465,61 @@ def _platform_status(platform: str, health: Dict[str, Any], live: bool) -> Dict[
                 out["issues"].append(f"Live API check failed: {str(e)[:80]}")
         return out
 
+    if platform == "rethink_website":
+        from core.rethink_website_ingestion import get_stored_website_session
+        session = get_stored_website_session()
+        configured = bool(session and session.get("scooda_session"))
+        issues: List[str] = []
+        state = "ok" if configured else "down"
+        if not configured:
+            issues.append("No active website session - paste cookies in Sessions tab")
+
+        h = health.get("rethink_website", {}) if isinstance(health, dict) else {}
+        last_ok = h.get("last_ok_at")
+        last_ok_age = _age_minutes(last_ok)
+        if configured and last_ok_age is not None and last_ok_age > 15:
+            state = "warning"
+            issues.append(f"Last sync cycle was {int(last_ok_age)} min ago")
+
+        if h.get("consecutive_failures", 0) >= 3:
+            state = "down"
+            issues.append(f"{h['consecutive_failures']} failed sync cycles in a row: {h.get('last_error') or ''}".strip())
+
+        sync_data = dict(h)
+        if not sync_data.get("last_ingested_at"):
+            try:
+                conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=1.0)
+                row = conn.execute("""
+                    SELECT MAX("Created Date (UTC)"), MAX("Created Time (UTC)")
+                    FROM donations WHERE Platform = 'Rethink Website'
+                """).fetchone()
+                if row and row[0]:
+                    sync_data["last_ingested_at"] = f"{row[0]}T{row[1] or '00:00:00'}Z"
+                conn.close()
+            except Exception:
+                pass
+
+        token_info = {
+            "present": configured,
+            "captured_by": "Session Cookie (scooda_session)",
+            "retrieved_at": session.get("updated_at") if session else None,
+            "status_text": "Active" if state == "ok" else "Needs reconnect"
+        }
+        out = {
+            "platform": "rethink_website",
+            "name": "Rethink Website (rethinkcharity.org.uk)",
+            "state": state,
+            "issues": issues,
+            "token": token_info,
+            "sync": sync_data
+        }
+        if live and configured:
+            out["live_check"] = _live_check("rethink_website")
+            if not out["live_check"]["ok"]:
+                out["state"] = "down"
+                out["issues"].append(f"Live website check failed: {out['live_check'].get('detail', 'Session expired')}")
+        return out
+
     h = health.get(platform, {}) if isinstance(health, dict) else {}
     token = _token_info(platform)
     issues: List[str] = []
@@ -549,7 +631,8 @@ def _outlook_status() -> List[Dict[str, Any]]:
 
 # which charity each platform integration belongs to (for people who only see their own charities' status)
 PLATFORM_COMPANY = {"givebrite_iqra": "iqra", "givebrite_rethink": "rethink", "madinah": "iqra", "paysuite": "rethink",
-                    "stripe_rethink": "rethink", "launchgood_rethink": "rethink", "launchgood_iqra": "iqra"}
+                    "stripe_rethink": "rethink", "launchgood_rethink": "rethink", "launchgood_iqra": "iqra",
+                    "rethink_website": "rethink"}
 
 
 @router.get("/status")
@@ -732,7 +815,7 @@ def _launchgood_check(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "http_status": 200}
 
 
-SESSION_PLATFORMS = ["givebrite_iqra", "givebrite_rethink", "madinah", "launchgood_rethink", "launchgood_iqra"]
+SESSION_PLATFORMS = ["givebrite_iqra", "givebrite_rethink", "madinah", "launchgood_rethink", "launchgood_iqra", "rethink_website"]
 
 
 @router.get("/platform-sessions")
@@ -744,6 +827,27 @@ def list_sessions():
 def upload_session(platform: str, payload: SessionUpload, user: dict = Depends(require_super_admin)):
     """Stores a manually captured session after proving it works against the platform API."""
     platform = platform.lower()
+    if platform == "rethink_website":
+        import urllib.parse
+        from core.rethink_website_ingestion import save_website_session
+        blob = (payload.accessToken or "") + " " + (payload.rawCookie or "") + " " + (payload.refreshToken or "")
+        scooda_match = re.search(r"scooda_session=([^;\s]+)", blob) or re.search(r"\"scooda_session\":\s*\"([^\"]+)\"", blob)
+        xsrf_match = re.search(r"XSRF-TOKEN=([^;\s]+)", blob) or re.search(r"\"xsrf_token\":\s*\"([^\"]+)\"", blob)
+
+        scooda = urllib.parse.unquote(scooda_match.group(1)) if scooda_match else (payload.accessToken or "").strip()
+        xsrf = urllib.parse.unquote(xsrf_match.group(1)) if xsrf_match else (payload.refreshToken or "").strip()
+
+        if not scooda:
+            raise HTTPException(status_code=400, detail="Missing scooda_session cookie. Please paste the full Cookie string or JSON.")
+
+        save_website_session(scooda, xsrf or "")
+        check = _live_check("rethink_website")
+        if not check["ok"]:
+            raise HTTPException(status_code=400, detail=f"Website session rejected: {check.get('detail')}")
+        log_event("session.uploaded", category="session", actor=user.get("email"), platform="rethink_website",
+                  source=payload.source, message="Rethink website session updated and verified")
+        return {"status": "ok", "platform": "rethink_website", "verified": True, "message": "Rethink Website session successfully connected and verified!"}
+
     if platform == "givebrite":
         platform = "givebrite_iqra"
     if platform not in TOKEN_FILES:
@@ -945,6 +1049,22 @@ def sync_helper_upload(platform: str, payload: BookmarkletPayload, request: Requ
         raise HTTPException(status_code=401, detail="Invalid sync key or missing authentication")
 
     platform = platform.lower()
+    if platform == "rethink_website":
+        import urllib.parse
+        from core.rethink_website_ingestion import save_website_session
+        blob = (payload.accessToken or "") + " " + (payload.rawCookie or "") + " " + (payload.refreshToken or "")
+        scooda_match = re.search(r"scooda_session=([^;\s]+)", blob)
+        xsrf_match = re.search(r"XSRF-TOKEN=([^;\s]+)", blob)
+        scooda = urllib.parse.unquote(scooda_match.group(1)) if scooda_match else ""
+        xsrf = urllib.parse.unquote(xsrf_match.group(1)) if xsrf_match else ""
+        if not scooda:
+            raise HTTPException(status_code=400, detail="Missing scooda_session cookie in browser data")
+        save_website_session(scooda, xsrf)
+        check = _live_check("rethink_website")
+        if not check["ok"]:
+            raise HTTPException(status_code=400, detail=f"Website session check failed: {check.get('detail')}")
+        return {"ok": True, "message": "Rethink Website session successfully connected!"}
+
     if platform not in ("launchgood_rethink", "launchgood_iqra"):  # the bookmarklet only carries LaunchGood sessions
         raise HTTPException(status_code=404, detail="Unknown platform")
 

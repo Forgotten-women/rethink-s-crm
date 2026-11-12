@@ -155,7 +155,7 @@ def _row(bt: Dict[str, Any], now_iso: str, company: str) -> Dict[str, Any]:
         "invoice_id": invoice if isinstance(invoice, str) else ((invoice or {}).get("id") or ""),
         "customer_id": charge.get("customer") if isinstance(charge.get("customer"), str) else "",
         "payment_method_type": (charge.get("payment_method_details") or {}).get("type") or "",
-        "donor_name": meta.get("Donor Name") or billing.get("name") or "",
+        "donor_name": (meta.get("Donor Name") or billing.get("name") or "").strip() if (meta.get("Donor Name") or billing.get("name") or "").strip().lower() not in ("undefined", "undefined undefined", "nan", "null", "none") else "",
         "donor_email": meta.get("Donor Email") or billing.get("email") or charge.get("receipt_email") or "",
         "project_name": meta.get("Project Name") or "",
         "gift_aid": meta.get("Gift Aid?") or "",

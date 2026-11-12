@@ -512,6 +512,7 @@ function SessionsTab() {
                                (p === 'givebrite_iqra' || p === 'givebrite') ? 'GiveBrite (Iqra)' :
                                p === 'launchgood_rethink' ? 'LaunchGood (Rethink)' :
                                p === 'launchgood_iqra' ? 'LaunchGood (Iqra)' :
+                               p === 'rethink_website' ? 'Rethink Website' :
                                'Madinah (Iqra)';
           return (
           <div key={p} className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 grid grid-cols-2 gap-x-3 gap-y-1.5 shadow-2xs text-xs">
@@ -620,11 +621,12 @@ function SessionsTab() {
           Or paste tokens manually
         </div>
         <div className="flex flex-wrap gap-2">
-          {['givebrite_iqra', 'givebrite_rethink', 'madinah', 'launchgood_rethink', 'launchgood_iqra'].map(p => {
+          {['givebrite_iqra', 'givebrite_rethink', 'madinah', 'launchgood_rethink', 'launchgood_iqra', 'rethink_website'].map(p => {
             const btnLabel = p === 'givebrite_rethink' ? 'GiveBrite (Rethink)' :
                              p === 'givebrite_iqra' ? 'GiveBrite (Iqra)' :
                              p === 'launchgood_rethink' ? 'LaunchGood (Rethink)' :
                              p === 'launchgood_iqra' ? 'LaunchGood (Iqra)' :
+                             p === 'rethink_website' ? 'Rethink Website' :
                              'Madinah (Iqra)';
             return (
               <button
@@ -644,13 +646,13 @@ function SessionsTab() {
         </div>
         <div className={`flex flex-col gap-1.5 ${form.platform?.startsWith('launchgood') ? 'hidden' : ''}`}>
           <label className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
-            {form.platform?.startsWith('launchgood') ? 'Access token (optional when you paste the refresh token)' : 'Access token (Bearer string or full JSON)'}
+            {form.platform?.startsWith('launchgood') ? 'Access token (optional when you paste the refresh token)' : form.platform === 'rethink_website' ? 'Session Cookies (paste scooda_session cookie, full Cookie header, or JSON)' : 'Access token (Bearer string or full JSON)'}
           </label>
           <textarea
             value={form.accessToken}
             onChange={e => setForm(f => ({ ...f, accessToken: e.target.value }))}
             rows={3}
-            placeholder={form.platform?.startsWith('launchgood') ? 'Bearer eyJhbGci... or paste full JSON with headers/cookies' : 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'}
+            placeholder={form.platform?.startsWith('launchgood') ? 'Bearer eyJhbGci... or paste full JSON with headers/cookies' : form.platform === 'rethink_website' ? 'scooda_session=eyJpdiI6...; XSRF-TOKEN=eyJpdiI6...' : 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'}
             className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 font-mono text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all"
           />
         </div>

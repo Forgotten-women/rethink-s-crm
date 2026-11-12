@@ -190,6 +190,13 @@ function formatMoney(val, ccy) {
   return symbol ? `${symbol}${amount}` : `${amount} ${ccy}`;
 }
 
+function cleanDisplayCell(val) {
+  if (val === undefined || val === null) return '';
+  const s = String(val).trim();
+  if (['undefined', 'nan', 'null', 'none'].includes(s.toLowerCase())) return '';
+  return s;
+}
+
 export default function ExplorerView({ user, filters, onFilterChange, onResetFilters, onSelectDonor, onDataChange, activeCompany = 'rethink', companies = [] }) {
   const [data, setData] = useState({ total_records: 0, page: 1, page_size: 100, total_pages: 1, available_columns: [], records: [] });
   const [loading, setLoading] = useState(true);
@@ -1703,6 +1710,11 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
 
                         if (c === 'First Name' || c === 'Display Name') {
                           const isSettled = String(row['Payout Settled'] || row['payout_settled'] || '').toLowerCase() === 'yes';
+                          const statusStr = String(row['Status'] || '').toLowerCase();
+                          const txTypeStr = String(row['Transaction Type'] || '').toLowerCase();
+                          const isRefundRow = statusStr === 'refund' || txTypeStr === 'refund' || Number(row['Amount'] || 0) < 0;
+                          const isRefundedDonation = statusStr === 'refunded' || statusStr.includes('reversed');
+                          const donorNameDisplay = cleanDisplayCell(val) || 'Unnamed Donor';
                           return (
                             <td 
                               key={c} 
@@ -1719,8 +1731,18 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
                                   title="Click to view donor detail side view"
                                 >
                                   <Eye className="w-3 h-3 opacity-60 group-hover:opacity-100" />
-                                  <span>{val || 'Unnamed Donor'}</span>
+                                  <span>{donorNameDisplay}</span>
                                 </button>
+                                {isRefundRow && (
+                                  <span className="text-[10px] px-2 py-0.5 rounded-full font-extrabold uppercase bg-rose-500/15 text-rose-600 dark:text-rose-400 border border-rose-500/30 shadow-sm" title="Refund / Reversal Transaction">
+                                    Refund
+                                  </span>
+                                )}
+                                {isRefundedDonation && (
+                                  <span className="text-[10px] px-2 py-0.5 rounded-full font-extrabold uppercase bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 shadow-sm" title="Donation was Refunded">
+                                    Refunded
+                                  </span>
+                                )}
                                 {isSettled && (
                                   <span className="text-[10px] px-2 py-0.5 rounded-full font-extrabold uppercase bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 shadow-sm" title="Donor transaction settled in payout bank transfer">
                                     Settled
@@ -1840,7 +1862,7 @@ export default function ExplorerView({ user, filters, onFilterChange, onResetFil
                             key={c} 
                             className="max-w-[240px] truncate text-slate-200"
                           >
-                            {val !== undefined && val !== null ? String(val) : ''}
+                            {cleanDisplayCell(val)}
                           </td>
                         );
                       })}
