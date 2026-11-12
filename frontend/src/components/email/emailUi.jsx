@@ -54,7 +54,7 @@ export const VARIABLES = [
   ['last_gift_date', 'Last gift date'], ['last_gift_amount', 'Last gift amount'], ['last_gift_cause', 'Last gift cause'],
   ['top_cause', 'Top cause'], ['matching_total', 'Matching donations total'], ['matching_gifts_count', 'Matching donations'],
   ['matching_causes', 'Matching causes'], ['matching_sponsorships', 'Matching sponsorships'], ['sponsorship_types', 'Sponsorship types'],
-  ['beneficiary_name', 'Beneficiary (all, joined)'], ['beneficiary_first_name', 'Beneficiary first name'], ['beneficiary_last_name', 'Beneficiary last name'], ['sponsorships_list', 'List of all their sponsorships'], ['beneficiary_names_with_types', 'Name - type, one per line'],
+  ['beneficiary_name', 'Beneficiary (all, joined)'], ['beneficiary_first_name', 'Beneficiary first name'], ['beneficiary_last_name', 'Beneficiary last name'], ['sponsorships_list', 'List of all their sponsorships'],
   ['sponsorships_count', 'Number of sponsorships'], ['sponsorship_type', 'Sponsorship type'], ['location', 'Location'],
   ['profile_link', 'Profile link'], ['video_link', 'Video link'], ['video_buttons', 'Watch-video button per beneficiary'], ['renewal_deadline', 'Renewal date'],
   ['days_remaining', 'Days remaining'], ['message_body', 'Your message'],
@@ -148,11 +148,17 @@ export function PreviewFrame({
 
   const hasMissing = preview.unresolved_placeholders && preview.unresolved_placeholders.length > 0;
   const hasSupplied = customVariables && Object.keys(customVariables).length > 0;
-  // the sponsorships picked for this email (none = all of them); older callers pass a single id
-  const picked = Array.isArray(selectedAllocationId) ? selectedAllocationId : (selectedAllocationId ? [selectedAllocationId] : []);
+  const allSpons = preview.sponsorships || [];
+  const allIds = allSpons.map(s => s.id);
+  // When selectedAllocationId is null/empty, all sponsorships are selected by default
+  const isAll = selectedAllocationId == null;
+  const picked = isAll
+    ? allIds
+    : (Array.isArray(selectedAllocationId) ? selectedAllocationId : [selectedAllocationId]);
+  const allActive = isAll || (allIds.length > 0 && picked.length === allIds.length);
   const sepIds = preview.separate_ids || [];
   const sepAt = Math.max(0, sepIds.indexOf(preview.previewing_allocation_id));
-  const hasMultipleBeneficiaries = preview.has_multiple_beneficiaries || (preview.sponsorships && preview.sponsorships.length > 1);
+  const hasMultipleBeneficiaries = preview.has_multiple_beneficiaries || allSpons.length > 1;
 
   return (
     <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-900 shadow-sm flex flex-col">
@@ -175,10 +181,12 @@ export function PreviewFrame({
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-1.5 text-xs font-bold text-violet-950 dark:text-violet-200">
               <Users className="w-4 h-4 text-violet-600 shrink-0" />
-              <span>Multiple Beneficiaries Detected ({preview.sponsorships.length} sponsorships)</span>
+              <span>Multiple Beneficiaries Detected ({allSpons.length} sponsorships)</span>
             </div>
             <span className="text-[11px] text-violet-700 dark:text-violet-300 font-medium">
-              Tick the ones this email is about - one, several, or all of them:
+              {allActive
+                ? `All ${allIds.length} beneficiaries selected. Click any to exclude or choose individual beneficiaries:`
+                : `${picked.length} of ${allIds.length} beneficiaries selected:`}
             </span>
           </div>
           <div className="flex flex-wrap gap-1.5">
@@ -186,19 +194,28 @@ export function PreviewFrame({
               type="button"
               onClick={() => onSelectAllocation?.(null)}
               className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
-                !picked.length
+                allActive
                   ? 'bg-violet-600 text-white border-violet-600 shadow-xs'
                   : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-violet-400'
               }`}
             >
-              All of them
+              All of them ({allIds.length})
             </button>
-            {preview.sponsorships.map(s => {
+            {allSpons.map(s => {
               const active = picked.includes(s.id);
               const toggle = () => {
-                const next = active ? picked.filter(x => x !== s.id) : [...picked, s.id];
-                // nothing ticked, or every one ticked, is the same as "All of them"
-                onSelectAllocation?.(next.length && next.length < preview.sponsorships.length ? next : null);
+                let next;
+                if (active) {
+                  next = picked.filter(x => x !== s.id);
+                  if (next.length === 0) return; // Keep at least one selected
+                } else {
+                  next = [...picked, s.id];
+                }
+                onSelectAllocation?.(next.length >= allIds.length ? null : next);
+              };
+              const selectOnly = (e) => {
+                e.stopPropagation();
+                onSelectAllocation?.([s.id]);
               };
               return (
                 <button
@@ -207,7 +224,7 @@ export function PreviewFrame({
                   role="checkbox"
                   aria-checked={active}
                   onClick={toggle}
-                  className={`px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 transition-all ${
+                  className={`group px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 transition-all ${
                     active
                       ? 'bg-violet-600 text-white border-violet-600 font-bold shadow-xs'
                       : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-violet-400'
@@ -221,6 +238,15 @@ export function PreviewFrame({
                     </span>
                   )}
                   {s.sponsorship_type && <span className="text-[10px] opacity-75">({s.sponsorship_type})</span>}
+                  {allIds.length > 1 && (
+                    <span
+                      onClick={selectOnly}
+                      title={`Select ONLY ${s.beneficiary_name}`}
+                      className={`ml-1 text-[10px] px-1 py-0.5 rounded hover:underline opacity-80 hover:opacity-100 ${active ? 'text-violet-200 hover:text-white' : 'text-slate-400 hover:text-violet-600'}`}
+                    >
+                      (only)
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -229,12 +255,12 @@ export function PreviewFrame({
             <div className="flex items-center justify-between gap-2 flex-wrap pt-1 border-t border-violet-200/70 dark:border-violet-800/70">
               <label className="flex items-center gap-1.5 text-xs font-semibold text-violet-950 dark:text-violet-200 cursor-pointer">
                 <input type="checkbox" checked={!!separate} onChange={e => onSeparateChange(e.target.checked)} className="accent-violet-600" />
-                Send a separate email for each {picked.length ? 'ticked one' : 'beneficiary'}
+                Send a separate email for each {picked.length < allIds.length ? 'selected beneficiary' : 'beneficiary'}
                 {separate && sepIds.length > 1 && <span className="font-normal text-violet-700 dark:text-violet-300">({sepIds.length} emails)</span>}
               </label>
               {separate && sepIds.length > 1 && !onExtraEmailsChange && (
                 <span className="flex items-center gap-1 text-[11px] text-violet-800 dark:text-violet-200">
-                  Previewing email {sepAt + 1} of {sepIds.length}: <b>{(preview.sponsorships.find(x => x.id === sepIds[sepAt]) || {}).beneficiary_name}</b>
+                  Previewing email {sepAt + 1} of {sepIds.length}: <b>{(allSpons.find(x => x.id === sepIds[sepAt]) || {}).beneficiary_name}</b>
                   <button type="button" disabled={sepAt <= 0} onClick={() => onPreviewAllocation?.(sepIds[sepAt - 1])} className="px-1.5 rounded border border-violet-300 disabled:opacity-30">‹</button>
                   <button type="button" disabled={sepAt >= sepIds.length - 1} onClick={() => onPreviewAllocation?.(sepIds[sepAt + 1])} className="px-1.5 rounded border border-violet-300 disabled:opacity-30">›</button>
                 </span>

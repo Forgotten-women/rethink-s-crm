@@ -282,7 +282,7 @@ def _separate_selections(comp: str, email: str, sel: Any) -> List[List[int]]:
         return []
     picked = _selected_ids(sel)
     ids = [a["id"] for a in allocs if not picked or a["id"] in picked]
-    return [[i] for i in ids] if len(ids) > 1 else []
+    return [[i] for i in ids]
 
 
 def _person_emails(comp: str, email: str, cust: Dict[str, Any], template_type: str, subject_tpl: Optional[str],
@@ -417,6 +417,19 @@ def _ph_re(ph: str) -> str:
     return r"\{\{?\s*" + ph + r"\s*\}?\}"
 
 
+# "{beneficiary_name} - {sponsorship_type}" written together in a template is one unit: for a donor with
+# several beneficiaries it renders as "Name - Type", one line per beneficiary, instead of the two
+# placeholders substituting their full lists separately ("A<br>B - X<br>Y").
+_NAME_TYPE_PAIR_RE = re.compile(_ph_re("beneficiary_name") + r"\s*[-–]\s*" + _ph_re("sponsorship_type"), re.I)
+
+
+def _paired_name_type_lines(allocs: List[Dict[str, Any]]) -> str:
+    return _join_lines([
+        ((a.get("beneficiary_name") or a.get("campaign_name") or "") +
+         (f" - {a.get('b_type') or a.get('sponsorship_type')}" if (a.get("b_type") or a.get("sponsorship_type")) else "")).strip()
+        for a in allocs])
+
+
 _LINK_BUTTON_RES = {ph: re.compile(r"<a\b[^>]*" + _ph_re(ph) + r"[^>]*>(.*?)</a>", re.I | re.S)
                     for ph, _ in _LINK_BUTTON_PLACEHOLDERS}
 # The template's whole button block: the innermost <table> that holds the placeholder anchor (buttons in these
@@ -503,7 +516,12 @@ def _render(comp: str, theme: str, template_type: str, subject_tpl: Optional[str
             variables.pop(k, None)
         variables.update(_sponsorship_vars(picked))
     about = picked if picked and len(picked) < len(allocs) else allocs
-    if len(about) > 1:  # one profile / video button per beneficiary instead of one shared one
+    if len(about) > 1:
+        # "{beneficiary_name} - {sponsorship_type}" as one unit: one "Name - Type" line per beneficiary
+        paired = _paired_name_type_lines(about)
+        body_tpl = _NAME_TYPE_PAIR_RE.sub(lambda m: paired, body_tpl)
+        subject_tpl = _NAME_TYPE_PAIR_RE.sub(lambda m: _unbreak(paired), subject_tpl)
+        # one profile / video button per beneficiary instead of one shared one
         body_tpl = _multiply_link_buttons(body_tpl, about)
 
     # Apply sender-provided custom variables so missing fields are not skipped
@@ -849,7 +867,8 @@ def send(req: SendRequest, request: Request):
         cust = (req.recipient_customizations or {}).get(em, {})
         c_vars = {**(req.custom_variables or {}), **(cust.get("custom_variables") or {})}
         msg_body = cust.get("message_body") or req.message_body
-        plan = _person_emails(comp, em, {**cust, "selected_allocation_id": cust.get("selected_allocation_id") or req.selected_allocation_id},
+        sel = cust.get("selected_allocation_id") if cust.get("selected_allocation_id") is not None else req.selected_allocation_id
+        plan = _person_emails(comp, em, {**cust, "selected_allocation_id": sel},
                               req.template_type, req.subject_template, req.body_template, req.separate_per_beneficiary)
         for item in plan:
             t, s_tpl, b_tpl = item["template"]

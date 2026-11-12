@@ -4613,6 +4613,14 @@ def render_email_for_donor(cur, allocation_id: int, allocation_donor_id: Optiona
             allocs = donor_sponsorships(comp, donor_em)
         except Exception:
             pass
+    if len(allocs) > 1:
+        # "{beneficiary_name} - {sponsorship_type}" as one unit: one "Name - Type" line per beneficiary
+        try:
+            from backend.api.donor_email import _NAME_TYPE_PAIR_RE, _paired_name_type_lines
+            paired = _paired_name_type_lines(allocs)
+            body_template = _NAME_TYPE_PAIR_RE.sub(lambda m: paired, body_template)
+        except Exception:
+            pass
 
     sponsorships_data = [{
         "id": a["id"],
