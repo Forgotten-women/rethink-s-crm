@@ -8,7 +8,7 @@ function buildParams(filters, activeCompany, extra = {}) {
   params.append('company_id', activeCompany);
   if (filters) {
     ['payment_type', 'tier', 'source', 'heading', 'subheading', 'country', 'code', 'zakat',
-      'donor_country', 'campaign_search', 'gift_aid', 'start_date', 'end_date', 'programme_fund'
+      'donor_country', 'campaign_search', 'gift_aid', 'start_date', 'end_date', 'programme_fund', 'special_case'
     ].forEach(k => { if (filters[k]) params.append(k, filters[k]); });
   }
   Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') params.append(k, v); });

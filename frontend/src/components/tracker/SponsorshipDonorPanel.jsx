@@ -4,6 +4,7 @@ import {
   HeartHandshake, Inbox, Clock, Loader2, ExternalLink, Users, Eye, Reply
 } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
+import SingleDonorExportButtons from '../SingleDonorExportButtons';
 import DonationDetailModal from '../DonationDetailModal';
 import AddDonationModal, { canEditRecords } from '../AddDonationModal';
 import SingleEmailComposer from '../email/SingleEmailComposer';
@@ -108,7 +109,14 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
             </div>
             <p className="text-sm text-slate-500 mt-0.5">Sponsorship donor profile · {companyId}</p>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 flex-wrap justify-end shrink-0">
+            {data && (
+              <SingleDonorExportButtons
+                donorId={data?.contact?.emails?.[0] || donorKey}
+                companyId={companyId}
+                compact={false}
+              />
+            )}
             {data && canEdit && (
               <button type="button" onClick={() => setAdding(true)} className="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold flex items-center gap-1">
                 <PlusCircle className="w-4 h-4" /> Add donation

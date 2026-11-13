@@ -1505,10 +1505,12 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 COALESCE(c.zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(c.programme_fund, '') as "Programme Fund",
                 COALESCE(c.fund_code, '') as "Fund Code",
-                COALESCE(m.special_case, '') as "Special Case"
+                COALESCE(m.special_case, '') as "Special Case",
+                NULLIF(TRIM(COALESCE(m.campaign_ref, '')), '') as "campaign_ref",
+                COALESCE(m.giving_level_ref, '') as "giving_level_ref"
             FROM platform_campaign_mappings m
-            LEFT JOIN master_project_codes c 
-                ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code)) 
+            LEFT JOIN master_project_codes c
+                ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
                 AND LOWER(COALESCE(m.company_id, 'rethink')) = LOWER(COALESCE(c.company_id, 'rethink'))
             WHERE LOWER(COALESCE(m.company_id, 'rethink')) = ?
         """, conn, params=(comp,))
@@ -1619,12 +1621,16 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
 
         mapped_series = pd.Series(gl_mapped, index=comp_indices).combine_first(pd.Series(camp_mapped, index=comp_indices))
         if col == "Special Case":
+            # A giving-level rule without its own special case falls back to the campaign's, instead of wiping it
+            _invalid_sc = {"", "nan", "none", "none (standard)", "unassigned", "null", "n/a"}
+            _sc_clean = lambda v: None if (v is None or str(v).strip().lower() in _invalid_sc) else str(v).strip()  # noqa: E731
+            gl_sc = pd.Series([_sc_clean(v) for v in gl_mapped], index=comp_indices)
+            camp_sc = pd.Series([_sc_clean(v) for v in camp_mapped], index=comp_indices)
+            mapped_series = gl_sc.combine_first(camp_sc)
             is_matched = [bool(camp_default_rule_map.get(c) or camp_default_rule_map.get(b) or camp_default_rule_map.get(cn) or gl_rule_map.get(k) or gl_rule_map.get(bk) or gl_rule_map.get(cnk)) for c, b, cn, k, bk, cnk in zip(c_sub, b_sub, cn_sub, keys, b_keys, cn_keys)]
             match_mask = pd.Series(is_matched, index=comp_indices)
             if match_mask.any():
-                sc_to_set = mapped_series.fillna("")
-                invalid_sc = ["nan", "none", "none (standard)", "unassigned", "null"]
-                sc_cleaned = sc_to_set.replace({v: "" for v in invalid_sc})
+                sc_cleaned = mapped_series.fillna("")
                 df_raw.loc[match_mask[match_mask].index, col] = sc_cleaned.loc[match_mask[match_mask].index]
         else:
             valid_mask = mapped_series.notna() & (~mapped_series.astype(str).str.lower().isin(["", "nan", "none", "unassigned"]))
@@ -1632,13 +1638,19 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 valid_idx = valid_mask[valid_mask].index
                 df_raw.loc[valid_idx, col] = mapped_series.loc[valid_idx]
 
-    # Classification by ID first (overrides name mapping when an ID rule matches)
+    # Classification by ID first (overrides name mapping when an ID rule matches).
+    # map_fields reads db-style field names (special_case, sub_heading, ...), so alias the title-case columns.
+    id_rules = all_rules.copy()
+    for t_col in target_cols:
+        db_f = t_col.lower().replace("-", "_").replace(" ", "_")
+        if t_col in id_rules.columns and db_f not in id_rules.columns:
+            id_rules[db_f] = id_rules[t_col]
     for plat in ["givebrite", "madinah", "launchgood"]:
         plat_filter = "givebrite|givebright" if plat == "givebrite" else plat
         plat_mask = comp_mask & (df_raw["Platform"].astype(str).str.lower().str.contains(plat_filter))
         if plat_mask.any():
             plat_sub = df_raw.loc[plat_mask]
-            id_map = _id_rule_values(plat_sub, plat, comp, all_rules, [c.lower().replace("-", "_").replace(" ", "_") for c in target_cols])
+            id_map = _id_rule_values(plat_sub, plat, comp, id_rules, [c.lower().replace("-", "_").replace(" ", "_") for c in target_cols])
             for col in target_cols:
                 db_f = col.lower().replace("-", "_").replace(" ", "_")
                 if db_f in id_map:
@@ -3157,10 +3169,10 @@ def _enrich_dataframe(df, platform="auto", company_id: str = "rethink"):
     df = deduplicate_dataframe_columns(df)
 
     # --- CLASSIFICATIONS MATRIX LOOKUP BY CAMPAIGN NAME (INDEPENDENT PER PLATFORM) ---
-    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code"]
+    target_cols = ["Heading", "Sub-Heading", "Country", "Code", "Zakat Eligibility", "Department", "Office", "Portfolio", "Programme Fund", "Fund Code", "Special Case"]
     for col in target_cols:
         if col not in df.columns:
-            df[col] = "Unassigned"
+            df[col] = "" if col == "Special Case" else "Unassigned"
 
     try:
         conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30.0)
@@ -3913,6 +3925,240 @@ def set_cached_data(df: pd.DataFrame):
     with _CACHE_LOCK:
         _CACHED_DF = df
         _CACHE_MTIME = time.time()
+
+
+def refresh_donor_ltv(
+    company_id: Optional[str] = None,
+    donor_ids=None,
+    fix_website_ids: bool = False,
+) -> dict:
+    """Recomputes canonical Total LTV (GBP settled net) and Lifetime Donor Classification
+    for the target charity (or all charities) / target Donor IDs, updating SQLite 'donations'
+    and donations_cache.parquet without altering codes, amounts, or categories."""
+    from core.utils import canonical_donor_id
+
+    target_dids = (
+        {str(d).strip().lower() for d in donor_ids if str(d or "").strip()}
+        if donor_ids is not None
+        else None
+    )
+    if target_dids is not None and not target_dids and not fix_website_ids:
+        return {"companies": {}, "sql_rows_updated": 0, "parquet_rows_updated": 0}
+
+    with _DB_LOCK:
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
+        try:
+            if company_id and str(company_id).strip().lower() != "all":
+                companies = [str(company_id).strip().lower()]
+            else:
+                companies = [
+                    str(r[0]).strip().lower()
+                    for r in conn.execute(
+                        "SELECT DISTINCT LOWER(COALESCE(company_id, 'rethink')) FROM donations"
+                    ).fetchall()
+                    if r and r[0]
+                ]
+
+            id_fixes = 0
+            if fix_website_ids:
+                q_comp = (
+                    " AND LOWER(COALESCE(company_id, 'rethink')) IN ("
+                    + ",".join("?" * len(companies))
+                    + ")"
+                )
+                cand_rows = conn.execute(
+                    f"""
+                    SELECT rowid, "Donation ID", "Email", "First Name", "Last Name",
+                           "Display Name", "Donor ID", LOWER(COALESCE(company_id, 'rethink'))
+                    FROM donations
+                    WHERE Platform = 'Rethink Website'
+                      AND LOWER(TRIM(COALESCE("Donor ID", ''))) = LOWER(TRIM(COALESCE("Donation ID", '')))
+                      {q_comp}
+                    """,
+                    companies,
+                ).fetchall()
+                updates = []
+                for rid, don_id, em, fn, ln, disp, old_did, c_id in cand_rows:
+                    new_did = canonical_donor_id(
+                        email=em or "",
+                        first_name=fn or "",
+                        last_name=ln or "",
+                        display_name=disp or "",
+                        fallback_id=don_id or "",
+                    )
+                    if new_did and new_did != str(old_did or "").strip():
+                        updates.append((new_did, rid))
+                if updates:
+                    with conn:
+                        conn.executemany(
+                            'UPDATE donations SET "Donor ID" = ? WHERE rowid = ?', updates
+                        )
+                    id_fixes = len(updates)
+        finally:
+            conn.close()
+
+    if id_fixes and os.path.exists(PARQUET_PATH):
+        try:
+            pq_df = pd.read_parquet(PARQUET_PATH)
+            if not pq_df.empty and "Platform" in pq_df.columns and "Donor ID" in pq_df.columns:
+                mask_rw = (
+                    (pq_df["Platform"].astype(str) == "Rethink Website")
+                    & (pq_df["Donor ID"].fillna("").astype(str).str.strip().str.lower()
+                       == pq_df["Donation ID"].fillna("").astype(str).str.strip().str.lower())
+                )
+                if company_id and str(company_id).strip().lower() != "all" and "company_id" in pq_df.columns:
+                    mask_rw &= pq_df["company_id"].astype(str).str.strip().str.lower() == str(company_id).strip().lower()
+                if mask_rw.any():
+                    for idx in pq_df.index[mask_rw]:
+                        pq_df.at[idx, "Donor ID"] = canonical_donor_id(
+                            email=pq_df.at[idx, "Email"] if "Email" in pq_df.columns else "",
+                            first_name=pq_df.at[idx, "First Name"] if "First Name" in pq_df.columns else "",
+                            last_name=pq_df.at[idx, "Last Name"] if "Last Name" in pq_df.columns else "",
+                            display_name=pq_df.at[idx, "Display Name"] if "Display Name" in pq_df.columns else "",
+                            fallback_id=pq_df.at[idx, "Donation ID"] if "Donation ID" in pq_df.columns else "",
+                        )
+                    pq_df = sanitize_df_dtypes_for_parquet(pq_df)
+                    atomic_write_parquet(pq_df, PARQUET_PATH)
+        except Exception as e:
+            print(f"[refresh_donor_ltv] Website ID parquet notice: {e}")
+
+    invalidate_data_cache()
+
+    comp_ltv_maps = {}
+    summary_counts = {}
+    sql_updated_total = 0
+
+    for comp in companies:
+        df_c = load_data(company_id=comp)
+        if df_c is None or df_c.empty or "Donor ID" not in df_c.columns:
+            continue
+        col_amt = "Total Online Donations Net Amount in Settled Currency"
+        if col_amt not in df_c.columns:
+            col_amt = "Donation Amount in Project Currency (May be approx.)"
+        if col_amt not in df_c.columns:
+            continue
+
+        did_l = df_c["Donor ID"].fillna("").astype(str).str.strip().str.lower()
+        amt_s = pd.to_numeric(df_c[col_amt], errors="coerce").fillna(0.0)
+        if "Status" in df_c.columns:
+            valid_mask = ~df_c["Status"].fillna("").astype(str).str.strip().str.lower().isin(
+                ["failed", "cancelled", "canceled"]
+            )
+            ltv_series = amt_s.where(valid_mask, 0.0).groupby(did_l).sum()
+        else:
+            ltv_series = amt_s.groupby(did_l).sum()
+
+        ltv_map = {k: round(float(v), 2) for k, v in ltv_series.items() if k}
+        tier_map = {k: classify_donor_amount(v) for k, v in ltv_map.items()}
+        comp_ltv_maps[comp] = (ltv_map, tier_map)
+
+        # Find rows in SQLite needing LTV/classification update
+        params_sql = []
+        did_to_update = []
+        with _DB_LOCK:
+            conn = sqlite3.connect(LOCAL_DB_PATH, timeout=60.0)
+            try:
+                if target_dids is not None:
+                    check_dids = [d for d in target_dids if d in ltv_map]
+                    for dk in check_dids:
+                        params_sql.append((ltv_map[dk], tier_map[dk], comp, dk))
+                else:
+                    existing_rows = conn.execute(
+                        """
+                        SELECT DISTINCT LOWER(TRIM(COALESCE("Donor ID", ''))) AS dk,
+                               "Total LTV",
+                               "Lifetime Donor Classification"
+                        FROM donations
+                        WHERE LOWER(COALESCE(company_id, 'rethink')) = ?
+                        """,
+                        (comp,),
+                    ).fetchall()
+                    dirty_dids = set()
+                    for dk, old_ltv, old_tier in existing_rows:
+                        if not dk or dk not in ltv_map:
+                            continue
+                        new_ltv = ltv_map[dk]
+                        new_tier = tier_map[dk]
+                        try:
+                            old_ltv_f = round(float(old_ltv), 2) if old_ltv is not None else None
+                        except Exception:
+                            old_ltv_f = None
+                        if old_ltv_f != new_ltv or str(old_tier or "").strip() != new_tier:
+                            dirty_dids.add(dk)
+                    for dk in dirty_dids:
+                        params_sql.append((ltv_map[dk], tier_map[dk], comp, dk))
+
+                if params_sql:
+                    with conn:
+                        conn.executemany(
+                            """
+                            UPDATE donations
+                            SET "Total LTV" = ?,
+                                "Lifetime Donor Classification" = ?
+                            WHERE LOWER(COALESCE(company_id, 'rethink')) = ?
+                              AND LOWER(TRIM(COALESCE("Donor ID", ''))) = ?
+                            """,
+                            params_sql,
+                        )
+                        sql_updated_total += conn.total_changes
+                did_to_update = [p[3] for p in params_sql]
+            finally:
+                conn.close()
+        summary_counts[comp] = {"donors_updated": len(did_to_update), "website_id_fixes": id_fixes}
+
+    # Sync Parquet cache cleanly across all updated companies
+    pq_updated = 0
+    if comp_ltv_maps and os.path.exists(PARQUET_PATH):
+        try:
+            pq_df = pd.read_parquet(PARQUET_PATH)
+            if not pq_df.empty and "Donor ID" in pq_df.columns:
+                if "Total LTV" not in pq_df.columns:
+                    pq_df["Total LTV"] = 0.0
+                if "Lifetime Donor Classification" not in pq_df.columns:
+                    pq_df["Lifetime Donor Classification"] = "Low End"
+                comp_s = (
+                    pq_df["company_id"].fillna("rethink").astype(str).str.strip().str.lower()
+                    if "company_id" in pq_df.columns
+                    else pd.Series("rethink", index=pq_df.index)
+                )
+                did_s = pq_df["Donor ID"].fillna("").astype(str).str.strip().str.lower()
+                cur_ltv = pd.to_numeric(pq_df["Total LTV"], errors="coerce").round(2)
+                cur_tier = pq_df["Lifetime Donor Classification"].fillna("").astype(str).str.strip()
+
+                changed_any = False
+                for comp, (ltv_map, tier_map) in comp_ltv_maps.items():
+                    c_mask = comp_s == comp
+                    if target_dids is not None:
+                        c_mask &= did_s.isin(target_dids)
+                    if not c_mask.any():
+                        continue
+                    mapped_ltv = did_s.loc[c_mask].map(ltv_map)
+                    mapped_tier = did_s.loc[c_mask].map(tier_map)
+                    valid = mapped_ltv.notna() & mapped_tier.notna()
+                    if not valid.any():
+                        continue
+                    v_idx = mapped_ltv.index[valid]
+                    need = (cur_ltv.loc[v_idx] != mapped_ltv.loc[v_idx]) | (cur_tier.loc[v_idx] != mapped_tier.loc[v_idx])
+                    if need.any():
+                        u_idx = need.index[need]
+                        pq_df.loc[u_idx, "Total LTV"] = mapped_ltv.loc[u_idx].astype(float)
+                        pq_df.loc[u_idx, "Lifetime Donor Classification"] = mapped_tier.loc[u_idx].astype(str)
+                        pq_updated += int(len(u_idx))
+                        changed_any = True
+                if changed_any:
+                    pq_df = sanitize_df_dtypes_for_parquet(pq_df)
+                    atomic_write_parquet(pq_df, PARQUET_PATH)
+        except Exception as e:
+            print(f"[refresh_donor_ltv] Parquet sync notice: {e}")
+
+    invalidate_data_cache()
+    try:
+        from core.cache import bump
+        bump("donations", "classification")
+    except Exception:
+        pass
+    return {"companies": summary_counts, "sql_changes": sql_updated_total, "parquet_rows_updated": pq_updated}
+
 
 
 def purge_payout_data():

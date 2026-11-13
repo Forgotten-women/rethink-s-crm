@@ -29,11 +29,11 @@ def _get_amount_column(df):
 
 
 def _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-              donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=None):
+              donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=None, special_case=None):
     df_raw = load_data(company_id=company_id)
     return _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat,
                           donor_country, campaign_search, gift_aid, start_date, end_date,
-                          programme_fund=programme_fund, company_id=company_id)
+                          programme_fund=programme_fund, company_id=company_id, special_case=special_case)
 
 
 def _donor_count(df):
@@ -99,10 +99,11 @@ def get_overview_timeline(
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    programme_fund: Optional[str] = None
+    programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None
 ):
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col_amount = _get_amount_column(df)
     col_date = "_parsed_date" if ("_parsed_date" in df.columns and df["_parsed_date"].dropna().astype(str).str.strip().ne("").any()) else ("Created Date (UTC)" if "Created Date (UTC)" in df.columns else "Date")
 
@@ -143,10 +144,11 @@ def get_overview_headings(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None,
     limit: int = Query(7, ge=0, le=500)
 ):
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col_amount = _get_amount_column(df)
     if df.empty or not col_amount or "Heading" not in df.columns:
         return []
@@ -172,11 +174,12 @@ def get_overview_top_campaigns(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(8, ge=1, le=100)
 ):
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col_amount = _get_amount_column(df)
     if df.empty or not col_amount or "Campaign Name" not in df.columns:
         return {"items": [], "total_count": 0, "page": 1, "total_pages": 1, "max_raised": 0.0}
@@ -218,10 +221,11 @@ def get_overview_subheadings(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None,
     limit: int = Query(10, ge=0, le=500)
 ):
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col_amount = _get_amount_column(df)
     if df.empty or not col_amount or "Sub-Heading" not in df.columns:
         return []
@@ -246,11 +250,12 @@ def get_campaign_breakdown(
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    programme_fund: Optional[str] = None
+    programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None
 ):
     """Where one campaign's money came from: pages, platforms, payment types, monthly trend and recent gifts."""
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col_amount = _get_amount_column(df)
     if df.empty or not col_amount or "Campaign Name" not in df.columns:
         raise HTTPException(status_code=404, detail="No data for this campaign under the current filters.")
@@ -322,7 +327,8 @@ def get_category_breakdown(
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    programme_fund: Optional[str] = None
+    programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None
 ):
     """Where one category's money came from (campaigns, platforms) and its share of all funds raised."""
     # The clicked category is measured against the other filters, so its own heading filter is left out
@@ -331,7 +337,7 @@ def get_category_breakdown(
     else:
         subheading = None
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col = "Heading" if kind == "heading" else "Sub-Heading"
     col_amount = _get_amount_column(df)
     if df.empty or not col_amount or col not in df.columns:
@@ -377,11 +383,12 @@ def export_overview_csv(
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    programme_fund: Optional[str] = None
+    programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None
 ):
     """CSV of a dashboard section under the current filters. Contains aggregates and donor display names only."""
     df = _filtered(company_id, payment_type, tier, source, heading, subheading, country, code, zakat,
-                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund)
+                   donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund, special_case)
     col_amount = _get_amount_column(df)
     if df.empty or not col_amount:
         raise HTTPException(status_code=400, detail="No data available to export.")

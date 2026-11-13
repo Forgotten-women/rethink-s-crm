@@ -30,7 +30,8 @@ from typing import Any, Dict, List
 from config.settings import LOCAL_DB_PATH
 from core.stripe_accounts import account_setting, is_connected
 from core.stripe_reconciliation import _match_crm_classification
-from core.utils import classify_donor_amount
+from core.data_processor import refresh_donor_ltv
+from core.utils import classify_donor_amount, canonical_donor_id
 
 logger = logging.getLogger("stripe_crm_sync")
 
@@ -113,6 +114,7 @@ def _new_record(conn, row: Dict[str, Any], meta: Dict[str, str], table_cols: Lis
     gross, fee, net = float(row["amount"]), float(row["fee"]), float(row["net"])
     date, time_ = (row["created_at"] + " ").split(" ")[:2]
     recurring = _is_recurring(row)
+    platform_name = "Rethink Website" if (ref and str(ref).startswith("pmt_")) else "Stripe"
     rec = {
         "Donation ID": ref or row["charge_id"] or row["id"],
         "Created Date (UTC)": date, "Created Time (UTC)": time_, "Settled Date (UTC)": date,
@@ -133,12 +135,17 @@ def _new_record(conn, row: Dict[str, Any], meta: Dict[str, str], table_cols: Lis
         "Payment Type": "Direct Debit / Stripe" if row.get("payment_method_type") == "bacs_debit" else "Card / Stripe",
         "Payment Frequency": "Recurring Payment" if recurring else "One-Time Payment",
         "Subscription Type": "Subscription" if recurring else "",
-        "Platform": PLATFORM, "Source": SOURCE, "gateway": "stripe",
+        "Platform": platform_name, "Source": SOURCE, "gateway": "stripe",
         "charge_id": row["charge_id"], "Customer Ref": row.get("payment_intent_id") or "",
         "Subscription Reference": row.get("invoice_id") or "",
         "Transfer ID": row.get("payout_id") or None, "Payout Settled": "Yes" if row.get("payout_id") else "No",
         "Donation Payout Flag": "Paid" if row.get("payout_id") else "Unpaid",
-        "Donor ID": email or (row["charge_id"] or row["id"]),
+        "Donor ID": canonical_donor_id(
+            email=email,
+            first_name=first,
+            last_name=last,
+            fallback_id=(row["charge_id"] or row["id"]),
+        ),
         "Total LTV": gross, "Lifetime Donor Classification": classify_donor_amount(gross),
         "Transaction Donor Classification": classify_donor_amount(gross),
         "Code": cls["code"], "New Code": cls["code"], "Heading": cls.get("heading") or "", "Sub-Heading": cls.get("subheading") or "",
@@ -297,7 +304,7 @@ def apply_plan(conn, plan: Dict[str, Any], company: str) -> Dict[str, Any]:
                     "Amount": float(r["amount"]), GROSS: str(r["amount"]), FEES: float(r["fee"]), NET: float(r["net"]),
                     "Donation Amount (in Donation Currency)": str(r["amount"]),
                     "Donation Amount in Project Currency (May be approx.)": str(r["amount"]), "fee_amount": str(r["fee"]),
-                    "Source": SOURCE, "Comments": f"{'Failed payment reversed' if failed else 'Refund'} of {rv['donation_id']}",
+                    "Platform": "Stripe", "Source": SOURCE, "Comments": f"{'Failed payment reversed' if failed else 'Refund'} of {rv['donation_id']}",
                     "Transfer ID": r.get("payout_id"), "Payout Settled": "Yes" if r.get("payout_id") else "No",
                     "Total LTV": float(r["amount"])})
         cols = [c for c in table_cols if c in neg]
@@ -352,6 +359,10 @@ def run(apply: bool = False, backup: bool = True, company: str = "rethink") -> D
         # SQLite is the source of truth; bring the dashboards' copy level now: new rows + just the rows changed
         from core.donations_reconcile import reconcile
         reconcile(deep=False, apply=True, require_confirmation=False, only_keys=touched)
+        try:
+            refresh_donor_ltv(company_id=company)
+        except Exception as ltv_err:
+            logger.warning(f"Stripe LTV refresh notice: {ltv_err}")
     return {"dry_run": False, "applied": counts, "summary": summary}
 
 

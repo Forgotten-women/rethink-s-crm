@@ -346,6 +346,60 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
           )}
         </div>
 
+        {/* Special Case Pill */}
+        {(filterOptions.special_cases || []).length > 0 && (
+          <div className="relative">
+            <button
+              onClick={() => toggleDropdown('special_case')}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition-all hover:bg-slate-50 dark:hover:bg-slate-800/50 ${
+                filters?.special_case && filters.special_case !== 'All Special Cases'
+                  ? `${actClass} font-bold`
+                  : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10'
+              }`}
+            >
+              <span>Special Case: {(!filters?.special_case || filters.special_case === 'All Special Cases') ? 'All'
+                : (String(filters.special_case).split(',').length > 1 ? `${String(filters.special_case).split(',').length} selected` : filters.special_case)}</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            {activeDropdown === 'special_case' && (
+              <div className="absolute left-0 mt-2 w-64 bg-white dark:bg-slate-950 border border-slate-200 dark:border-white/10 rounded-xl shadow-xl z-50 py-1.5 animate-in fade-in slide-in-from-top-1 duration-150 max-h-60 overflow-y-auto custom-scrollbar">
+                <button
+                  onClick={() => handleSelect('special_case', 'All Special Cases')}
+                  className={`w-full text-left px-4 py-2 text-xs font-bold hover:bg-slate-50 dark:hover:bg-slate-800 border-b border-slate-100 dark:border-white/5 pb-2 ${
+                    !filters?.special_case || filters.special_case === 'All Special Cases' ? 'text-cyan-500' : 'text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  Clear / All Special Cases
+                </button>
+                {(filterOptions.special_cases || []).map(opt => {
+                  const isSel = filters?.special_case && filters.special_case !== 'All Special Cases' && String(filters.special_case).split(',').includes(opt);
+                  return (
+                    <button
+                      key={opt}
+                      onClick={() => {
+                        let selected = (!filters?.special_case || filters.special_case === 'All Special Cases') ? [] : String(filters.special_case).split(',');
+                        if (selected.includes(opt)) {
+                          selected = selected.filter(s => s !== opt);
+                        } else {
+                          selected.push(opt);
+                        }
+                        onFilterChange('special_case', selected.length === 0 ? 'All Special Cases' : selected.join(','));
+                      }}
+                      className={`w-full text-left px-4 py-2 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors flex items-center justify-between ${
+                        isSel ? 'text-cyan-500 font-bold' : 'text-slate-700 dark:text-slate-300'
+                      }`}
+                    >
+                      <span>{opt}</span>
+                      {isSel && <span className="w-1.5 h-1.5 rounded-full bg-cyan-500" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Office Pill */}
         <div className="relative">
           <button

@@ -34,9 +34,10 @@ from core.data_processor import (
     sanitize_df_dtypes_for_parquet,
     invalidate_data_cache,
     invalidate_paysuite_payouts_cache,
+    refresh_donor_ltv,
 )
 from core.paysuite_client import get_paysuite_client, PaySuiteClient, PaySuiteAPIError
-from core.utils import classify_donor_amount
+from core.utils import classify_donor_amount, canonical_donor_id
 
 logger = logging.getLogger("paysuite_sync")
 
@@ -836,7 +837,13 @@ def reconcile_paysuite_to_crm(company_id: str = "rethink") -> Dict[str, Any]:
                     "Transfer ID": batch_id,
                     "Payout Settled": "Yes" if disb_id and not returned else "No",
                     "Donation Payout Flag": "Paid" if disb_id and not returned else "Unpaid",
-                    "Donor ID": email or pid,
+                    "Donor ID": canonical_donor_id(
+                        email=email,
+                        first_name=first,
+                        last_name=last,
+                        display_name=disp_name,
+                        fallback_id=pid,
+                    ),
                     "Total LTV": amt,
                     "Lifetime Donor Classification": classify_donor_amount(amt),
                     "Transaction Donor Classification": classify_donor_amount(amt),
@@ -905,7 +912,13 @@ def reconcile_paysuite_to_crm(company_id: str = "rethink") -> Dict[str, Any]:
                     "Transfer ID": batch_id,
                     "Payout Settled": "Yes" if disb_id else "No",
                     "Donation Payout Flag": "Unpaid",
-                    "Donor ID": email or pid,
+                    "Donor ID": canonical_donor_id(
+                        email=email,
+                        first_name=first,
+                        last_name=last,
+                        display_name=disp_name,
+                        fallback_id=pid,
+                    ),
                     "Total LTV": -amt,
                     "Lifetime Donor Classification": classify_donor_amount(amt),
                     "Transaction Donor Classification": classify_donor_amount(amt),
@@ -988,6 +1001,13 @@ def reconcile_paysuite_to_crm(company_id: str = "rethink") -> Dict[str, Any]:
                 reconcile(deep=False, apply=True, require_confirmation=False, only_keys=only_donation_keys)
             except Exception as rec_err:
                 logger.warning(f"[PaySuite] Donations reconcile notice: {rec_err}")
+            try:
+                refresh_donor_ltv(
+                    company_id=comp,
+                    donor_ids={r.get("Donor ID") for r in crm_donation_rows if r.get("Donor ID")},
+                )
+            except Exception as ltv_err:
+                logger.warning(f"[PaySuite] LTV refresh notice: {ltv_err}")
 
         invalidate_data_cache(comp)
         invalidate_paysuite_payouts_cache()

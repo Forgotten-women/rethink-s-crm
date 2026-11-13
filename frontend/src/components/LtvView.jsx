@@ -25,6 +25,8 @@ export default function LtvView({ filters, activeCompany = 'rethink' }) {
       if (filters.gift_aid) params.append('gift_aid', filters.gift_aid);
       if (filters.start_date) params.append('start_date', filters.start_date);
       if (filters.end_date) params.append('end_date', filters.end_date);
+      if (filters.programme_fund) params.append('programme_fund', filters.programme_fund);
+      if (filters.special_case) params.append('special_case', filters.special_case);
     }
 
     fetch(`${API_BASE_URL}/api/ltv/summary?${params.toString()}`)
@@ -77,8 +79,8 @@ export default function LtvView({ filters, activeCompany = 'rethink' }) {
             <div key={idx} className="glass-panel p-4 flex flex-col gap-2 border-t-2 border-cyan-400">
               <span className={`badge ${tierBadges[item.tier] || 'badge-cyan'} w-fit`}>{item.tier}</span>
               <div className="text-xl font-black mt-1" style={{ color: 'var(--text-main)' }}>£{item.total_raised?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
-              <div className="text-xs font-semibold flex items-center justify-between" style={{ color: 'var(--text-sub)' }}>
-                <span>{item.donation_count} donations</span>
+              <div className="text-xs font-semibold flex items-center justify-between gap-2 flex-wrap" style={{ color: 'var(--text-sub)' }}>
+                <span>{Number(item.donor_count || 0).toLocaleString()} donors · {Number(item.donation_count || 0).toLocaleString()} gifts</span>
                 <span className="text-emerald-400">Avg £{item.avg_donation?.toFixed(2)}</span>
               </div>
               <div className="w-full h-1.5 rounded-full bg-slate-800 mt-1 overflow-hidden">
@@ -103,6 +105,7 @@ export default function LtvView({ filters, activeCompany = 'rethink' }) {
             <thead>
               <tr>
                 <th>Donor Tier</th>
+                <th>Unique Donors</th>
                 <th>Total Raised (£)</th>
                 <th>Donation Count</th>
                 <th>Average Donation (£)</th>
@@ -114,6 +117,7 @@ export default function LtvView({ filters, activeCompany = 'rethink' }) {
                   <td>
                     <span className={`badge ${tierBadges[item.tier] || 'badge-cyan'}`}>{item.tier}</span>
                   </td>
+                  <td className="font-semibold text-slate-300">{Number(item.donor_count || 0).toLocaleString()}</td>
                   <td className="font-extrabold text-cyan-400">£{item.total_raised?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                   <td className="font-semibold text-slate-200">{item.donation_count?.toLocaleString()}</td>
                   <td className="font-bold text-emerald-400">£{item.avg_donation?.toFixed(2)}</td>

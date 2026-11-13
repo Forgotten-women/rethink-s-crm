@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { X, User, Mail, Phone, MapPin, Calendar, PieChart, ShieldCheck, Search, Columns, ChevronLeft, ChevronRight } from 'lucide-react';
 import { API_BASE_URL } from '../config';
+import SingleDonorExportButtons from './SingleDonorExportButtons';
 import DonationDetailModal from './DonationDetailModal';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
 import { AgentInput, useAgents } from './AddDonorModal';
@@ -45,7 +46,7 @@ const COLUMNS = [
   { key: 'Comments', label: 'Comments', wide: true },
 ];
 
-export default function DonorDrawer({ donorId, onClose, activeCompany }) {
+export default function DonorDrawer({ donorId, onClose, activeCompany, user }) {
   const [profile, setProfile] = useState(null);
   const agents = useAgents(activeCompany);
   const [loading, setLoading] = useState(true);
@@ -217,7 +218,19 @@ export default function DonorDrawer({ donorId, onClose, activeCompany }) {
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 flex-wrap justify-end shrink-0">
+            {profile && (
+              <SingleDonorExportButtons
+                donorId={profile?.donor_id || resolvedDonorId}
+                companyId={activeCompany}
+                user={user}
+                dateFrom={dateFrom}
+                dateTo={dateTo}
+                heading={cause?.heading || ''}
+                subheading={cause?.subheading || ''}
+                compact={true}
+              />
+            )}
             {profile && canEdit && <button type="button" onClick={startEdit} className="px-2.5 py-1.5 text-xs rounded-lg font-semibold border flex items-center gap-1" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}><Pencil className="w-3.5 h-3.5" /> Edit details</button>}
             {profile && canEdit && <button type="button" onClick={() => setAdding(true)} className="px-2.5 py-1.5 text-xs rounded-lg font-semibold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1"><PlusCircle className="w-3.5 h-3.5" /> Add donation</button>}
             {profile && clean(profile?.email) && activeCompany !== 'all' && <button type="button" onClick={() => setEmailing(true)} className="px-2.5 py-1.5 text-xs rounded-lg font-semibold border flex items-center gap-1" style={{ borderColor: 'var(--border-glass)', color: 'var(--text-main)' }}><Send className="w-3.5 h-3.5 text-sky-500" /> Email</button>}

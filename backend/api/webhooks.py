@@ -16,9 +16,10 @@ from core.data_processor import (
     init_classification_db,
     fix_mojibake,
     get_code_to_classification_map,
-    atomic_write_parquet
+    atomic_write_parquet,
+    refresh_donor_ltv,
 )
-from core.utils import classify_donor_amount
+from core.utils import classify_donor_amount, canonical_donor_id
 from core.givebrite_ingestion import FX_BENCHMARKS
 from backend.api.events import broadcast_event_sync
 from backend.api.auth import require_super_admin
@@ -626,7 +627,13 @@ def build_webhook_donation_record(payload: Dict[str, Any], target_cid: str = "re
         optin_val = "True" if is_optin else "False"
 
     # Donor ID, Classifications & LTV
-    donor_id = email if email else (f"{first_name} {last_name}".strip().lower() or don_id)
+    donor_id = canonical_donor_id(
+        email=email,
+        first_name=first_name,
+        last_name=last_name,
+        display_name=display_name,
+        fallback_id=don_id,
+    )
     txn_class = classify_donor_amount(settled_gross)
 
     prior_ltv = 0.0
@@ -766,6 +773,7 @@ def build_webhook_donation_record(payload: Dict[str, Any], target_cid: str = "re
                     conn.commit()
                     df_new_row.to_sql("donations", con=conn, if_exists="append", index=False)
                     conn.close()
+                    refresh_donor_ltv(company_id=target_cid, donor_ids=[donor_id])
                 except Exception as sqle:
                     print(f"[SQLite Webhook Ingest Notice]: {sqle}")
 

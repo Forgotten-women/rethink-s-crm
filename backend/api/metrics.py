@@ -25,10 +25,11 @@ def get_metrics_summary(
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    programme_fund: Optional[str] = None
+    programme_fund: Optional[str] = None,
+    special_case: Optional[str] = None
 ):
     df_raw = load_data(company_id=company_id)
-    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, start_date, end_date, programme_fund=programme_fund, company_id=company_id, special_case=special_case)
 
     if df.empty:
         return {

@@ -37,8 +37,8 @@ if BASE_DIR not in sys.path:
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH
 from core.database import get_db_connection
-from core.data_processor import atomic_write_parquet, invalidate_data_cache
-from core.utils import classify_donor_amount
+from core.data_processor import atomic_write_parquet, invalidate_data_cache, refresh_donor_ltv
+from core.utils import classify_donor_amount, canonical_donor_id
 
 logger = logging.getLogger("madinah_ingestion")
 if not logger.handlers:
@@ -371,7 +371,13 @@ def build_madinah_record(
         "Payment Type": payment_method,
         "Platform": "Madinah",
         "Source": "Madinah Sync",
-        "Donor ID": donor_email or doc_id,
+        "Donor ID": canonical_donor_id(
+            email=donor_email,
+            first_name=first_name,
+            last_name=last_name,
+            display_name=donor_name,
+            fallback_id=doc_id,
+        ),
         "Total LTV": usd_amount,
         "Lifetime Donor Classification": lifetime_class,
         "Transaction Donor Classification": txn_class,
@@ -497,8 +503,6 @@ def ingest_madinah_donations(
                         SET "Settlement Currency" = 'USD',
                             "Total Online Donation Gross Amount in Settled Currency" = ?,
                             "Total Online Donations Net Amount in Settled Currency" = ?,
-                            "Total LTV" = ?,
-                            "Lifetime Donor Classification" = ?,
                             "Transaction Donor Classification" = ?,
                             "Donation Currency (DC)" = ?,
                             "Donation Amount (in Donation Currency)" = ?,
@@ -506,7 +510,7 @@ def ingest_madinah_donations(
                             "Currency" = ?
                         WHERE company_id = ? AND "Donation ID" = ?
                           AND ("Settlement Currency" != 'USD' OR "Total Online Donation Gross Amount in Settled Currency" != ?)
-                    """, (str(u_amt), u_amt, u_amt, t_cls, t_cls, curr, str(amt_val), amt_val, curr, company_id, did, str(u_amt)))
+                    """, (str(u_amt), u_amt, t_cls, curr, str(amt_val), amt_val, curr, company_id, did, str(u_amt)))
                     if cursor.rowcount > 0:
                         updated_records.append(did)
                 except Exception as u_err:
@@ -570,6 +574,10 @@ def ingest_madinah_donations(
     if sync_parquet and all_parquet_sync:
         try:
             update_madinah_parquet_cache(all_parquet_sync)
+            refresh_donor_ltv(
+                company_id=company_id,
+                donor_ids=[r.get("Donor ID") for r in all_parquet_sync if r.get("Donor ID")],
+            )
         except Exception as p_err:
             logger.error(f"Failed to update Parquet cache for Madinah: {p_err}")
 
@@ -698,6 +706,10 @@ def run_madinah_historical_backfill(
         try:
             logger.info(f"[Madinah Backfill] Updating Parquet cache with {len(all_new_parquet_records)} newly backfilled records...")
             update_madinah_parquet_cache(all_new_parquet_records)
+            refresh_donor_ltv(
+                company_id=company_id,
+                donor_ids=[r.get("Donor ID") for r in all_new_parquet_records if r.get("Donor ID")],
+            )
             invalidate_data_cache()
             from backend.api.events import broadcast_event_sync
             broadcast_event_sync("DONORS_UPDATED", {

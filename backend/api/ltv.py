@@ -3,6 +3,7 @@ from fastapi import APIRouter, Query
 from config.settings import DONOR_TIER_ORDER
 from core.cache import cached
 from core.data_processor import load_data
+from core.utils import donor_identity_key_series
 
 router = APIRouter(prefix="/api/ltv", tags=["Lifetime LTV & Segmentation"])
 
@@ -28,6 +29,7 @@ def get_ltv_summary(
     payment_type: Optional[str] = None,
     tier: Optional[str] = None,
     source: Optional[str] = None,
+    programme_fund: Optional[str] = None,
     heading: Optional[str] = None,
     subheading: Optional[str] = None,
     country: Optional[str] = None,
@@ -37,7 +39,8 @@ def get_ltv_summary(
     campaign_search: Optional[str] = None,
     gift_aid: Optional[str] = None,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    special_case: Optional[str] = None,
 ):
     df_raw = load_data(company_id=company_id)
     df = _apply_filters(
@@ -55,14 +58,20 @@ def get_ltv_summary(
         gift_aid=gift_aid,
         start_date=start_date,
         end_date=end_date,
-        company_id=company_id
+        programme_fund=programme_fund,
+        company_id=company_id,
+        special_case=special_case,
     )
     col_amount = _get_amount_column(df)
 
     if df.empty or not col_amount or "Lifetime Donor Classification" not in df.columns:
         return []
 
+    df = df.copy()
+    df["_donor_key"] = donor_identity_key_series(df)
+
     ltv_summary = df.groupby("Lifetime Donor Classification").agg(
+        donor_count=("_donor_key", "nunique"),
         total_raised=(col_amount, "sum"),
         donation_count=(col_amount, "count"),
         avg_donation=(col_amount, "mean")
@@ -73,6 +82,7 @@ def get_ltv_summary(
     )
     ltv_summary = ltv_summary.sort_values("tier_order").drop(columns=["tier_order"])
     ltv_summary.rename(columns={"Lifetime Donor Classification": "tier"}, inplace=True)
+    ltv_summary["donor_count"] = ltv_summary["donor_count"].astype(int)
 
     ltv_summary["total_raised"] = ltv_summary["total_raised"].round(2)
     ltv_summary["avg_donation"] = ltv_summary["avg_donation"].round(2)

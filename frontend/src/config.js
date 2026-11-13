@@ -111,3 +111,26 @@ export const downloadFile = async (url, fallbackName = 'export') => {
   link.remove();
   setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
 };
+
+export const downloadSingleDonorRecord = async ({
+  donorId,
+  companyId = 'rethink',
+  format = 'xlsx',
+  dateFrom = '',
+  dateTo = '',
+  heading = '',
+  subheading = '',
+}) => {
+  if (!donorId) return;
+  const params = new URLSearchParams({
+    donor_id: String(donorId),
+    company_id: companyId || 'rethink',
+    format,
+  });
+  if (dateFrom) params.append('date_from', dateFrom);
+  if (dateTo) params.append('date_to', dateTo);
+  if (heading) params.append('heading', heading);
+  if (subheading) params.append('subheading', subheading);
+  const ext = format === 'csv' ? 'csv' : 'xlsx';
+  await downloadFile(`${API_BASE_URL}/api/donors/single-export?${params.toString()}`, `donor_record.${ext}`);
+};

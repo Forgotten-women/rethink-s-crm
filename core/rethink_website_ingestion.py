@@ -40,9 +40,9 @@ if BASE_DIR not in sys.path:
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH
 from core.database import get_db_connection
-from core.data_processor import atomic_write_parquet, invalidate_data_cache
+from core.data_processor import atomic_write_parquet, invalidate_data_cache, refresh_donor_ltv
 from core.donations_reconcile import _arrow_safe
-from core.utils import classify_donor_amount
+from core.utils import classify_donor_amount, canonical_donor_id
 
 logger = logging.getLogger("rethink_website_ingestion")
 if not logger.handlers:
@@ -462,7 +462,12 @@ def ingest_rethink_website_records(records: List[Dict[str, Any]], company_id: st
                 "gateway": "stripe",
                 "Platform": "Rethink Website",
                 "Source": "Rethink Website Sync",
-                "Donor ID": donor_email or r["reference"],
+                "Donor ID": canonical_donor_id(
+                    email=donor_email,
+                    first_name=donor_first,
+                    last_name=donor_last,
+                    fallback_id=r["reference"],
+                ),
                 "Total LTV": amt,
                 "Lifetime Donor Classification": ltv_class,
                 "Transaction Donor Classification": ltv_class,
@@ -509,6 +514,14 @@ def ingest_rethink_website_records(records: List[Dict[str, Any]], company_id: st
         df_safe = _arrow_safe(full_df)
         atomic_write_parquet(df_safe, PARQUET_PATH)
         invalidate_data_cache()
+        if inserted_rows:
+            try:
+                refresh_donor_ltv(
+                    company_id=company_id,
+                    donor_ids=[row.get("Donor ID") for row in inserted_rows if row.get("Donor ID")],
+                )
+            except Exception as ltv_err:
+                logger.warning(f"LTV refresh notice (website ingest): {ltv_err}")
         logger.info("Parquet cache rebuilt and memory cache invalidated successfully.")
 
         return {

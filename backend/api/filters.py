@@ -166,9 +166,17 @@ def get_filter_options(
     if "Campaign Name" in camp_df.columns:
         campaigns = sorted([str(c).strip() for c in camp_df["Campaign Name"].dropna().unique() if str(c).strip() not in ["", "nan", "None", "Unassigned"]])
 
+    # 13. Special cases: every distinct assigned special case in this charity's data
+    special_cases = []
+    if "Special Case" in df_raw.columns:
+        sc_vals = df_raw["Special Case"].fillna("").astype(str).str.strip()
+        special_cases = sorted({v for v in sc_vals.unique() if v and v.lower() not in ["nan", "none", "null", "unassigned", "n/a"]},
+                               key=str.lower)
+
     return {
         "sources": sources,
         "programme_funds": programme_funds,
+        "special_cases": special_cases,
         "headings": headings,
         "subheadings": subheadings,
         "countries": countries,

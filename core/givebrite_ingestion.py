@@ -35,8 +35,8 @@ if BASE_DIR not in sys.path:
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH, GIVEBRITE_CHARITY_IDS
 from core.database import get_db_connection
-from core.data_processor import atomic_write_parquet, invalidate_data_cache
-from core.utils import classify_donor_amount
+from core.data_processor import atomic_write_parquet, invalidate_data_cache, refresh_donor_ltv
+from core.utils import classify_donor_amount, canonical_donor_id
 
 logger = logging.getLogger("givebrite_ingestion")
 if not logger.handlers:
@@ -677,7 +677,13 @@ def build_donation_record(
         "Payment Type": payment_method,
         "Platform": "GiveBrite",
         "Source": "GiveBrite Sync",
-        "Donor ID": email,
+        "Donor ID": canonical_donor_id(
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            display_name=display_name,
+            fallback_id=doc_id,
+        ),
         "Total LTV": total_ltv,
         "Lifetime Donor Classification": lifetime_class,
         "Transaction Donor Classification": txn_class,
@@ -880,6 +886,13 @@ def ingest_givebrite_donations(
             update_parquet_cache(records_to_insert)
         except Exception as p_err:
             logger.error(f"Failed to update Parquet cache: {p_err}")
+        try:
+            refresh_donor_ltv(
+                company_id=company_id,
+                donor_ids=[r.get("Donor ID") for r in records_to_insert if r.get("Donor ID")],
+            )
+        except Exception as ltv_err:
+            logger.warning(f"GiveBrite LTV refresh notice: {ltv_err}")
 
     # Broadcast WebSocket event so the UI refreshes in real-time
     try:

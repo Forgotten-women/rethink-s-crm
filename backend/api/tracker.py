@@ -5680,7 +5680,7 @@ _RETHINK_BLACK_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/rethink_black_logo.png"
 _IQRA_EMAIL_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/iqra_email_logo.png"
 _IQRA_LOGO_URI = _IQRA_EMAIL_LOGO_URI
 _SP_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/sp_logo.png"
-_SP_RETHINK_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/sp_rethink_logo.png"
+_SP_RETHINK_LOGO_URI = f"{_PUBLIC_APP_BASE}/logos/sp_rethink_logo_v2.png"
 
 # SP Single Unified Header: "Powered by" + Sisters' Project logo ✕ Rethink Charity logo
 _SP_COLLAB_HEADER = f'''

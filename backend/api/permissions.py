@@ -62,6 +62,7 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "donors.update_single_donor_record": "explorer.edit",
     "donors.bulk_edit_donors": "explorer.bulk_edit",
     "donors.export_donors": AnyOf("explorer.export", "donors.export"),
+    "donors.export_single_donor": AnyOf("donors.export", "explorer.export", "dashboard.export"),
     "donors.get_donation_detail": AnyOf("explorer.view", "donors.view"),
     "donors.get_campaigns_list": SIGNED_IN,
     "donors.get_donor_360_profile": "donors.view",
@@ -315,13 +316,13 @@ CONTACT_EXPORTS = {"donors.export_donors", "donors.export_kanban_tier"}
 # Payout files: allowed without donors.contact, with the email / phone / address columns blanked in the file
 # (backend/api/contact_mask.py strip_contacts_from_file)
 CONTACT_STRIPPED_EXPORTS = {"payouts.export_payouts_excel", "stripe_payouts.download_enriched_csv",
-                            "stripe_payouts.export_stripe_payouts_excel"}
+                            "stripe_payouts.export_stripe_payouts_excel", "donors.export_single_donor"}
 
 # Endpoints that apply a person's fundraiser limit (core.rbac.scope_donations / request_scope). In a charity where
 # someone is limited to specific fundraisers, every other endpoint is refused - pages such as the dashboard or
 # payouts show charity-wide figures and would leak beyond their fundraisers.
 SCOPE_AWARE = {
-    "donors.get_donors_paginated", "donors.export_donors", "donors.get_donation_detail", "donors.get_donor_360_profile",
+    "donors.get_donors_paginated", "donors.export_donors", "donors.export_single_donor", "donors.get_donation_detail", "donors.get_donor_360_profile",
     "donors.get_segment_options", "donors.get_donor_directory", "donors.get_donor_history_paginated",
     "donors.list_donor_notes", "donors.list_agents",
     "fundraisers.get_fundraisers_list", "fundraisers.get_fundraiser_detail", "fundraisers.get_fundraiser_statuses",

@@ -26,7 +26,8 @@ function buildFilterParams(filters, activeCompany) {
   params.append('company_id', activeCompany);
   if (filters) {
     ['payment_type', 'tier', 'source', 'heading', 'subheading', 'country', 'code', 'zakat',
-      'donor_country', 'campaign_search', 'gift_aid', 'programme_fund'
+      'donor_country', 'campaign_search', 'gift_aid', 'programme_fund', 'special_case',
+      'start_date', 'end_date'
     ].forEach(k => { if (filters[k]) params.append(k, filters[k]); });
   }
   return params;
@@ -147,7 +148,7 @@ export default function KanbanBoard({ filters, onSelectDonor, activeCompany = 'r
                 <button
                   key={idx}
                   type="button"
-                  onClick={() => onSelectDonor(card.email || card.name)}
+                  onClick={() => onSelectDonor({ donor_id: card.donor_id || card.email || card.name, email: card.email, name: card.name })}
                   className="glass-panel p-3.5 cursor-pointer transition-all group flex flex-col gap-2 border rounded-xl text-left"
                   style={{ borderColor: 'var(--border-glass)' }}
                 >
@@ -160,7 +161,9 @@ export default function KanbanBoard({ filters, onSelectDonor, activeCompany = 'r
                         <div className="text-xs font-extrabold group-hover:text-cyan-400 transition-colors truncate" style={{ color: 'var(--text-main)' }}>
                           {card.name || 'Anonymous Donor'}
                         </div>
-                        <div className="text-[10px] truncate" style={{ color: 'var(--text-sub)' }}>{card.email}</div>
+                        {card.email && (
+                          <div className="text-[10px] truncate" style={{ color: 'var(--text-sub)' }}>{card.email}</div>
+                        )}
                       </div>
                     </div>
                     <ChevronRight className="w-4 h-4 group-hover:text-cyan-400 transition-colors shrink-0 mt-1" style={{ color: 'var(--text-sub)' }} />

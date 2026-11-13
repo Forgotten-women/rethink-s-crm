@@ -1827,4 +1827,82 @@ def change_user_password(email_or_username, current_password, new_password):
         conn.close()
 
 
+_ANON_DONOR_WORDS = {
+    "", "nan", "none", "null", "n/a", "na", "unknown", "unassigned",
+    "anonymous", "anonymous donor", "anonymous kind soul", "kind soul",
+    "donation boost", "unnamed donor", "guest user", "guest", "supporter",
+    "user", "donor",
+}
+_DONOR_TITLE_PREFIXES = {
+    "dr", "mr", "mrs", "ms", "miss", "prof", "professor",
+    "sheikh", "shaykh", "shaykha", "sheikha",
+    "haji", "hajji", "hajjah", "haja", "ustadh", "ustad", "ustadha",
+    "imam", "mufti", "brother", "sister", "lord", "lady", "sir",
+}
+
+
+def _clean_donor_name_part(val) -> str:
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if s.lower() in _ANON_DONOR_WORDS:
+        return ""
+    return " ".join(s.split())
+
+
+def canonical_donor_id(
+    email="",
+    first_name="",
+    last_name="",
+    display_name="",
+    fallback_id="",
+) -> str:
+    """Canonical CRM Donor ID: lowercased email if present, else 'name:<clean name>', else fallback_id."""
+    em = str(email or "").strip().lower()
+    if em and "@" in em and em not in _ANON_DONOR_WORDS:
+        return em
+    fn = _clean_donor_name_part(first_name)
+    ln = _clean_donor_name_part(last_name)
+    disp = _clean_donor_name_part(display_name)
+    if fn and ln:
+        full = f"{fn} {ln}".strip()
+    elif disp and " " in disp:
+        full = disp
+    else:
+        full = ""
+    if full and full.lower() not in _ANON_DONOR_WORDS:
+        parts = full.split()
+        while len(parts) > 1 and parts[0].lower().rstrip(".") in _DONOR_TITLE_PREFIXES:
+            parts.pop(0)
+        cleaned = " ".join(parts).strip().lower()
+        if cleaned and cleaned not in _ANON_DONOR_WORDS and len(cleaned) >= 3:
+            return f"name:{cleaned}"
+    return str(fallback_id or "").strip()
+
+
+def donor_identity_key_series(df: pd.DataFrame) -> pd.Series:
+    """Normalized per-row canonical donor key used across Kanban, LTV, and exports."""
+    if df is None or df.empty:
+        return pd.Series([], index=df.index if df is not None else None, dtype=str)
+    if "Donor ID" in df.columns:
+        did_l = df["Donor ID"].fillna("").astype(str).str.strip().str.lower()
+        key = did_l.where(~did_l.isin(_ANON_DONOR_WORDS), "")
+    else:
+        key = pd.Series("", index=df.index, dtype=str)
+    if "Email" in df.columns:
+        em = df["Email"].fillna("").astype(str).str.strip().str.lower()
+        valid_em = (~em.isin(_ANON_DONOR_WORDS)) & em.str.contains("@", na=False)
+        key = key.where(key != "", em.where(valid_em, ""))
+    if "Donation ID" in df.columns:
+        don = df["Donation ID"].fillna("").astype(str).str.strip().str.lower()
+        valid_don = ~don.isin(_ANON_DONOR_WORDS)
+        key = key.where(key != "", ("id:" + don).where(valid_don, ""))
+    missing = key == ""
+    if missing.any():
+        key.loc[missing] = [f"row:{i}" for i in df.index[missing]]
+    return key
+
+
+
+
 
