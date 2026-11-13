@@ -51,8 +51,12 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "overview.get_overview_headings": "dashboard.view",
     "overview.get_overview_top_campaigns": "dashboard.view",
     "overview.get_overview_subheadings": "dashboard.view",
+    "overview.get_campaign_breakdown": "dashboard.view",
+    "overview.get_category_breakdown": "dashboard.view",
+    "overview.export_overview_csv": "dashboard.export",
     "ltv.get_ltv_summary": "dashboard.view",
     "donors.get_donors_kanban": "dashboard.view",
+    "donors.export_kanban_tier": "dashboard.export",
     # --- explorer / donors ---------------------------------------------------------------------------------
     "donors.get_donors_paginated": "explorer.view",
     "donors.update_single_donor_record": "explorer.edit",
@@ -307,7 +311,7 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
 
 
 # File exports that are mostly donor contact details: need donors.contact too.
-CONTACT_EXPORTS = {"donors.export_donors"}
+CONTACT_EXPORTS = {"donors.export_donors", "donors.export_kanban_tier"}
 # Payout files: allowed without donors.contact, with the email / phone / address columns blanked in the file
 # (backend/api/contact_mask.py strip_contacts_from_file)
 CONTACT_STRIPPED_EXPORTS = {"payouts.export_payouts_excel", "stripe_payouts.download_enriched_csv",

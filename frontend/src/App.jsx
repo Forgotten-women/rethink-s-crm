@@ -647,11 +647,12 @@ export default function App() {
                 />
               )}
               {activeTab === 'kanban' && (
-                <KanbanBoard 
-                  key={`${activeCompany}-${dataVersion}`} 
-                  filters={filters} 
-                  onSelectDonor={setSelectedDonor} 
+                <KanbanBoard
+                  key={`${activeCompany}-${dataVersion}`}
+                  filters={filters}
+                  onSelectDonor={setSelectedDonor}
                   activeCompany={activeCompany}
+                  user={user}
                 />
               )}
               {activeTab === 'donors' && (

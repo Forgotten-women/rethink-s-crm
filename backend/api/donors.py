@@ -563,10 +563,14 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
             mask &= src_mask
 
     if isinstance(heading, str) and heading.strip() and heading != "All Headings" and "Heading" in df.columns:
-        mask &= (df["Heading"].astype(str).str.strip().str.lower() == heading.strip().lower())
+        heads = [h.strip().lower() for h in heading.split(",") if h.strip() and h.strip() != "All Headings"]
+        if heads:
+            mask &= df["Heading"].astype(str).str.strip().str.lower().isin(heads)
 
     if isinstance(subheading, str) and subheading.strip() and subheading != "All Sub-Headings" and "Sub-Heading" in df.columns:
-        mask &= (df["Sub-Heading"].astype(str).str.strip().str.lower() == subheading.strip().lower())
+        subs = [s.strip().lower() for s in subheading.split(",") if s.strip() and s.strip() != "All Sub-Headings"]
+        if subs:
+            mask &= df["Sub-Heading"].astype(str).str.strip().str.lower().isin(subs)
 
     if isinstance(country, str) and country.strip() and country != "All Project Countries" and "Country" in df.columns:
         mask &= df["Country"].astype(str).str.contains(country.strip(), case=False, regex=False, na=False)
@@ -1054,9 +1058,13 @@ def get_donors_kanban(
     donor_country: Optional[str] = None,
     campaign_search: Optional[str] = None,
     gift_aid: Optional[str] = None,
+    board_tier: Optional[str] = Query(None, description="Only this tier's cards are returned (tab view)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     company_id: Optional[str] = Query("rethink")
 ):
-    """Returns donor cards grouped by LTV Tier for the Kanban Pipeline Board with column total sums."""
+    """Returns donor cards grouped by LTV Tier for the Kanban Pipeline Board with column total sums.
+    With board_tier, cards are paged for that tier only; the other tiers keep their header totals."""
     df_raw = load_data(company_id=company_id)
     df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, programme_fund=programme_fund, company_id=company_id)
 
@@ -1086,27 +1094,20 @@ def get_donors_kanban(
     for t in tiers:
         t_df = df[df["Lifetime Donor Classification"] == t]
         total_sum_amount = float(t_df[col_amount].sum()) if (not t_df.empty and col_amount in t_df.columns) else 0.0
+        donor_summary = _kanban_donor_summary(t_df, group_col, col_amount)
+        unique_donors = len(donor_summary)
 
-        if not t_df.empty:
-            donor_summary = t_df.groupby(group_col).agg(
-                name=("_real_name", "first"),
-                email=("Email", "first") if "Email" in t_df.columns else (group_col, "first"),
-                tier=("Lifetime Donor Classification", "first"),
-                txn_tier=("Transaction Donor Classification", "first") if "Transaction Donor Classification" in t_df.columns else ("Lifetime Donor Classification", "first"),
-                total_ltv=(col_amount, "sum") if col_amount in t_df.columns else (group_col, "count"),
-                donation_count=(col_amount, "count") if col_amount in t_df.columns else (group_col, "count")
-            ).reset_index()
-
-            donor_summary = donor_summary.sort_values("total_ltv", ascending=False).head(30)
-
-            records = []
-            for _, r in donor_summary.iterrows():
+        cards, pages, cur_page = [], 1, 1
+        if not donor_summary.empty and (not board_tier or board_tier == t):
+            pages = max(1, math.ceil(unique_donors / page_size))
+            cur_page = min(page, pages) if board_tier == t else 1
+            page_df = donor_summary.iloc[(cur_page - 1) * page_size: cur_page * page_size]
+            for _, r in page_df.iterrows():
                 r_name = str(r["name"]).strip() if (pd.notna(r["name"]) and str(r["name"]).strip().lower() not in ["nan", "none", "null", ""]) else "Anonymous Donor"
                 r_email = str(r["email"]) if (pd.notna(r["email"]) and str(r["email"]).strip().lower() not in ["nan", "none", "null"]) else ""
                 r_tier = str(r["tier"]) if (pd.notna(r["tier"]) and str(r["tier"]).strip().lower() not in ["nan", "none", "null"]) else "Unassigned"
                 r_txntier = str(r["txn_tier"]) if (pd.notna(r["txn_tier"]) and str(r["txn_tier"]).strip().lower() not in ["nan", "none", "null"]) else "Unassigned"
-                
-                records.append({
+                cards.append({
                     "name": r_name,
                     "email": r_email,
                     "total_ltv": round(float(r.get("total_ltv", 0.0)), 2),
@@ -1114,18 +1115,88 @@ def get_donors_kanban(
                     "tier": r_tier,
                     "txn_tier": r_txntier
                 })
-            cards = records
-        else:
-            cards = []
 
         kanban_data[t] = {
             "tier_name": t,
-            "total_donors": len(t_df),
+            "total_donors": unique_donors,
+            "total_gifts": len(t_df),
             "total_sum_amount": round(total_sum_amount, 2),
-            "cards": cards
+            "cards": cards,
+            "page": cur_page,
+            "page_size": page_size,
+            "total_pages": pages
         }
 
     return kanban_data
+
+
+def _kanban_donor_summary(t_df, group_col, col_amount):
+    """One row per donor in a tier, sorted by lifetime value."""
+    if t_df.empty:
+        return pd.DataFrame(columns=["name", "email", "tier", "txn_tier", "total_ltv", "donation_count"])
+    donor_summary = t_df.groupby(group_col).agg(
+        name=("_real_name", "first"),
+        email=("Email", "first") if "Email" in t_df.columns else (group_col, "first"),
+        tier=("Lifetime Donor Classification", "first"),
+        txn_tier=("Transaction Donor Classification", "first") if "Transaction Donor Classification" in t_df.columns else ("Lifetime Donor Classification", "first"),
+        total_ltv=(col_amount, "sum") if col_amount in t_df.columns else (group_col, "count"),
+        donation_count=(col_amount, "count") if col_amount in t_df.columns else (group_col, "count")
+    ).reset_index(drop=True)
+    return donor_summary.sort_values("total_ltv", ascending=False)
+
+
+@router.get("/kanban/export")
+def export_kanban_tier(
+    board_tier: str = Query(..., description="Which pipeline tier to export"),
+    payment_type: Optional[str] = None,
+    tier: Optional[str] = None,
+    source: Optional[str] = None,
+    programme_fund: Optional[str] = None,
+    heading: Optional[str] = None,
+    subheading: Optional[str] = None,
+    country: Optional[str] = None,
+    code: Optional[str] = None,
+    zakat: Optional[str] = None,
+    donor_country: Optional[str] = None,
+    campaign_search: Optional[str] = None,
+    gift_aid: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink")
+):
+    """CSV of every donor in one pipeline tier (name, email, gifts, lifetime value), under the current filters."""
+    df_raw = load_data(company_id=company_id)
+    df = _apply_filters(df_raw, payment_type, tier, source, heading, subheading, country, code, zakat, donor_country, campaign_search, gift_aid, programme_fund=programme_fund, company_id=company_id)
+    if df.empty or "Lifetime Donor Classification" not in df.columns:
+        raise HTTPException(status_code=400, detail="No donor data available to export.")
+    df = df.copy()
+    if "First Name" in df.columns and "Last Name" in df.columns:
+        df["_real_name"] = (df["First Name"].astype(str).replace('nan', '') + " " + df["Last Name"].astype(str).replace('nan', '')).str.strip()
+        df.loc[df["_real_name"] == "", "_real_name"] = df.get("Display Name", "")
+    elif "Billing Name" in df.columns:
+        df["_real_name"] = df["Billing Name"].astype(str).replace('nan', '').str.strip()
+    else:
+        df["_real_name"] = df.get("Display Name", "")
+    col_amount = "Total Online Donations Net Amount in Settled Currency"
+    if col_amount not in df.columns:
+        col_amount = "Donation Amount in Project Currency (May be approx.)"
+    group_col = "Email" if "Email" in df.columns else "Display Name"
+    t_df = df[df["Lifetime Donor Classification"] == board_tier.strip()]
+    summary = _kanban_donor_summary(t_df, group_col, col_amount)
+    export_df = summary.rename(columns={"name": "Donor Name", "email": "Email", "tier": "Lifetime Tier",
+                                        "txn_tier": "Transaction Tier", "total_ltv": "Lifetime Value",
+                                        "donation_count": "Gifts"})
+    export_df["Lifetime Value"] = export_df["Lifetime Value"].astype(float).round(2)
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_tier = re.sub(r"[^A-Za-z0-9]+", "_", board_tier.strip().lower()) or "tier"
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    temp_file_path = temp_file.name
+    temp_file.close()
+    dataframe_to_fast_csv(export_df, temp_file_path)
+    return FileResponse(
+        path=temp_file_path,
+        filename=f"pipeline_{safe_tier}_donors_{date_str}.csv",
+        media_type="text/csv",
+        background=BackgroundTask(_cleanup_temp_file, temp_file_path)
+    )
 
 
 NON_NAME_PHRASES = {
@@ -2547,6 +2618,8 @@ def get_donor_directory(
         seg.setdefault("recurring", recurring)
     if sp in ("yes", "no"):
         seg.setdefault("sp", sp)
+    # Tier narrowing is applied last so the tier chips can show every tier's count under the other filters
+    tiers_sel = _as_list(seg.pop("tiers", None)) if seg else []
     f = apply_segment(frame, dx, seg) if seg else frame
     if search and search.strip():
         q = search.strip().lower()
@@ -2588,6 +2661,9 @@ def get_donor_directory(
         f = f[f["last_gift"] >= pd.to_datetime(last_gift_from, errors="coerce")]
     if last_gift_to:
         f = f[f["last_gift"] < pd.to_datetime(last_gift_to, errors="coerce") + pd.Timedelta(days=1)]
+    tier_counts = {k: int(v) for k, v in f["tier"].value_counts().items()}
+    if tiers_sel:
+        f = f[f["tier"].isin(tiers_sel)]
     column = {"total": "total", "gifts": "gifts", "last_gift": "last_gift", "first_gift": "first_gift", "name": "name",
               "avg_gift": "avg_gift", "recurring_gifts": "recurring_gifts", "allocations": "allocations",
               "matched_total": "matched_total" if "matched_total" in f.columns else "total"}.get(sort_by, "total")
@@ -2614,7 +2690,7 @@ def get_donor_directory(
                     "recurring_donors": int(f["recurring"].sum()), "sp_donors": int(f["sp"].sum()),
                     "sa_donors": int(f["sa"].fillna(False).astype(bool).sum()) if "sa" in f.columns else 0,
                     "manual_only_donors": int(f["manual_donor"].fillna(False).astype(bool).sum()) if "manual_donor" in f.columns else 0,
-                    "tiers": {k: int(v) for k, v in f["tier"].value_counts().items()},
+                    "tiers": tier_counts,
                     "matched_total": round(float(f["matched_total"].sum()), 2) if "matched_total" in f.columns else None},
         "donors": rows.to_dict(orient="records"),
     }

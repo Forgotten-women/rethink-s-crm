@@ -304,31 +304,44 @@ export default function HorizontalFilters({ filters, onFilterChange, onResetFilt
                 : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10'
             }`}
           >
-            <span>Department: {filters.heading === 'All Headings' ? 'All' : filters.heading}</span>
+            <span>Department: {(!filters.heading || filters.heading === 'All Headings') ? 'All'
+              : (String(filters.heading).split(',').length > 1 ? `${String(filters.heading).split(',').length} selected` : filters.heading)}</span>
             <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
-          
+
           {activeDropdown === 'heading' && (
             <div className="absolute left-0 mt-2 w-64 bg-white dark:bg-slate-950 border border-slate-200 dark:border-white/10 rounded-xl shadow-xl z-50 py-1.5 animate-in fade-in slide-in-from-top-1 duration-150 max-h-60 overflow-y-auto custom-scrollbar">
               <button
                 onClick={() => handleSelect('heading', 'All Headings')}
-                className={`w-full text-left px-4 py-2 text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors ${
-                  filters.heading === 'All Headings' ? 'text-cyan-500 font-bold' : 'text-slate-700 dark:text-slate-300'
+                className={`w-full text-left px-4 py-2 text-xs font-bold hover:bg-slate-50 dark:hover:bg-slate-800 border-b border-slate-100 dark:border-white/5 pb-2 ${
+                  !filters.heading || filters.heading === 'All Headings' ? 'text-cyan-500' : 'text-slate-700 dark:text-slate-300'
                 }`}
               >
-                All Departments
+                Clear / All Departments
               </button>
-              {filterOptions.headings.map(opt => (
-                <button
-                  key={opt}
-                  onClick={() => handleSelect('heading', opt)}
-                  className={`w-full text-left px-4 py-2 text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors ${
-                    filters.heading === opt ? 'text-cyan-500 font-bold' : 'text-slate-700 dark:text-slate-300'
-                  }`}
-                >
-                  {opt}
-                </button>
-              ))}
+              {filterOptions.headings.map(opt => {
+                const isSel = filters.heading && filters.heading !== 'All Headings' && String(filters.heading).split(',').includes(opt);
+                return (
+                  <button
+                    key={opt}
+                    onClick={() => {
+                      let selected = (!filters.heading || filters.heading === 'All Headings') ? [] : String(filters.heading).split(',');
+                      if (selected.includes(opt)) {
+                        selected = selected.filter(s => s !== opt);
+                      } else {
+                        selected.push(opt);
+                      }
+                      onFilterChange('heading', selected.length === 0 ? 'All Headings' : selected.join(','));
+                    }}
+                    className={`w-full text-left px-4 py-2 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors flex items-center justify-between ${
+                      isSel ? 'text-cyan-500 font-bold' : 'text-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    <span>{opt}</span>
+                    {isSel && <span className="w-1.5 h-1.5 rounded-full bg-cyan-500" />}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
