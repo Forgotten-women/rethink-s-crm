@@ -574,7 +574,10 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
                 mask &= sc_series.isin(wanted)
 
     if company_id and str(company_id).strip().lower() != "all" and "company_id" in df.columns:
-        mask &= (df["company_id"].astype(str).str.strip().str.lower() == str(company_id).strip().lower())
+        cid_req = str(company_id).strip().lower()
+        comps = df["company_id"].dropna().unique()
+        if not (len(comps) == 1 and str(comps[0]).strip().lower() == cid_req):
+            mask &= (df["company_id"].astype(str).str.strip().str.lower() == cid_req)
 
     if isinstance(programme_fund, str) and programme_fund.strip() and programme_fund != "All Programme Funds" and "Programme Fund" in df.columns:
         mask &= (df["Programme Fund"].astype(str).str.strip().str.lower() == programme_fund.strip().lower())
@@ -658,33 +661,37 @@ def _apply_filters(df, payment_type=None, tier=None, source=None, heading=None, 
         s_date = start_date.strip()[:10] if isinstance(start_date, str) and start_date.strip() else None
         e_date = end_date.strip()[:10] if isinstance(end_date, str) and end_date.strip() else None
 
-        date_col = None
-        for dcol in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)", "Date of collection", "Date Due"]:
-            if dcol in df.columns:
-                cur_s = df[dcol].astype(str).str.strip()
-                valid = ~cur_s.str.lower().isin(["", "nan", "none", "nat", "<na>"])
-                if valid.any():
-                    valid_cur = cur_s[valid]
-                    # If format has slashes DD/MM/YYYY, convert to YYYY-MM-DD
-                    slash_mask = valid_cur.str.match(r"^\d{1,2}/\d{1,2}/\d{4}")
-                    if slash_mask.any():
-                        parts = valid_cur[slash_mask].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
-                        norm = parts[2] + "-" + parts[1].str.zfill(2) + "-" + parts[0].str.zfill(2)
-                        cur_s = cur_s.copy()
-                        cur_s.loc[slash_mask.index[slash_mask]] = norm
+        if "_parsed_date" in df.columns:
+            date_col = df["_parsed_date"].fillna("").astype(str).str.slice(0, 10)
+            valid_mask = ~date_col.str.lower().isin(["", "nan", "none", "nat", "<na>"])
+        else:
+            date_col = None
+            for dcol in ["Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)", "Date of collection", "Date Due"]:
+                if dcol in df.columns:
+                    cur_s = df[dcol].astype(str).str.strip()
+                    valid = ~cur_s.str.lower().isin(["", "nan", "none", "nat", "<na>"])
+                    if valid.any():
+                        valid_cur = cur_s[valid]
+                        # If format has slashes DD/MM/YYYY, convert to YYYY-MM-DD
+                        slash_mask = valid_cur.str.match(r"^\d{1,2}/\d{1,2}/\d{4}")
+                        if slash_mask.any():
+                            parts = valid_cur[slash_mask].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
+                            norm = parts[2] + "-" + parts[1].str.zfill(2) + "-" + parts[0].str.zfill(2)
+                            cur_s = cur_s.copy()
+                            cur_s.loc[slash_mask.index[slash_mask]] = norm
 
-                    cur_s = cur_s.str.slice(0, 10)
-                    if date_col is None:
-                        date_col = cur_s.where(valid)
-                    else:
-                        date_col = date_col.fillna(cur_s.where(valid))
+                        cur_s = cur_s.str.slice(0, 10)
+                        if date_col is None:
+                            date_col = cur_s.where(valid)
+                        else:
+                            date_col = date_col.fillna(cur_s.where(valid))
+            valid_mask = date_col.notna() & (~date_col.astype(str).str.lower().isin(["", "nan", "none", "nat", "<na>"])) if date_col is not None else None
 
-        if date_col is not None:
-            valid_mask = date_col.notna() & (~date_col.astype(str).str.lower().isin(["", "nan", "none", "nat", "<na>"]))
+        if date_col is not None and valid_mask is not None:
             if s_date:
-                mask &= (valid_mask & (date_col.astype(str) >= s_date))
+                mask &= (valid_mask & (date_col >= s_date))
             if e_date:
-                mask &= (valid_mask & (date_col.astype(str) <= e_date))
+                mask &= (valid_mask & (date_col <= e_date))
 
     if mask.all():
         return df
@@ -1158,6 +1165,15 @@ def get_donors_kanban(
 ):
     """Returns donor cards grouped by LTV Tier for the Kanban Pipeline Board with column total sums.
     With board_tier, cards are paged for that tier only; the other tiers keep their header totals."""
+    try:
+        page_size = int(getattr(page_size, "default", page_size))
+    except (TypeError, ValueError):
+        page_size = 10
+    try:
+        page = int(getattr(page, "default", page))
+    except (TypeError, ValueError):
+        page = 1
+
     df_raw = load_data(company_id=company_id)
     df = _apply_filters(
         df_raw, payment_type, tier, source, heading, subheading, country, code, zakat,

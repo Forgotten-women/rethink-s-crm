@@ -35,6 +35,18 @@ COUNTRY_ISO_MAP = {
 _CACHED_DF: Optional[pd.DataFrame] = None
 _CACHE_MTIME: float = 0.0
 _CACHE_LOCK = threading.Lock()
+_CACHED_COMPANY_DFS: Dict[str, pd.DataFrame] = {}
+
+
+def _rebuild_company_slices(df: Optional[pd.DataFrame]) -> None:
+    global _CACHED_COMPANY_DFS
+    slices = {}
+    if df is not None and not df.empty and "company_id" in df.columns:
+        c_clean = df["company_id"].astype(str).str.strip().str.lower()
+        for cid in c_clean.unique():
+            if cid and cid not in ("nan", "none"):
+                slices[cid] = df[c_clean == cid]
+    _CACHED_COMPANY_DFS = slices
 
 
 
@@ -1505,9 +1517,7 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 COALESCE(c.zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(c.programme_fund, '') as "Programme Fund",
                 COALESCE(c.fund_code, '') as "Fund Code",
-                COALESCE(m.special_case, '') as "Special Case",
-                NULLIF(TRIM(COALESCE(m.campaign_ref, '')), '') as "campaign_ref",
-                COALESCE(m.giving_level_ref, '') as "giving_level_ref"
+                COALESCE(m.special_case, '') as "Special Case"
             FROM platform_campaign_mappings m
             LEFT JOIN master_project_codes c
                 ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -1638,19 +1648,16 @@ def sync_matrix_classifications_to_donors(matrix_df=None, company_id: str = "ret
                 valid_idx = valid_mask[valid_mask].index
                 df_raw.loc[valid_idx, col] = mapped_series.loc[valid_idx]
 
-    # Classification by ID first (overrides name mapping when an ID rule matches).
-    # map_fields reads db-style field names (special_case, sub_heading, ...), so alias the title-case columns.
-    id_rules = all_rules.copy()
-    for t_col in target_cols:
-        db_f = t_col.lower().replace("-", "_").replace(" ", "_")
-        if t_col in id_rules.columns and db_f not in id_rules.columns:
-            id_rules[db_f] = id_rules[t_col]
+    # Classification by ID (when an ID rule matches). NOTE: all_rules deliberately carries no campaign_ref
+    # column here, so this block is inert in the matrix sweep. Activating it (13 Nov 2026) re-stamped 10k+
+    # fundraiser-page donations with their PARENT campaign's rule, overriding the fundraiser-name
+    # classifications - so it stays name-based; ID-first matching lives in the live sync paths instead.
     for plat in ["givebrite", "madinah", "launchgood"]:
         plat_filter = "givebrite|givebright" if plat == "givebrite" else plat
         plat_mask = comp_mask & (df_raw["Platform"].astype(str).str.lower().str.contains(plat_filter))
         if plat_mask.any():
             plat_sub = df_raw.loc[plat_mask]
-            id_map = _id_rule_values(plat_sub, plat, comp, id_rules, [c.lower().replace("-", "_").replace(" ", "_") for c in target_cols])
+            id_map = _id_rule_values(plat_sub, plat, comp, all_rules, [c.lower().replace("-", "_").replace(" ", "_") for c in target_cols])
             for col in target_cols:
                 db_f = col.lower().replace("-", "_").replace(" ", "_")
                 if db_f in id_map:
@@ -3913,10 +3920,11 @@ def delete_single_dataset(source_tag):
 def invalidate_data_cache(company_id=None):
     """Forces the in-memory dataset cache to be invalidated.
     company_id is accepted for callers that pass it; the parquet frame is shared by all companies."""
-    global _CACHED_DF, _CACHE_MTIME
+    global _CACHED_DF, _CACHE_MTIME, _CACHED_COMPANY_DFS
     with _CACHE_LOCK:
         _CACHED_DF = None
         _CACHE_MTIME = 0.0
+        _CACHED_COMPANY_DFS = {}
 
 
 def set_cached_data(df: pd.DataFrame):
@@ -3925,6 +3933,31 @@ def set_cached_data(df: pd.DataFrame):
     with _CACHE_LOCK:
         _CACHED_DF = df
         _CACHE_MTIME = time.time()
+        _rebuild_company_slices(df)
+
+
+def _async_warm_cache(companies=("rethink", "iqra")) -> None:
+    """Non-blocking background warm of hot dashboard endpoints after cache invalidation."""
+    def _run():
+        for comp in companies:
+            try:
+                from backend.api.metrics import get_metrics_summary
+                get_metrics_summary(company_id=comp)
+            except Exception:
+                pass
+            try:
+                from backend.api.ltv import get_ltv_summary
+                get_ltv_summary(company_id=comp)
+            except Exception:
+                pass
+            try:
+                from backend.api.donors import get_donors_kanban
+                get_donors_kanban(company_id=comp)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_run, daemon=True, name="crm_cache_warmer")
+    t.start()
 
 
 def refresh_donor_ltv(
@@ -4157,6 +4190,7 @@ def refresh_donor_ltv(
         bump("donations", "classification")
     except Exception:
         pass
+    _async_warm_cache(["rethink", "iqra"])
     return {"companies": summary_counts, "sql_changes": sql_updated_total, "parquet_rows_updated": pq_updated}
 
 
@@ -4415,8 +4449,11 @@ def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> p
         if current_mtime == _CACHE_MTIME or current_mtime == 0.0:
             if company_id is not None:
                 cid_clean = str(company_id).strip().lower()
-                if cid_clean != "all" and "company_id" in _CACHED_DF.columns:
-                    return _CACHED_DF[_CACHED_DF["company_id"].astype(str).str.strip().str.lower() == cid_clean]
+                if cid_clean != "all":
+                    if cid_clean in _CACHED_COMPANY_DFS:
+                        return _CACHED_COMPANY_DFS[cid_clean]
+                    if "company_id" in _CACHED_DF.columns:
+                        return _CACHED_DF[_CACHED_DF["company_id"].astype(str).str.strip().str.lower() == cid_clean]
             return _CACHED_DF
 
     with _CACHE_LOCK:
@@ -4433,6 +4470,7 @@ def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> p
                     df = _apply_gbp_view(_ensure_two_tier_columns(df))
                     _CACHED_DF = df
                     _CACHE_MTIME = current_mtime
+                    _rebuild_company_slices(_CACHED_DF)
                     return _filter_cached_by_company(_CACHED_DF, company_id)
             except Exception as e:
                 print(f"[CACHE NOTICE] Parquet read fallback: {e}")
@@ -4451,6 +4489,7 @@ def load_data(force_reload: bool = False, company_id: Optional[str] = None) -> p
                 except Exception:
                     pass
                 _CACHED_DF = _apply_gbp_view(df)
+                _rebuild_company_slices(_CACHED_DF)
                 return _filter_cached_by_company(_CACHED_DF, company_id)
         except Exception as e:
             print(f"[CACHE NOTICE] SQLite read fallback: {e}")
@@ -4482,7 +4521,9 @@ def _filter_cached_by_company(df, company_id):
     if company_id is not None and df is not None and not df.empty and "company_id" in df.columns:
         cid_clean = str(company_id).strip().lower()
         if cid_clean != "all":
-            return df[df["company_id"].astype(str).str.strip().str.lower() == cid_clean].copy()
+            if cid_clean in _CACHED_COMPANY_DFS:
+                return _CACHED_COMPANY_DFS[cid_clean]
+            return df[df["company_id"].astype(str).str.strip().str.lower() == cid_clean]
     return df
 
 
