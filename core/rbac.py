@@ -46,7 +46,8 @@ CATALOGUE: List[Dict[str, Any]] = [
                  ("export", "Export donors", EXTRA)]},
     {"key": "fundraisers", "label": "Fundraisers", "description": "Fundraiser pages, links and Ramadan periods",
      "actions": [("view", "View fundraisers", READ), ("edit", "Create and edit fundraisers, links, assign donations", WRITE),
-                 ("sync", "Sync discovered fundraisers", WRITE), ("delete", "Delete fundraisers", EXTRA)]},
+                 ("sync", "Sync discovered fundraisers", WRITE), ("delete", "Delete fundraisers", EXTRA),
+                 ("export", "Export fundraisers (CSV)", EXTRA)]},
     {"key": "payouts", "label": "Payout reconciliation", "description": "Platform payouts, ledgers, PaySuite",
      "actions": [("view", "View payouts and ledgers", READ), ("classify", "Classify payout lines", WRITE),
                  ("sync", "Run PaySuite sync", EXTRA), ("export", "Export payouts", EXTRA)]},
@@ -116,7 +117,7 @@ SYSTEM_PRESETS: List[Dict[str, Any]] = [
     {"name": "Finance", "description": "Payouts, Stripe, expenses, transfers and classifications.",
      "permissions": _level("dashboard", "donors", "fundraisers", "tracker", "email")
      + _level("explorer", "payouts", "stripe", "classifications", "expenses", level=WRITE)
-     + ["explorer.export", "dashboard.export", "payouts.export", "payouts.sync", "stripe.approve", "stripe.export",
+     + ["explorer.export", "dashboard.export", "fundraisers.export", "payouts.export", "payouts.sync", "stripe.approve", "stripe.export",
         "expenses.approve", "expenses.transfers", "expenses.export", "classifications.export", "data.view", "data.upload"]},
     {"name": "Fundraiser", "description": "Their fundraisers and the donors/donations behind them (combine with "
                                           "a fundraiser scope to limit to specific pages).",
@@ -128,13 +129,13 @@ SYSTEM_PRESETS: List[Dict[str, Any]] = [
     {"name": "Management", "description": "Sees everything incl. contact details and exports; approves expenses "
                                           "and payouts; doesn't edit data.",
      "permissions": _level(*_ALL_RESOURCES)
-     + ["donors.contact", "donors.export", "explorer.export", "dashboard.export", "payouts.export", "stripe.export",
+     + ["donors.contact", "donors.export", "explorer.export", "dashboard.export", "fundraisers.export", "payouts.export", "stripe.export",
         "stripe.approve", "expenses.approve", "expenses.export", "classifications.export", "users.view"]},
     # What a plain "admin" account could do before RBAC existed, so moving to RBAC changes nothing for them.
     {"name": "Standard (previous admin)", "description": "Same access as the old 'admin' account had before "
                                                          "access control; review and replace with a preset.",
      "permissions": _level(*_ALL_RESOURCES)
-     + ["donors.contact", "explorer.export", "donors.export", "dashboard.export", "payouts.export", "stripe.export",
+     + ["donors.contact", "explorer.export", "donors.export", "dashboard.export", "fundraisers.export", "payouts.export", "stripe.export",
         "classifications.export", "expenses.export", "classifications.edit", "payouts.classify", "expenses.submit",
         "expenses.transfers", "tracker.edit", "tracker.import", "tracker.delete", "email.templates", "email.send",
         "email.campaigns", "email.resubscribe", "mailbox.sync", "data.upload", "fundraisers.sync"]},

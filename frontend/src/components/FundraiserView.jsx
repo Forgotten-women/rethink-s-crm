@@ -7,9 +7,9 @@ import {
   Layers, CheckCircle2, Award, ArrowUpRight, LayoutGrid, List, Sparkles,
   ArrowRight, ExternalLink, Activity, ChevronLeft, ChevronsLeft,
   ChevronsRight, ArrowUpDown, ArrowDown, ArrowUp, SlidersHorizontal,
-  ChevronDown, ChevronUp, Plus
+  ChevronDown, ChevronUp, Plus, Download
 } from 'lucide-react';
-import { API_BASE_URL } from '../config';
+import { API_BASE_URL, downloadFile } from '../config';
 import { can } from '../access';
 import FundraiserFormModal from './FundraiserFormModal';
 import AddDonationModal, { canEditRecords } from './AddDonationModal';
@@ -22,6 +22,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const canDeleteF = can(user, 'fundraisers.delete', activeCompany);
   const canSyncF = can(user, 'fundraisers.sync', activeCompany);
   const canEditPages = canEditF && activeCompany !== 'all';
+  const canExportF = can(user, 'fundraisers.export', activeCompany);
   const [linkFormFor, setLinkFormFor] = useState(null);
   const [linkType, setLinkType] = useState('fundraiser_url');
   const [linkValue, setLinkValue] = useState('');
@@ -1049,6 +1050,28 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                 {sortOrder === 'desc' ? <ArrowDown className="w-3.5 h-3.5 text-cyan-500" /> : <ArrowUp className="w-3.5 h-3.5 text-cyan-500" />}
               </button>
             </div>
+
+            {/* Download the filtered fundraiser list as CSV */}
+            {canExportF && (
+              <button
+                type="button"
+                onClick={() => {
+                  const params = new URLSearchParams();
+                  params.append('company_id', activeCompany);
+                  if (statusFilter !== 'ALL') params.append('status_filter', statusFilter);
+                  if (pageGroupFilter !== 'ALL') params.append('page_group', pageGroupFilter);
+                  if (searchQuery.trim()) params.append('search', searchQuery.trim());
+                  if (appliedStartDate) params.append('start_date', appliedStartDate);
+                  if (appliedEndDate) params.append('end_date', appliedEndDate);
+                  downloadFile(`${API_BASE_URL}/api/fundraisers/export?${params.toString()}`, 'fundraisers.csv');
+                }}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition-colors hover:border-cyan-500/50 hover:text-cyan-500"
+                style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', borderColor: 'var(--input-border)' }}
+                title="Download the fundraisers shown (with the current filters) as CSV"
+              >
+                <Download className="w-3.5 h-3.5" /> CSV
+              </button>
+            )}
           </div>
 
           {/* Preset Buttons */}
@@ -1843,6 +1866,24 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                   <button type="button" onClick={() => setAddingDonationFor(drilldownData.fundraiser)}
                     className="px-2.5 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1" title="Record an offline donation for this fundraiser">
                     <Plus className="w-3.5 h-3.5" /> Add donation
+                  </button>
+                )}
+                {canExportF && drilldownData?.fundraiser && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const params = new URLSearchParams();
+                      params.append('company_id', activeCompany);
+                      if (drilldownStartDate) params.append('start_date', drilldownStartDate);
+                      if (drilldownEndDate) params.append('end_date', drilldownEndDate);
+                      downloadFile(`${API_BASE_URL}/api/fundraisers/${encodeURIComponent(selectedFundraiserId)}/export?${params.toString()}`,
+                        `fundraiser_${(drilldownData.fundraiser.name || 'export').replace(/\s+/g, '_')}.csv`);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg text-xs font-bold border flex items-center gap-1 hover:border-cyan-500/50 hover:text-cyan-500 transition-colors"
+                    style={{ borderColor: 'var(--border-glass)', color: 'var(--text-sub)' }}
+                    title="Download every donation for this fundraiser (current date filter) as CSV"
+                  >
+                    <Download className="w-3.5 h-3.5" /> CSV
                   </button>
                 )}
                 <button

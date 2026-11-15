@@ -156,6 +156,8 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "stripe_payouts.export_stripe_payouts_excel": "stripe.export",
     # --- fundraisers ---------------------------------------------------------------------------------------
     "fundraisers.get_fundraisers_list": "fundraisers.view",
+    "fundraisers.export_fundraisers_csv": "fundraisers.export",
+    "fundraisers.export_fundraiser_detail_csv": "fundraisers.export",
     "fundraisers.get_fundraiser_detail": "fundraisers.view",
     "fundraisers.get_fundraiser_statuses": "fundraisers.view",
     "fundraisers.resolve_fundraiser_link": "fundraisers.view",
@@ -316,7 +318,8 @@ CONTACT_EXPORTS = {"donors.export_donors", "donors.export_kanban_tier"}
 # Payout files: allowed without donors.contact, with the email / phone / address columns blanked in the file
 # (backend/api/contact_mask.py strip_contacts_from_file)
 CONTACT_STRIPPED_EXPORTS = {"payouts.export_payouts_excel", "stripe_payouts.download_enriched_csv",
-                            "stripe_payouts.export_stripe_payouts_excel", "donors.export_single_donor"}
+                            "stripe_payouts.export_stripe_payouts_excel", "donors.export_single_donor",
+                            "fundraisers.export_fundraiser_detail_csv"}
 
 # Endpoints that apply a person's fundraiser limit (core.rbac.scope_donations / request_scope). In a charity where
 # someone is limited to specific fundraisers, every other endpoint is refused - pages such as the dashboard or
@@ -326,6 +329,7 @@ SCOPE_AWARE = {
     "donors.get_segment_options", "donors.get_donor_directory", "donors.get_donor_history_paginated",
     "donors.list_donor_notes", "donors.list_agents",
     "fundraisers.get_fundraisers_list", "fundraisers.get_fundraiser_detail", "fundraisers.get_fundraiser_statuses",
+    "fundraisers.export_fundraisers_csv", "fundraisers.export_fundraiser_detail_csv",
     "fundraisers.get_ramadan_periods",
     "classifications.get_master_project_codes", "classifications.get_campaign_codes_lookup", "classifications.get_code_map",
 }

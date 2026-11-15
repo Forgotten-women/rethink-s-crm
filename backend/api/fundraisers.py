@@ -11,8 +11,13 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
+import tempfile
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH, PAYOUTS_PARQUET_PATH
 from core.data_processor import load_data, load_payouts_data, get_code_to_classification_map
+from core.fast_export import dataframe_to_fast_csv
 from backend.api.events import broadcast_event_sync
 
 router = APIRouter(prefix="/api/fundraisers", tags=["Fundraiser Tracking"])
@@ -1320,6 +1325,162 @@ def update_ramadan_periods(payload: RamadanPeriodsRequest, request: Request):
     finally:
         conn.close()
     return {"periods": sorted(clean, key=lambda p: p["year"])}
+
+
+def _csv_response(export_df: pd.DataFrame, name: str) -> FileResponse:
+    from backend.api.donors import _cleanup_temp_file
+    import re as _re
+    safe = _re.sub(r"[^A-Za-z0-9]+", "_", str(name).strip().lower()).strip("_") or "export"
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    path = tf.name
+    tf.close()
+    dataframe_to_fast_csv(export_df, path)
+    return FileResponse(path=path, filename=f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        media_type="text/csv", background=BackgroundTask(_cleanup_temp_file, path))
+
+
+def _donor_display_names(df: pd.DataFrame) -> pd.Series:
+    def _clean(col):
+        v = df[col].fillna("").astype(str).str.strip() if col in df.columns else pd.Series("", index=df.index)
+        return v.where(~v.str.lower().isin(["", "nan", "none", "null"]), "")
+    s = (_clean("First Name") + " " + _clean("Last Name")).str.strip()
+    return s.where(s != "", _clean("Display Name"))
+
+
+@router.get("/export")
+def export_fundraisers_csv(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    status_filter: Optional[str] = "ALL",
+    page_group: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    company_id: Optional[str] = Query("rethink"),
+):
+    """CSV of the fundraisers list under the current filters: the main page's columns, one row per fundraiser."""
+    data = get_fundraisers_list(start_date=start_date, end_date=end_date, status_filter=status_filter,
+                                company_id=company_id, page_group=page_group)
+    items = (data or {}).get("fundraisers") or []
+    if search and str(search).strip():
+        q = str(search).strip().lower()
+        items = [f for f in items if q in str(f.get("name") or "").lower() or q in str(f.get("email") or "").lower()]
+    if not items:
+        raise HTTPException(status_code=400, detail="No fundraisers to export under the current filters.")
+    filtered = bool(start_date or end_date)
+    rows = []
+    for f in items:
+        camps = f.get("assigned_campaigns") or []
+        row = {
+            "Fundraiser": f.get("name") or "",
+            "Status": f.get("status") or "",
+            "Group": f.get("page_group_label") or f.get("page_group") or "",
+            "Email": f.get("email") or "",
+            "Phone": f.get("phone") or "",
+            "Total Raised (All Time)": f.get("total_raised_all_time") or 0.0,
+            "Target Goal": f.get("target_goal") or 0.0,
+            "Progress %": f.get("progress_percentage") or 0.0,
+            "Donors": f.get("total_donors") or 0,
+            "Donations": f.get("total_donations_count") or 0,
+            "Average Donation": f.get("avg_donation") or 0.0,
+            "First Gift Date": f.get("first_donation_date") or "",
+            "Latest Gift Date": f.get("latest_donation_date") or "",
+            "Linked Campaigns": "; ".join(dict.fromkeys(
+                str(c.get("campaign_name") or "").strip() for c in camps if str(c.get("campaign_name") or "").strip())),
+            "Campaign Codes": "; ".join(sorted({
+                str(c.get("code") or "").strip() for c in camps
+                if str(c.get("code") or "").strip() and str(c.get("code")).strip().upper() not in ("ALL", "UNASSIGNED")})),
+            "Notes": f.get("notes") or "",
+        }
+        if filtered:
+            row["Raised (Selected Period)"] = f.get("total_raised_period") or 0.0
+            row["Donors (Selected Period)"] = f.get("period_donors") or 0
+            row["Donations (Selected Period)"] = f.get("period_donations_count") or 0
+        rows.append(row)
+    return _csv_response(pd.DataFrame(rows), "fundraisers")
+
+
+@router.get("/{fundraiser_id}/export")
+def export_fundraiser_detail_csv(
+    fundraiser_id: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    company_id: Optional[str] = Query("rethink"),
+):
+    """Every donation attributed to one fundraiser (the drill-down's full data) as CSV."""
+    scope = rbac.request_scope(company_id)
+    if scope is not None and str(fundraiser_id) not in scope:
+        raise HTTPException(status_code=404, detail="Fundraiser not found.")
+    init_fundraiser_db()
+    comp = (company_id or "rethink").strip().lower()
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        if comp != "all":
+            cur.execute("SELECT * FROM fundraisers WHERE id = ? AND company_id = ?", (fundraiser_id, comp))
+        else:
+            cur.execute("SELECT * FROM fundraisers WHERE id = ?", (fundraiser_id,))
+        f_row = cur.fetchone()
+        fundraiser = dict(f_row) if f_row else None
+    finally:
+        conn.close()
+
+    df_donations = load_data(company_id=comp)
+    if df_donations is None or df_donations.empty:
+        raise HTTPException(status_code=400, detail="No donation data available to export.")
+    assignments_full = _load_assignments(comp)
+    fn_series, _attr_aid, _attr_type = attribute_donations(df_donations, comp, assignments_full)
+
+    if not fundraiser:  # auto-discovered fundraisers have synthetic ids derived from the page name
+        for fn_k in fn_series[fn_series != ""].unique():
+            if (f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, f'{comp}_{fn_k}').hex[:16]}" == fundraiser_id
+                    or f"fund_{uuid.uuid5(uuid.NAMESPACE_DNS, fn_k).hex[:16]}" == fundraiser_id
+                    or fn_k == fundraiser_id.lower()):
+                fundraiser = {"id": fundraiser_id, "name": fn_k}
+                break
+    if not fundraiser:
+        raise HTTPException(status_code=404, detail="Fundraiser not found.")
+
+    fname_clean = str(fundraiser.get("name") or "").strip().lower()
+    sub_df = df_donations[fn_series == fname_clean].copy()
+    if sub_df.empty:
+        raise HTTPException(status_code=400, detail="This fundraiser has no donations to export.")
+
+    if "_parsed_date" not in sub_df.columns or sub_df["_parsed_date"].dropna().astype(str).str.strip().isin(["", "nan", "none", "nat"]).all():
+        date_cand = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)"] if c in sub_df.columns), None)
+        sub_df["_parsed_date"] = (pd.to_datetime(sub_df[date_cand], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d").fillna("")
+                                  if date_cand else "")
+    else:
+        sub_df["_parsed_date"] = sub_df["_parsed_date"].fillna("").astype(str).str.strip()
+    if start_date:
+        sub_df = sub_df[sub_df["_parsed_date"] >= str(start_date)[:10]]
+    if end_date:
+        sub_df = sub_df[sub_df["_parsed_date"] <= str(end_date)[:10]]
+    if sub_df.empty:
+        raise HTTPException(status_code=400, detail="No donations in the selected date range.")
+
+    sub_df = sub_df.sort_values("_parsed_date", ascending=False)
+    amounts = platform_raised_amount(sub_df).astype(float).round(2)
+    export_df = pd.DataFrame({
+        "Date": sub_df["_parsed_date"],
+        "Donor": _donor_display_names(sub_df),
+        "Email": sub_df["Email"].fillna("").astype(str).str.strip() if "Email" in sub_df.columns else "",
+        "Amount": amounts,
+        "Campaign": sub_df.get("Campaign Name", ""),
+        "Giving Level": sub_df.get("Giving Level Title", ""),
+        "Code": sub_df.get("Code", ""),
+        "Platform": sub_df.get("Platform", ""),
+        "Payment Type": sub_df.get("Payment Frequency", ""),
+        "Heading": sub_df.get("Heading", ""),
+        "Country": sub_df.get("Country", ""),
+        "Special Case": sub_df.get("Special Case", ""),
+        "Gift Aid": sub_df.get("Gift Aid (yes or no)", ""),
+        "Donation ID": sub_df.get("Donation ID", ""),
+    })
+    for c in export_df.columns:
+        if export_df[c].dtype == object:
+            export_df[c] = export_df[c].astype(str).replace({"nan": "", "None": "", "NaT": ""})
+    return _csv_response(export_df, f"fundraiser_{fundraiser.get('name') or fundraiser_id}")
 
 
 @router.get("/{fundraiser_id}")
