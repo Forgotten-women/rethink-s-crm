@@ -2629,6 +2629,38 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         if (allocFilters.open_status === 'unopened' && (outbound === 0 || hasOpened)) return false;
       }
 
+      if (allocFilters?.first_mail_6_months || allocFilters?.first_emailed_preset === '6_months_ago') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days < 180) return false;
+      } else if (allocFilters?.first_emailed_preset === '3_months_ago') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days < 90) return false;
+      } else if (allocFilters?.first_emailed_preset === '1_month_ago') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days < 30) return false;
+      } else if (allocFilters?.first_emailed_preset === 'last_30_days') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days > 30) return false;
+      }
+
+      if (allocFilters?.first_emailed_from) {
+        if (!d.first_email_sent_at || d.first_email_sent_at.slice(0, 10) < allocFilters.first_emailed_from) return false;
+      }
+      if (allocFilters?.first_emailed_to) {
+        if (!d.first_email_sent_at || d.first_email_sent_at.slice(0, 10) > allocFilters.first_emailed_to) return false;
+      }
+
+      if (allocFilters?.last_emailed_from) {
+        if (!d.latest_email_sent_at || d.latest_email_sent_at.slice(0, 10) < allocFilters.last_emailed_from) return false;
+      }
+      if (allocFilters?.last_emailed_to) {
+        if (!d.latest_email_sent_at || d.latest_email_sent_at.slice(0, 10) > allocFilters.last_emailed_to) return false;
+      }
+
       return true;
     });
 
@@ -2775,11 +2807,37 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       }
       if (allocFilters?.contact_status && allocFilters.contact_status !== 'all') {
         const cs = allocFilters.contact_status.toLowerCase();
-        const isContacted = c.contact_status === 'contacted' || (c.outbound_emails_count || 0) > 0;
+        const isContacted = c.contact_status === 'contacted' || (c.outbound_emails_count || 0) > 0 || (c.allocated_beneficiaries || []).some(ab => {
+          const st = (ab.latest_status || ab.communication_status || '').toLowerCase();
+          return st && !st.includes('pending');
+        });
         if (cs === 'contacted' && !isContacted) return false;
         if (cs === 'not_contacted' && isContacted) return false;
       }
-      if (allocFilters?.never_emailed && (c.outbound_emails_count || 0) > 0) return false;
+      if (allocFilters?.never_emailed || allocFilters?.email_sequence === '0') {
+        if ((c.outbound_emails_count || 0) > 0) return false;
+      }
+      if (allocFilters?.email_sequence && allocFilters.email_sequence !== 'all' && allocFilters.email_sequence !== '0') {
+        const count = c.outbound_emails_count || 0;
+        if (allocFilters.email_sequence === '1' && count !== 1) return false;
+        if (allocFilters.email_sequence === '2' && count !== 2) return false;
+        if (allocFilters.email_sequence === '3_plus' && count < 3) return false;
+      }
+      if (allocFilters?.no_response || allocFilters?.response_status === 'no_response') {
+        const outbound = c.outbound_emails_count || 0;
+        const inbound = c.inbound_replies_count || 0;
+        if (outbound === 0 || inbound > 0) return false;
+      } else if (allocFilters?.response_status === 'replied') {
+        const inbound = c.inbound_replies_count || 0;
+        if (inbound === 0) return false;
+      }
+      if (allocFilters?.open_status && allocFilters.open_status !== 'all') {
+        const opens = c.total_open_count || 0;
+        const hasOpened = opens > 0 || Boolean(c.latest_email_opened_at);
+        const outbound = c.outbound_emails_count || 0;
+        if (allocFilters.open_status === 'opened' && !hasOpened) return false;
+        if (allocFilters.open_status === 'unopened' && (outbound === 0 || hasOpened)) return false;
+      }
       return true;
     });
     return {

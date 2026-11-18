@@ -1123,9 +1123,10 @@ def get_beneficiaries(
             query += " AND b.project_code LIKE ?"
             params.append(f"%{project_code.strip()}%")
         if donor:
-            query += (" AND EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
-                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?))")
-            params.extend([f"%{donor.strip()}%"] * 3)
+            query += (" AND (a.donor_name LIKE ? OR a.donor_email LIKE ? OR a.donor_phone LIKE ?"
+                      " OR EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
+                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?)))")
+            params.extend([f"%{donor.strip()}%"] * 6)
         if campaign:
             query += " AND a.campaign_name LIKE ?"
             params.append(f"%{campaign.strip()}%")
@@ -3306,9 +3307,11 @@ async def get_tracker_page_data(
     import asyncio
     comp = _unwrap_param(company_id, "rethink").strip().lower()
     s_type = _unwrap_param(sponsorship_type, "Orphan").strip() or "Orphan"
+    ben_str = _unwrap_param(ben, "")
+    alloc_str = _unwrap_param(alloc, "")
     jobs = {
-        "beneficiaries": lambda: _call_with_query(get_beneficiaries, ben, comp),
-        "allocations": lambda: _call_with_query(get_allocations, alloc, comp),
+        "beneficiaries": lambda: _call_with_query(get_beneficiaries, ben_str, comp),
+        "allocations": lambda: _call_with_query(get_allocations, alloc_str, comp),
         "qualifying_donors": lambda: _call_with_query(get_qualifying_donors, "", comp, sponsorship_type=s_type),
         "qualifying_campaigns": lambda: _call_with_query(get_qualifying_campaigns, "", comp, sponsorship_type=s_type),
         "outlook_status": lambda: get_outlook_status(company_id=comp),
@@ -3845,9 +3848,10 @@ def get_allocations(
             s_param = f"%{search.strip()}%"
             params.extend([s_param] * 9)
         if donor:
-            query += (" AND EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
-                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?))")
-            params.extend([f"%{donor.strip()}%"] * 3)
+            query += (" AND (a.donor_name LIKE ? OR a.donor_email LIKE ? OR a.donor_phone LIKE ?"
+                      " OR EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
+                      " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?)))")
+            params.extend([f"%{donor.strip()}%"] * 6)
         if beneficiary:
             query += " AND (b.name LIKE ? OR b.project_code LIKE ?)"
             params.extend([f"%{beneficiary.strip()}%"] * 2)
