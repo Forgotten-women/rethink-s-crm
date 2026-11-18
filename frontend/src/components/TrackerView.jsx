@@ -5,7 +5,7 @@ import {
   UserCheck, Flame, HeartHandshake, Plus, Search, Filter, 
   ExternalLink, FileText, Video, Folder, Mail, Phone, RefreshCw, 
   Trash2, X, Send, Eye, MessageSquare, Layers, Settings, Upload,
-  Check, ArrowRight, UserPlus, Users, Link2, Copy, Sparkles,
+  Check, ArrowRight, UserPlus, User, Users, Link2, Copy, Sparkles,
   Calendar, Award, Inbox, Clock, ChevronRight, ChevronLeft,
   ChevronsLeft, ChevronsRight, ChevronDown, ChevronUp, Code, RotateCcw,
   FileCode, Tag, HelpCircle, LayoutTemplate, Zap, AlertTriangle, Bell, Download, Sliders, SendHorizontal, EyeOff, Ban,
@@ -312,6 +312,21 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // --- ACTIVE ALLOCATIONS PAGINATION STATE ---
   const [allocationPage, setAllocationPage] = useState(1);
   const [allocationPageSize, setAllocationPageSize] = useState(10);
+
+  // --- BULK & CAMPAIGN STATUS ASSIGNMENT STATE ---
+  const [selectedBenIdsForBulk, setSelectedBenIdsForBulk] = useState([]);
+  const [bulkStatusModalOpen, setBulkStatusModalOpen] = useState(false);
+  const [bulkStatusTarget, setBulkStatusTarget] = useState({ campaignName: null, beneficiaryIds: [], beneficiaries: [], title: '' });
+  const [bulkSelectedIds, setBulkSelectedIds] = useState([]);
+  const [bulkStatusName, setBulkStatusName] = useState('First Email Sent');
+  const [bulkStatusCustom, setBulkStatusCustom] = useState('');
+  const [bulkStatusTimestamp, setBulkStatusTimestamp] = useState(() => {
+    const now = new Date();
+    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+    return now.toISOString().slice(0, 16);
+  });
+  const [bulkStatusNotes, setBulkStatusNotes] = useState('');
+  const [bulkStatusSubmitting, setBulkStatusSubmitting] = useState(false);
 
   // Modals State
   const [showAddBeneficiaryModal, setShowAddBeneficiaryModal] = useState(false);
@@ -865,6 +880,80 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         }
       })
       .catch(console.error);
+  };
+
+  const STATUS_PRESETS = [
+    'First Email Sent',
+    'Profile Sent',
+    'Welcome Pack Sent',
+    'Update Sent',
+    'Video Sent',
+    'Feedback Sent',
+    'Annual Report Sent',
+    'Eid Gift Sent',
+    'Renewal Outreach',
+    'Donor Replied',
+    'Custom'
+  ];
+
+  const allTargetBens = useMemo(() => {
+    if (bulkStatusTarget.beneficiaries && bulkStatusTarget.beneficiaries.length > 0) {
+      return bulkStatusTarget.beneficiaries;
+    }
+    const idSet = new Set(bulkStatusTarget.beneficiaryIds || []);
+    return beneficiaries.filter(b => idSet.has(b.id)).map(b => ({
+      beneficiary_id: b.id,
+      beneficiary_name: b.name,
+      project_code: b.project_code,
+      latest_status: b.status,
+      sponsorship_type: b.sponsorship_type
+    }));
+  }, [bulkStatusTarget, beneficiaries]);
+
+  const handleExecuteBulkStatus = async () => {
+    const statusFinal = bulkStatusName === 'Custom' ? bulkStatusCustom.trim() : bulkStatusName.trim();
+    if (!statusFinal) {
+      alert('Please specify a status.');
+      return;
+    }
+    const benIds = bulkSelectedIds || [];
+    if (benIds.length === 0) {
+      alert('Please select at least one beneficiary to assign status to.');
+      return;
+    }
+
+    setBulkStatusSubmitting(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/tracker/beneficiaries/bulk-status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: activeCompany,
+          status: statusFinal,
+          beneficiary_ids: benIds,
+          campaign_name: null,
+          timestamp: bulkStatusTimestamp ? bulkStatusTimestamp.replace('T', ' ') : null,
+          notes: bulkStatusNotes || '',
+          source: bulkStatusTarget.campaignName ? 'campaign' : 'bulk'
+        })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to update status in bulk');
+      }
+
+      await loadBeneficiariesAndAllocations();
+      setSelectedBenIdsForBulk([]);
+      setBulkStatusModalOpen(false);
+      setBulkStatusNotes('');
+      setBulkStatusCustom('');
+    } catch (err) {
+      console.error('Failed to assign bulk status:', err);
+      alert(err.message || 'Error updating status in bulk');
+    } finally {
+      setBulkStatusSubmitting(false);
+    }
   };
 
   const loadOverdueDonors = (forceRefresh = false) => {
@@ -2218,14 +2307,67 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         if (benFilters.media_status === 'missing_profile' && b.profile_link) return false;
       }
 
+      // Beneficiary Name or Project Code filter from TrackerFilterBar
+      if (benFilters.beneficiary) {
+        const bq = benFilters.beneficiary.toLowerCase().trim();
+        const matchesName = (b.name || '').toLowerCase().includes(bq);
+        const matchesCode = (b.project_code || '').toLowerCase().includes(bq);
+        if (!matchesName && !matchesCode) return false;
+      }
+
+      // Donor filter from TrackerFilterBar
+      if (benFilters.donor) {
+        const dq = benFilters.donor.toLowerCase().trim();
+        const matchesDonorName = (b.donor_name || '').toLowerCase().includes(dq);
+        const matchesDonorEmail = (b.donor_email || '').toLowerCase().includes(dq);
+        const matchesDonorPhone = (b.donor_phone || '').toLowerCase().includes(dq);
+        const matchesDonorsList = (b.donors || []).some(d =>
+          (d.donor_name || '').toLowerCase().includes(dq) ||
+          (d.donor_email || '').toLowerCase().includes(dq) ||
+          (d.donor_phone || '').toLowerCase().includes(dq)
+        );
+        if (!matchesDonorName && !matchesDonorEmail && !matchesDonorPhone && !matchesDonorsList) return false;
+      }
+
+      // Campaign filter from TrackerFilterBar
+      if (benFilters.campaign) {
+        const cq = benFilters.campaign.toLowerCase().trim();
+        const matchesCamp = (b.campaign_name || '').toLowerCase().includes(cq);
+        const matchesComm = (b.community_name || '').toLowerCase().includes(cq);
+        if (!matchesCamp && !matchesComm) return false;
+      }
+
+      // Location filter from TrackerFilterBar
+      if (benFilters.location) {
+        const lq = benFilters.location.toLowerCase().trim();
+        if (!(b.location || '').toLowerCase().includes(lq)) return false;
+      }
+
+      // Funding status filter
+      if (benFilters.funded_status && benFilters.funded_status !== 'all') {
+        if (b.funding_status && b.funding_status !== benFilters.funded_status) return false;
+      }
+
+      // Needs review toggle
+      if (benFilters.needs_review) {
+        if (!b.needs_review) return false;
+      }
+
       if (searchQuery) {
-        const q = searchQuery.toLowerCase();
+        const q = searchQuery.toLowerCase().trim();
         const matchesName = (b.name || '').toLowerCase().includes(q);
         const matchesCode = (b.project_code || '').toLowerCase().includes(q);
         const matchesLoc = (b.location || '').toLowerCase().includes(q);
         const matchesDonor = (b.donor_name || '').toLowerCase().includes(q);
         const matchesEmail = (b.donor_email || '').toLowerCase().includes(q);
-        if (!matchesName && !matchesCode && !matchesLoc && !matchesDonor && !matchesEmail) return false;
+        const matchesPhone = (b.donor_phone || '').toLowerCase().includes(q);
+        const matchesDonorsList = (b.donors || []).some(d =>
+          (d.donor_name || '').toLowerCase().includes(q) ||
+          (d.donor_email || '').toLowerCase().includes(q) ||
+          (d.donor_phone || '').toLowerCase().includes(q)
+        );
+        const matchesCamp = (b.campaign_name || '').toLowerCase().includes(q);
+        if (!matchesName && !matchesCode && !matchesLoc && !matchesDonor && !matchesEmail && !matchesPhone && !matchesDonorsList && !matchesCamp) return false;
       }
       return true;
     });
@@ -2242,15 +2384,28 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
   // -------------------------------------------------------------
   useEffect(() => {
     setDonorPage(1);
-  }, [donorSearchQuery, donorSlotFilter, donorClassificationFilter, selectedDonorType, activeCompany]);
+  }, [donorSearchQuery, donorSlotFilter, donorClassificationFilter, selectedDonorType, activeCompany, allocFilters]);
+
+  // Synchronize sponsorship type selection between top filter bar and subtabs
+  useEffect(() => {
+    if (allocFilters?.sponsorship_type && allocFilters.sponsorship_type !== 'all' && allocFilters.sponsorship_type !== selectedDonorType) {
+      setSelectedDonorType(allocFilters.sponsorship_type);
+    }
+  }, [allocFilters?.sponsorship_type]);
 
   const filteredQualifyingDonors = useMemo(() => {
     return qualifyingDonors.filter(d => {
+      // 1. Slot Filter ('all', 'available', 'full')
       if (donorSlotFilter === 'available' && d.remaining_slots <= 0) return false;
       if (donorSlotFilter === 'full' && d.remaining_slots > 0) return false;
+
+      // 2. Classification / Source Filter
       if (donorClassificationFilter !== 'all' && d.classification !== donorClassificationFilter) return false;
-      if (donorSearchQuery) {
-        const q = donorSearchQuery.toLowerCase().trim();
+      if (allocFilters?.classification && allocFilters.classification !== 'all' && d.classification !== allocFilters.classification) return false;
+
+      // 3. Donor search query (from local input or allocFilters.donor)
+      const q = (donorSearchQuery || '').toLowerCase().trim();
+      if (q) {
         const cleanQ = q.replace(/[\s\-\(\)\+]/g, '');
         const cleanPhone = (d.donor_phone || '').replace(/[\s\-\(\)\+]/g, '');
 
@@ -2260,9 +2415,124 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
         const matchesId = (String(d.donor_id || '')).toLowerCase().includes(q);
         if (!matchesName && !matchesEmail && !matchesPhone && !matchesId) return false;
       }
+
+      if (allocFilters?.donor) {
+        const dq = allocFilters.donor.toLowerCase().trim();
+        const cleanDQ = dq.replace(/[\s\-\(\)\+]/g, '');
+        const cleanPhone = (d.donor_phone || '').replace(/[\s\-\(\)\+]/g, '');
+
+        const matchesName = (d.donor_name || '').toLowerCase().includes(dq);
+        const matchesEmail = (d.donor_email || '').toLowerCase().includes(dq);
+        const matchesPhone = (d.donor_phone || '').toLowerCase().includes(dq) || (Boolean(cleanDQ) && cleanPhone.includes(cleanDQ));
+        const matchesId = (String(d.donor_id || '')).toLowerCase().includes(dq);
+        if (!matchesName && !matchesEmail && !matchesPhone && !matchesId) return false;
+      }
+
+      // 4. Beneficiary filter from allocFilters
+      if (allocFilters?.beneficiary) {
+        const bq = allocFilters.beneficiary.toLowerCase().trim();
+        const hasBen = (d.allocated_beneficiaries || []).some(ab => 
+          (ab.beneficiary_name || '').toLowerCase().includes(bq) ||
+          (ab.project_code || '').toLowerCase().includes(bq)
+        );
+        if (!hasBen) return false;
+      }
+
+      // 5. Campaign filter from allocFilters
+      if (allocFilters?.campaign) {
+        const cq = allocFilters.campaign.toLowerCase().trim();
+        const hasCamp = (d.campaigns_involved || []).some(c => 
+          (c || '').toLowerCase().includes(cq)
+        );
+        if (!hasCamp) return false;
+      }
+
+      // 6. Funded Status filter from allocFilters ('partial', 'full')
+      if (allocFilters?.funded_status && allocFilters.funded_status !== 'all') {
+        if (allocFilters.funded_status === 'partial' && (d.remaining_slots <= 0 || d.allocated_count === 0)) return false;
+        if (allocFilters.funded_status === 'full' && d.remaining_slots > 0) return false;
+      }
+
+      // 7. Contact Status ('contacted', 'not_contacted')
+      if (allocFilters?.contact_status && allocFilters.contact_status !== 'all') {
+        const cs = allocFilters.contact_status.toLowerCase();
+        const isContacted = d.contact_status === 'contacted' || (d.outbound_emails_count || 0) > 0 || (d.allocated_beneficiaries || []).some(ab => {
+          const st = (ab.latest_status || ab.communication_status || '').toLowerCase();
+          return st && !st.includes('pending');
+        });
+        if (cs === 'contacted' && !isContacted) return false;
+        if (cs === 'not_contacted' && isContacted) return false;
+      }
+
+      // 8. Never Emailed (toggle or email_sequence === '0')
+      if (allocFilters?.never_emailed || allocFilters?.email_sequence === '0') {
+        const emailCount = d.outbound_emails_count || 0;
+        if (emailCount > 0) return false;
+      }
+
+      // 9. Email Sequence ('1', '2', '3_plus')
+      if (allocFilters?.email_sequence && allocFilters.email_sequence !== 'all' && allocFilters.email_sequence !== '0') {
+        const count = d.outbound_emails_count || 0;
+        if (allocFilters.email_sequence === '1' && count !== 1) return false;
+        if (allocFilters.email_sequence === '2' && count !== 2) return false;
+        if (allocFilters.email_sequence === '3_plus' && count < 3) return false;
+      }
+
+      // 10. Response Status & No Response toggle
+      if (allocFilters?.no_response || allocFilters?.response_status === 'no_response') {
+        const outbound = d.outbound_emails_count || 0;
+        const inbound = d.inbound_replies_count || 0;
+        if (outbound === 0 || inbound > 0) return false;
+      } else if (allocFilters?.response_status === 'replied') {
+        const inbound = d.inbound_replies_count || 0;
+        if (inbound === 0) return false;
+      }
+
+      // 11. Email Open Status ('opened', 'unopened')
+      if (allocFilters?.open_status && allocFilters.open_status !== 'all') {
+        const opens = d.total_open_count || 0;
+        const hasOpened = opens > 0 || Boolean(d.latest_email_opened_at);
+        const outbound = d.outbound_emails_count || 0;
+        if (allocFilters.open_status === 'opened' && !hasOpened) return false;
+        if (allocFilters.open_status === 'unopened' && (outbound === 0 || hasOpened)) return false;
+      }
+
+      // 12. First mail sent presets / ranges
+      if (allocFilters?.first_mail_6_months || allocFilters?.first_emailed_preset === '6_months_ago') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days < 180) return false;
+      } else if (allocFilters?.first_emailed_preset === '3_months_ago') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days < 90) return false;
+      } else if (allocFilters?.first_emailed_preset === '1_month_ago') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days < 30) return false;
+      } else if (allocFilters?.first_emailed_preset === 'last_30_days') {
+        if (!d.first_email_sent_at) return false;
+        const days = (Date.now() - new Date(d.first_email_sent_at).getTime()) / (1000 * 60 * 60 * 24);
+        if (days > 30) return false;
+      }
+
+      if (allocFilters?.first_emailed_from) {
+        if (!d.first_email_sent_at || d.first_email_sent_at.slice(0, 10) < allocFilters.first_emailed_from) return false;
+      }
+      if (allocFilters?.first_emailed_to) {
+        if (!d.first_email_sent_at || d.first_email_sent_at.slice(0, 10) > allocFilters.first_emailed_to) return false;
+      }
+
+      if (allocFilters?.last_emailed_from) {
+        if (!d.latest_email_sent_at || d.latest_email_sent_at.slice(0, 10) < allocFilters.last_emailed_from) return false;
+      }
+      if (allocFilters?.last_emailed_to) {
+        if (!d.latest_email_sent_at || d.latest_email_sent_at.slice(0, 10) > allocFilters.last_emailed_to) return false;
+      }
+
       return true;
     });
-  }, [qualifyingDonors, donorSearchQuery, donorSlotFilter, donorClassificationFilter]);
+  }, [qualifyingDonors, donorSearchQuery, donorSlotFilter, donorClassificationFilter, allocFilters]);
 
   const totalDonorPages = Math.max(1, Math.ceil(filteredQualifyingDonors.length / donorPageSize));
   const paginatedQualifyingDonors = useMemo(() => {
@@ -2270,35 +2540,254 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
     return filteredQualifyingDonors.slice(start, start + donorPageSize);
   }, [filteredQualifyingDonors, donorPage, donorPageSize]);
 
+  const donorSlotCounts = useMemo(() => {
+    // Computes All / Available / Full counts under current active filters
+    const list = qualifyingDonors.filter(d => {
+      if (donorClassificationFilter !== 'all' && d.classification !== donorClassificationFilter) return false;
+      if (allocFilters?.classification && allocFilters.classification !== 'all' && d.classification !== allocFilters.classification) return false;
+
+      const q = (donorSearchQuery || '').toLowerCase().trim();
+      if (q) {
+        const cleanQ = q.replace(/[\s\-\(\)\+]/g, '');
+        const cleanPhone = (d.donor_phone || '').replace(/[\s\-\(\)\+]/g, '');
+        const matchesName = (d.donor_name || '').toLowerCase().includes(q);
+        const matchesEmail = (d.donor_email || '').toLowerCase().includes(q);
+        const matchesPhone = (d.donor_phone || '').toLowerCase().includes(q) || (Boolean(cleanQ) && cleanPhone.includes(cleanQ));
+        const matchesId = (String(d.donor_id || '')).toLowerCase().includes(q);
+        if (!matchesName && !matchesEmail && !matchesPhone && !matchesId) return false;
+      }
+
+      if (allocFilters?.donor) {
+        const dq = allocFilters.donor.toLowerCase().trim();
+        const cleanDQ = dq.replace(/[\s\-\(\)\+]/g, '');
+        const cleanPhone = (d.donor_phone || '').replace(/[\s\-\(\)\+]/g, '');
+        const matchesName = (d.donor_name || '').toLowerCase().includes(dq);
+        const matchesEmail = (d.donor_email || '').toLowerCase().includes(dq);
+        const matchesPhone = (d.donor_phone || '').toLowerCase().includes(dq) || (Boolean(cleanDQ) && cleanPhone.includes(cleanDQ));
+        const matchesId = (String(d.donor_id || '')).toLowerCase().includes(dq);
+        if (!matchesName && !matchesEmail && !matchesPhone && !matchesId) return false;
+      }
+
+      if (allocFilters?.beneficiary) {
+        const bq = allocFilters.beneficiary.toLowerCase().trim();
+        const hasBen = (d.allocated_beneficiaries || []).some(ab => 
+          (ab.beneficiary_name || '').toLowerCase().includes(bq) ||
+          (ab.project_code || '').toLowerCase().includes(bq)
+        );
+        if (!hasBen) return false;
+      }
+
+      if (allocFilters?.campaign) {
+        const cq = allocFilters.campaign.toLowerCase().trim();
+        const hasCamp = (d.campaigns_involved || []).some(c => 
+          (c || '').toLowerCase().includes(cq)
+        );
+        if (!hasCamp) return false;
+      }
+
+      if (allocFilters?.funded_status && allocFilters.funded_status !== 'all') {
+        if (allocFilters.funded_status === 'partial' && (d.remaining_slots <= 0 || d.allocated_count === 0)) return false;
+        if (allocFilters.funded_status === 'full' && d.remaining_slots > 0) return false;
+      }
+
+      if (allocFilters?.contact_status && allocFilters.contact_status !== 'all') {
+        const cs = allocFilters.contact_status.toLowerCase();
+        const isContacted = d.contact_status === 'contacted' || (d.outbound_emails_count || 0) > 0 || (d.allocated_beneficiaries || []).some(ab => {
+          const st = (ab.latest_status || ab.communication_status || '').toLowerCase();
+          return st && !st.includes('pending');
+        });
+        if (cs === 'contacted' && !isContacted) return false;
+        if (cs === 'not_contacted' && isContacted) return false;
+      }
+
+      if (allocFilters?.never_emailed || allocFilters?.email_sequence === '0') {
+        const emailCount = d.outbound_emails_count || 0;
+        if (emailCount > 0) return false;
+      }
+
+      if (allocFilters?.email_sequence && allocFilters.email_sequence !== 'all' && allocFilters.email_sequence !== '0') {
+        const count = d.outbound_emails_count || 0;
+        if (allocFilters.email_sequence === '1' && count !== 1) return false;
+        if (allocFilters.email_sequence === '2' && count !== 2) return false;
+        if (allocFilters.email_sequence === '3_plus' && count < 3) return false;
+      }
+
+      if (allocFilters?.no_response || allocFilters?.response_status === 'no_response') {
+        const outbound = d.outbound_emails_count || 0;
+        const inbound = d.inbound_replies_count || 0;
+        if (outbound === 0 || inbound > 0) return false;
+      } else if (allocFilters?.response_status === 'replied') {
+        const inbound = d.inbound_replies_count || 0;
+        if (inbound === 0) return false;
+      }
+
+      if (allocFilters?.open_status && allocFilters.open_status !== 'all') {
+        const opens = d.total_open_count || 0;
+        const hasOpened = opens > 0 || Boolean(d.latest_email_opened_at);
+        const outbound = d.outbound_emails_count || 0;
+        if (allocFilters.open_status === 'opened' && !hasOpened) return false;
+        if (allocFilters.open_status === 'unopened' && (outbound === 0 || hasOpened)) return false;
+      }
+
+      return true;
+    });
+
+    return {
+      all: list.length,
+      available: list.filter(d => d.remaining_slots > 0).length,
+      full: list.filter(d => d.remaining_slots <= 0).length,
+    };
+  }, [qualifyingDonors, donorSearchQuery, donorClassificationFilter, allocFilters]);
+
   // -------------------------------------------------------------
   // FILTERED & PAGINATED QUALIFYING CAMPAIGNS
   // -------------------------------------------------------------
   useEffect(() => {
     setCampaignPage(1);
-  }, [campaignListSearchQuery, campaignSlotFilter, campaignClassificationFilter, selectedDonorType, activeCompany]);
+  }, [campaignListSearchQuery, campaignSlotFilter, campaignClassificationFilter, selectedDonorType, activeCompany, allocFilters]);
 
   const filteredQualifyingCampaigns = useMemo(() => {
     return qualifyingCampaigns.filter(c => {
+      // 1. Slot Filter
       if (campaignSlotFilter === 'available' && c.remaining_slots <= 0) return false;
       if (campaignSlotFilter === 'full' && c.remaining_slots > 0) return false;
+
+      // 2. Classification
       if (campaignClassificationFilter !== 'all' && c.classification !== campaignClassificationFilter) return false;
-      if (campaignListSearchQuery) {
-        const q = campaignListSearchQuery.toLowerCase().trim();
+      if (allocFilters?.classification && allocFilters.classification !== 'all' && c.classification !== allocFilters.classification) return false;
+
+      // 3. Search query
+      const q = (campaignListSearchQuery || '').toLowerCase().trim();
+      if (q) {
         const matchesName = (c.campaign_name || '').toLowerCase().includes(q);
         const matchesComm = (c.community_name || '').toLowerCase().includes(q);
         const matchesEmail = (c.organizer_email || '').toLowerCase().includes(q);
         const matchesOrgName = (c.organizer_name || '').toLowerCase().includes(q);
         if (!matchesName && !matchesComm && !matchesEmail && !matchesOrgName) return false;
       }
+
+      if (allocFilters?.campaign) {
+        const cq = allocFilters.campaign.toLowerCase().trim();
+        const matchesName = (c.campaign_name || '').toLowerCase().includes(cq);
+        const matchesComm = (c.community_name || '').toLowerCase().includes(cq);
+        if (!matchesName && !matchesComm) return false;
+      }
+
+      // 4. Beneficiary filter
+      if (allocFilters?.beneficiary) {
+        const bq = allocFilters.beneficiary.toLowerCase().trim();
+        const hasBen = (c.allocated_beneficiaries || []).some(ab => 
+          (ab.beneficiary_name || '').toLowerCase().includes(bq) ||
+          (ab.project_code || '').toLowerCase().includes(bq)
+        );
+        if (!hasBen) return false;
+      }
+
+      // 5. Funded Status
+      if (allocFilters?.funded_status && allocFilters.funded_status !== 'all') {
+        if (allocFilters.funded_status === 'partial' && (c.remaining_slots <= 0 || c.allocated_count === 0)) return false;
+        if (allocFilters.funded_status === 'full' && c.remaining_slots > 0) return false;
+      }
+
+      // 6. Contact Status
+      if (allocFilters?.contact_status && allocFilters.contact_status !== 'all') {
+        const cs = allocFilters.contact_status.toLowerCase();
+        const isContacted = c.contact_status === 'contacted' || (c.outbound_emails_count || 0) > 0 || (c.allocated_beneficiaries || []).some(ab => {
+          const st = (ab.latest_status || ab.communication_status || '').toLowerCase();
+          return st && !st.includes('pending');
+        });
+        if (cs === 'contacted' && !isContacted) return false;
+        if (cs === 'not_contacted' && isContacted) return false;
+      }
+
+      // 7. Never Emailed
+      if (allocFilters?.never_emailed || allocFilters?.email_sequence === '0') {
+        const emailCount = c.outbound_emails_count || 0;
+        if (emailCount > 0) return false;
+      }
+
+      // 8. Email Sequence
+      if (allocFilters?.email_sequence && allocFilters.email_sequence !== 'all' && allocFilters.email_sequence !== '0') {
+        const count = c.outbound_emails_count || 0;
+        if (allocFilters.email_sequence === '1' && count !== 1) return false;
+        if (allocFilters.email_sequence === '2' && count !== 2) return false;
+        if (allocFilters.email_sequence === '3_plus' && count < 3) return false;
+      }
+
+      // 9. Response Status
+      if (allocFilters?.no_response || allocFilters?.response_status === 'no_response') {
+        const outbound = c.outbound_emails_count || 0;
+        const inbound = c.inbound_replies_count || 0;
+        if (outbound === 0 || inbound > 0) return false;
+      } else if (allocFilters?.response_status === 'replied') {
+        const inbound = c.inbound_replies_count || 0;
+        if (inbound === 0) return false;
+      }
+
+      // 10. Open Status
+      if (allocFilters?.open_status && allocFilters.open_status !== 'all') {
+        const opens = c.total_open_count || 0;
+        const hasOpened = opens > 0 || Boolean(c.latest_email_opened_at);
+        const outbound = c.outbound_emails_count || 0;
+        if (allocFilters.open_status === 'opened' && !hasOpened) return false;
+        if (allocFilters.open_status === 'unopened' && (outbound === 0 || hasOpened)) return false;
+      }
+
       return true;
     });
-  }, [qualifyingCampaigns, campaignListSearchQuery, campaignSlotFilter, campaignClassificationFilter]);
+  }, [qualifyingCampaigns, campaignListSearchQuery, campaignSlotFilter, campaignClassificationFilter, allocFilters]);
 
   const totalCampaignPages = Math.max(1, Math.ceil(filteredQualifyingCampaigns.length / campaignPageSize));
   const paginatedQualifyingCampaigns = useMemo(() => {
     const start = (campaignPage - 1) * campaignPageSize;
     return filteredQualifyingCampaigns.slice(start, start + campaignPageSize);
   }, [filteredQualifyingCampaigns, campaignPage, campaignPageSize]);
+
+  const campaignSlotCounts = useMemo(() => {
+    const list = qualifyingCampaigns.filter(c => {
+      if (campaignClassificationFilter !== 'all' && c.classification !== campaignClassificationFilter) return false;
+      if (allocFilters?.classification && allocFilters.classification !== 'all' && c.classification !== allocFilters.classification) return false;
+      const q = (campaignListSearchQuery || '').toLowerCase().trim();
+      if (q) {
+        const matchesName = (c.campaign_name || '').toLowerCase().includes(q);
+        const matchesComm = (c.community_name || '').toLowerCase().includes(q);
+        const matchesEmail = (c.organizer_email || '').toLowerCase().includes(q);
+        const matchesOrgName = (c.organizer_name || '').toLowerCase().includes(q);
+        if (!matchesName && !matchesComm && !matchesEmail && !matchesOrgName) return false;
+      }
+      if (allocFilters?.campaign) {
+        const cq = allocFilters.campaign.toLowerCase().trim();
+        const matchesName = (c.campaign_name || '').toLowerCase().includes(cq);
+        const matchesComm = (c.community_name || '').toLowerCase().includes(cq);
+        if (!matchesName && !matchesComm) return false;
+      }
+      if (allocFilters?.beneficiary) {
+        const bq = allocFilters.beneficiary.toLowerCase().trim();
+        const hasBen = (c.allocated_beneficiaries || []).some(ab => 
+          (ab.beneficiary_name || '').toLowerCase().includes(bq) ||
+          (ab.project_code || '').toLowerCase().includes(bq)
+        );
+        if (!hasBen) return false;
+      }
+      if (allocFilters?.funded_status && allocFilters.funded_status !== 'all') {
+        if (allocFilters.funded_status === 'partial' && (c.remaining_slots <= 0 || c.allocated_count === 0)) return false;
+        if (allocFilters.funded_status === 'full' && c.remaining_slots > 0) return false;
+      }
+      if (allocFilters?.contact_status && allocFilters.contact_status !== 'all') {
+        const cs = allocFilters.contact_status.toLowerCase();
+        const isContacted = c.contact_status === 'contacted' || (c.outbound_emails_count || 0) > 0;
+        if (cs === 'contacted' && !isContacted) return false;
+        if (cs === 'not_contacted' && isContacted) return false;
+      }
+      if (allocFilters?.never_emailed && (c.outbound_emails_count || 0) > 0) return false;
+      return true;
+    });
+    return {
+      all: list.length,
+      available: list.filter(c => c.remaining_slots > 0).length,
+      full: list.filter(c => c.remaining_slots <= 0).length,
+    };
+  }, [qualifyingCampaigns, campaignListSearchQuery, campaignClassificationFilter, allocFilters]);
 
   // -------------------------------------------------------------
   // FILTERED & PAGINATED ACTIVE ALLOCATIONS
@@ -2491,8 +2980,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
 
       {activeTab === 'beneficiaries' && (
         <div className="flex flex-col gap-5">
-          <TrackerFilterBar values={benFilters} onChange={setBenFilters} resultCount={filteredBeneficiaries.length}
+          <TrackerFilterBar values={benFilters} onChange={setBenFilters} resultCount={filteredBeneficiaries.length} resultLabel="beneficiary"
             fields={[
+              { key: 'beneficiary', label: 'Beneficiary', placeholder: 'Name or project code' },
               { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone' },
               { key: 'campaign', label: 'Campaign', placeholder: 'Campaign name' },
               { key: 'location', label: 'Location', placeholder: 'e.g. Gaza' },
@@ -2528,21 +3018,88 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               { key: 'needs_review', label: 'Needs review only', type: 'toggle' }
             ]} />
           {/* Toolbar & Filter Bar */}
-          <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm">
-            {/* Search Input */}
-            <div className="relative flex-1 max-w-md">
-              <Search className="w-4 h-4 absolute left-3.5 top-3 text-slate-400" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search beneficiary, project code, donor..."
-                className="w-full pl-9 pr-4 py-2 text-xs md:text-sm bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-              />
+          <div className="flex flex-col gap-3.5 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm">
+            {/* Top Row: Search Input + Action Buttons */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+              <div className="relative flex-1 sm:max-w-md min-w-[280px]">
+                <Search className="w-4 h-4 absolute left-3.5 top-3 text-slate-400 pointer-events-none" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search beneficiary name, project code, donor..."
+                  className="w-full pl-9 pr-8 py-2 text-xs md:text-sm bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2.5 top-2.5 p-0.5 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
+                    title="Clear search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap shrink-0">
+                <button
+                  onClick={() => {
+                    setEditingManualDonor(null);
+                    const activeType = selectedTypeFilter !== 'All' ? selectedTypeFilter : selectedDonorType || 'Orphan';
+                    setManualDonorForm({
+                      donor_name: '',
+                      donor_email: '',
+                      donor_phone: '',
+                      sponsorship_type: activeType,
+                      total_donated: targetInputs[activeType] || 480,
+                      custom_slots: 1,
+                      notes: '',
+                      classification: getAllowedClassifications(activeCompany)[0]
+                    });
+                    setShowManualDonorModal(true);
+                  }}
+                  className="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-all"
+                  title="Create a sponsorship donor record manually without needing to assign a beneficiary immediately"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  Add Manual Donor
+                </button>
+
+                <button
+                  onClick={() => {
+                    setEditingBeneficiary(null);
+                    setBeneficiaryForm({
+                      sponsorship_type: 'Orphan',
+                      name: '',
+                      location: '',
+                      project_code: '',
+                      donor_folder_link: '',
+                      profile_link: '',
+                      video_link: '',
+                      status: 'Unallocated'
+                    });
+                    setShowAddBeneficiaryModal(true);
+                  }}
+                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-all"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Beneficiary
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowBeneficiaryImport(true)}
+                  className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-all"
+                >
+                  <Upload className="w-4 h-4" />
+                  Bulk upload
+                </button>
+              </div>
             </div>
 
-            {/* Type & Status Filters */}
-            <div className="flex flex-wrap items-center gap-2">
+            {/* Bottom Row: Type, Status & Team Filter Pills */}
+            <div className="flex flex-wrap items-center gap-2 pt-2.5 border-t border-slate-100 dark:border-slate-800/80">
               <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs">
                 {['All', 'Orphan', 'Widow', 'Ex-Prisoner', 'Hafiz'].map((t) => {
                   const statusSubset = selectedStatusFilter === 'All'
@@ -2653,61 +3210,56 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   );
                 })}
               </div>
-
-              {/* Action Buttons */}
-              <button
-                onClick={() => {
-                  setEditingManualDonor(null);
-                  const activeType = selectedTypeFilter !== 'All' ? selectedTypeFilter : selectedDonorType || 'Orphan';
-                  setManualDonorForm({
-                    donor_name: '',
-                    donor_email: '',
-                    donor_phone: '',
-                    sponsorship_type: activeType,
-                    total_donated: targetInputs[activeType] || 480,
-                    custom_slots: 1,
-                    notes: '',
-                    classification: getAllowedClassifications(activeCompany)[0]
-                  });
-                  setShowManualDonorModal(true);
-                }}
-                className="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs md:text-sm flex items-center gap-1.5 shadow-sm transition-all"
-                title="Create a sponsorship donor record manually without needing to assign a beneficiary immediately"
-              >
-                <UserPlus className="w-4 h-4" />
-                Add Manual Donor
-              </button>
-
-              <button
-                onClick={() => {
-                  setEditingBeneficiary(null);
-                  setBeneficiaryForm({
-                    sponsorship_type: 'Orphan',
-                    name: '',
-                    location: '',
-                    project_code: '',
-                    donor_folder_link: '',
-                    profile_link: '',
-                    video_link: '',
-                    status: 'Unallocated'
-                  });
-                  setShowAddBeneficiaryModal(true);
-                }}
-                className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-all"
-              >
-                <Plus className="w-4 h-4" />
-                Add Beneficiary
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowBeneficiaryImport(true)}
-                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-xs md:text-sm flex items-center gap-2 shadow-sm transition-all"
-              >
-                <Upload className="w-4 h-4" />
-                Bulk upload
-              </button>
             </div>
           </div>
+
+          {/* Bulk Selection Action Bar */}
+          {selectedBenIdsForBulk.length > 0 && (
+            <div className="mb-4 px-4 py-3 bg-blue-50 dark:bg-blue-950/70 border border-blue-200 dark:border-blue-800 rounded-xl flex items-center justify-between flex-wrap gap-3 animate-fadeIn">
+              <div className="flex items-center gap-2.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-blue-600 animate-pulse" />
+                <span className="text-xs md:text-sm font-bold text-blue-900 dark:text-blue-100">
+                  <strong>{selectedBenIdsForBulk.length}</strong> {selectedBenIdsForBulk.length === 1 ? 'beneficiary' : 'beneficiaries'} selected
+                </span>
+                {selectedBenIdsForBulk.length < filteredBeneficiaries.length && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedBenIdsForBulk(filteredBeneficiaries.map(b => b.id))}
+                    className="text-xs text-blue-600 dark:text-blue-400 underline hover:text-blue-800 dark:hover:text-blue-200 font-semibold ml-2"
+                  >
+                    Select all {filteredBeneficiaries.length} filtered
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const matched = beneficiaries.filter(b => selectedBenIdsForBulk.includes(b.id));
+                    setBulkStatusTarget({
+                      campaignName: null,
+                      beneficiaryIds: [...selectedBenIdsForBulk],
+                      beneficiaries: matched.map(b => ({ beneficiary_id: b.id, beneficiary_name: b.name, project_code: b.project_code, latest_status: b.status })),
+                      title: `Assign Status to ${selectedBenIdsForBulk.length} Beneficiaries`
+                    });
+                    setBulkSelectedIds([...selectedBenIdsForBulk]);
+                    setBulkStatusModalOpen(true);
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-all"
+                >
+                  <Tag className="w-3.5 h-3.5" />
+                  Assign Status
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedBenIdsForBulk([])}
+                  className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 font-bold text-xs transition-all"
+                >
+                  Deselect All
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Beneficiaries Table */}
           <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-sm overflow-hidden">
@@ -2715,6 +3267,26 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/75 dark:bg-slate-800/40 text-[11px] uppercase tracking-wider text-slate-500 dark:text-slate-400 font-bold">
+                    <th className="py-3.5 px-3 w-10 text-center">
+                      <input
+                        type="checkbox"
+                        aria-label="Select all beneficiaries on current page"
+                        checked={
+                          paginatedBeneficiaries.length > 0 &&
+                          paginatedBeneficiaries.every(b => selectedBenIdsForBulk.includes(b.id))
+                        }
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            const combined = Array.from(new Set([...selectedBenIdsForBulk, ...paginatedBeneficiaries.map(b => b.id)]));
+                            setSelectedBenIdsForBulk(combined);
+                          } else {
+                            const pageSet = new Set(paginatedBeneficiaries.map(b => b.id));
+                            setSelectedBenIdsForBulk(selectedBenIdsForBulk.filter(id => !pageSet.has(id)));
+                          }
+                        }}
+                        className="w-4 h-4 rounded text-blue-600 border-slate-300 dark:border-slate-600 focus:ring-blue-500 cursor-pointer"
+                      />
+                    </th>
                     <th className="py-3.5 px-4">Beneficiary & Type</th>
                     <th className="py-3.5 px-4">Project Code</th>
                     <th className="py-3.5 px-4">Location</th>
@@ -2728,6 +3300,9 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                   {loadingData ? (
                     Array.from({ length: 8 }).map((_, idx) => (
                       <tr key={idx} className="animate-pulse border-b border-slate-100 dark:border-slate-800/60">
+                        <td className="py-3.5 px-3 text-center">
+                          <div className="w-4 h-4 bg-slate-200 dark:bg-slate-800 rounded mx-auto" />
+                        </td>
                         <td className="py-3.5 px-4">
                           <div className="flex items-center gap-2.5">
                             <div className="w-8 h-8 rounded-lg bg-slate-200 dark:bg-slate-800 shrink-0" />
@@ -2765,7 +3340,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                     ))
                   ) : filteredBeneficiaries.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-400 font-medium">
+                      <td colSpan={8} className="py-12 text-center text-slate-400 font-medium">
                         No beneficiaries found matching your filter criteria.
                       </td>
                     </tr>
@@ -2778,8 +3353,25 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                         <tr 
                           key={b.id} 
                           onClick={() => setSelectedBeneficiaryForDetails(b)}
-                          className="hover:bg-blue-50/40 dark:hover:bg-blue-950/20 transition-colors cursor-pointer group"
+                          className={`hover:bg-blue-50/40 dark:hover:bg-blue-950/20 transition-colors cursor-pointer group ${selectedBenIdsForBulk.includes(b.id) ? 'bg-blue-50/60 dark:bg-blue-950/40' : ''}`}
                         >
+                          {/* Row Selection Checkbox */}
+                          <td className="py-3.5 px-3 text-center" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              aria-label={`Select beneficiary ${b.name}`}
+                              checked={selectedBenIdsForBulk.includes(b.id)}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setSelectedBenIdsForBulk(prev => [...prev, b.id]);
+                                } else {
+                                  setSelectedBenIdsForBulk(prev => prev.filter(id => id !== b.id));
+                                }
+                              }}
+                              className="w-4 h-4 rounded text-blue-600 border-slate-300 dark:border-slate-600 focus:ring-blue-500 cursor-pointer"
+                            />
+                          </td>
+
                           {/* Beneficiary Name & Type */}
                           <td className="py-3.5 px-4">
                             <div className="flex items-center gap-2.5">
@@ -2937,6 +3529,32 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                     <option value="Donor Replied">💬 Donor Replied</option>
                                   </select>
                                 </div>
+
+                                {/* Logged Multiple Status Badges */}
+                                {b.statuses && b.statuses.length > 0 && (
+                                  <div className="flex flex-wrap gap-1 mt-1">
+                                    {b.statuses.slice(0, 2).map((st, idx) => (
+                                      <span
+                                        key={idx}
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 font-semibold"
+                                        title={`${st.status}${st.created_at ? ' (' + st.created_at + ')' : ''}${st.notes ? ' — ' + st.notes : ''}`}
+                                      >
+                                        <Clock className="w-2.5 h-2.5 text-blue-500 shrink-0" />
+                                        <span className="truncate max-w-[80px]">{st.status}</span>
+                                        {st.created_at && (
+                                          <span className="text-[8px] text-slate-400">
+                                            {new Date(st.created_at.replace(' ', 'T')).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+                                          </span>
+                                        )}
+                                      </span>
+                                    ))}
+                                    {b.statuses.length > 2 && (
+                                      <span className="text-[9px] text-slate-400 font-semibold self-center" title={`${b.statuses.length - 2} more logged statuses`}>
+                                        +{b.statuses.length - 2}
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             ) : (
                                 <button
@@ -3116,7 +3734,21 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
       {activeTab === 'allocations' && (
         <div className="flex flex-col gap-6">
           <div id="alloc-filter-bar" className="scroll-mt-4" />
-          <TrackerFilterBar values={allocFilters} onChange={setAllocFilters} resultCount={allocations.length}
+          <TrackerFilterBar
+            values={allocFilters}
+            onChange={setAllocFilters}
+            resultCount={
+              matrixPane === 'allocations'
+                ? allocations.length
+                : (allocationLeftTab === 'campaigns'
+                    ? filteredQualifyingCampaigns.length
+                    : filteredQualifyingDonors.length)
+            }
+            resultLabel={
+              matrixPane === 'allocations'
+                ? 'allocation'
+                : (allocationLeftTab === 'campaigns' ? 'campaign' : 'donor')
+            }
             fields={[
               // General primary filters
               { key: 'donor', label: 'Donor', placeholder: 'Name, email or phone', section: 'general' },
@@ -3198,11 +3830,11 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             <div className="flex flex-wrap items-center gap-4 text-xs font-semibold text-slate-600 dark:text-slate-400">
               <div className="flex items-center gap-1.5">
                 <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-                <span>Available Donors ({qualifyingDonors.filter(d => d.remaining_slots > 0).length})</span>
+                <span>Available Donors ({donorSlotCounts.available})</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className="w-2.5 h-2.5 rounded-full bg-purple-500" />
-                <span>Available Campaigns ({qualifyingCampaigns.filter(c => c.remaining_slots > 0).length})</span>
+                <span>Available Campaigns ({campaignSlotCounts.available})</span>
               </div>
               <button
                 onClick={() => {
@@ -3268,7 +3900,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       }`}
                     >
                       <Users className="w-3.5 h-3.5" />
-                      Donors ({qualifyingDonors.length})
+                      Donors ({donorSlotCounts.all})
                     </button>
                     <button
                       onClick={() => setAllocationLeftTab('campaigns')}
@@ -3279,7 +3911,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                       }`}
                     >
                       <Layers className="w-3.5 h-3.5" />
-                      Campaigns ({qualifyingCampaigns.length})
+                      Campaigns ({campaignSlotCounts.all})
                     </button>
                     <button
                       onClick={() => setAllocationLeftTab('all_crm')}
@@ -3334,7 +3966,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                             }`}
                           >
-                            All {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingDonors.length})`}
+                            All {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${donorSlotCounts.all})`}
                           </button>
                           <button
                             onClick={() => setDonorSlotFilter('available')}
@@ -3344,7 +3976,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                             }`}
                           >
-                            Available {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingDonors.filter(d => d.remaining_slots > 0).length})`}
+                            Available {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${donorSlotCounts.available})`}
                           </button>
                           <button
                             onClick={() => setDonorSlotFilter('full')}
@@ -3354,7 +3986,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                             }`}
                           >
-                            Full {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingDonors.filter(d => d.remaining_slots <= 0).length})`}
+                            Full {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${donorSlotCounts.full})`}
                           </button>
 
                           <div className="flex items-center gap-1 ml-1 pl-1 border-l border-slate-200 dark:border-slate-700">
@@ -3574,19 +4206,154 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                   <Plus className="w-3 h-3" />
                                   {d.remaining_slots > 0 ? 'Assign' : 'Assign (Override)'}
                                 </button>
+                                {d.allocated_beneficiaries?.length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const bIds = d.allocated_beneficiaries.map(ab => ab.beneficiary_id).filter(Boolean);
+                                      setBulkStatusTarget({
+                                        campaignName: null,
+                                        beneficiaryIds: bIds,
+                                        beneficiaries: d.allocated_beneficiaries,
+                                        title: `Assign Status: ${d.donor_name || d.donor_email || 'Donor'} (${bIds.length} Beneficiaries)`
+                                      });
+                                      setBulkSelectedIds(bIds);
+                                      setBulkStatusModalOpen(true);
+                                    }}
+                                    className="px-2 py-1 rounded bg-blue-50 dark:bg-blue-950/60 hover:bg-blue-100 dark:hover:bg-blue-900/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 font-bold text-[11px] transition-all flex items-center gap-1"
+                                    title="Assign timestamped status to beneficiaries of this donor"
+                                  >
+                                    <Tag className="w-3 h-3 text-blue-500" />
+                                    Assign Status
+                                  </button>
+                                )}
                               </div>
                             </div>
 
                             {d.allocated_beneficiaries?.length > 0 && (
-                              <div className="flex flex-wrap gap-1 mt-1">
-                                {d.allocated_beneficiaries.map((ab, idx) => (
-                                  <span
-                                    key={idx}
-                                    className="px-2 py-0.5 rounded text-[10px] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold text-slate-600 dark:text-slate-300"
-                                  >
-                                    👤 {ab.beneficiary_name} ({ab.project_code})
-                                  </span>
-                                ))}
+                              <div className="flex flex-col gap-1.5 mt-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
+                                {d.allocated_beneficiaries.map((ab, idx) => {
+                                  const rawStatuses = ab.statuses || [];
+                                  const isPendingStatus = (s) => {
+                                    const norm = (s || '').toLowerCase().trim();
+                                    return norm === 'pending' || norm === 'profile pending' || norm === 'pending profile' || norm.startsWith('profile pending');
+                                  };
+                                  // Filter out initial pending placeholders when any active outreach milestone exists
+                                  const activeOutreach = rawStatuses.filter(st => !isPendingStatus(st.status));
+                                  const displayList = activeOutreach.length > 0 ? activeOutreach : rawStatuses;
+                                  const hasActiveOutreach = activeOutreach.length > 0;
+                                  const displayStatus = ab.latest_status || ab.communication_status || 'Profile Pending';
+
+                                  const getBadgeStyle = (statusStr, isLatest) => {
+                                    const s = (statusStr || '').toLowerCase();
+                                    if (s.includes('renewal')) {
+                                      return isLatest
+                                        ? 'bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800 font-bold shadow-xs'
+                                        : 'bg-white dark:bg-slate-800/80 text-purple-600/80 dark:text-purple-400/80 border-purple-200/60 dark:border-purple-900/40';
+                                    }
+                                    if (s.includes('welcome') || s.includes('profile sent') || s.includes('update') || s.includes('feedback') || s.includes('video') || s.includes('report') || s.includes('mailed') || s.includes('emailed')) {
+                                      return isLatest
+                                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 font-bold shadow-xs'
+                                        : 'bg-white dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700';
+                                    }
+                                    if (isPendingStatus(statusStr)) {
+                                      return 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800';
+                                    }
+                                    return isLatest
+                                      ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800 font-bold shadow-xs'
+                                      : 'bg-white dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700';
+                                  };
+
+                                  return (
+                                    <div
+                                      key={idx}
+                                      className="p-1.5 rounded-lg bg-slate-50/70 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 text-[11px] flex flex-col gap-1 hover:border-blue-300 dark:hover:border-blue-700/70 transition-colors"
+                                    >
+                                      <div className="flex items-center justify-between gap-1 flex-wrap">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const matchedBen = beneficiaries.find(b => b.id === ab.beneficiary_id);
+                                            if (matchedBen) {
+                                              setSelectedBeneficiaryForDetails(matchedBen);
+                                            } else {
+                                              setSelectedBeneficiaryForDetails({
+                                                id: ab.beneficiary_id,
+                                                name: ab.beneficiary_name,
+                                                project_code: ab.project_code,
+                                                sponsorship_type: ab.sponsorship_type || d.sponsorship_type,
+                                                status: displayStatus,
+                                                statuses: ab.statuses || []
+                                              });
+                                            }
+                                          }}
+                                          className="font-semibold text-slate-800 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 flex items-center gap-1.5 text-left"
+                                          title="Click to view beneficiary profile and timeline"
+                                        >
+                                          <User className="w-3.5 h-3.5 text-blue-500 shrink-0" />
+                                          <span>{ab.beneficiary_name}</span>
+                                          <span className="text-[10px] font-mono text-slate-400 dark:text-slate-500 font-normal">
+                                            ({ab.project_code})
+                                          </span>
+                                        </button>
+                                        <div className="flex items-center gap-1.5 ml-auto shrink-0">
+                                          {hasActiveOutreach && activeOutreach.length > 1 && (
+                                            <span className="text-[9px] text-slate-400 font-medium">
+                                              {activeOutreach.length} milestones
+                                            </span>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setBulkStatusTarget({
+                                                campaignName: null,
+                                                beneficiaryIds: [ab.beneficiary_id],
+                                                beneficiaries: [ab],
+                                                title: `Assign Status: ${ab.beneficiary_name}`
+                                              });
+                                              setBulkSelectedIds([ab.beneficiary_id]);
+                                              setBulkStatusModalOpen(true);
+                                            }}
+                                            className="p-1 rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/60 transition-colors"
+                                            title="Assign status to this beneficiary"
+                                          >
+                                            <Tag className="w-3 h-3" />
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {/* Status History Badges */}
+                                      <div className="flex flex-wrap items-center gap-1 pl-5">
+                                        {hasActiveOutreach ? (
+                                          activeOutreach.map((st, sIdx) => {
+                                            const isLatest = sIdx === 0;
+                                            const dateStr = st.created_at ? new Date(st.created_at.replace(' ', 'T')).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' }) : '';
+                                            return (
+                                              <span
+                                                key={sIdx}
+                                                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold border transition-all ${getBadgeStyle(st.status, isLatest)}`}
+                                                title={`${st.status}${st.created_at ? ' • ' + st.created_at : ''}${st.notes ? ' — ' + st.notes : ''}${st.source ? ' [' + st.source + ']' : ''}`}
+                                              >
+                                                <Clock className={`w-2.5 h-2.5 ${isLatest ? 'text-blue-500' : 'text-slate-400'} shrink-0`} />
+                                                <span>{st.status}</span>
+                                                {dateStr && <span className="text-[8.5px] opacity-75 font-normal">({dateStr})</span>}
+                                                {sIdx < activeOutreach.length - 1 && (
+                                                  <span className="text-slate-300 dark:text-slate-600 text-[8px] ml-0.5 font-bold">←</span>
+                                                )}
+                                              </span>
+                                            );
+                                          })
+                                        ) : (
+                                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                            <Clock className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                                            <span>{isPendingStatus(displayStatus) ? 'Profile Pending' : displayStatus}</span>
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
@@ -3694,7 +4461,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                             }`}
                           >
-                            All {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingCampaigns.length})`}
+                            All {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${campaignSlotCounts.all})`}
                           </button>
                           <button
                             onClick={() => setCampaignSlotFilter('available')}
@@ -3704,7 +4471,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                             }`}
                           >
-                            Available {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingCampaigns.filter(c => c.remaining_slots > 0).length})`}
+                            Available {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${campaignSlotCounts.available})`}
                           </button>
                           <button
                             onClick={() => setCampaignSlotFilter('full')}
@@ -3714,7 +4481,7 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
                             }`}
                           >
-                            Full {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${qualifyingCampaigns.filter(c => c.remaining_slots <= 0).length})`}
+                            Full {loadingData ? <span className="inline-block w-3 h-2 bg-slate-300 dark:bg-slate-700 rounded-xs animate-pulse align-middle" /> : `(${campaignSlotCounts.full})`}
                           </button>
 
                           <div className="flex items-center gap-1 ml-1 pl-1 border-l border-slate-200 dark:border-slate-700">
@@ -3843,18 +4610,153 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
                                 <Plus className="w-3 h-3" />
                                 Assign
                               </button>
+                              {c.allocated_beneficiaries?.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const bIds = c.allocated_beneficiaries.map(ab => ab.beneficiary_id).filter(Boolean);
+                                    setBulkStatusTarget({
+                                      campaignName: c.campaign_name,
+                                      beneficiaryIds: bIds,
+                                      beneficiaries: c.allocated_beneficiaries,
+                                      title: `Assign Status: ${c.campaign_name} (${bIds.length} Beneficiaries)`
+                                    });
+                                    setBulkSelectedIds(bIds);
+                                    setBulkStatusModalOpen(true);
+                                  }}
+                                  className="px-2 py-1 rounded bg-indigo-50 dark:bg-indigo-950/60 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-bold text-[11px] transition-all flex items-center gap-1"
+                                  title="Assign timestamped status to all beneficiaries in this campaign"
+                                >
+                                  <Tag className="w-3 h-3 text-indigo-500" />
+                                  Campaign Status
+                                </button>
+                              )}
                             </div>
 
                             {c.allocated_beneficiaries?.length > 0 && (
-                              <div className="flex flex-wrap gap-1 mt-1">
-                                {c.allocated_beneficiaries.map((ab, idx) => (
-                                  <span
-                                    key={idx}
-                                    className="px-2 py-0.5 rounded text-[10px] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold text-slate-600 dark:text-slate-300"
-                                  >
-                                    👤 {ab.beneficiary_name} ({ab.project_code})
-                                  </span>
-                                ))}
+                              <div className="flex flex-col gap-1.5 mt-2 pt-2 border-t border-slate-100 dark:border-slate-800/80">
+                                {c.allocated_beneficiaries.map((ab, idx) => {
+                                  const rawStatuses = ab.statuses || [];
+                                  const isPendingStatus = (s) => {
+                                    const norm = (s || '').toLowerCase().trim();
+                                    return norm === 'pending' || norm === 'profile pending' || norm === 'pending profile' || norm.startsWith('profile pending');
+                                  };
+                                  // Filter out initial pending placeholders when any active outreach milestone exists
+                                  const activeOutreach = rawStatuses.filter(st => !isPendingStatus(st.status));
+                                  const displayList = activeOutreach.length > 0 ? activeOutreach : rawStatuses;
+                                  const hasActiveOutreach = activeOutreach.length > 0;
+                                  const displayStatus = ab.latest_status || ab.communication_status || 'Profile Pending';
+
+                                  const getBadgeStyle = (statusStr, isLatest) => {
+                                    const s = (statusStr || '').toLowerCase();
+                                    if (s.includes('renewal')) {
+                                      return isLatest
+                                        ? 'bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800 font-bold shadow-xs'
+                                        : 'bg-white dark:bg-slate-800/80 text-purple-600/80 dark:text-purple-400/80 border-purple-200/60 dark:border-purple-900/40';
+                                    }
+                                    if (s.includes('welcome') || s.includes('profile sent') || s.includes('update') || s.includes('feedback') || s.includes('video') || s.includes('report') || s.includes('mailed') || s.includes('emailed')) {
+                                      return isLatest
+                                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 font-bold shadow-xs'
+                                        : 'bg-white dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700';
+                                    }
+                                    if (isPendingStatus(statusStr)) {
+                                      return 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800';
+                                    }
+                                    return isLatest
+                                      ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800 font-bold shadow-xs'
+                                      : 'bg-white dark:bg-slate-800/80 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700';
+                                  };
+
+                                  return (
+                                    <div
+                                      key={idx}
+                                      className="p-1.5 rounded-lg bg-slate-50/70 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 text-[11px] flex flex-col gap-1 hover:border-indigo-300 dark:hover:border-indigo-700/70 transition-colors"
+                                    >
+                                      <div className="flex items-center justify-between gap-1 flex-wrap">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const matchedBen = beneficiaries.find(b => b.id === ab.beneficiary_id);
+                                            if (matchedBen) {
+                                              setSelectedBeneficiaryForDetails(matchedBen);
+                                            } else {
+                                              setSelectedBeneficiaryForDetails({
+                                                id: ab.beneficiary_id,
+                                                name: ab.beneficiary_name,
+                                                project_code: ab.project_code,
+                                                sponsorship_type: ab.sponsorship_type || c.sponsorship_type,
+                                                status: displayStatus,
+                                                statuses: ab.statuses || []
+                                              });
+                                            }
+                                          }}
+                                          className="font-semibold text-slate-800 dark:text-slate-200 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1.5 text-left"
+                                          title="Click to view beneficiary profile and timeline"
+                                        >
+                                          <User className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                                          <span>{ab.beneficiary_name}</span>
+                                          <span className="text-[10px] font-mono text-slate-400 dark:text-slate-500 font-normal">
+                                            ({ab.project_code})
+                                          </span>
+                                        </button>
+                                        <div className="flex items-center gap-1.5 ml-auto shrink-0">
+                                          {hasActiveOutreach && activeOutreach.length > 1 && (
+                                            <span className="text-[9px] text-slate-400 font-medium">
+                                              {activeOutreach.length} milestones
+                                            </span>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setBulkStatusTarget({
+                                                campaignName: null,
+                                                beneficiaryIds: [ab.beneficiary_id],
+                                                beneficiaries: [ab],
+                                                title: `Assign Status: ${ab.beneficiary_name}`
+                                              });
+                                              setBulkSelectedIds([ab.beneficiary_id]);
+                                              setBulkStatusModalOpen(true);
+                                            }}
+                                            className="p-1 rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/60 transition-colors"
+                                            title="Assign status to this beneficiary"
+                                          >
+                                            <Tag className="w-3 h-3" />
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {/* Status History Badges */}
+                                      <div className="flex flex-wrap items-center gap-1 pl-5">
+                                        {hasActiveOutreach ? (
+                                          activeOutreach.map((st, sIdx) => {
+                                            const isLatest = sIdx === 0;
+                                            const dateStr = st.created_at ? new Date(st.created_at.replace(' ', 'T')).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' }) : '';
+                                            return (
+                                              <span
+                                                key={sIdx}
+                                                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold border transition-all ${getBadgeStyle(st.status, isLatest)}`}
+                                                title={`${st.status}${st.created_at ? ' • ' + st.created_at : ''}${st.notes ? ' — ' + st.notes : ''}${st.source ? ' [' + st.source + ']' : ''}`}
+                                              >
+                                                <Clock className={`w-2.5 h-2.5 ${isLatest ? 'text-indigo-500' : 'text-slate-400'} shrink-0`} />
+                                                <span>{st.status}</span>
+                                                {dateStr && <span className="text-[8.5px] opacity-75 font-normal">({dateStr})</span>}
+                                                {sIdx < activeOutreach.length - 1 && (
+                                                  <span className="text-slate-300 dark:text-slate-600 text-[8px] ml-0.5 font-bold">←</span>
+                                                )}
+                                              </span>
+                                            );
+                                          })
+                                        ) : (
+                                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                            <Clock className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                                            <span>{isPendingStatus(displayStatus) ? 'Profile Pending' : displayStatus}</span>
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
@@ -8665,6 +9567,228 @@ export default function TrackerView({ user, filters, onSelectDonor, activeCompan
             setIsBeneficiaryDropdownOpen(false);
           }}
         />
+      )}
+
+      {/* BULK / CAMPAIGN STATUS MODAL */}
+      {bulkStatusModalOpen && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="relative bg-white dark:bg-slate-900 rounded-2xl max-w-lg w-full shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-850 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-blue-100 dark:bg-blue-950/80 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800">
+                  <Tag className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                    {bulkStatusTarget.title || 'Assign Multiple Status'}
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {bulkStatusTarget.campaignName 
+                      ? `Campaign: ${bulkStatusTarget.campaignName} · `
+                      : ''}
+                    Targeting {bulkSelectedIds.length} of {allTargetBens.length} beneficiaries
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setBulkStatusModalOpen(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 space-y-4 text-xs md:text-sm max-h-[75vh] overflow-y-auto">
+              {/* Beneficiary Selection List */}
+              {allTargetBens.length > 0 && (
+                <div className="border border-slate-200 dark:border-slate-800 rounded-xl bg-slate-50/60 dark:bg-slate-850/60 p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                      <Users className="w-3.5 h-3.5 text-blue-500" />
+                      Select Beneficiaries ({bulkSelectedIds.length} of {allTargetBens.length})
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const allIds = allTargetBens.map(b => b.beneficiary_id || b.id).filter(Boolean);
+                          setBulkSelectedIds(allIds);
+                        }}
+                        className="text-[11px] font-bold text-blue-600 dark:text-blue-400 hover:underline px-1 py-0.5"
+                      >
+                        Select All
+                      </button>
+                      <span className="text-slate-300 dark:text-slate-700">|</span>
+                      <button
+                        type="button"
+                        onClick={() => setBulkSelectedIds([])}
+                        className="text-[11px] font-bold text-slate-500 hover:underline px-1 py-0.5"
+                      >
+                        Deselect All
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 divide-y divide-slate-100 dark:divide-slate-800/60">
+                    {allTargetBens.map((ben) => {
+                      const bId = ben.beneficiary_id || ben.id;
+                      const isSelected = bulkSelectedIds.includes(bId);
+                      return (
+                        <label
+                          key={bId}
+                          className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-all pt-2 ${
+                            isSelected
+                              ? 'bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900/50'
+                              : 'bg-white dark:bg-slate-800/80 hover:bg-slate-100 dark:hover:bg-slate-800 border border-transparent'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setBulkSelectedIds(prev => [...prev, bId]);
+                                } else {
+                                  setBulkSelectedIds(prev => prev.filter(id => id !== bId));
+                                }
+                              }}
+                              className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                            />
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold text-slate-800 dark:text-slate-100 truncate">
+                                {ben.beneficiary_name || ben.name || `Beneficiary #${bId}`}
+                              </p>
+                              {ben.project_code && (
+                                <p className="text-[10px] text-slate-400 font-mono">
+                                  {ben.project_code}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                          {(ben.latest_status || ben.status) && (
+                            <span className="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-slate-700">
+                              {ben.latest_status || ben.status}
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Status Preset Selector */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-2">
+                  Select Status
+                </label>
+                <div className="grid grid-cols-2 gap-2 mb-3">
+                  {STATUS_PRESETS.map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => setBulkStatusName(preset)}
+                      className={`px-3 py-2 rounded-lg text-xs font-bold border text-left transition-all flex items-center justify-between ${
+                        bulkStatusName === preset
+                          ? 'bg-blue-50 dark:bg-blue-950/80 text-blue-700 dark:text-blue-300 border-blue-400 dark:border-blue-700 shadow-xs'
+                          : 'bg-white dark:bg-slate-800/80 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
+                      }`}
+                    >
+                      <span>{preset}</span>
+                      {bulkStatusName === preset && <Check className="w-3.5 h-3.5 text-blue-600" />}
+                    </button>
+                  ))}
+                </div>
+
+                {bulkStatusName === 'Custom' && (
+                  <div className="mt-2">
+                    <input
+                      type="text"
+                      placeholder="e.g. First Email Sent, Profile Follow-up, Eid Gift Received"
+                      value={bulkStatusCustom}
+                      onChange={(e) => setBulkStatusCustom(e.target.value)}
+                      className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Timestamp Input */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1.5 flex items-center justify-between">
+                  <span>Log Timestamp (Accurately Recorded)</span>
+                  <span className="text-[11px] font-normal text-slate-400">Defaults to now</span>
+                </label>
+                <div className="relative">
+                  <input
+                    type="datetime-local"
+                    value={bulkStatusTimestamp}
+                    onChange={(e) => setBulkStatusTimestamp(e.target.value)}
+                    className="w-full pl-3 pr-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 text-xs font-mono font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              {/* Notes */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1.5">
+                  Admin Notes / Remarks (Optional)
+                </label>
+                <textarea
+                  rows={2}
+                  placeholder="e.g. Sent first outreach email campaign via Outlook; included welcome brochure."
+                  value={bulkStatusNotes}
+                  onChange={(e) => setBulkStatusNotes(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              {/* Informative Banner */}
+              <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 rounded-xl text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
+                <Clock className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  This creates an immutable timestamped event in each beneficiary's status timeline and updates their current outreach tracking state.
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-3.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-850 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setBulkStatusModalOpen(false)}
+                disabled={bulkStatusSubmitting}
+                className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-bold text-xs hover:bg-slate-50 transition-all disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteBulkStatus}
+                disabled={bulkStatusSubmitting || bulkSelectedIds.length === 0}
+                className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-all disabled:opacity-50"
+              >
+                {bulkStatusSubmitting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Updating Statuses...
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    {bulkSelectedIds.length === 1
+                      ? 'Assign Status (1 Beneficiary)'
+                      : `Assign Status (${bulkSelectedIds.length} Beneficiaries)`}
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail, KeyRound } from 'lucide-react';
+import { TrendingUp, Crown, Columns, Table, Shield, CreditCard, Database, Target, Diamond, DollarSign, ChevronLeft, ChevronRight, HeartHandshake, Users, Mail, KeyRound, Landmark, Wallet } from 'lucide-react';
 import { canSeeTab } from '../access';
 import { API_BASE_URL } from '../config';
 import { useUnsubscribeAlerts, UnsubscribeToast } from './email/unsubscribeAlerts';
@@ -21,6 +21,8 @@ const tabs = [
   { id: 'email', label: 'Email', icon: Mail },
   { id: 'fundraisers', label: 'Fundraisers', icon: HeartHandshake },
   { id: 'payouts', label: 'Payout Reconciliation', icon: DollarSign },
+  { id: 'treasury', label: 'Treasury & Banks', icon: Landmark },
+  { id: 'pots', label: 'Project Pots', icon: Wallet },
   { id: 'tracker', label: 'Sponsorship Tracker', icon: Target },
   { id: 'classifications', label: 'Classifications', icon: Shield },
   { id: 'expenses', label: 'Expenses', icon: CreditCard },

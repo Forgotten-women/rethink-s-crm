@@ -8,7 +8,7 @@ import SingleDonorExportButtons from '../SingleDonorExportButtons';
 import DonationDetailModal from '../DonationDetailModal';
 import AddDonationModal, { canEditRecords } from '../AddDonationModal';
 import SingleEmailComposer from '../email/SingleEmailComposer';
-import { PlusCircle, Send, Search } from 'lucide-react';
+import { PlusCircle, Send, Search, Pencil, Check } from 'lucide-react';
 
 const money = (v, cur = '£') => (v === null || v === undefined ? '—' : `${cur}${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const CURRENCY_SYMBOLS = { GBP: '£', USD: '$', EUR: '€', CAD: 'C$', AUD: 'A$' };
@@ -53,6 +53,14 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
   const [adding, setAdding] = useState(false);
   const [emailing, setEmailing] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
+  const [editingContact, setEditingContact] = useState(false);
+  const [contactForm, setContactForm] = useState({ name: '', email: '', phone: '' });
+  const [savingContact, setSavingContact] = useState(false);
+  const [contactError, setContactError] = useState('');
+  const [contactSaved, setContactSaved] = useState('');
+  const [keyOverride, setKeyOverride] = useState(null);
+  const activeKey = keyOverride || donorKey;
+  useEffect(() => { setKeyOverride(null); setEditingContact(false); setContactSaved(''); }, [donorKey]);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -62,13 +70,13 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
     window.addEventListener('keydown', onKey);
     setLoading(true); setError(''); if (!reloadTick) setData(null); setShowAllDonations(false);
     const params = new URLSearchParams({ company_id: companyId });
-    fetch(`${API_BASE_URL}/api/tracker/donors/${encodeURIComponent(donorKey)}/details?${params}`)
+    fetch(`${API_BASE_URL}/api/tracker/donors/${encodeURIComponent(activeKey)}/details?${params}`)
       .then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.detail || 'Could not load donor'); return j; })
       .then(setData)
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
     return () => window.removeEventListener('keydown', onKey);
-  }, [donorKey, companyId, reloadTick]);
+  }, [activeKey, companyId, reloadTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!donorKey) return null;
   const consent = consentStyle[data?.contact?.marketing_consent] || consentStyle.Unknown;
@@ -90,6 +98,44 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
   const visibleDonations = showAllDonations || filtersOn ? donations : donations.slice(0, 10);
   const canEdit = canEditRecords(null, 'donors.create', companyId) && companyId && companyId !== 'all';
   const primaryEmail = data?.contact?.emails?.[0] || '';
+  const canEditContact = canEditRecords(null, 'tracker.edit', companyId) && companyId && companyId !== 'all';
+  const manualId = data?.donor_type === 'manual' ? String(data.donor_key || donorKey).replace(/^manual_/i, '') : null;
+  const editableRows = (data?.sponsorships || []).map(s => s.allocation_donor_id).filter(Boolean);
+  const canSaveContact = canEditContact && (manualId || editableRows.length > 0);
+
+  const startEditContact = () => {
+    setContactForm({ name: data?.contact?.name || '', email: primaryEmail, phone: data?.contact?.phone || '' });
+    setContactError(''); setContactSaved(''); setEditingContact(true);
+  };
+
+  const saveContact = async (e) => {
+    e.preventDefault();
+    const email = contactForm.email.trim();
+    const phone = contactForm.phone.trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setContactError(`'${email}' is not a valid email address.`); return; }
+    if (!email && !phone) { setContactError('Keep at least an email or a phone number.'); return; }
+    setSavingContact(true); setContactError('');
+    const body = JSON.stringify({ company_id: companyId, donor_name: contactForm.name.trim(), donor_email: email, donor_phone: phone });
+    const q = new URLSearchParams({ company_id: companyId });
+    try {
+      const urls = manualId
+        ? [`${API_BASE_URL}/api/tracker/manual-donors/${encodeURIComponent(manualId)}?${q}`]
+        : editableRows.map(id => `${API_BASE_URL}/api/tracker/allocation-donors/${id}?${q}`);
+      for (const url of urls) {
+        const r = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body });
+        if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || `Could not save (${r.status})`); }
+      }
+      setEditingContact(false);
+      setContactSaved(manualId ? 'Donor details saved.' : `Saved on ${urls.length} sponsorship record${urls.length === 1 ? '' : 's'}.`);
+      // reload by a key that survives a rename: the email, or the sponsorship row itself
+      if (!manualId) setKeyOverride(email ? email.toLowerCase() : `ad_${editableRows[0]}`);
+      setReloadTick(t => t + 1);
+    } catch (err) {
+      setContactError(err.message);
+    } finally {
+      setSavingContact(false);
+    }
+  };
   const focusType = sponsorshipType && sponsorshipType !== 'All' ? sponsorshipType : null;
   const giving = (data?.giving || []).slice().sort((a, b) => (a.sponsorship_type === focusType ? -1 : b.sponsorship_type === focusType ? 1 : 0));
 
@@ -143,7 +189,44 @@ export default function SponsorshipDonorPanel({ donorKey, companyId, sponsorship
 
           {data && (
             <>
-              <Section title="Contact" icon={Mail}>
+              <Section title="Contact" icon={Mail} right={canSaveContact && !editingContact ? (
+                <button type="button" onClick={startEditContact} className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:border-blue-400 flex items-center gap-1">
+                  <Pencil className="w-3.5 h-3.5" /> Edit details
+                </button>
+              ) : null}>
+                {contactSaved && !editingContact && (
+                  <div className="p-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 text-xs flex items-center gap-1.5"><Check className="w-3.5 h-3.5" /> {contactSaved}</div>
+                )}
+                {editingContact && (
+                  <form onSubmit={saveContact} className="p-3 rounded-xl border border-blue-300 dark:border-blue-800 bg-blue-50/40 dark:bg-blue-950/20 flex flex-col gap-3">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <label className="flex flex-col gap-1 text-xs font-semibold text-slate-600 dark:text-slate-300">Name
+                        <input value={contactForm.name} onChange={e => setContactForm({ ...contactForm, name: e.target.value })}
+                          className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-normal" />
+                      </label>
+                      <label className="flex flex-col gap-1 text-xs font-semibold text-slate-600 dark:text-slate-300">Email
+                        <input type="email" autoFocus={!primaryEmail} value={contactForm.email} onChange={e => setContactForm({ ...contactForm, email: e.target.value })}
+                          placeholder="name@example.com" className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-normal font-mono" />
+                      </label>
+                      <label className="flex flex-col gap-1 text-xs font-semibold text-slate-600 dark:text-slate-300">Phone
+                        <input value={contactForm.phone} onChange={e => setContactForm({ ...contactForm, phone: e.target.value })}
+                          className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-normal font-mono" />
+                      </label>
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      {manualId
+                        ? 'Updates this manual donor.'
+                        : `Updates this donor on ${editableRows.length} sponsorship record${editableRows.length === 1 ? '' : 's'} (used for emails and reminders). Donation records imported from the platforms are not changed.`}
+                    </p>
+                    {contactError && <div className="p-2 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 text-xs">{contactError}</div>}
+                    <div className="flex justify-end gap-2">
+                      <button type="button" onClick={() => setEditingContact(false)} className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm">Cancel</button>
+                      <button type="submit" disabled={savingContact} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold flex items-center gap-1">
+                        {savingContact ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Save
+                      </button>
+                    </div>
+                  </form>
+                )}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col gap-1.5">
                     {data.contact.emails.length ? data.contact.emails.map(e => (

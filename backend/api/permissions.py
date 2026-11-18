@@ -90,6 +90,8 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "classifications.get_stripe_matrix": "classifications.view",
     "classifications.export_classifications": "classifications.export",
     "classifications.save_matrix_rules": "classifications.edit",
+    "classifications.verify_classification_rule": "classifications.verify",
+    "classifications.set_needs_feedback": AnyOf("classifications.edit", "classifications.verify"),
     "classifications.sync_stripe_payment_links": "classifications.edit",
     "classifications.delete_single_rule": "classifications.delete",
     "classifications.clear_platform_rules": "classifications.delete",
@@ -129,6 +131,43 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "expenses.test_smtp_email": SUPER,                      # global (every charity) SMTP settings
     "expenses.show_email_approval_page": PUBLIC,    # single-use approval token
     "expenses.handle_email_approval_post": PUBLIC,
+    # --- treasury & project pots ---------------------------------------------------------------------------
+    "treasury.get_treasury_fx_rates": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_treasury_overview": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_treasury_accounts": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_account_transactions": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_internal_transfers": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_treasury_pots": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_pot_detail": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.create_internal_transfer": AnyOf("expenses.transfers", "expenses.submit"),
+    "treasury.create_bank_transaction": AnyOf("expenses.transfers", "expenses.submit"),
+    "treasury.reallocate_pot_funds": AnyOf("expenses.transfers", "expenses.submit"),
+    "treasury.get_treasury_approvals": AnyOf("expenses.view", "expenses.transfers_approve", "expenses.approve"),
+    "treasury.submit_transfer_approval": AnyOf("expenses.transfers", "expenses.submit"),
+    "treasury.review_transfer_approval": AnyOf("expenses.transfers_approve", "expenses.approve"),
+    "treasury.get_adjustments": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_confirm_items": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_sources": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.get_activity": AnyOf("expenses.view", "payouts.view", "dashboard.view"),
+    "treasury.preview_reallocation_plan": AnyOf("expenses.view", "payouts.view", "dashboard.view"),  # dry run, saves nothing
+    "treasury.export_treasury_accounts": "expenses.export",
+    "treasury.export_account_transactions": "expenses.export",
+    "treasury.export_treasury_pots": "expenses.export",
+    "treasury.export_adjustments": "expenses.export",
+    "treasury.apply_reallocation_plan": "expenses.transfers",
+    "treasury.update_account_balance": "expenses.transfers",
+    "treasury.create_treasury_account": "expenses.transfers",
+    "treasury.update_treasury_account": "expenses.transfers",
+    "treasury.create_trust": "expenses.transfers",
+    "treasury.update_trust": "expenses.transfers",
+    "treasury.settle_trust": "expenses.transfers",
+    "treasury.create_receivable": "expenses.transfers",
+    "treasury.update_receivable": "expenses.transfers",
+    "treasury.settle_receivable": "expenses.transfers",
+    "treasury.create_pot": "expenses.transfers",
+    "treasury.reverse_activity": "expenses.transfers",
+    "treasury.resolve_confirm_item": AnyOf("expenses.approve", "expenses.transfers"),
+    "treasury.reopen_confirm_item": AnyOf("expenses.approve", "expenses.transfers"),
     # --- payouts / stripe ----------------------------------------------------------------------------------
     "payouts.get_payouts_summary": "payouts.view",
     "payouts.get_payout_platforms": "payouts.view",
@@ -140,6 +179,9 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "payouts.get_paysuite_sync_status": "payouts.view",
     "payouts.get_paysuite_disbursals": "payouts.view",
     "payouts.update_payout_classification": "payouts.classify",
+    "payouts.upload_payout_settlement": AnyOf("payouts.upload", "data.upload"),
+    "payouts.download_accounting_pack": AnyOf("payouts.export", "payouts.view", "data.view"),
+    "payouts.list_accounting_packs": AnyOf("payouts.view", "payouts.export"),
     "payouts.export_payouts_excel": "payouts.export",
     "payouts.trigger_paysuite_sync": "payouts.sync",
     "stripe_payouts.get_stripe_payouts": "stripe.view",
@@ -199,6 +241,10 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "tracker.update_beneficiary": "tracker.edit",
     "tracker.patch_beneficiary_status": "tracker.edit",
     "tracker.update_beneficiary_status": "tracker.edit",
+    "tracker.get_beneficiary_statuses": "tracker.view",
+    "tracker.add_beneficiary_status": "tracker.edit",
+    "tracker.delete_beneficiary_status": "tracker.edit",
+    "tracker.bulk_assign_beneficiary_status": "tracker.edit",
     "tracker.create_manual_donor": "tracker.edit",
     "tracker.update_manual_donor": "tracker.edit",
     "tracker.classify_donor": "tracker.edit",
@@ -264,6 +310,8 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
     "donor_email.rename_campaign": "email.campaigns",
     "donor_email.mark_campaign_sponsorships": "tracker.edit",
     "donor_email.delete_campaign": "email.campaigns",
+    "donor_email.get_general_feedback_eligible": "email.view",
+    "donor_email.export_general_feedback_eligible": "email.view",
     # --- unsubscribes / mailbox ----------------------------------------------------------------------------
     "unsubscribe.unsubscribe_page": PUBLIC,           # HMAC-signed link
     "unsubscribe.unsubscribe_confirm": PUBLIC,
@@ -317,9 +365,9 @@ ROUTE_PERMISSIONS: Dict[str, Requirement] = {
 CONTACT_EXPORTS = {"donors.export_donors", "donors.export_kanban_tier"}
 # Payout files: allowed without donors.contact, with the email / phone / address columns blanked in the file
 # (backend/api/contact_mask.py strip_contacts_from_file)
-CONTACT_STRIPPED_EXPORTS = {"payouts.export_payouts_excel", "stripe_payouts.download_enriched_csv",
+CONTACT_STRIPPED_EXPORTS = {"payouts.export_payouts_excel", "payouts.download_accounting_pack", "stripe_payouts.download_enriched_csv",
                             "stripe_payouts.export_stripe_payouts_excel", "donors.export_single_donor",
-                            "fundraisers.export_fundraiser_detail_csv"}
+                            "fundraisers.export_fundraiser_detail_csv", "donor_email.export_general_feedback_eligible"}
 
 # Endpoints that apply a person's fundraiser limit (core.rbac.scope_donations / request_scope). In a charity where
 # someone is limited to specific fundraisers, every other endpoint is refused - pages such as the dashboard or

@@ -546,6 +546,20 @@ def init_classification_db():
                 cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN giving_level TEXT NOT NULL DEFAULT ''")
             if "special_case" not in map_cols:
                 cur.execute("ALTER TABLE platform_campaign_mappings ADD COLUMN special_case TEXT DEFAULT ''")
+            for col_name, col_ddl in (
+                ("is_verified", "INTEGER DEFAULT 0"),
+                ("verified_by", "TEXT DEFAULT ''"),
+                ("verified_at", "TEXT DEFAULT ''"),
+                ("needs_feedback", "INTEGER DEFAULT 0"),
+                ("campaign_needs_feedback", "INTEGER DEFAULT 0"),
+            ):
+                if col_name not in map_cols:
+                    cur.execute(f"ALTER TABLE platform_campaign_mappings ADD COLUMN {col_name} {col_ddl}")
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_pcm_feedback ON platform_campaign_mappings(company_id, needs_feedback, campaign_needs_feedback)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_pcm_verified ON platform_campaign_mappings(company_id, is_verified)")
+            except Exception:
+                pass
 
             # Purge duplicate unassigned ghost rows when an assigned row exists for that same (platform, company_id, campaign_name, giving_level)
             try:
@@ -621,7 +635,12 @@ def init_classification_db():
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
                     COALESCE(m.campaign_ref, cat.campaign_ref, '') AS campaign_ref,
-                    COALESCE(m.giving_level_ref, '') AS giving_level_ref
+                    COALESCE(m.giving_level_ref, '') AS giving_level_ref,
+                    COALESCE(m.is_verified, 0) AS is_verified,
+                    COALESCE(m.verified_by, '') AS verified_by,
+                    COALESCE(m.verified_at, '') AS verified_at,
+                    COALESCE(m.needs_feedback, 0) AS needs_feedback,
+                    COALESCE(m.campaign_needs_feedback, 0) AS campaign_needs_feedback
                 FROM platform_campaign_mappings m
                 LEFT JOIN platform_campaign_catalog cat 
                     ON cat.platform = m.platform 
@@ -663,7 +682,12 @@ def init_classification_db():
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
                     COALESCE(m.campaign_ref, cat.campaign_ref, '') AS campaign_ref,
-                    COALESCE(m.giving_level_ref, '') AS giving_level_ref
+                    COALESCE(m.giving_level_ref, '') AS giving_level_ref,
+                    COALESCE(m.is_verified, 0) AS is_verified,
+                    COALESCE(m.verified_by, '') AS verified_by,
+                    COALESCE(m.verified_at, '') AS verified_at,
+                    COALESCE(m.needs_feedback, 0) AS needs_feedback,
+                    COALESCE(m.campaign_needs_feedback, 0) AS campaign_needs_feedback
                 FROM platform_campaign_mappings m
                 LEFT JOIN platform_campaign_catalog cat 
                     ON cat.platform = m.platform 
@@ -705,7 +729,12 @@ def init_classification_db():
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
-                    COALESCE(m.is_primary, 0) AS is_primary
+                    COALESCE(m.is_primary, 0) AS is_primary,
+                    COALESCE(m.is_verified, 0) AS is_verified,
+                    COALESCE(m.verified_by, '') AS verified_by,
+                    COALESCE(m.verified_at, '') AS verified_at,
+                    COALESCE(m.needs_feedback, 0) AS needs_feedback,
+                    COALESCE(m.campaign_needs_feedback, 0) AS campaign_needs_feedback
                 FROM platform_campaign_mappings m
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -737,7 +766,12 @@ def init_classification_db():
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 0) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
-                    COALESCE(m.donor_email, '') AS donor_email
+                    COALESCE(m.donor_email, '') AS donor_email,
+                    COALESCE(m.is_verified, 0) AS is_verified,
+                    COALESCE(m.verified_by, '') AS verified_by,
+                    COALESCE(m.verified_at, '') AS verified_at,
+                    COALESCE(m.needs_feedback, 0) AS needs_feedback,
+                    COALESCE(m.campaign_needs_feedback, 0) AS campaign_needs_feedback
                 FROM platform_campaign_mappings m
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -770,7 +804,12 @@ def init_classification_db():
                     COALESCE(c.zakat_eligibility, 'Unassigned') AS zakat_eligibility,
                     COALESCE(m.is_primary, 1) AS is_primary,
                     COALESCE(m.donor_name, '') AS donor_name,
-                    COALESCE(m.donor_email, '') AS donor_email
+                    COALESCE(m.donor_email, '') AS donor_email,
+                    COALESCE(m.is_verified, 0) AS is_verified,
+                    COALESCE(m.verified_by, '') AS verified_by,
+                    COALESCE(m.verified_at, '') AS verified_at,
+                    COALESCE(m.needs_feedback, 0) AS needs_feedback,
+                    COALESCE(m.campaign_needs_feedback, 0) AS campaign_needs_feedback
                 FROM platform_campaign_mappings m
                 LEFT JOIN master_project_codes c 
                     ON UPPER(TRIM(m.code)) = UPPER(TRIM(c.code))
@@ -805,7 +844,12 @@ def init_classification_db():
                     COALESCE(m.donor_name, '') AS donor_name,
                     COALESCE(m.donor_email, '') AS donor_email,
                     COALESCE(m.campaign_ref, cat.campaign_ref, '') AS campaign_ref,
-                    COALESCE(m.giving_level_ref, '') AS giving_level_ref
+                    COALESCE(m.giving_level_ref, '') AS giving_level_ref,
+                    COALESCE(m.is_verified, 0) AS is_verified,
+                    COALESCE(m.verified_by, '') AS verified_by,
+                    COALESCE(m.verified_at, '') AS verified_at,
+                    COALESCE(m.needs_feedback, 0) AS needs_feedback,
+                    COALESCE(m.campaign_needs_feedback, 0) AS campaign_needs_feedback
                 FROM platform_campaign_mappings m
                 LEFT JOIN platform_campaign_catalog cat 
                     ON cat.platform = m.platform 
@@ -1009,6 +1053,104 @@ def init_classification_db():
 _MATRIX_INVALID_CODES = ["UNASSIGNED", "N/A", "NONE", "NAN", ""]
 _MATRIX_INVALID_SPECIAL = ["unassigned", "none", "none (standard)", "nan", "null", "n/a", ""]
 
+_SP_LOOKUP_CACHE = None
+_SP_LOOKUP_TIME = 0.0
+
+
+def get_sp_lookup_sets():
+    """Returns (sp_camps_set, sp_slugs_set, sp_names_set) for SP detection with 60s in-memory caching."""
+    global _SP_LOOKUP_CACHE, _SP_LOOKUP_TIME
+    import time
+    now = time.time()
+    if _SP_LOOKUP_CACHE is not None and (now - _SP_LOOKUP_TIME) < 60.0:
+        return _SP_LOOKUP_CACHE
+    try:
+        conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        try:
+            frs = conn.execute("SELECT id, name, page_group, company_id FROM fundraisers").fetchall()
+            fc = conn.execute("SELECT fundraiser_id, campaign_name, company_id FROM fundraiser_campaigns").fetchall()
+        finally:
+            conn.close()
+        from backend.api.fundraisers import is_sp_text, resolve_page_group
+        assigned_map = {}
+        for fid, cn, cid in fc:
+            if cn:
+                assigned_map.setdefault(fid, []).append(cn)
+        sp_fr_ids = {f[0] for f in frs if resolve_page_group(f[2], f[1] or "", assigned_map.get(f[0], [])) == "SP"}
+        sp_names = {str(f[1] or "").strip().lower() for f in frs if f[0] in sp_fr_ids}
+        sp_camps = {str(c[1] or "").strip().lower() for c in fc if c[0] in sp_fr_ids and c[1]}
+        slug = lambda u: str(u or "").strip().lower().split("?")[0].rstrip("/").split("/")[-1]
+        sp_slugs = {slug(c[1]) for c in fc if c[0] in sp_fr_ids and c[1]}
+        res = (sp_camps, sp_slugs, sp_names)
+        _SP_LOOKUP_CACHE = res
+        _SP_LOOKUP_TIME = now
+        return res
+    except Exception as e:
+        return set(), set(), set()
+
+
+def _finalize_matrix_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalizes verification, feedback, and SP cause flags across all classification platforms."""
+    if df is None or df.empty:
+        return df
+    for col in ("is_verified", "needs_feedback", "campaign_needs_feedback", "is_primary"):
+        if col not in df.columns:
+            df[col] = 0
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    for col in ("verified_by", "verified_at"):
+        if col not in df.columns:
+            df[col] = ""
+        else:
+            df[col] = df[col].fillna("").astype(str).replace({
+                "Unassigned": "", "unassigned": "", "None": "", "none": "", "nan": "", "NaN": "", "null": ""
+            })
+    if "campaign_needs_feedback" in df.columns and "Campaign Name" in df.columns:
+        camp_fb = df.groupby(df["Campaign Name"].astype(str).str.strip().str.lower())["campaign_needs_feedback"].transform("max")
+        df["campaign_needs_feedback"] = camp_fb
+
+    # Compute is_sp flag for every classification rule
+    camp_col = "Campaign Name" if "Campaign Name" in df.columns else ("campaign_name" if "campaign_name" in df.columns else None)
+    url_col = "Campaign URL" if "Campaign URL" in df.columns else ("campaign_url" if "campaign_url" in df.columns else None)
+    comm_col = "Community Name" if "Community Name" in df.columns else ("community_name" if "community_name" in df.columns else None)
+    code_col = "Code" if "Code" in df.columns else ("code" if "code" in df.columns else None)
+
+    if "is_sp" not in df.columns:
+        sp_camps, sp_slugs, sp_names = get_sp_lookup_sets()
+        from backend.api.fundraisers import is_sp_text
+        from backend.api.tracker import is_sp_campaign_name
+        slug = lambda u: str(u or "").strip().lower().split("?")[0].rstrip("/").split("/")[-1]
+
+        sp_mask = pd.Series(False, index=df.index)
+        if camp_col and camp_col in df.columns:
+            u_camps = df[camp_col].dropna().unique()
+            c_map = {c: bool(is_sp_campaign_name(c) or is_sp_text(c) or str(c).strip().lower() in sp_camps) for c in u_camps}
+            sp_mask |= df[camp_col].map(c_map).fillna(False)
+
+        if url_col and url_col in df.columns:
+            u_urls = df[url_col].dropna().unique()
+            u_map = {u: bool(is_sp_text(u) or slug(u) in sp_slugs or str(u).strip().lower() in sp_camps) for u in u_urls}
+            sp_mask |= df[url_col].map(u_map).fillna(False)
+
+        if comm_col and comm_col in df.columns:
+            u_comms = df[comm_col].dropna().unique()
+            cm_map = {cm: bool(is_sp_text(cm) or str(cm).strip().lower() in sp_names) for cm in u_comms}
+            sp_mask |= df[comm_col].map(cm_map).fillna(False)
+
+        if code_col and code_col in df.columns:
+            u_codes = df[code_col].dropna().unique()
+            cd_map = {cd: bool("GBR-SOC-AID-SIS" in str(cd).upper() or "-SIS" in str(cd).upper()) for cd in u_codes}
+            sp_mask |= df[code_col].map(cd_map).fillna(False)
+
+        df["is_sp"] = sp_mask.astype(int)
+    else:
+        df["is_sp"] = pd.to_numeric(df["is_sp"], errors="coerce").fillna(0).astype(int)
+
+    if camp_col and camp_col in df.columns:
+        df["is_sp"] = df.groupby(df[camp_col].astype(str).str.strip().str.lower())["is_sp"].transform("max")
+
+    return df
+
 
 def _dedupe_matrix_rows(merged_raw: pd.DataFrame) -> pd.DataFrame:
     """One row per (campaign, giving level, code), vectorised.
@@ -1112,7 +1254,12 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
                 COALESCE(donor_name, '') as "Donor Name",
                 COALESCE(donor_email, '') as "Donor Email",
                 COALESCE(campaign_ref, '') as "campaign_ref",
-                COALESCE(giving_level_ref, '') as "giving_level_ref"
+                COALESCE(giving_level_ref, '') as "giving_level_ref",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback"
             FROM campaign_classifications
             {where_clause}
         """, conn, params=params)
@@ -1296,7 +1443,7 @@ def get_classification_matrix(df_raw=None, company_id: Optional[str] = "rethink"
         if ref_c in deduped_df.columns:
             deduped_df[ref_c] = deduped_df[ref_c].fillna("").astype(str).str.strip().replace({"Unassigned": "", "None": "", "nan": ""})
 
-    return deduped_df
+    return _finalize_matrix_flags(deduped_df)
 
 
 
@@ -1920,6 +2067,24 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                             _ref_snapshot.setdefault((_n, "*"), (_r, None))
                     except sqlite3.OperationalError:
                         _ref_snapshot = {}
+
+                    # Snapshot verification & feedback metadata before deleting/re-inserting rows whose code changed
+                    _meta_snapshot = {}
+                    _camp_fb_snapshot = set()
+                    try:
+                        for _n, _g, _iv, _vb, _va, _nf, _cnf in conn.execute("""
+                            SELECT LOWER(campaign_name), LOWER(COALESCE(giving_level, '')),
+                                   COALESCE(is_verified, 0), COALESCE(verified_by, ''), COALESCE(verified_at, ''),
+                                   COALESCE(needs_feedback, 0), COALESCE(campaign_needs_feedback, 0)
+                            FROM platform_campaign_mappings
+                            WHERE company_id = ? AND platform = ?
+                        """, (comp, platform.lower())):
+                            if _iv or _nf or _cnf:
+                                _meta_snapshot[(_n, _g)] = (_iv, _vb, _va, _nf, _cnf)
+                            if _cnf:
+                                _camp_fb_snapshot.add(_n)
+                    except sqlite3.OperationalError:
+                        pass
                     # Codes are saved upper-case; an existing row that differs only in case ("Unassigned" vs
                     # "UNASSIGNED") is the same rule - rename it rather than add a second "variant" next to it.
                     for (cname_lower, gl_lower), codes in cname_gl_to_codes.items():
@@ -1984,6 +2149,24 @@ def save_platform_matrix_rules(platform: str, matrix_df: pd.DataFrame, company_i
                                     lref = _cid_cat(conn, platform.lower(), comp)["level"].get((hit[0], _cid_key(_g))) or f"title:{_cid_key(_g)}"
                                 conn.execute("UPDATE platform_campaign_mappings SET campaign_ref = ?, giving_level_ref = COALESCE(giving_level_ref, ?) WHERE id = ?",
                                              (hit[0], lref, _id))
+
+                    if _meta_snapshot or _camp_fb_snapshot:
+                        for _id, _n, _g in conn.execute("""SELECT id, LOWER(campaign_name), LOWER(COALESCE(giving_level, ''))
+                                                           FROM platform_campaign_mappings WHERE company_id = ? AND platform = ?""",
+                                                        (comp, platform.lower())).fetchall():
+                            meta = _meta_snapshot.get((_n, _g))
+                            camp_fb = 1 if _n in _camp_fb_snapshot else 0
+                            if meta or camp_fb:
+                                _iv, _vb, _va, _nf, _cnf = meta or (0, "", "", 0, 0)
+                                conn.execute("""
+                                    UPDATE platform_campaign_mappings
+                                    SET is_verified = COALESCE(NULLIF(is_verified, 0), ?),
+                                        verified_by = CASE WHEN COALESCE(verified_by, '') != '' THEN verified_by ELSE ? END,
+                                        verified_at = CASE WHEN COALESCE(verified_at, '') != '' THEN verified_at ELSE ? END,
+                                        needs_feedback = CASE WHEN needs_feedback = 1 THEN 1 WHEN ? = 1 THEN 1 ELSE ? END,
+                                        campaign_needs_feedback = CASE WHEN campaign_needs_feedback = 1 THEN 1 ELSE ? END
+                                    WHERE id = ?
+                                """, (_iv, _vb, _va, camp_fb, _nf, camp_fb or _cnf, _id))
 
                     # Propagate non-empty special_case to matching campaigns / base campaign titles in platform_campaign_mappings
                     spec_updates = {}
@@ -2069,7 +2252,12 @@ def get_paysuite_classification_matrix(df_raw=None, company_id: Optional[str] = 
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(donor_name, '') as "Donor Name",
-                COALESCE(donor_email, '') as "Donor Email"
+                COALESCE(donor_email, '') as "Donor Email",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback"
             FROM paysuite_classifications
             {where_clause}
         """, conn, params=params)
@@ -2095,7 +2283,7 @@ def get_paysuite_classification_matrix(df_raw=None, company_id: Optional[str] = 
             donor_distinct = donor_df.drop_duplicates(subset=["Campaign Name", "Code"])
 
             if db_matrix.empty:
-                return donor_distinct.fillna("Unassigned").reset_index(drop=True)
+                return _finalize_matrix_flags(donor_distinct.fillna("Unassigned").reset_index(drop=True))
 
             merged = pd.merge(
                 donor_distinct[["Campaign Name", "Code", "Community Name"]],
@@ -2103,11 +2291,14 @@ def get_paysuite_classification_matrix(df_raw=None, company_id: Optional[str] = 
                 on=["Campaign Name", "Code"],
                 how="outer",
                 suffixes=('', '_db')
-            ).fillna("Unassigned")
-            return merged.drop_duplicates(subset=["Campaign Name", "Code"]).reset_index(drop=True)
+            )
+            meta_cols = ["is_verified", "verified_by", "verified_at", "needs_feedback", "campaign_needs_feedback"]
+            fill_text = [c for c in merged.columns if c not in meta_cols]
+            merged[fill_text] = merged[fill_text].fillna("Unassigned")
+            return _finalize_matrix_flags(merged.drop_duplicates(subset=["Campaign Name", "Code"]).reset_index(drop=True))
 
     if not db_matrix.empty:
-        return db_matrix.fillna("Unassigned").reset_index(drop=True)
+        return _finalize_matrix_flags(db_matrix)
 
     return pd.DataFrame(columns=["Campaign Name", "Code", "Community Name"] + [c for c in target_cols if c != "Code"])
 
@@ -2135,7 +2326,12 @@ def get_rethink_website_classification_matrix(df_raw=None, company_id: Optional[
                 COALESCE(heading, 'Unassigned') as "Heading",
                 COALESCE(sub_heading, 'Unassigned') as "Sub-Heading",
                 COALESCE(country, 'Unassigned') as "Country",
-                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility"
+                COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback"
             FROM rethink_website_classifications
             {where_clause}
         """, conn, params=params)
@@ -2160,7 +2356,7 @@ def get_rethink_website_classification_matrix(df_raw=None, company_id: Optional[
             donor_distinct = donor_df.drop_duplicates(subset=["Campaign Name", "Code"])
 
             if db_matrix.empty:
-                return donor_distinct.fillna("Unassigned").reset_index(drop=True)
+                return _finalize_matrix_flags(donor_distinct.fillna("Unassigned").reset_index(drop=True))
 
             merged = pd.merge(
                 donor_distinct[["Campaign Name", "Code", "Community Name"]],
@@ -2168,11 +2364,14 @@ def get_rethink_website_classification_matrix(df_raw=None, company_id: Optional[
                 on=["Campaign Name", "Code"],
                 how="outer",
                 suffixes=('', '_db')
-            ).fillna("Unassigned")
-            return merged.drop_duplicates(subset=["Campaign Name", "Code"]).reset_index(drop=True)
+            )
+            meta_cols = ["is_verified", "verified_by", "verified_at", "needs_feedback", "campaign_needs_feedback"]
+            fill_text = [c for c in merged.columns if c not in meta_cols]
+            merged[fill_text] = merged[fill_text].fillna("Unassigned")
+            return _finalize_matrix_flags(merged.drop_duplicates(subset=["Campaign Name", "Code"]).reset_index(drop=True))
 
     if not db_matrix.empty:
-        return db_matrix.fillna("Unassigned").reset_index(drop=True)
+        return _finalize_matrix_flags(db_matrix)
 
     return pd.DataFrame(columns=["Campaign Name", "Code", "Community Name"] + [c for c in target_cols if c != "Code"])
 
@@ -2205,6 +2404,11 @@ def get_stripe_classification_matrix(df_raw=None, company_id: Optional[str] = "r
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(special_case, '') as "Special Case",
                 COALESCE(is_primary, 1) as "is_primary",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback",
                 company_id
             FROM stripe_link_classifications
             {where_clause}
@@ -2215,7 +2419,7 @@ def get_stripe_classification_matrix(df_raw=None, company_id: Optional[str] = "r
         conn.close()
 
     if not db_matrix.empty:
-        return db_matrix.fillna("Unassigned").reset_index(drop=True)
+        return _finalize_matrix_flags(db_matrix).reset_index(drop=True)
 
     return pd.DataFrame(columns=["Campaign Name", "Giving Level", "Code", "Community Name", "Campaign URL"] + [c for c in target_cols if c != "Code"] + ["Special Case", "is_primary"])
 
@@ -3327,6 +3531,15 @@ def process_and_upload_excel(file_buffer, source_name=None, upload_mode="replace
     df["company_id"] = target_cid
 
     # Check if uploaded file is a Payout report vs Raw Donor report
+    is_givebrite_payout = (
+        str(platform).lower() in ["givebrite payout", "givebrite_payout", "iqra givebrite payout", "rethink givebrite payout"] or
+        (str(platform).lower() in ["givebrite", "auto"] and ("amount_charity" in df.columns or "Transfer Amount" in df.columns or "Transfer Amount (SC)" in df.columns) and ("charge_id" in df.columns or "ID" in df.columns))
+    )
+
+    if is_givebrite_payout:
+        from backend.services.payout_enrichment import process_payout_upload_pipeline
+        return process_payout_upload_pipeline(file_buffer=file_buffer, filename=batch_label, company_id=target_cid, upload_mode=upload_mode)
+
     is_payout_file = (
         str(platform).lower() == "launchgood payout" or
         "Settlement Gross (SC)" in df.columns or
@@ -4727,7 +4940,12 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
                 COALESCE(donor_name, '') as "Donor Name",
                 COALESCE(donor_email, '') as "Donor Email",
                 COALESCE(campaign_ref, '') as "campaign_ref",
-                COALESCE(giving_level_ref, '') as "giving_level_ref"
+                COALESCE(giving_level_ref, '') as "giving_level_ref",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback"
             FROM givebright_classifications
             {where_clause}
         """, conn, params=params)
@@ -4863,14 +5081,14 @@ def get_givebright_classification_matrix(df_raw=None, company_id: Optional[str] 
     else:
         deduped_df["total_amount"] = 0.0
 
-    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary", "campaign_ref", "giving_level_ref"]]
+    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary", "campaign_ref", "giving_level_ref", "is_verified", "verified_by", "verified_at", "needs_feedback", "campaign_needs_feedback"]]
     deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
     for ref_c in ["campaign_ref", "giving_level_ref"]:
         if ref_c in deduped_df.columns:
             deduped_df[ref_c] = deduped_df[ref_c].fillna("").astype(str).str.strip().replace({"Unassigned": "", "None": "", "nan": ""})
     if "Campaign URL" in deduped_df.columns:
         deduped_df["Campaign URL"] = deduped_df["Campaign URL"].map(clean_campaign_url)
-    return deduped_df.reset_index(drop=True)
+    return _finalize_matrix_flags(deduped_df).reset_index(drop=True)
 
 
 def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "iqra"):
@@ -4901,7 +5119,12 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
                 COALESCE(sub_heading, office, 'Unassigned') as "Sub-Heading",
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
-                COALESCE(is_primary, 0) as "is_primary"
+                COALESCE(is_primary, 0) as "is_primary",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback"
             FROM madinah_classifications
             {where_clause}
         """, conn, params=params)
@@ -5013,14 +5236,14 @@ def get_madinah_classification_matrix(df_raw=None, company_id: Optional[str] = "
     else:
         deduped_df["total_amount"] = 0.0
 
-    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary", "campaign_ref", "giving_level_ref"]]
+    text_cols = [c for c in deduped_df.columns if c not in ["donation_count", "total_amount", "is_primary", "campaign_ref", "giving_level_ref", "is_verified", "verified_by", "verified_at", "needs_feedback", "campaign_needs_feedback"]]
     deduped_df[text_cols] = deduped_df[text_cols].fillna("Unassigned")
     for ref_c in ["campaign_ref", "giving_level_ref"]:
         if ref_c in deduped_df.columns:
             deduped_df[ref_c] = deduped_df[ref_c].fillna("").astype(str).str.strip().replace({"Unassigned": "", "None": "", "nan": ""})
     if "Campaign URL" in deduped_df.columns:
         deduped_df["Campaign URL"] = deduped_df["Campaign URL"].map(clean_campaign_url)
-    return deduped_df.reset_index(drop=True)
+    return _finalize_matrix_flags(deduped_df).reset_index(drop=True)
 
 
 def save_givebright_classification_matrix(matrix_df, company_id: str = "rethink"):

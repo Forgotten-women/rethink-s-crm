@@ -8,7 +8,7 @@ import { Search, X, SlidersHorizontal, Mail, ChevronDown, ChevronUp } from 'luci
  *   daterange: { key, label, type: 'daterange', section? }
  *   toggle: { key, label, type: 'toggle' }
  */
-export default function TrackerFilterBar({ fields, values, onChange, resultCount }) {
+export default function TrackerFilterBar({ fields, values, onChange, resultCount, resultLabel }) {
   const [local, setLocal] = useState(values);
   const [showComms, setShowComms] = useState(true);
 
@@ -175,7 +175,7 @@ export default function TrackerFilterBar({ fields, values, onChange, resultCount
 
         {resultCount !== undefined && (
           <span className="text-xs text-slate-500 dark:text-slate-400 font-bold ml-auto">
-            {resultCount} {resultCount === 1 ? 'allocation result' : 'allocation results'}
+            {resultCount} {resultCount === 1 ? (resultLabel || 'allocation result') : (resultLabel ? (resultLabel.endsWith('y') ? `${resultLabel.slice(0, -1)}ies` : `${resultLabel}s`) : 'allocation results')}
           </span>
         )}
       </div>

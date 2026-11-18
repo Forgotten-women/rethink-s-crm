@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, HTTPException, Response
+from fastapi import APIRouter, Depends, Query, HTTPException, Response, Request, File, Form, UploadFile
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from core.cache import cached
@@ -14,6 +14,8 @@ from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+from backend.services.payout_enrichment import process_payout_upload_pipeline, REPORTS_DIR
 
 from core.data_processor import (
     LOCAL_DB_PATH,
@@ -36,7 +38,7 @@ from core.data_processor import (
     invalidate_paysuite_payouts_cache as _core_invalidate_paysuite_payouts_cache
 )
 from core.database import get_db_connection, _DB_LOCK
-from backend.api.auth import require_super_admin
+from backend.api.auth import require_super_admin, get_current_user, enforce_route_permission
 
 router = APIRouter(prefix="/api/payouts", tags=["Payouts Reconciliation"])
 
@@ -340,6 +342,19 @@ def _get_classification_matrix_dict(platform: str = "launchgood", company_id: Op
             return {}
 
 
+def _filter_payout_by_platform(target_df: pd.DataFrame, plat_req: str) -> pd.DataFrame:
+    if target_df is None or target_df.empty:
+        return pd.DataFrame()
+    p = str(plat_req or "").lower().strip()
+    if p in ("givebrite", "givebrite payout"):
+        m = target_df["Platform"].astype(str).str.lower().str.contains("givebrite", na=False)
+        return target_df[m].copy()
+    elif p == "launchgood":
+        m = target_df["Platform"].astype(str).str.lower().str.contains("launchgood", na=False)
+        return target_df[m].copy()
+    return target_df.copy()
+
+
 def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = False, company_id: Optional[str] = "rethink"):
     global _CLASSIFIED_PAYOUTS_CACHE, _CLASSIFIED_PAYSUITE_CACHE
     p_clean = _clean_str(platform, "launchgood").lower()
@@ -463,9 +478,9 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                                 needs_reclass = True
                                 break
                         if not needs_reclass:
-                            return cached_df
+                            return _filter_payout_by_platform(cached_df, p_clean)
                 else:
-                    return cached_df
+                    return _filter_payout_by_platform(cached_df, p_clean)
 
         try:
             df_p = load_payouts_data(force_reload=force_reload, company_id=cid)
@@ -529,7 +544,10 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
                 df["zakat"] = df.get("Zakat Eligibility", pd.Series("Unassigned", index=df.index)).fillna("Unassigned").apply(fix_mojibake)
                 df["settlement_currency"] = df.get("Settlement Currency", pd.Series("GBP", index=df.index)).fillna("GBP").astype(str).str.strip().str.upper()
                 df["Settlement Currency"] = df["settlement_currency"]
-                df["Platform"] = "LaunchGood"
+                if "Platform" not in df.columns:
+                    df["Platform"] = "LaunchGood"
+                else:
+                    df["Platform"] = df["Platform"].fillna("LaunchGood")
 
                 rule_dict = _get_classification_matrix_dict("launchgood", company_id=cid)
                 c_keys = df["campaign_name"].astype(str).str.strip().str.lower().apply(fix_mojibake).tolist()
@@ -620,15 +638,15 @@ def _get_payout_data_from_db(platform: str = "launchgood", force_reload: bool = 
 
                 _CLASSIFIED_PAYOUTS_CACHE[cid] = df
                 _CACHE_PAYOUTS_MTIME[cid] = cur_mtime
-                return _CLASSIFIED_PAYOUTS_CACHE[cid]
+                return _filter_payout_by_platform(_CLASSIFIED_PAYOUTS_CACHE[cid], p_clean)
 
             _CLASSIFIED_PAYOUTS_CACHE[cid] = pd.DataFrame()
             _CACHE_PAYOUTS_MTIME[cid] = cur_mtime
-            return _CLASSIFIED_PAYOUTS_CACHE[cid]
+            return pd.DataFrame()
         except Exception as e:
-            print(f"[Error] Reading cached launchgood payout data: {e}")
+            print(f"[Error] Reading cached payout data: {e}")
             _CLASSIFIED_PAYOUTS_CACHE[cid] = pd.DataFrame()
-            return _CLASSIFIED_PAYOUTS_CACHE[cid]
+            return pd.DataFrame()
 
 
 def _generate_disbursement_summary(df_curr: pd.DataFrame, currency_name: str, platform: str = "launchgood") -> Dict[str, Any]:
@@ -1058,7 +1076,7 @@ def get_payout_platforms(company_id: str = Query("rethink")):
     (PaySuite client REC and the connected Stripe account are Rethink's)."""
     from core.stripe_accounts import is_connected
     comp = str(company_id or "rethink").strip().lower()
-    platforms = ["launchgood"]
+    platforms = ["launchgood", "givebrite"]
     if comp == PAYSUITE_COMPANY:
         platforms.append("paysuite")
     if comp != "all" and is_connected(comp):
@@ -2462,3 +2480,114 @@ def get_paysuite_disbursals(
         return {"disbursals": results}
     finally:
         conn.close()
+
+
+# -----------------------------------------------------------------------------
+# Direct Payout Settlements Upload & Accounting Pack Generation
+# -----------------------------------------------------------------------------
+
+@router.post("/upload")
+def upload_payout_settlement(
+    request: Request,
+    company_id: str = Form("rethink"),
+    platform: str = Form("givebrite"),
+    upload_mode: str = Form("merge"),
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Directly uploads and auto-enriches a GiveBrite payout or transfer file for Rethink or Iqra.
+    Matches against live CRM donations, marks records as Payout Settled = 'Yes', and generates
+    a 10-Sheet Executive Accounting Audit Workbook (.xlsx).
+    """
+    target_cid = str(company_id or "rethink").strip().lower()
+    if not target_cid or target_cid == "all":
+        raise HTTPException(status_code=400, detail="Please select a specific charity partition to upload payout data into.")
+
+    # RBAC Enforcement: user must hold payouts.upload or data.upload for target_cid
+    enforce_route_permission(request, current_user, [target_cid])
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".csv", ".xlsx", ".xls"]:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Please upload a .csv, .xlsx, or .xls file.")
+
+    try:
+        file_bytes = file.file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty (0 bytes).")
+        file_buffer = io.BytesIO(file_bytes)
+
+        res = process_payout_upload_pipeline(
+            file_buffer=file_buffer,
+            filename=file.filename,
+            company_id=target_cid,
+            upload_mode=upload_mode
+        )
+        return res
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        print(f"[Error] Payout settlement upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process payout upload: {str(e)}")
+
+
+@router.get("/reports/{company_id}/{filename}")
+def download_accounting_pack(
+    request: Request,
+    company_id: str,
+    filename: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Downloads the generated 10-Sheet Executive Accounting Audit Workbook."""
+    target_cid = str(company_id or "").strip().lower()
+    enforce_route_permission(request, current_user, [target_cid])
+
+    safe_name = os.path.basename(filename)
+    report_path = os.path.join(REPORTS_DIR, target_cid, safe_name)
+    if not os.path.exists(report_path):
+        raise HTTPException(status_code=404, detail="Requested accounting pack was not found or has expired.")
+
+    with open(report_path, "rb") as f:
+        content_bytes = f.read()
+
+    return Response(
+        content=content_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={safe_name}"}
+    )
+
+
+@router.get("/reports")
+def list_accounting_packs(
+    request: Request,
+    company_id: str = Query("rethink"),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Lists available generated accounting workbooks for this charity."""
+    target_cid = str(company_id or "rethink").strip().lower()
+    enforce_route_permission(request, current_user, [target_cid])
+
+    company_dir = os.path.join(REPORTS_DIR, target_cid)
+    if not os.path.exists(company_dir):
+        return {"status": "success", "reports": []}
+
+    reports = []
+    for f in os.listdir(company_dir):
+        if f.endswith(".xlsx"):
+            full_p = os.path.join(company_dir, f)
+            mtime = os.path.getmtime(full_p)
+            size = os.path.getsize(full_p)
+            reports.append({
+                "filename": f,
+                "url": f"/api/payouts/reports/{target_cid}/{f}",
+                "created_at": datetime.fromtimestamp(mtime).isoformat(),
+                "size_bytes": size
+            })
+
+    reports.sort(key=lambda r: r["created_at"], reverse=True)
+    return {"status": "success", "reports": reports}

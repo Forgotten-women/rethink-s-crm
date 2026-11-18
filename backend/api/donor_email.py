@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from config.settings import LOCAL_DB_PATH
+from core.cache import cached
 from backend.api.unsubscribe import is_unsubscribed
 from backend.api.tracker import (
     THEME_OWNER_COMPANY, _PLACEHOLDER_RE, _get_outlook_auth_row, _get_template, _get_valid_graph_token,
@@ -1592,3 +1593,523 @@ def check_recipients(req: CheckRequest):
                 problems.append({"email": em, "name": rendered["recipient_name"], "missing": missing, "issue": _issue_text(missing, has_spons) + about})
                 break
     return {"checked": len(req.recipients), "ok": len(req.recipients) - len(problems), "problems": problems}
+
+
+# ==============================================================================
+# General Feedback Eligible (Campaigns & Giving Levels flagged 'needs_feedback')
+# ==============================================================================
+
+def _norm_feedback_platform(plat: str) -> str:
+    p = str(plat or "launchgood").strip().lower()
+    if p in ("givebrite", "givebright"):
+        return "givebrite"
+    if p in ("rethink website", "website", "rethink_website"):
+        return "website"
+    if p in ("stripe", "payment_links", "stripe links"):
+        return "stripe"
+    if p == "madinah":
+        return "madinah"
+    if p == "paysuite":
+        return "paysuite"
+    return "launchgood"
+
+
+@cached(scopes=["donations", "classification"], ttl=3600)
+def _load_feedback_matched_donations(company_id: str) -> Dict[str, Any]:
+    """
+    Loads all donations matching campaigns or giving levels flagged with `needs_feedback = 1`
+    using DuckDB semi-join over Parquet (~30ms) cached by ['donations', 'classification'] version.
+    """
+    import os
+    import duckdb
+    import pandas as pd
+    from config.settings import PARQUET_PATH
+
+    comp = _company(company_id)
+
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10.0)
+    try:
+        rows = conn.execute("""
+            SELECT
+                LOWER(TRIM(platform)) AS plat_raw,
+                LOWER(TRIM(campaign_name)) AS camp_low,
+                LOWER(TRIM(COALESCE(giving_level, ''))) AS gl_low,
+                COALESCE(needs_feedback, 0) AS needs_feedback,
+                COALESCE(campaign_needs_feedback, 0) AS campaign_needs_feedback,
+                campaign_name,
+                COALESCE(giving_level, '') AS giving_level,
+                COALESCE(code, 'Unassigned') AS code,
+                COALESCE(is_verified, 0) AS is_verified,
+                COALESCE(verified_by, '') AS verified_by
+            FROM platform_campaign_mappings
+            WHERE (COALESCE(needs_feedback, 0) = 1 OR COALESCE(campaign_needs_feedback, 0) = 1)
+              AND LOWER(COALESCE(company_id, 'rethink')) = ?
+        """, (comp,)).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"rules": [], "donations": [], "campaigns": []}
+
+    whole_pairs = set()
+    specific_triples = set()
+    rules_list = []
+    seen_rules = set()
+
+    for plat_raw, camp_low, gl_low, nf, cnf, cname, gl_orig, code, is_ver, ver_by in rows:
+        plat = _norm_feedback_platform(plat_raw)
+        if cnf:
+            whole_pairs.add((plat, camp_low))
+        if nf:
+            specific_triples.add((plat, camp_low, gl_low))
+        rk = (plat, camp_low, gl_low, code)
+        if rk not in seen_rules:
+            seen_rules.add(rk)
+            rules_list.append({
+                "platform": plat,
+                "campaign_name": cname,
+                "giving_level": gl_orig,
+                "code": code,
+                "whole_campaign": bool(cnf),
+                "is_verified": bool(is_ver),
+                "verified_by": ver_by or "",
+            })
+
+    if not os.path.exists(PARQUET_PATH):
+        return {"rules": rules_list, "donations": [], "campaigns": sorted({r["campaign_name"] for r in rules_list})}
+
+    df_whole = pd.DataFrame(list(whole_pairs), columns=["plat", "camp"]) if whole_pairs else pd.DataFrame(columns=["plat", "camp"])
+    df_spec = pd.DataFrame(list(specific_triples), columns=["plat", "camp", "gl"]) if specific_triples else pd.DataFrame(columns=["plat", "camp", "gl"])
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("SET threads TO 4;")
+        con.register("df_whole", df_whole)
+        con.register("df_spec", df_spec)
+        pq_path = PARQUET_PATH.replace("\\", "/")
+
+        sql = f"""
+            WITH base AS (
+                SELECT
+                    CAST("Donation ID" AS VARCHAR) AS donation_id,
+                    COALESCE(CAST("Created Date (UTC)" AS VARCHAR), CAST("Date" AS VARCHAR), '') AS created_date,
+                    LOWER(TRIM(COALESCE(CAST("company_id" AS VARCHAR), 'rethink'))) AS company_id,
+                    CASE
+                        WHEN LOWER(COALESCE(CAST("Platform" AS VARCHAR), '')) IN ('givebrite', 'givebright') THEN 'givebrite'
+                        WHEN LOWER(COALESCE(CAST("Platform" AS VARCHAR), '')) IN ('rethink website', 'website', 'rethink_website') THEN 'website'
+                        WHEN LOWER(COALESCE(CAST("Platform" AS VARCHAR), '')) IN ('stripe', 'payment_links') THEN 'stripe'
+                        WHEN LOWER(COALESCE(CAST("Platform" AS VARCHAR), '')) = 'madinah' THEN 'madinah'
+                        WHEN LOWER(COALESCE(CAST("Platform" AS VARCHAR), '')) = 'paysuite' THEN 'paysuite'
+                        ELSE 'launchgood'
+                    END AS plat_norm,
+                    COALESCE(CAST("Platform" AS VARCHAR), 'LaunchGood') AS platform,
+                    COALESCE(NULLIF(TRIM(CAST("Campaign Name" AS VARCHAR)), ''), 'N/A') AS campaign_name,
+                    CASE
+                        WHEN "Giving Level Title" IS NOT NULL AND LOWER(TRIM(CAST("Giving Level Title" AS VARCHAR))) NOT IN ('', 'nan', 'none', 'null', 'n/a', 'default (general)')
+                            THEN TRIM(CAST("Giving Level Title" AS VARCHAR))
+                        WHEN "impact_name" IS NOT NULL AND LOWER(TRIM(CAST("impact_name" AS VARCHAR))) NOT IN ('', 'nan', 'none', 'null', 'n/a', 'default (general)')
+                            THEN TRIM(CAST("impact_name" AS VARCHAR))
+                        ELSE ''
+                    END AS giving_level,
+                    COALESCE(NULLIF(TRIM(CAST("Code" AS VARCHAR)), ''), 'Unassigned') AS code,
+                    COALESCE(NULLIF(TRIM(CAST("Heading" AS VARCHAR)), ''), NULLIF(TRIM(CAST("Department" AS VARCHAR)), ''), 'Unassigned') AS department,
+                    COALESCE(NULLIF(TRIM(CAST("Country" AS VARCHAR)), ''), 'Unassigned') AS country,
+                    COALESCE(NULLIF(TRIM(CAST("First Name" AS VARCHAR)), ''), '') AS first_name,
+                    COALESCE(NULLIF(TRIM(CAST("Last Name" AS VARCHAR)), ''), '') AS last_name,
+                    COALESCE(NULLIF(TRIM(CAST("Billing Name" AS VARCHAR)), ''), NULLIF(TRIM(CAST("Display Name" AS VARCHAR)), ''), '') AS fallback_name,
+                    LOWER(TRIM(COALESCE(
+                        NULLIF(NULLIF(LOWER(TRIM(CAST("Email" AS VARCHAR))), 'nan'), ''),
+                        NULLIF(NULLIF(LOWER(TRIM(CAST("Email (for tax receipt)" AS VARCHAR))), 'nan'), ''),
+                        ''
+                    ))) AS email,
+                    COALESCE(NULLIF(TRIM(CAST("Donor ID" AS VARCHAR)), ''), '') AS donor_id,
+                    COALESCE(NULLIF(TRIM(CAST("Marketing Consent" AS VARCHAR)), ''), 'Unknown') AS marketing_consent,
+                    COALESCE(TRY_CAST(REPLACE(REPLACE(COALESCE(
+                        CAST("Total Online Donation Gross Amount in Settled Currency" AS VARCHAR),
+                        CAST("Donation Amount (in Donation Currency)" AS VARCHAR),
+                        '0'
+                    ), '£', ''), ',', '') AS DOUBLE), 0.0) AS amount,
+                    COALESCE(NULLIF(TRIM(CAST("fundraiser_name" AS VARCHAR)), ''), '') AS fundraiser_name
+                FROM '{pq_path}'
+                WHERE LOWER(TRIM(COALESCE(CAST("company_id" AS VARCHAR), 'rethink'))) = ?
+            )
+            SELECT
+                donation_id, created_date, plat_norm, platform, campaign_name, giving_level,
+                code, department, country, first_name, last_name, fallback_name, email,
+                donor_id, marketing_consent, amount, fundraiser_name
+            FROM base b
+            WHERE EXISTS (
+                SELECT 1 FROM df_whole w
+                WHERE w.plat = b.plat_norm AND w.camp = LOWER(TRIM(b.campaign_name))
+            )
+            OR EXISTS (
+                SELECT 1 FROM df_spec s
+                WHERE s.plat = b.plat_norm AND s.camp = LOWER(TRIM(b.campaign_name)) AND s.gl = LOWER(TRIM(b.giving_level))
+            )
+            ORDER BY created_date DESC
+        """
+        df_matched = con.execute(sql, [comp]).df()
+    finally:
+        con.close()
+
+    # Apply RBAC fundraiser record scope if user is restricted
+    from core import rbac
+    scope = rbac.request_scope(comp)
+    if scope is not None and not df_matched.empty:
+        scoped_names = rbac.scoped_fundraiser_names(comp, scope)
+        df_matched = df_matched[df_matched["fundraiser_name"].str.strip().str.lower().isin(scoped_names)].copy()
+
+    # Get SP lookup sets
+    from core.data_processor import get_sp_lookup_sets
+    sp_camps, sp_slugs, sp_names = get_sp_lookup_sets()
+    from backend.api.fundraisers import is_sp_text
+    from backend.api.tracker import is_sp_campaign_name
+
+    donations = []
+    if not df_matched.empty:
+        for r in df_matched.itertuples(index=False):
+            fn = "" if str(r.first_name).lower() in ("nan", "none") else str(r.first_name).strip()
+            ln = "" if str(r.last_name).lower() in ("nan", "none") else str(r.last_name).strip()
+            fb = "" if str(r.fallback_name).lower() in ("nan", "none") else str(r.fallback_name).strip()
+            dname = f"{fn} {ln}".strip() or fb or "Anonymous / Unknown"
+            em = str(r.email or "").strip()
+            if em in ("nan", "none", "n/a", "<na>"):
+                em = ""
+            d_key = em if "@" in em else (str(r.donor_id or "").strip().lower() or dname.lower())
+            
+            cname_str = str(r.campaign_name or "").strip()
+            fr_str = str(r.fundraiser_name or "").strip()
+            is_sp_flag = bool(
+                is_sp_campaign_name(cname_str)
+                or is_sp_text(cname_str)
+                or cname_str.lower() in sp_camps
+                or (fr_str and (is_sp_text(fr_str) or fr_str.lower() in sp_names))
+            )
+
+            donations.append({
+                "donation_id": str(r.donation_id or ""),
+                "created_date": str(r.created_date or "")[:10],
+                "plat_norm": r.plat_norm,
+                "platform": r.platform,
+                "campaign_name": r.campaign_name,
+                "giving_level": r.giving_level,
+                "code": r.code,
+                "department": r.department,
+                "country": r.country,
+                "donor_name": dname,
+                "email": em,
+                "donor_id": str(r.donor_id or em or d_key),
+                "donor_key": d_key,
+                "marketing_consent": str(r.marketing_consent or "Unknown"),
+                "amount": round(float(r.amount or 0.0), 2),
+                "is_sp": is_sp_flag,
+                "cause": "SP" if is_sp_flag else "Non-SP",
+            })
+
+    campaigns = sorted({d["campaign_name"] for d in donations} | {r["campaign_name"] for r in rules_list})
+    return {
+        "rules": rules_list,
+        "donations": donations,
+        "campaigns": campaigns,
+    }
+
+
+def _live_email_status_maps(comp: str):
+    """Fetches real-time sent email & unsubscribe maps directly from SQLite in <2ms."""
+    conn = sqlite3.connect(f"file:{LOCAL_DB_PATH}?mode=ro", uri=True, timeout=10.0)
+    emailed_any = {}
+    emailed_feedback = {}
+    unsub_set = set()
+    try:
+        for em, tpl, sent_at, opened_at, opens, replied_at in conn.execute("""
+            SELECT LOWER(TRIM(recipient_email)), COALESCE(template_type, ''),
+                   COALESCE(sent_at, created_at, ''), COALESCE(opened_at, ''),
+                   COALESCE(open_count, 0), COALESCE(replied_at, '')
+            FROM crm_email_messages
+            WHERE LOWER(company_id) = ? AND status = 'sent'
+            ORDER BY id ASC
+        """, (comp,)):
+            if not em:
+                continue
+            rec = emailed_any.get(em, {"sent_at": "", "template_type": "", "open_count": 0, "replied_at": ""})
+            rec["sent_at"] = sent_at or rec["sent_at"]
+            rec["template_type"] = tpl or rec["template_type"]
+            rec["open_count"] = rec["open_count"] + int(opens or 0)
+            if replied_at:
+                rec["replied_at"] = replied_at
+            emailed_any[em] = rec
+
+            if "feedback" in tpl.lower():
+                frec = emailed_feedback.get(em, {"sent_at": "", "template_type": tpl, "open_count": 0, "replied_at": ""})
+                frec["sent_at"] = sent_at or frec["sent_at"]
+                frec["open_count"] = frec["open_count"] + int(opens or 0)
+                if replied_at:
+                    frec["replied_at"] = replied_at
+                emailed_feedback[em] = frec
+
+        for (em,) in conn.execute("SELECT LOWER(TRIM(email)) FROM email_unsubscribes WHERE LOWER(company_id) = ?", (comp,)):
+            if em:
+                unsub_set.add(em)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return emailed_any, emailed_feedback, unsub_set
+
+
+def _filter_and_aggregate_feedback(
+    comp: str,
+    platform: str = "all",
+    campaign: str = "all",
+    email_status: str = "all",
+    consent: str = "all",
+    search: str = "",
+    sp: str = "all",
+):
+    data = _load_feedback_matched_donations(company_id=comp)
+    emailed_any, emailed_feedback, unsub_set = _live_email_status_maps(comp)
+
+    raw_donations = data["donations"]
+    plat_f = str(platform or "all").strip().lower()
+    camp_f = str(campaign or "all").strip().lower()
+    es_f = str(email_status or "all").strip().lower()
+    con_f = str(consent or "all").strip().lower()
+    q = str(search or "").strip().lower()
+    sp_f = str(sp or "all").strip().lower()
+
+    # Build filtered donations + donor aggregation
+    filtered_donations = []
+    donors_map: Dict[str, Dict[str, Any]] = {}
+
+    for d in raw_donations:
+        if plat_f != "all" and d["plat_norm"] != plat_f:
+            continue
+        if camp_f != "all" and d["campaign_name"].strip().lower() != camp_f:
+            continue
+        if con_f == "yes" and d["marketing_consent"].strip().lower() != "yes":
+            continue
+        if con_f == "no" and d["marketing_consent"].strip().lower() == "yes":
+            continue
+        if sp_f in ("sp", "sp_only") and not d.get("is_sp"):
+            continue
+        if sp_f in ("non_sp", "non-sp", "non_sp_only") and d.get("is_sp"):
+            continue
+
+        em = d["email"]
+        any_info = emailed_any.get(em) if em else None
+        fb_info = emailed_feedback.get(em) if em else None
+        is_unsub = em in unsub_set if em else False
+
+        if es_f == "not_emailed" and any_info:
+            continue
+        if es_f == "emailed" and not any_info:
+            continue
+        if es_f == "feedback_not_sent" and fb_info:
+            continue
+        if es_f == "feedback_sent" and not fb_info:
+            continue
+
+        if q:
+            hay = f"{d['donor_name']} {em} {d['campaign_name']} {d['giving_level']} {d['code']} {d['donation_id']}".lower()
+            if q not in hay:
+                continue
+
+        d_enriched = {
+            **d,
+            "is_unsubscribed": is_unsub,
+            "emailed_at": str(any_info["sent_at"])[:16] if any_info else "",
+            "feedback_emailed_at": str(fb_info["sent_at"])[:16] if fb_info else "",
+            "email_template": any_info["template_type"] if any_info else "",
+        }
+        filtered_donations.append(d_enriched)
+
+        dk = d["donor_key"]
+        if dk not in donors_map:
+            donors_map[dk] = {
+                "donor_key": dk,
+                "donor_id": d["donor_id"],
+                "donor_name": d["donor_name"],
+                "email": em,
+                "has_email": "@" in em,
+                "donation_count": 0,
+                "total_amount": 0.0,
+                "last_gift_date": d["created_date"],
+                "first_gift_date": d["created_date"],
+                "campaigns": set(),
+                "giving_levels": set(),
+                "platforms": set(),
+                "codes": set(),
+                "marketing_consent": d["marketing_consent"],
+                "is_unsubscribed": is_unsub,
+                "emailed_at": str(any_info["sent_at"])[:16] if any_info else "",
+                "feedback_emailed_at": str(fb_info["sent_at"])[:16] if fb_info else "",
+                "email_template": any_info["template_type"] if any_info else "",
+                "email_opens": any_info["open_count"] if any_info else 0,
+                "replied_at": str(any_info["replied_at"])[:16] if (any_info and any_info["replied_at"]) else "",
+                "is_sp": False,
+            }
+        agg = donors_map[dk]
+        agg["donation_count"] += 1
+        agg["total_amount"] = round(agg["total_amount"] + d["amount"], 2)
+        if d.get("is_sp"):
+            agg["is_sp"] = True
+        if d["created_date"] and (not agg["last_gift_date"] or d["created_date"] > agg["last_gift_date"]):
+            agg["last_gift_date"] = d["created_date"]
+        if d["created_date"] and (not agg["first_gift_date"] or d["created_date"] < agg["first_gift_date"]):
+            agg["first_gift_date"] = d["created_date"]
+        agg["campaigns"].add(d["campaign_name"])
+        if d["giving_level"]:
+            agg["giving_levels"].add(d["giving_level"])
+        agg["platforms"].add(d["platform"])
+        if d["code"] and d["code"] != "Unassigned":
+            agg["codes"].add(d["code"])
+        if d["marketing_consent"].strip().lower() == "yes":
+            agg["marketing_consent"] = "Yes"
+
+    donors_list = []
+    for agg in donors_map.values():
+        donors_list.append({
+            **agg,
+            "cause": "SP" if agg.get("is_sp") else "Non-SP",
+            "campaigns": sorted(agg["campaigns"]),
+            "giving_levels": sorted(agg["giving_levels"]),
+            "platforms": sorted(agg["platforms"]),
+            "codes": sorted(agg["codes"]),
+        })
+    donors_list.sort(key=lambda x: (x["last_gift_date"] or "", x["total_amount"]), reverse=True)
+
+    emailed_donors = sum(1 for x in donors_list if x["emailed_at"])
+    fb_emailed_donors = sum(1 for x in donors_list if x["feedback_emailed_at"])
+    with_email = sum(1 for x in donors_list if x["has_email"] and not x["is_unsubscribed"])
+
+    summary = {
+        "total_donations": len(filtered_donations),
+        "total_donors": len(donors_list),
+        "emailable_donors": with_email,
+        "total_amount": round(sum(d["amount"] for d in filtered_donations), 2),
+        "emailed_donors": emailed_donors,
+        "not_emailed_donors": len(donors_list) - emailed_donors,
+        "feedback_sent_donors": fb_emailed_donors,
+        "feedback_pending_donors": len(donors_list) - fb_emailed_donors,
+        "flagged_rules": len(data["rules"]),
+        "flagged_campaigns": len({r["campaign_name"] for r in data["rules"]}),
+        "sp_donations": sum(1 for d in filtered_donations if d.get("is_sp")),
+        "non_sp_donations": sum(1 for d in filtered_donations if not d.get("is_sp")),
+        "sp_donors": sum(1 for d in donors_list if d.get("is_sp")),
+        "non_sp_donors": sum(1 for d in donors_list if not d.get("is_sp")),
+    }
+    return {
+        "summary": summary,
+        "rules": data["rules"],
+        "campaigns": data["campaigns"],
+        "donors": donors_list,
+        "donations": filtered_donations,
+    }
+
+
+@router.get("/general-feedback-eligible")
+def get_general_feedback_eligible(
+    company_id: str = Query(...),
+    view: str = Query("donors"),
+    platform: str = Query("all"),
+    campaign: str = Query("all"),
+    email_status: str = Query("all"),
+    consent: str = Query("all"),
+    search: str = Query(""),
+    sp: str = Query("all"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+):
+    """
+    Real-time endpoint for 'General Feedback Eligible' tab in Emails:
+    Returns eligible donors and donations under campaigns/giving levels marked with 'needs_feedback'.
+    """
+    comp = _company(company_id)
+    res = _filter_and_aggregate_feedback(
+        comp=comp,
+        platform=platform,
+        campaign=campaign,
+        email_status=email_status,
+        consent=consent,
+        search=search,
+        sp=sp,
+    )
+    items = res["donations"] if view == "donations" else res["donors"]
+    total = len(items)
+    start = (page - 1) * page_size
+    end = start + page_size
+    emailable_donor_ids = [d["donor_id"] for d in res["donors"] if d["has_email"] and not d["is_unsubscribed"]][:5000]
+
+    return {
+        "status": "success",
+        "company_id": comp,
+        "view": view,
+        "summary": res["summary"],
+        "rules": res["rules"],
+        "campaigns": res["campaigns"],
+        "items": items[start:end],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "emailable_donor_ids": emailable_donor_ids,
+    }
+
+
+@router.get("/general-feedback-eligible/export")
+def export_general_feedback_eligible(
+    company_id: str = Query(...),
+    view: str = Query("donors"),
+    platform: str = Query("all"),
+    campaign: str = Query("all"),
+    email_status: str = Query("all"),
+    consent: str = Query("all"),
+    search: str = Query(""),
+    sp: str = Query("all"),
+):
+    """Exports General Feedback Eligible donors or donations as CSV supporting filters."""
+    import csv
+    import io
+    from fastapi import Response
+
+    comp = _company(company_id)
+    res = _filter_and_aggregate_feedback(
+        comp=comp,
+        platform=platform,
+        campaign=campaign,
+        email_status=email_status,
+        consent=consent,
+        search=search,
+        sp=sp,
+    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    if view == "donations":
+        writer.writerow(["Date", "Donation ID", "Donor Name", "Email", "Cause (SP / Non-SP)", "Platform", "Campaign Name", "Giving Level", "Code", "Amount", "Marketing Consent", "Last Emailed", "Feedback Emailed"])
+        for d in res["donations"]:
+            writer.writerow([
+                d["created_date"], d["donation_id"], d["donor_name"], d["email"],
+                "SP" if d.get("is_sp") else "Non-SP",
+                d["platform"], d["campaign_name"], d["giving_level"] or "Default",
+                d["code"], d["amount"], d["marketing_consent"],
+                d["emailed_at"] or "Not Emailed", d["feedback_emailed_at"] or "Pending",
+            ])
+    else:
+        writer.writerow(["Donor Name", "Email", "Cause (SP / Non-SP)", "Donations Count", "Total Amount", "Last Gift Date", "Campaigns", "Giving Levels", "Platforms", "Codes", "Marketing Consent", "Unsubscribed", "Last Emailed", "Feedback Emailed"])
+        for d in res["donors"]:
+            writer.writerow([
+                d["donor_name"], d["email"],
+                "SP" if d.get("is_sp") else "Non-SP",
+                d["donation_count"], d["total_amount"],
+                d["last_gift_date"], "; ".join(d["campaigns"]), "; ".join(d["giving_levels"]) or "Default",
+                "; ".join(d["platforms"]), "; ".join(d["codes"]), d["marketing_consent"],
+                "Yes" if d["is_unsubscribed"] else "No", d["emailed_at"] or "Not Emailed",
+                d["feedback_emailed_at"] or "Pending",
+            ])
+
+    fname = f"{comp}_general_feedback_eligible_{view}_{datetime.datetime.now().strftime('%Y%m%d')}.csv"
+    return Response(
+        content=buf.getvalue().encode("utf-8-sig"),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )

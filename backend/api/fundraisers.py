@@ -109,6 +109,19 @@ def page_group_label(group: str, comp: str) -> str:
     return "SP" if group == "SP" else ("Iqra" if comp == "iqra" else "Rethink")
 
 
+def sp_rt_tag(group: Optional[str], comp: str = "rethink", name: str = "", campaigns: Optional[List[str]] = None) -> str:
+    """'SP' or 'RT' (or 'IQ' for Iqra). Returns the concise brand acronym for reporting."""
+    g = str(group or "").strip().upper()
+    if g == "SP":
+        return "SP"
+    if name or campaigns:
+        resolved = resolve_page_group(group, name, campaigns or [])
+        if resolved == "SP":
+            return "SP"
+    c = str(comp or "").strip().lower()
+    return "IQ" if c == "iqra" else "RT"
+
+
 def platform_label(platform: str) -> str:
     known = {"launchgood": "LaunchGood", "givebrite": "GiveBrite", "givebright": "GiveBrite", "madinah": "Madinah"}
     return known.get(platform, platform.title() if platform and platform != "*" else "Any platform")
@@ -893,6 +906,8 @@ def get_fundraisers_list(
     status_filter: Optional[str] = "ALL",
     company_id: Optional[str] = Query("rethink"),
     page_group: Optional[str] = Query(None),
+    email_filter: Optional[str] = Query("ALL"),
+    phone_filter: Optional[str] = Query("ALL"),
 ):
     """
     Returns list of all fundraisers with live aggregated metrics for the given company.
@@ -1135,11 +1150,32 @@ def get_fundraisers_list(
         period_progress_pct = round((period_raised / target_goal * 100.0), 1) if target_goal > 0 else 0.0
         avg_donation = round(all_time_raised / txn_count, 2) if txn_count > 0 else 0.0
 
+        has_em = bool(str(email or "").strip() and str(email or "").strip().lower() not in ("nan", "none", "n/a", "null"))
+        has_ph = bool(str(phone or "").strip() and str(phone or "").strip().lower() not in ("nan", "none", "n/a", "null"))
+
+        ef = str(email_filter or "ALL").strip().upper()
+        if ef in ("HAS_EMAIL", "WITH_EMAIL", "YES", "EMAIL_EXISTS"):
+            if not has_em:
+                continue
+        elif ef in ("MISSING_EMAIL", "NO_EMAIL", "NO", "WITHOUT_EMAIL"):
+            if has_em:
+                continue
+
+        pf = str(phone_filter or "ALL").strip().upper()
+        if pf in ("HAS_PHONE", "HAS_NUMBER", "WITH_PHONE", "WITH_NUMBER", "YES", "PHONE_EXISTS", "NUMBER_EXISTS"):
+            if not has_ph:
+                continue
+        elif pf in ("MISSING_PHONE", "MISSING_NUMBER", "NO_PHONE", "NO_NUMBER", "NO", "WITHOUT_PHONE", "WITHOUT_NUMBER"):
+            if has_ph:
+                continue
+
         fundraiser_obj = {
             "id": fid,
             "name": fname,
             "email": email,
             "phone": phone,
+            "has_email": has_em,
+            "has_phone": has_ph,
             "target_goal": round(target_goal, 2),
             "first_donation_date": first_donation_date or "N/A",
             "latest_donation_date": latest_donation_date or "N/A",
@@ -1347,34 +1383,156 @@ def _donor_display_names(df: pd.DataFrame) -> pd.Series:
     return s.where(s != "", _clean("Display Name"))
 
 
+def _extract_url_col(df: pd.DataFrame, *col_names: str) -> pd.Series:
+    res = pd.Series("", index=df.index, dtype=str)
+    for c in col_names:
+        if c in df.columns:
+            val = df[c].fillna("").astype(str).str.strip()
+            val = val.where(~val.str.lower().isin(["", "nan", "none", "<na>", "null", "nat"]), "")
+            res = res.where(res != "", val)
+    return res
+
+
 @router.get("/export")
 def export_fundraisers_csv(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     status_filter: Optional[str] = "ALL",
-    page_group: Optional[str] = Query(None),
-    search: Optional[str] = Query(None),
-    company_id: Optional[str] = Query("rethink"),
+    page_group: Optional[str] = None,
+    search: Optional[str] = None,
+    company_id: Optional[str] = "rethink",
+    mode: Optional[str] = "summary",
+    email_filter: Optional[str] = "ALL",
+    phone_filter: Optional[str] = "ALL",
 ):
-    """CSV of the fundraisers list under the current filters: the main page's columns, one row per fundraiser."""
+    """CSV export of filtered fundraisers: either summary list (1 row per fundraiser) or combined donations."""
     data = get_fundraisers_list(start_date=start_date, end_date=end_date, status_filter=status_filter,
-                                company_id=company_id, page_group=page_group)
+                                company_id=company_id, page_group=page_group,
+                                email_filter=email_filter, phone_filter=phone_filter)
     items = (data or {}).get("fundraisers") or []
     if search and str(search).strip():
         q = str(search).strip().lower()
-        items = [f for f in items if q in str(f.get("name") or "").lower() or q in str(f.get("email") or "").lower()]
+        items = [f for f in items if q in str(f.get("name") or "").lower() or q in str(f.get("email") or "").lower() or q in str(f.get("phone") or "").lower()]
     if not items:
         raise HTTPException(status_code=400, detail="No fundraisers to export under the current filters.")
+
+    comp = (company_id or "rethink").strip().lower()
+    df_donations = load_data(company_id=comp)
+    assignments_full = _load_assignments(comp)
+
+    # Combined detailed donations export mode
+    if str(mode or "").strip().lower() in ("donations", "combined"):
+        if df_donations is None or df_donations.empty:
+            raise HTTPException(status_code=400, detail="No donation data available to export.")
+        f_meta_map = {str(f.get("name") or "").strip().lower(): f for f in items}
+        allowed_fnames = set(f_meta_map.keys())
+
+        aid_map = {a["assignment_id"]: a for a in assignments_full}
+        fn_series, aid_series, mtype_series = attribute_donations(df_donations, comp, assignments_full)
+
+        mask = fn_series.isin(allowed_fnames)
+        sub_df = df_donations[mask].copy()
+        if sub_df.empty:
+            raise HTTPException(status_code=400, detail="No donations found for the filtered fundraisers.")
+
+        if "_parsed_date" not in sub_df.columns or sub_df["_parsed_date"].dropna().astype(str).str.strip().isin(["", "nan", "none", "nat"]).all():
+            date_cand = next((c for c in ["_parsed_date", "Created Date (UTC)", "Date", "created_at", "Settled Date (UTC)"] if c in sub_df.columns), None)
+            sub_df["_parsed_date"] = (pd.to_datetime(sub_df[date_cand], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d").fillna("")
+                                      if date_cand else "")
+        else:
+            sub_df["_parsed_date"] = sub_df["_parsed_date"].fillna("").astype(str).str.strip()
+
+        if start_date:
+            sub_df = sub_df[sub_df["_parsed_date"] >= str(start_date)[:10]]
+        if end_date:
+            sub_df = sub_df[sub_df["_parsed_date"] <= str(end_date)[:10]]
+        if sub_df.empty:
+            raise HTTPException(status_code=400, detail="No donations found for the filtered fundraisers in the selected date range.")
+
+        sub_df = sub_df.sort_values("_parsed_date", ascending=False)
+        sub_fn = fn_series.loc[sub_df.index]
+        sub_aid = aid_series.loc[sub_df.index]
+        sub_mtype = mtype_series.loc[sub_df.index]
+
+        f_url = _extract_url_col(sub_df, "Fundraiser URL", "fundraiser_url")
+        c_url = _extract_url_col(sub_df, "Community URL", "team_url")
+        camp_url = _extract_url_col(sub_df, "Campaign URL", "campaign_url")
+
+        tracked_page_url = sub_aid.map(lambda x: (aid_map.get(x, {}).get("match_value") or aid_map.get(x, {}).get("campaign_name") or "") if x else "").fillna("")
+        f_url = f_url.where(f_url != "", tracked_page_url.where(sub_mtype == "fundraiser_url", ""))
+        c_url = c_url.where(c_url != "", tracked_page_url.where(sub_mtype == "community_url", ""))
+        camp_url = camp_url.where(camp_url != "", tracked_page_url.where(sub_mtype == "campaign_url", ""))
+
+        amounts = platform_raised_amount(sub_df).astype(float).round(2)
+        export_df = pd.DataFrame({
+            "Date": sub_df["_parsed_date"],
+            "Fundraiser": sub_fn.map(lambda k: f_meta_map.get(k, {}).get("name") or k.title()),
+            "SP/RT": sub_fn.map(lambda k: sp_rt_tag(f_meta_map.get(k, {}).get("page_group") or f_meta_map.get(k, {}).get("page_group_label"), comp, f_meta_map.get(k, {}).get("name") or k)),
+            "Fundraiser Status": sub_fn.map(lambda k: f_meta_map.get(k, {}).get("status") or ""),
+            "Fundraiser Group": sub_fn.map(lambda k: f_meta_map.get(k, {}).get("page_group_label") or f_meta_map.get(k, {}).get("page_group") or ""),
+            "Donor": _donor_display_names(sub_df),
+            "Email": sub_df["Email"].fillna("").astype(str).str.strip() if "Email" in sub_df.columns else "",
+            "Amount": amounts,
+            "Campaign": sub_df.get("Campaign Name", ""),
+            "Giving Level": sub_df.get("Giving Level Title", ""),
+            "Code": sub_df.get("Code", ""),
+            "Platform": sub_df.get("Platform", ""),
+            "Payment Type": sub_df.get("Payment Frequency", ""),
+            "Heading": sub_df.get("Heading", ""),
+            "Country": sub_df.get("Country", ""),
+            "Special Case": sub_df.get("Special Case", ""),
+            "Gift Aid": sub_df.get("Gift Aid (yes or no)", ""),
+            "Fundraiser Page URL": f_url,
+            "Community URL": c_url,
+            "Campaign URL": camp_url,
+            "Tracked Page URL": tracked_page_url,
+            "Donation ID": sub_df.get("Donation ID", ""),
+        })
+        for c in export_df.columns:
+            if export_df[c].dtype == object:
+                export_df[c] = export_df[c].astype(str).replace({"nan": "", "None": "", "NaT": ""})
+        return _csv_response(export_df, f"fundraisers_combined_donations_{comp}")
+
+    # Summary list export mode (1 row per fundraiser)
+    f_urls_map, c_urls_map, camp_urls_map = {}, {}, {}
+    if df_donations is not None and not df_donations.empty:
+        fn_series, _aid_series, _ = attribute_donations(df_donations, comp, assignments_full)
+        df_url_scan = pd.DataFrame({
+            "fn": fn_series,
+            "f_url": _extract_url_col(df_donations, "Fundraiser URL", "fundraiser_url"),
+            "c_url": _extract_url_col(df_donations, "Community URL", "team_url"),
+            "camp_url": _extract_url_col(df_donations, "Campaign URL", "campaign_url"),
+        })
+        df_url_scan = df_url_scan[df_url_scan["fn"] != ""]
+        if not df_url_scan.empty:
+            f_urls_map = df_url_scan[df_url_scan["f_url"] != ""].groupby("fn")["f_url"].apply(lambda s: list(dict.fromkeys(s))).to_dict()
+            c_urls_map = df_url_scan[df_url_scan["c_url"] != ""].groupby("fn")["c_url"].apply(lambda s: list(dict.fromkeys(s))).to_dict()
+            camp_urls_map = df_url_scan[df_url_scan["camp_url"] != ""].groupby("fn")["camp_url"].apply(lambda s: list(dict.fromkeys(s))).to_dict()
+
     filtered = bool(start_date or end_date)
     rows = []
     for f in items:
         camps = f.get("assigned_campaigns") or []
+        fn_clean = str(f.get("name") or "").strip().lower()
+        tracked = f.get("tracked_pages") or []
+        tracked_f_urls = [p["value"] for p in tracked if p.get("match_type") == "fundraiser_url" and p.get("value")]
+        tracked_c_urls = [p["value"] for p in tracked if p.get("match_type") == "community_url" and p.get("value")]
+        tracked_camp_urls = [p["value"] for p in tracked if p.get("match_type") == "campaign_url" and p.get("value")]
+        all_tracked_urls = [p["value"] for p in tracked if p.get("value")]
+
+        comb_f_urls = list(dict.fromkeys(tracked_f_urls + f_urls_map.get(fn_clean, [])))
+        comb_c_urls = list(dict.fromkeys(tracked_c_urls + c_urls_map.get(fn_clean, [])))
+        comb_camp_urls = list(dict.fromkeys(tracked_camp_urls + camp_urls_map.get(fn_clean, [])))
+
         row = {
             "Fundraiser": f.get("name") or "",
+            "SP/RT": sp_rt_tag(f.get("page_group") or f.get("page_group_label"), comp, f.get("name") or ""),
             "Status": f.get("status") or "",
             "Group": f.get("page_group_label") or f.get("page_group") or "",
             "Email": f.get("email") or "",
+            "Has Email": "Yes" if f.get("has_email") else "No",
             "Phone": f.get("phone") or "",
+            "Has Number": "Yes" if f.get("has_phone") else "No",
             "Total Raised (All Time)": f.get("total_raised_all_time") or 0.0,
             "Target Goal": f.get("target_goal") or 0.0,
             "Progress %": f.get("progress_percentage") or 0.0,
@@ -1388,6 +1546,10 @@ def export_fundraisers_csv(
             "Campaign Codes": "; ".join(sorted({
                 str(c.get("code") or "").strip() for c in camps
                 if str(c.get("code") or "").strip() and str(c.get("code")).strip().upper() not in ("ALL", "UNASSIGNED")})),
+            "Tracked Page URLs": "; ".join(all_tracked_urls),
+            "Fundraiser Page URLs": "; ".join(comb_f_urls),
+            "Community URLs": "; ".join(comb_c_urls),
+            "Campaign URLs": "; ".join(comb_camp_urls),
             "Notes": f.get("notes") or "",
         }
         if filtered:
@@ -1405,7 +1567,7 @@ def export_fundraiser_detail_csv(
     end_date: Optional[str] = None,
     company_id: Optional[str] = Query("rethink"),
 ):
-    """Every donation attributed to one fundraiser (the drill-down's full data) as CSV."""
+    """Every donation attributed to one fundraiser (the drill-down's full data) as CSV, with full page & community URLs."""
     scope = rbac.request_scope(company_id)
     if scope is not None and str(fundraiser_id) not in scope:
         raise HTTPException(status_code=404, detail="Fundraiser not found.")
@@ -1460,9 +1622,25 @@ def export_fundraiser_detail_csv(
         raise HTTPException(status_code=400, detail="No donations in the selected date range.")
 
     sub_df = sub_df.sort_values("_parsed_date", ascending=False)
+    sub_aid = _attr_aid.loc[sub_df.index]
+    sub_mtype = _attr_type.loc[sub_df.index]
+    aid_map = {a["assignment_id"]: a for a in assignments_full}
+    tracked_page_url = sub_aid.map(lambda x: (aid_map.get(x, {}).get("match_value") or aid_map.get(x, {}).get("campaign_name") or "") if x else "").fillna("")
+
+    f_url = _extract_url_col(sub_df, "Fundraiser URL", "fundraiser_url")
+    c_url = _extract_url_col(sub_df, "Community URL", "team_url")
+    camp_url = _extract_url_col(sub_df, "Campaign URL", "campaign_url")
+
+    f_url = f_url.where(f_url != "", tracked_page_url.where(sub_mtype == "fundraiser_url", ""))
+    c_url = c_url.where(c_url != "", tracked_page_url.where(sub_mtype == "community_url", ""))
+    camp_url = camp_url.where(camp_url != "", tracked_page_url.where(sub_mtype == "campaign_url", ""))
+
+    f_sprt = sp_rt_tag(fundraiser.get("page_group"), comp, fundraiser.get("name") or "")
     amounts = platform_raised_amount(sub_df).astype(float).round(2)
     export_df = pd.DataFrame({
         "Date": sub_df["_parsed_date"],
+        "Fundraiser": fundraiser.get("name") or "",
+        "SP/RT": f_sprt,
         "Donor": _donor_display_names(sub_df),
         "Email": sub_df["Email"].fillna("").astype(str).str.strip() if "Email" in sub_df.columns else "",
         "Amount": amounts,
@@ -1475,6 +1653,10 @@ def export_fundraiser_detail_csv(
         "Country": sub_df.get("Country", ""),
         "Special Case": sub_df.get("Special Case", ""),
         "Gift Aid": sub_df.get("Gift Aid (yes or no)", ""),
+        "Fundraiser Page URL": f_url,
+        "Community URL": c_url,
+        "Campaign URL": camp_url,
+        "Tracked Page URL": tracked_page_url,
         "Donation ID": sub_df.get("Donation ID", ""),
     })
     for c in export_df.columns:

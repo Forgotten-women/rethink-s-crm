@@ -15,6 +15,8 @@ const ExplorerView = lazyPage(() => import('./components/ExplorerView'));
 const DonorsView = lazyPage(() => import('./components/DonorsView'));
 const ClassificationView = lazyPage(() => import('./components/ClassificationView'));
 const ExpenseView = lazyPage(() => import('./components/ExpenseView'));
+const TreasuryView = lazyPage(() => import('./components/treasury/TreasuryView'));
+const PotsView = lazyPage(() => import('./components/treasury/PotsView'));
 const AdminView = lazyPage(() => import('./components/AdminView'));
 const TrackerView = lazyPage(() => import('./components/TrackerView'));
 const PayoutsView = lazyPage(() => import('./components/PayoutsView'));
@@ -92,7 +94,7 @@ export default function App() {
     const PAGE_TITLES = {
       overview: 'Dashboard', kanban: 'Kanban', ltv: 'Lifetime LTV', explorer: 'Data Explorer', donors: 'Donors',
       email: 'Email', fundraisers: 'Fundraisers', payouts: 'Payouts', tracker: 'Sponsorship Tracker',
-      classifications: 'Classifications', expenses: 'Expenses', admin: 'Admin & Data', access: 'Users & Access',
+      classifications: 'Classifications', expenses: 'Expenses', treasury: 'Treasury & Banks', pots: 'Project Pots & Budget', admin: 'Admin & Data', access: 'Users & Access',
     };
     const comp = companies.find(c => c.id === activeCompany);
     const charity = activeCompany === 'all' ? 'All charities' : (comp?.name || 'CRM');
@@ -291,7 +293,7 @@ export default function App() {
     }
     // 'All companies' needs every charity, and can't apply a "limited to specific fundraisers" scope
     const limited = Object.keys(user.access?.scopes || {}).length > 0;
-    const TAB_IDS = ['overview', 'donors', 'explorer', 'tracker', 'fundraisers', 'payouts', 'email', 'classifications', 'expenses', 'kanban', 'ltv', 'admin'];
+    const TAB_IDS = ['overview', 'donors', 'explorer', 'tracker', 'fundraisers', 'payouts', 'treasury', 'pots', 'email', 'classifications', 'expenses', 'kanban', 'ltv', 'admin'];
     const nothingInAll = activeCompany === 'all' && !TAB_IDS.some(t => canSeeTab(user, t, 'all'));
     if (reachable && activeCompany === 'all' && (limited || nothingInAll || !(user.allowed_companies || []).includes('ALL')) && reachable.length) {
       setActiveCompany(reachable[0]);
@@ -299,7 +301,7 @@ export default function App() {
       return;
     }
     if (!canSeeTab(user, activeTab, activeCompany)) {
-      const first = ['overview', 'donors', 'explorer', 'tracker', 'fundraisers', 'payouts', 'email', 'classifications',
+      const first = ['overview', 'donors', 'explorer', 'tracker', 'fundraisers', 'payouts', 'treasury', 'pots', 'email', 'classifications',
         'expenses', 'kanban', 'ltv', 'admin', 'access'].find(t => canSeeTab(user, t, activeCompany));
       if (first) setActiveTab(first);
     }
@@ -719,6 +721,20 @@ export default function App() {
                   user={user} 
                   activeCompany={activeCompany}
                   companies={companies}
+                />
+              )}
+              {activeTab === 'treasury' && (
+                <TreasuryView
+                  key={`${activeCompany}-${dataVersion}`}
+                  user={user}
+                  activeCompany={activeCompany}
+                />
+              )}
+              {activeTab === 'pots' && (
+                <PotsView
+                  key={`${activeCompany}-${dataVersion}`}
+                  user={user}
+                  activeCompany={activeCompany}
                 />
               )}
               {activeTab === 'access' && (

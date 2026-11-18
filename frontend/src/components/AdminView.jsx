@@ -799,14 +799,16 @@ export default function AdminView({ user, onDataChange, activeCompany = 'rethink
               <option value="auto">Auto-Detect Platform</option>
               {uploadTargetCompany === 'iqra' ? (
                 <>
-                  <option value="givebrite">GiveBrite</option>
+                  <option value="givebrite payout">GiveBrite Payout Settlement (Iqra)</option>
+                  <option value="givebrite">GiveBrite (Raw Donations)</option>
                   <option value="madinah">Madinah</option>
                 </>
               ) : (
                 <>
                   <option value="launchgood">LaunchGood (Raw Donations)</option>
                   <option value="launchgood payout">LaunchGood Payout Settlement</option>
-                  <option value="givebrite">GiveBrite</option>
+                  <option value="givebrite payout">GiveBrite Payout / Transfers (Rethink)</option>
+                  <option value="givebrite">GiveBrite (Raw Donations)</option>
                   <option value="paysuite">Paysuite</option>
                   <option value="website">Rethink Website</option>
                 </>

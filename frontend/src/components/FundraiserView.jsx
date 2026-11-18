@@ -7,7 +7,7 @@ import {
   Layers, CheckCircle2, Award, ArrowUpRight, LayoutGrid, List, Sparkles,
   ArrowRight, ExternalLink, Activity, ChevronLeft, ChevronsLeft,
   ChevronsRight, ArrowUpDown, ArrowDown, ArrowUp, SlidersHorizontal,
-  ChevronDown, ChevronUp, Plus, Download
+  ChevronDown, ChevronUp, Plus, Download, Mail, Phone, AlertTriangle
 } from 'lucide-react';
 import { API_BASE_URL, downloadFile } from '../config';
 import { can } from '../access';
@@ -118,6 +118,10 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   const [pageGroupFilter, setPageGroupFilter] = useState('ALL');
   const mainGroupLabel = activeCompany === 'iqra' ? 'Iqra' : 'Rethink';
 
+  // Contact info filters: Email & Phone presence
+  const [emailFilter, setEmailFilter] = useState('ALL'); // 'ALL' | 'HAS_EMAIL' | 'MISSING_EMAIL'
+  const [phoneFilter, setPhoneFilter] = useState('ALL'); // 'ALL' | 'HAS_PHONE' | 'MISSING_PHONE'
+
   // Status list (incl. RAMADAN and any custom status in use) and the Ramadan date presets
   useEffect(() => {
     fetch(`${API_BASE_URL}/api/fundraisers/statuses?company_id=${encodeURIComponent(activeCompany)}`)
@@ -143,6 +147,44 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
   });
   const [sortBy, setSortBy] = useState('period_raised'); // 'period_raised', 'all_time_raised', 'target_goal', 'progress', 'donors', 'txns', 'date', 'name'
   const [sortOrder, setSortOrder] = useState('desc'); // 'desc' or 'asc'
+
+  // Export dropdown state
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportMenuRef = useRef(null);
+
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const handleClickOutside = (e) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target)) {
+        setExportMenuOpen(false);
+      }
+    };
+    const handleEsc = (e) => { if (e.key === 'Escape') setExportMenuOpen(false); };
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleEsc);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEsc);
+    };
+  }, [exportMenuOpen]);
+
+  const handleExport = (mode = 'summary') => {
+    setExportMenuOpen(false);
+    const params = new URLSearchParams();
+    params.append('company_id', activeCompany);
+    params.append('mode', mode);
+    if (statusFilter !== 'ALL') params.append('status_filter', statusFilter);
+    if (pageGroupFilter !== 'ALL') params.append('page_group', pageGroupFilter);
+    if (emailFilter !== 'ALL') params.append('email_filter', emailFilter);
+    if (phoneFilter !== 'ALL') params.append('phone_filter', phoneFilter);
+    if (searchQuery.trim()) params.append('search', searchQuery.trim());
+    if (appliedStartDate) params.append('start_date', appliedStartDate);
+    if (appliedEndDate) params.append('end_date', appliedEndDate);
+    const filename = mode === 'donations'
+      ? `fundraisers_combined_donations_${activeCompany}.csv`
+      : `fundraisers_summary_${activeCompany}.csv`;
+    downloadFile(`${API_BASE_URL}/api/fundraisers/export?${params.toString()}`, filename);
+  };
   const [jumpPageInput, setJumpPageInput] = useState('');
 
   // Modal State (Create / Edit)
@@ -484,6 +526,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
       const matchSearch = !searchQuery || 
         f.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
         (f.email && f.email.toLowerCase().includes(searchQuery.toLowerCase())) ||
+        (f.phone && f.phone.toLowerCase().includes(searchQuery.toLowerCase())) ||
         (f.assigned_campaigns || []).some(c => 
           c.campaign_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
           (c.code && c.code.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -492,9 +535,28 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
       const matchPage = !searchQuery || (f.tracked_pages || []).some(tp => (tp.value || '').toLowerCase().includes(searchQuery.toLowerCase()));
       const matchStatus = statusFilter === 'ALL' || f.status === statusFilter;
       const matchGroup = pageGroupFilter === 'ALL' || (f.page_group || 'MAIN') === pageGroupFilter;
-      return (matchSearch || matchPage) && matchStatus && matchGroup;
+
+      const hasEmail = Boolean(f.email && f.email.trim() && !['nan', 'none', 'n/a', 'null'].includes(f.email.trim().toLowerCase()));
+      const matchEmail = emailFilter === 'ALL' || (emailFilter === 'HAS_EMAIL' ? hasEmail : !hasEmail);
+
+      const hasPhone = Boolean(f.phone && f.phone.trim() && !['nan', 'none', 'n/a', 'null'].includes(f.phone.trim().toLowerCase()));
+      const matchPhone = phoneFilter === 'ALL' || (phoneFilter === 'HAS_PHONE' ? hasPhone : !hasPhone);
+
+      return (matchSearch || matchPage) && matchStatus && matchGroup && matchEmail && matchPhone;
     });
-  }, [fundraisersData.fundraisers, searchQuery, statusFilter, pageGroupFilter]);
+  }, [fundraisersData.fundraisers, searchQuery, statusFilter, pageGroupFilter, emailFilter, phoneFilter]);
+
+  const contactCounts = useMemo(() => {
+    const list = (fundraisersData.fundraisers || []).filter(f => f.assigned_campaigns && f.assigned_campaigns.length);
+    let withEmail = 0, missingEmail = 0, withPhone = 0, missingPhone = 0;
+    for (const f of list) {
+      const hasEmail = Boolean(f.email && f.email.trim() && !['nan', 'none', 'n/a', 'null'].includes(f.email.trim().toLowerCase()));
+      const hasPhone = Boolean(f.phone && f.phone.trim() && !['nan', 'none', 'n/a', 'null'].includes(f.phone.trim().toLowerCase()));
+      if (hasEmail) withEmail++; else missingEmail++;
+      if (hasPhone) withPhone++; else missingPhone++;
+    }
+    return { withEmail, missingEmail, withPhone, missingPhone, total: list.length };
+  }, [fundraisersData.fundraisers]);
   const pageGroupCounts = useMemo(() => {
     const list = (fundraisersData.fundraisers || []).filter(f => f.assigned_campaigns && f.assigned_campaigns.length);
     return { ALL: list.length, MAIN: list.filter(f => (f.page_group || 'MAIN') === 'MAIN').length, SP: list.filter(f => f.page_group === 'SP').length };
@@ -799,8 +861,43 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
     );
   };
 
-  const summary = fundraisersData.summary || {};
   const isDateFiltered = !!(appliedStartDate || appliedEndDate);
+
+  // Compute live summary dynamically from the filtered fundraisers list
+  // so KPI cards immediately update upon searching, changing page group (Rethink/SP), status, or date range.
+  const summary = useMemo(() => {
+    const list = filteredFundraisers || [];
+    const total_fundraisers = list.length;
+    const active_fundraisers = list.filter(f => f.status === 'ACTIVE').length;
+
+    let total_raised_period = 0;
+    let total_raised_all_time = 0;
+    let total_target_goal = 0;
+    let total_transactions = 0;
+
+    for (const f of list) {
+      total_raised_period += (f.total_raised_period != null ? f.total_raised_period : (f.total_raised || 0));
+      total_raised_all_time += (f.total_raised_all_time != null ? f.total_raised_all_time : (f.total_raised || 0));
+      total_target_goal += (f.target_goal || 0);
+      total_transactions += (isDateFiltered
+        ? (f.period_donations_count != null ? f.period_donations_count : (f.total_donations_count || 0))
+        : (f.total_donations_count || 0));
+    }
+
+    const overall_progress_pct = total_target_goal > 0
+      ? Math.round((total_raised_all_time / total_target_goal * 1000)) / 10
+      : (total_raised_all_time > 0 ? 100 : 0);
+
+    return {
+      total_fundraisers,
+      active_fundraisers,
+      total_raised_period: Math.round(total_raised_period * 100) / 100,
+      total_raised_all_time: Math.round(total_raised_all_time * 100) / 100,
+      total_target_goal: Math.round(total_target_goal * 100) / 100,
+      overall_progress_pct: Math.min(overall_progress_pct, 999.9),
+      total_transactions,
+    };
+  }, [filteredFundraisers, isDateFiltered]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -907,7 +1004,7 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               {summary.total_fundraisers || 0}
             </div>
             <div className="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold truncate">
-              {filteredFundraisers.filter(f => f.status === 'ACTIVE').length} currently active
+              {summary.active_fundraisers || 0} currently active
             </div>
           </div>
         </div>
@@ -1022,6 +1119,52 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               ))}
             </select>
 
+            {/* Email Presence Filter */}
+            <div className="relative flex items-center">
+              <Mail className={`w-3.5 h-3.5 absolute left-2.5 pointer-events-none transition-colors ${
+                emailFilter === 'MISSING_EMAIL' ? 'text-amber-500' : emailFilter === 'HAS_EMAIL' ? 'text-cyan-500' : 'text-slate-400'
+              }`} />
+              <select
+                value={emailFilter}
+                onChange={e => {
+                  setEmailFilter(e.target.value);
+                  setCurrentPage(1);
+                }}
+                className={`pl-7 pr-2.5 py-1.5 text-xs rounded-lg focus:outline-none font-medium transition-colors ${
+                  emailFilter !== 'ALL' ? 'border-cyan-500 text-cyan-600 dark:text-cyan-400' : ''
+                }`}
+                style={{ backgroundColor: 'var(--input-bg)', color: emailFilter !== 'ALL' ? undefined : 'var(--input-text)', border: '1px solid var(--input-border)' }}
+                title="Filter by email availability"
+              >
+                <option value="ALL">Email: All</option>
+                <option value="HAS_EMAIL">Has Email ({contactCounts.withEmail})</option>
+                <option value="MISSING_EMAIL">Missing Email ({contactCounts.missingEmail})</option>
+              </select>
+            </div>
+
+            {/* Phone Number Filter */}
+            <div className="relative flex items-center">
+              <Phone className={`w-3.5 h-3.5 absolute left-2.5 pointer-events-none transition-colors ${
+                phoneFilter === 'MISSING_PHONE' ? 'text-rose-500' : phoneFilter === 'HAS_PHONE' ? 'text-cyan-500' : 'text-slate-400'
+              }`} />
+              <select
+                value={phoneFilter}
+                onChange={e => {
+                  setPhoneFilter(e.target.value);
+                  setCurrentPage(1);
+                }}
+                className={`pl-7 pr-2.5 py-1.5 text-xs rounded-lg focus:outline-none font-medium transition-colors ${
+                  phoneFilter !== 'ALL' ? 'border-cyan-500 text-cyan-600 dark:text-cyan-400' : ''
+                }`}
+                style={{ backgroundColor: 'var(--input-bg)', color: phoneFilter !== 'ALL' ? undefined : 'var(--input-text)', border: '1px solid var(--input-border)' }}
+                title="Filter by phone number availability"
+              >
+                <option value="ALL">Number: All</option>
+                <option value="HAS_PHONE">Has Number ({contactCounts.withPhone})</option>
+                <option value="MISSING_PHONE">Missing Number ({contactCounts.missingPhone})</option>
+              </select>
+            </div>
+
             {/* Sort Filter */}
             <div className="flex items-center gap-1">
               <select
@@ -1051,26 +1194,65 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
               </button>
             </div>
 
-            {/* Download the filtered fundraiser list as CSV */}
+            {/* Download the filtered fundraiser list or combined donations as CSV */}
             {canExportF && (
-              <button
-                type="button"
-                onClick={() => {
-                  const params = new URLSearchParams();
-                  params.append('company_id', activeCompany);
-                  if (statusFilter !== 'ALL') params.append('status_filter', statusFilter);
-                  if (pageGroupFilter !== 'ALL') params.append('page_group', pageGroupFilter);
-                  if (searchQuery.trim()) params.append('search', searchQuery.trim());
-                  if (appliedStartDate) params.append('start_date', appliedStartDate);
-                  if (appliedEndDate) params.append('end_date', appliedEndDate);
-                  downloadFile(`${API_BASE_URL}/api/fundraisers/export?${params.toString()}`, 'fundraisers.csv');
-                }}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition-colors hover:border-cyan-500/50 hover:text-cyan-500"
-                style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', borderColor: 'var(--input-border)' }}
-                title="Download the fundraisers shown (with the current filters) as CSV"
-              >
-                <Download className="w-3.5 h-3.5" /> CSV
-              </button>
+              <div className="relative" ref={exportMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setExportMenuOpen(prev => !prev)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition-all hover:border-cyan-500/50 hover:text-cyan-500 shadow-sm"
+                  style={{ backgroundColor: 'var(--input-bg)', color: 'var(--input-text)', borderColor: exportMenuOpen ? 'var(--color-primary, #06b6d4)' : 'var(--input-border)' }}
+                  title="Export filtered fundraisers or combined donations as CSV"
+                  aria-expanded={exportMenuOpen}
+                >
+                  <Download className="w-3.5 h-3.5 text-cyan-500" />
+                  <span>CSV</span>
+                  <ChevronDown className={`w-3 h-3 text-slate-400 transition-transform ${exportMenuOpen ? 'rotate-180' : ''}`} />
+                </button>
+
+                {exportMenuOpen && (
+                  <div
+                    className="absolute right-0 top-full mt-1.5 z-50 w-72 rounded-xl border p-1.5 shadow-2xl backdrop-blur-md flex flex-col gap-1 text-left animate-in fade-in zoom-in-95 duration-100"
+                    style={{ backgroundColor: 'var(--bg-canvas)', borderColor: 'var(--border-glass)' }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleExport('summary')}
+                      className="flex items-start gap-2.5 p-2 rounded-lg text-left transition-colors hover:bg-cyan-500/10 group"
+                    >
+                      <div className="p-1.5 rounded-md bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 shrink-0 mt-0.5">
+                        <Download className="w-3.5 h-3.5" />
+                      </div>
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-[11px] font-bold text-slate-800 dark:text-slate-100 group-hover:text-cyan-500">
+                          Filtered Fundraisers Summary
+                        </span>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400 leading-tight">
+                          1 row per fundraiser with metrics, tracked links &amp; all page URLs
+                        </span>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleExport('donations')}
+                      className="flex items-start gap-2.5 p-2 rounded-lg text-left transition-colors hover:bg-emerald-500/10 group"
+                    >
+                      <div className="p-1.5 rounded-md bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5">
+                        <Layers className="w-3.5 h-3.5" />
+                      </div>
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-[11px] font-bold text-slate-800 dark:text-slate-100 group-hover:text-emerald-500">
+                          Combined Donations CSV
+                        </span>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400 leading-tight">
+                          All donation records for filtered fundraisers with full page &amp; community URLs
+                        </span>
+                      </div>
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
           </div>
 
@@ -1326,9 +1508,30 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                         <h4 className="text-xs font-black group-hover:text-cyan-500 transition-colors truncate" style={{ color: 'var(--text-main)' }}>
                           {f.name}
                         </h4>
-                        <div className="text-[10px] flex items-center gap-1.5 truncate" style={{ color: 'var(--text-muted)' }}>
-                          {f.email ? <span className="truncate">{f.email}</span> : null}
-                          {f.phone ? <span>• {f.phone}</span> : null}
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                          {f.email ? (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 max-w-[170px] truncate" title={f.email}>
+                              <Mail className="w-2.5 h-2.5 text-cyan-500 shrink-0" />
+                              <span className="truncate">{f.email}</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 shrink-0" title="Missing Email Address">
+                              <AlertTriangle className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                              No Email
+                            </span>
+                          )}
+
+                          {f.phone ? (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0" title={f.phone}>
+                              <Phone className="w-2.5 h-2.5 text-emerald-500 shrink-0" />
+                              <span>{f.phone}</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 shrink-0" title="Missing Phone Number">
+                              <AlertTriangle className="w-2.5 h-2.5 text-rose-500 shrink-0" />
+                              No Number
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -1659,9 +1862,32 @@ export default function FundraiserView({ user, accentColor = 'cyan', activeCompa
                         <div className="w-6 h-6 rounded-md bg-cyan-500/20 text-cyan-500 font-bold flex items-center justify-center text-[10px]">
                           {f.name.substring(0, 2).toUpperCase()}
                         </div>
-                        <div>
-                          <div>{f.name}</div>
-                          <div className="text-[10px] font-normal" style={{ color: 'var(--text-sub)' }}>{f.email || 'No email'}</div>
+                        <div className="flex flex-col gap-0.5">
+                          <div className="text-xs font-bold" style={{ color: 'var(--text-main)' }}>{f.name}</div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {f.email ? (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9.5px] font-medium bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
+                                <Mail className="w-2.5 h-2.5 text-cyan-500" />
+                                {f.email}
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                <AlertTriangle className="w-2.5 h-2.5 text-amber-500" />
+                                No Email
+                              </span>
+                            )}
+                            {f.phone ? (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9.5px] font-mono text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                                <Phone className="w-2.5 h-2.5 text-emerald-500" />
+                                {f.phone}
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-bold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800">
+                                <AlertTriangle className="w-2.5 h-2.5 text-rose-500" />
+                                No Number
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </td>

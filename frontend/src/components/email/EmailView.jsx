@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDownLeft, ArrowUpRight, Inbox, LayoutTemplate, ListChecks, Mail, MailOpen, Activity, PenSquare, Search, UserMinus, X } from 'lucide-react';
+import { ArrowDownLeft, ArrowUpRight, Inbox, LayoutTemplate, ListChecks, Mail, MailOpen, Activity, MessageSquare, PenSquare, Search, UserMinus, X } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
 import { can } from '../../access';
 import BulkEmailComposer from './BulkEmailComposer';
+import GeneralFeedbackEligibleView from './GeneralFeedbackEligibleView';
 import EmailThread, { localTime } from './EmailThread';
 import EmailCampaignsView from '../tracker/EmailCampaignsView';
 import TrackerView from '../TrackerView';
@@ -12,8 +13,13 @@ import GmailMailbox from './GmailMailbox';
 import { OPEN_UNSUBSCRIBES_EVENT, UNSUBSCRIBES_SEEN_EVENT, takePendingOpen } from './unsubscribeAlerts';
 
 const TABS = [
-  ['compose', 'Compose', PenSquare], ['campaigns', 'Campaigns', ListChecks], ['activity', 'Sent & replies', Activity],
-  ['queue', 'Sponsorship queue', Inbox], ['templates', 'Templates', LayoutTemplate], ['mailbox', 'Mailbox (Outlook)', Mail],
+  ['compose', 'Compose', PenSquare],
+  ['feedback_eligible', 'General Feedback Eligible', MessageSquare],
+  ['campaigns', 'Campaigns', ListChecks],
+  ['activity', 'Sent & replies', Activity],
+  ['queue', 'Sponsorship queue', Inbox],
+  ['templates', 'Templates', LayoutTemplate],
+  ['mailbox', 'Mailbox (Outlook)', Mail],
   ['unsubscribed', 'Unsubscribed', UserMinus],
 ];
 
@@ -191,7 +197,8 @@ export default function EmailView({ user, activeCompany, onSelectDonor, preset }
       .then(r => (r.ok ? r.json() : null)).then(d => setMailProvider(d?.provider || 'outlook')).catch(() => setMailProvider('outlook'));
   }, [activeCompany]);
   const [composeKey, setComposeKey] = useState(0);
-  useEffect(() => { if (preset) { setTab('compose'); setComposeKey(k => k + 1); } }, [preset]);
+  const [composeDonorIds, setComposeDonorIds] = useState([]);
+  useEffect(() => { if (preset) { setComposeDonorIds([]); setTab('compose'); setComposeKey(k => k + 1); } }, [preset]);
   useEffect(() => {
     const open = () => { takePendingOpen(); setTab('unsubscribed'); };
     window.addEventListener(OPEN_UNSUBSCRIBES_EVENT, open);
@@ -225,7 +232,19 @@ export default function EmailView({ user, activeCompany, onSelectDonor, preset }
           ); })}
         </div>
       </div>
-      {tab === 'compose' && <BulkEmailComposer key={`${activeCompany}-${composeKey}`} inline company={activeCompany} initialSegment={preset?.segment || {}} />}
+      {tab === 'compose' && <BulkEmailComposer key={`${activeCompany}-${composeKey}`} inline company={activeCompany} initialSegment={preset?.segment || {}} initialDonorIds={composeDonorIds} />}
+      {tab === 'feedback_eligible' && (
+        <GeneralFeedbackEligibleView
+          company={activeCompany}
+          user={user}
+          onSelectDonor={onSelectDonor}
+          onComposeToDonors={(ids) => {
+            setComposeDonorIds(ids || []);
+            setComposeKey(k => k + 1);
+            setTab('compose');
+          }}
+        />
+      )}
       {tab === 'campaigns' && <EmailCampaignsView companyId={activeCompany} />}
       {tab === 'activity' && <ActivityFeed company={activeCompany} onSelectDonor={onSelectDonor} />}
       {tab === 'queue' && <TrackerView key={`queue-${activeCompany}`} embeddedTab="queue" user={user} activeCompany={activeCompany} onSelectDonor={onSelectDonor} />}

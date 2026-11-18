@@ -39,7 +39,8 @@ import {
   Calendar,
   ShieldCheck,
   Filter,
-  Sparkles
+  Sparkles,
+  Upload
 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
 import { can } from '../access';
@@ -165,12 +166,24 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
   // What this person may do here (access.js; the server checks every action again).
   const isSuperAdmin = can(user, 'data.purge', activeCompany); // name kept: gates the purge button
   const canEdit = can(user, 'payouts.classify', activeCompany);
+  const canUpload = can(user, 'payouts.upload', activeCompany) || can(user, 'data.upload', activeCompany) || user?.role === 'super_admin';
   const currSymbol = '£';
   const isPaysuite = selectedPlatform === 'paysuite';
   const isStripe = selectedPlatform === 'stripe';
+  const isGivebrite = selectedPlatform === 'givebrite';
+
+  // Payout Upload Modal State
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadTargetCompany, setUploadTargetCompany] = useState(activeCompany !== 'all' ? activeCompany : 'rethink');
+  const [uploadPlatform, setUploadPlatform] = useState('givebrite');
+  const [uploadMode, setUploadMode] = useState('merge');
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [uploadError, setUploadError] = useState('');
 
   // Dynamic Platform Counts per Tenant
-  const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0, stripe: 0 });
+  const [platformCounts, setPlatformCounts] = useState({ launchgood: 0, paysuite: 0, stripe: 0, givebrite: 0 });
   const [stripeRefreshKey, setStripeRefreshKey] = useState(0);
   const [isSyncingPaysuite, setIsSyncingPaysuite] = useState(false);
   const [lgBatchMode, setLgBatchMode] = useState('monthly'); // 'monthly' | 'batch'
@@ -203,13 +216,15 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
     // showed Rethink's 100 Stripe payouts
     Promise.all([
       fetch(`${API_BASE_URL}/api/payouts/summary?platform=launchgood&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {}),
+      fetch(`${API_BASE_URL}/api/payouts/summary?platform=givebrite&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {}),
       comp === 'rethink'
         ? fetch(`${API_BASE_URL}/api/payouts/summary?platform=paysuite&currency=${currency}${companyParam}`, { headers }).then(r => r.ok ? r.json() : {})
         : Promise.resolve({}),
       fetch(`${API_BASE_URL}/api/payouts/stripe/list?limit=100&company_id=${encodeURIComponent(comp)}`, { headers }).then(r => r.ok ? r.json() : {})
-    ]).then(([lgRes, psRes, stripeRes]) => {
+    ]).then(([lgRes, gbRes, psRes, stripeRes]) => {
       setPlatformCounts({
         launchgood: lgRes?.total_transactions || 0,
+        givebrite: gbRes?.total_transactions || 0,
         paysuite: psRes?.total_transactions || 0,
         stripe: stripeRes?.payouts?.length || 0
       });
@@ -685,6 +700,55 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
     }
   };
 
+  const handleUploadPayout = (e) => {
+    e.preventDefault();
+    if (!uploadFile) {
+      setUploadError('Please select a payout settlement file to upload.');
+      return;
+    }
+    setIsUploading(true);
+    setUploadError('');
+    setUploadResult(null);
+
+    const formData = new FormData();
+    formData.append('company_id', uploadTargetCompany);
+    formData.append('platform', uploadPlatform);
+    formData.append('upload_mode', uploadMode);
+    formData.append('file', uploadFile);
+
+    const token = localStorage.getItem('analytics_token');
+    const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+
+    fetch(`${API_BASE_URL}/api/payouts/upload`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    })
+      .then(async r => {
+        let resData = null;
+        try {
+          resData = await r.json();
+        } catch (err) {}
+        if (!r.ok) {
+          throw new Error(resData?.detail || resData?.message || `Upload failed (HTTP ${r.status})`);
+        }
+        return resData;
+      })
+      .then(res => {
+        setIsUploading(false);
+        setUploadResult(res);
+        fetchPlatformCounts();
+        fetchSummary();
+        fetchBatches();
+        fetchLedger();
+        if (onDataChange) onDataChange();
+      })
+      .catch(err => {
+        setIsUploading(false);
+        setUploadError(err.message || 'Error uploading payout file.');
+      });
+  };
+
   // Sorted and Paginated Data for all 4 View Modes
   const sortedCodes = useMemo(() => sortItems(codeGroups), [codeGroups, sortBy, sortOrder]);
   const effectiveCodePageSize = codePageSize === 'All' ? Math.max(1, sortedCodes.length) : Number(codePageSize);
@@ -862,24 +926,68 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
               </span>
             </button>
             )}
+
+            {availablePlatforms.includes('givebrite') && (
+            <button
+              onClick={() => {
+                setSelectedPlatform('givebrite');
+                setSelectedBatch('ALL');
+                setStatusFilter('ALL');
+                setCurrentPage(1);
+                setDonorPage(1);
+              }}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                isGivebrite
+                  ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-md shadow-purple-500/20'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <TrendingUp className="w-3.5 h-3.5" />
+              <span>GiveBrite</span>
+              <span className={`text-[10px] px-1.5 py-0.2 rounded-md font-mono font-black ${
+                isGivebrite ? 'bg-white/20 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
+              }`}>
+                {(platformCounts.givebrite || 0).toLocaleString()}
+              </span>
+            </button>
+            )}
           </div>
 
           {/* Export Multi-Sheet Excel Button */}
           {can(user, isStripe ? 'stripe.export' : 'payouts.export', activeCompany) && (
-<button
-            onClick={handleExportExcel}
-            disabled={exporting || loading}
-            className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isStripe ? 'from-cyan-600 to-blue-600 shadow-cyan-500/20 hover:from-cyan-500 hover:to-blue-500' : isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
-            title={`Download multi-sheet Excel report (.xlsx) for ${isStripe ? 'Stripe' : isPaysuite ? 'Paysuite' : 'LaunchGood'}`}
-          >
-            {exporting ? (
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <FileSpreadsheet className="w-3.5 h-3.5" />
-            )}
-            <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' && !isStripe ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
-          </button>
-)}
+            <button
+              onClick={handleExportExcel}
+              disabled={exporting || loading}
+              className={`px-4 py-2 text-xs font-bold text-white bg-gradient-to-r ${isStripe ? 'from-cyan-600 to-blue-600 shadow-cyan-500/20 hover:from-cyan-500 hover:to-blue-500' : isPaysuite ? 'from-amber-600 to-orange-600 shadow-amber-500/20 hover:from-amber-500 hover:to-orange-500' : isGivebrite ? 'from-purple-600 to-indigo-600 shadow-purple-500/20 hover:from-purple-500 hover:to-indigo-500' : 'from-emerald-600 to-teal-600 shadow-emerald-500/20 hover:from-emerald-500 hover:to-teal-500'} rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50`}
+              title={`Download multi-sheet Excel report (.xlsx) for ${isStripe ? 'Stripe' : isPaysuite ? 'Paysuite' : isGivebrite ? 'GiveBrite' : 'LaunchGood'}`}
+            >
+              {exporting ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <FileSpreadsheet className="w-3.5 h-3.5" />
+              )}
+              <span>{exporting ? 'Exporting...' : selectedBatch !== 'ALL' && !isStripe ? `Export ${selectedBatch}` : 'Export Excel (.xlsx)'}</span>
+            </button>
+          )}
+
+          {/* Direct Payout Upload Button (RBAC: payouts.upload or data.upload) */}
+          {canUpload && (
+            <button
+              onClick={() => {
+                setShowUploadModal(true);
+                setUploadResult(null);
+                setUploadError('');
+                setUploadFile(null);
+                setUploadTargetCompany(activeCompany !== 'all' ? activeCompany : 'rethink');
+                setUploadPlatform(activeCompany === 'iqra' ? 'iqra givebrite payout' : 'givebrite payout');
+              }}
+              className="px-4 py-2 text-xs font-bold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 rounded-xl shadow-md shadow-purple-500/20 transition-all flex items-center gap-2 cursor-pointer"
+              title="Upload payout settlement and auto-generate 10-Sheet Accounting Pack"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>Upload Payout</span>
+            </button>
+          )}
 
           {/* Sync PaySuite API Button (the PaySuite account is Rethink's) */}
           {isPaysuite && activeCompany === 'rethink' && (
@@ -3255,6 +3363,207 @@ export default function PayoutsView({ user, accentColor, onDataChange, activeCom
                 <span>{purging ? 'Purging...' : 'Confirm Purge'}</span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Upload Payout Settlement Modal */}
+      {showUploadModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-slate-900 border border-purple-500/30 rounded-2xl p-6 max-w-lg w-full shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-white/10">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-purple-500/20 text-purple-400">
+                  <Upload className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Upload Payout Settlement</h3>
+                  <p className="text-[11px] text-slate-400">
+                    Auto-enriches with live project codes and creates a 10-Sheet Accounting Audit Pack
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowUploadModal(false)}
+                className="text-slate-400 hover:text-white transition-colors cursor-pointer p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {uploadResult ? (
+              <div className="space-y-4 py-2">
+                <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-200 text-xs space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-emerald-300 text-sm">
+                    <CheckCircle className="w-4 h-4 text-emerald-400" />
+                    <span>Payout Enriched & Reconciled Successfully!</span>
+                  </div>
+                  <p className="text-slate-300 text-[11px] leading-relaxed">
+                    {uploadResult.message}
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 pt-2 border-t border-emerald-500/20 font-mono text-center">
+                    <div className="bg-slate-900/60 p-2 rounded-lg">
+                      <div className="text-[10px] text-slate-400 font-sans">Matched</div>
+                      <div className="font-bold text-white">{uploadResult.matched_rows} / {uploadResult.total_rows}</div>
+                      <div className="text-[9px] text-emerald-400">({uploadResult.match_percentage}%)</div>
+                    </div>
+                    <div className="bg-slate-900/60 p-2 rounded-lg">
+                      <div className="text-[10px] text-slate-400 font-sans">Gross Total</div>
+                      <div className="font-bold text-white">£{Number(uploadResult.total_gross || 0).toLocaleString()}</div>
+                    </div>
+                    <div className="bg-slate-900/60 p-2 rounded-lg">
+                      <div className="text-[10px] text-slate-400 font-sans">Net Payout</div>
+                      <div className="font-bold text-emerald-400">£{Number(uploadResult.net_payout || 0).toLocaleString()}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {uploadResult.report_download_url && (
+                  <a
+                    href={`${API_BASE_URL}${uploadResult.report_download_url}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full py-2.5 px-4 rounded-xl font-bold text-xs text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <FileSpreadsheet className="w-4 h-4" />
+                    <span>Download 10-Sheet Executive Accounting Pack (.xlsx)</span>
+                  </a>
+                )}
+
+                <div className="flex justify-end pt-2">
+                  <button
+                    onClick={() => {
+                      setShowUploadModal(false);
+                      setUploadResult(null);
+                    }}
+                    className="px-4 py-1.5 rounded-lg text-xs font-bold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 transition-all cursor-pointer"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <form onSubmit={handleUploadPayout} className="space-y-4">
+                {uploadError && (
+                  <div className="p-3 rounded-xl bg-rose-950/50 border border-rose-500/30 text-rose-300 text-xs flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                    <span>{uploadError}</span>
+                  </div>
+                )}
+
+                {/* Target Charity Selector */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold text-slate-300">Target Charity</label>
+                  <select
+                    value={uploadTargetCompany}
+                    onChange={e => {
+                      const c = e.target.value;
+                      setUploadTargetCompany(c);
+                      setUploadPlatform(c === 'iqra' ? 'iqra givebrite payout' : 'givebrite payout');
+                    }}
+                    className="w-full bg-slate-950 border border-white/15 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-400 cursor-pointer"
+                  >
+                    {companies.length > 0 ? (
+                      companies.map(c => (
+                        <option key={c.id} value={c.id}>{c.name} ({c.id})</option>
+                      ))
+                    ) : (
+                      <>
+                        <option value="rethink">Rethink Charity (rethink)</option>
+                        <option value="iqra">Iqra Charity (iqra)</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                {/* Platform Platform Type */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold text-slate-300">Payout Platform</label>
+                  <select
+                    value={uploadPlatform}
+                    onChange={e => setUploadPlatform(e.target.value)}
+                    className="w-full bg-slate-950 border border-white/15 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-400 cursor-pointer"
+                  >
+                    {uploadTargetCompany === 'iqra' ? (
+                      <>
+                        <option value="iqra givebrite payout">GiveBrite Payout Settlement (Iqra 4-Tier Matching)</option>
+                        <option value="launchgood payout">LaunchGood Payout Settlement</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="givebrite payout">GiveBrite Payout / Transfers (Rethink)</option>
+                        <option value="launchgood payout">LaunchGood Payout Settlement</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                {/* File Upload Drag & Drop */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold text-slate-300">Payout File (.csv, .xlsx)</label>
+                  <div className="relative border-2 border-dashed border-white/15 hover:border-purple-500/50 rounded-xl p-4 text-center transition-all bg-slate-950/50">
+                    <input
+                      type="file"
+                      accept=".csv,.xlsx,.xls"
+                      onChange={e => setUploadFile(e.target.files?.[0] || null)}
+                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                    />
+                    <div className="flex flex-col items-center justify-center gap-1.5 pointer-events-none">
+                      <Upload className="w-6 h-6 text-purple-400" />
+                      {uploadFile ? (
+                        <div className="font-bold text-xs text-white">{uploadFile.name} ({(uploadFile.size / 1024).toFixed(1)} KB)</div>
+                      ) : (
+                        <>
+                          <div className="text-xs text-slate-300 font-bold">Choose a file or drag and drop</div>
+                          <div className="text-[10px] text-slate-500">CSV or Excel spreadsheet</div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Ingestion Strategy */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold text-slate-300">Upload Strategy</label>
+                  <select
+                    value={uploadMode}
+                    onChange={e => setUploadMode(e.target.value)}
+                    className="w-full bg-slate-950 border border-white/15 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-400 cursor-pointer"
+                  >
+                    <option value="merge">Append / Merge Batch (Preserves existing payouts)</option>
+                    <option value="replace">Replace Entire Payout Dataset</option>
+                  </select>
+                </div>
+
+                {/* Submit buttons */}
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowUploadModal(false)}
+                    className="px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition-all cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isUploading || !uploadFile}
+                    className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50 shadow-md shadow-purple-500/20"
+                  >
+                    {isUploading ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Enriching & Reconciling...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Upload className="w-3.5 h-3.5" />
+                        <span>Upload & Reconcile</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
         </div>
       )}

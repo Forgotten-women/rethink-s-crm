@@ -3,15 +3,17 @@ from core.cache import cached
 import io
 import os
 import sqlite3
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 import pandas as pd
-from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from pydantic import BaseModel
 
 from config.settings import LOCAL_DB_PATH, PARQUET_PATH
 from core.database import get_db_connection, _DB_LOCK
+from backend.api.auth import get_current_user, enforce_route_permission
 from core.data_processor import (
+    _finalize_matrix_flags,
     clean_campaign_url,
     get_classification_matrix,
     load_data,
@@ -267,11 +269,14 @@ def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
             pass
 
         result = []
+        from backend.api.fundraisers import is_sp_text
         for _, r in codes_df.iterrows():
             c_code = str(r["code"]).strip().upper()
             dept = sanitize_text(r["department"])
             off = sanitize_text(r["office"])
             port = sanitize_text(r.get("portfolio", ""))
+            desc_val = sanitize_text(r.get("description", ""))
+            is_sp_flag = 1 if (is_sp_text(c_code) or is_sp_text(desc_val) or "sisters project" in desc_val.lower() or "sisters project" in port.lower() or "-SIS" in c_code.upper()) else 0
             result.append({
                 "code": c_code,
                 "department": dept,
@@ -282,8 +287,9 @@ def get_master_project_codes(company_id: Optional[str] = Query("rethink")):
                 "sub_heading": off,
                 "country": sanitize_text(r["country"]),
                 "zakat_eligibility": sanitize_text(r["zakat_eligibility"]),
-                "description": sanitize_text(r.get("description", "")),
+                "description": desc_val,
                 "is_active": int(r.get("is_active", 1)),
+                "is_sp": is_sp_flag,
                 "project_status": sanitize_text(r.get("project_status", "Continuing")),
                 "programme_fund": sanitize_text(r.get("programme_fund", "")),
                 "fund_code": sanitize_text(r.get("fund_code", "")),
@@ -682,7 +688,15 @@ def _clean_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
         sc_col = df["special_case"].fillna("").astype(str).str.strip()
         sc_col = sc_col.replace({"Unassigned": "", "unassigned": "", "None": "", "none": "", "None (Standard)": "", "none (standard)": "", "nan": "", "NaN": "", "null": "", "N/A": "", "n/a": ""})
 
-    df_clean = df.fillna("Unassigned")
+    df_clean = df.copy()
+    _non_unassigned_cols = {
+        "is_verified", "verified_by", "verified_at", "needs_feedback", "campaign_needs_feedback", "is_sp",
+        "is_primary", "donation_count", "total_amount", "campaign_ref", "giving_level_ref",
+        "Special Case", "special_case", "Campaign URL", "campaign_url",
+    }
+    _fill_cols = [c for c in df_clean.columns if c not in _non_unassigned_cols]
+    if _fill_cols:
+        df_clean[_fill_cols] = df_clean[_fill_cols].fillna("Unassigned")
     if sc_col is not None:
         df_clean["Special Case"] = sc_col
         df_clean["special_case"] = sc_col
@@ -692,16 +706,16 @@ def _clean_matrix_df(df: pd.DataFrame) -> pd.DataFrame:
     # A missing link is shown (and saved back) as blank, never as "Unassigned"
     for url_col in ("Campaign URL", "campaign_url"):
         if url_col in df_clean.columns:
-            df_clean[url_col] = df_clean[url_col].map(clean_campaign_url)
+            df_clean[url_col] = df_clean[url_col].fillna("").map(clean_campaign_url)
     for ref_col in ("campaign_ref", "giving_level_ref", "Campaign Ref", "Giving Level Ref"):
         if ref_col in df_clean.columns:
-            df_clean[ref_col] = df_clean[ref_col].astype(str).str.strip().replace({"Unassigned": "", "unassigned": "", "None": "", "none": "", "nan": "", "NaN": "", "null": "", "N/A": "", "n/a": ""})
+            df_clean[ref_col] = df_clean[ref_col].fillna("").astype(str).str.strip().replace({"Unassigned": "", "unassigned": "", "None": "", "none": "", "nan": "", "NaN": "", "null": "", "N/A": "", "n/a": ""})
     for col in df_clean.columns:
         if col in ["Country", "country"]:
             df_clean[col] = df_clean[col].replace({"SHAM": "SHM", "sham": "SHM"})
         elif col in ["Code", "code"]:
             df_clean[col] = df_clean[col].apply(lambda x: ("SHM-" + str(x)[5:]) if str(x).upper().startswith("SHAM-") else x)
-    return df_clean
+    return _finalize_matrix_flags(df_clean)
 
 
 @router.get("/launchgood")
@@ -748,6 +762,11 @@ def get_paysuite_matrix(company_id: Optional[str] = Query("rethink")):
                 COALESCE(donor_name, '') as "Donor Name",
                 COALESCE(donor_email, '') as "Donor Email",
                 COALESCE(is_primary, 0) as "is_primary",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback",
                 company_id
             FROM paysuite_classifications
         """
@@ -785,6 +804,11 @@ def get_rethink_website_matrix(company_id: Optional[str] = Query("rethink")):
                 COALESCE(country, 'Unassigned') as "Country",
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(is_primary, 0) as "is_primary",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback",
                 company_id
             FROM rethink_website_classifications
         """
@@ -873,6 +897,11 @@ def get_stripe_matrix(company_id: Optional[str] = Query("rethink")):
                 COALESCE(zakat_eligibility, 'Unassigned') as "Zakat Eligibility",
                 COALESCE(special_case, '') as "Special Case",
                 COALESCE(is_primary, 1) as "is_primary",
+                COALESCE(is_verified, 0) as "is_verified",
+                COALESCE(verified_by, '') as "verified_by",
+                COALESCE(verified_at, '') as "verified_at",
+                COALESCE(needs_feedback, 0) as "needs_feedback",
+                COALESCE(campaign_needs_feedback, 0) as "campaign_needs_feedback",
                 company_id
             FROM stripe_link_classifications
         """
@@ -974,9 +1003,12 @@ def sync_stripe_payment_links(payload: dict):
 def export_classifications(
     platform: str = Query("launchgood", pattern="^(launchgood|givebright|givebrite|madinah|paysuite|website|rethink_website|stripe|master)$"),
     format: str = Query("csv", pattern="^(csv|xlsx)$"),
-    company_id: Optional[str] = Query("rethink")
+    company_id: Optional[str] = Query("rethink"),
+    sp: Optional[str] = Query("all"),
+    status: Optional[str] = Query("all"),
+    search: Optional[str] = Query(""),
 ):
-    """Exports active campaign classification matrix rules or master project codes to CSV or Excel (.xlsx)."""
+    """Exports active campaign classification matrix rules or master project codes to CSV or Excel (.xlsx) supporting filters."""
     p_clean = platform.lower().strip()
     comp = (company_id or "rethink").strip().lower()
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -985,10 +1017,33 @@ def export_classifications(
         res = get_master_project_codes(company_id=comp)
         matrix_df = pd.DataFrame(res.get("codes", []))
         if matrix_df.empty:
-            raise HTTPException(status_code=400, detail="No master project codes available to export.")
+            matrix_df = pd.DataFrame(columns=["code", "department", "office", "portfolio", "country", "zakat_eligibility", "description", "is_sp"])
+        else:
+            # 1. SP Filter
+            sp_clean = str(sp or "all").strip().lower()
+            if "is_sp" in matrix_df.columns:
+                if sp_clean in ("sp", "sp_only"):
+                    matrix_df = matrix_df[matrix_df["is_sp"] == 1]
+                elif sp_clean in ("non_sp", "non-sp", "non_sp_only"):
+                    matrix_df = matrix_df[matrix_df["is_sp"] == 0]
+
+            # 2. Search Filter
+            q = str(search or "").strip().lower()
+            if q:
+                mask = pd.Series(False, index=matrix_df.index)
+                for col in ["code", "department", "office", "portfolio", "country", "description", "programme_fund", "fund_code"]:
+                    if col in matrix_df.columns:
+                        mask |= matrix_df[col].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                matrix_df = matrix_df[mask]
+
+        if "is_sp" in matrix_df.columns:
+            matrix_df["Cause (SP / Non-SP)"] = matrix_df["is_sp"].apply(lambda v: "SP" if int(v or 0) == 1 else "Non-SP")
+        else:
+            matrix_df["Cause (SP / Non-SP)"] = "Non-SP"
+
         export_cols = [
             "code", "company_id", "programme_fund", "fund_code", "department", "office", "portfolio", 
-            "country", "zakat_eligibility", "legacy_non_zakat_code", "legacy_zakat_code", 
+            "country", "zakat_eligibility", "Cause (SP / Non-SP)", "legacy_non_zakat_code", "legacy_zakat_code", 
             "old_codes", "description", "is_active", "campaign_count", "total_raised"
         ]
         matrix_df = matrix_df[[c for c in export_cols if c in matrix_df.columns]]
@@ -1024,11 +1079,76 @@ def export_classifications(
         else:
             res = get_launchgood_matrix(company_id=comp)
 
-        matrix_df = pd.DataFrame(res.get("rules", []))
-        if matrix_df.empty:
-            raise HTTPException(status_code=400, detail="No classification rules available to export.")
+        raw_rules = res.get("rules", [])
+        matrix_df = pd.DataFrame(raw_rules)
+        if not matrix_df.empty:
+            matrix_df = sanitize_matrix_df(matrix_df)
+            if "is_sp" not in matrix_df.columns:
+                matrix_df = _finalize_matrix_flags(matrix_df)
 
-        matrix_df = sanitize_matrix_df(matrix_df)
+            # 1. SP Filter
+            sp_clean = str(sp or "all").strip().lower()
+            if "is_sp" in matrix_df.columns:
+                if sp_clean in ("sp", "sp_only"):
+                    matrix_df = matrix_df[matrix_df["is_sp"] == 1]
+                elif sp_clean in ("non_sp", "non-sp", "non_sp_only"):
+                    matrix_df = matrix_df[matrix_df["is_sp"] == 0]
+
+            # 2. Status Filter
+            st_clean = str(status or "all").strip().upper()
+            if st_clean == "SINGLE_CODE":
+                if "status" in matrix_df.columns:
+                    matrix_df = matrix_df[matrix_df["status"] == "single_code"]
+                elif "Code" in matrix_df.columns:
+                    matrix_df = matrix_df[~matrix_df["Code"].isin(["Unassigned", "", None])]
+            elif st_clean == "MULTI_CODE":
+                if "status" in matrix_df.columns:
+                    matrix_df = matrix_df[matrix_df["status"] == "multi_code"]
+            elif st_clean == "UNASSIGNED":
+                if "status" in matrix_df.columns:
+                    matrix_df = matrix_df[matrix_df["status"] == "unassigned"]
+                elif "Code" in matrix_df.columns and "Department" in matrix_df.columns:
+                    matrix_df = matrix_df[matrix_df["Code"].isin(["Unassigned", "", None]) | matrix_df["Department"].isin(["Unassigned", "", None])]
+            elif st_clean == "VERIFIED":
+                if "is_verified" in matrix_df.columns:
+                    matrix_df = matrix_df[matrix_df["is_verified"] == 1]
+            elif st_clean == "UNVERIFIED":
+                if "is_verified" in matrix_df.columns:
+                    matrix_df = matrix_df[matrix_df["is_verified"] == 0]
+            elif st_clean == "NEEDS_FEEDBACK":
+                fb_cond = pd.Series(False, index=matrix_df.index)
+                if "needs_feedback" in matrix_df.columns:
+                    fb_cond |= (matrix_df["needs_feedback"] == 1)
+                if "campaign_needs_feedback" in matrix_df.columns:
+                    fb_cond |= (matrix_df["campaign_needs_feedback"] == 1)
+                matrix_df = matrix_df[fb_cond]
+
+            # 3. Search Filter
+            q = str(search or "").strip().lower()
+            if q:
+                mask = pd.Series(False, index=matrix_df.index)
+                for col in ["Campaign Name", "campaign_name", "Giving Level", "giving_level", "Code", "code", "Department", "Office", "Country", "Donor Name", "Donor Email"]:
+                    if col in matrix_df.columns:
+                        mask |= matrix_df[col].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                matrix_df = matrix_df[mask]
+
+            # Add export-friendly labels
+            if "is_sp" in matrix_df.columns:
+                matrix_df["Cause (SP / Non-SP)"] = matrix_df["is_sp"].apply(lambda v: "SP" if int(v or 0) == 1 else "Non-SP")
+            else:
+                matrix_df["Cause (SP / Non-SP)"] = "Non-SP"
+
+            if "is_verified" in matrix_df.columns:
+                matrix_df["Verified"] = matrix_df["is_verified"].apply(lambda v: "Verified" if int(v or 0) == 1 else "Unverified")
+            else:
+                matrix_df["Verified"] = "Unverified"
+
+            if "needs_feedback" in matrix_df.columns or "campaign_needs_feedback" in matrix_df.columns:
+                nfb = matrix_df.get("needs_feedback", 0)
+                cnfb = matrix_df.get("campaign_needs_feedback", 0)
+                matrix_df["Requires Feedback"] = ((nfb == 1) | (cnfb == 1)).apply(lambda v: "Yes" if v else "No")
+            else:
+                matrix_df["Requires Feedback"] = "No"
 
         # Rename columns to match the real headers in the frontend UI
         rename_map = {"Code": "Code (Master Link)"}
@@ -1040,13 +1160,27 @@ def export_classifications(
 
         # Reorder columns to match UI exactly
         if p_clean == "paysuite":
-            cols = ["Direct Debit Ref (Bank Ref)", "Platform Source", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility", "Donor Name", "Donor Email"]
-            matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
+            cols = [
+                "Direct Debit Ref (Bank Ref)", "Platform Source", "Code (Master Link)",
+                "Cause (SP / Non-SP)", "Department", "Office", "Portfolio", "Country",
+                "Zakat Eligibility", "Verified", "Requires Feedback", "Donor Name", "Donor Email"
+            ]
         elif p_clean in ["givebright", "givebrite", "madinah"]:
-            cols = ["Campaign Name", "Campaign URL", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility"]
-            matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
+            cols = [
+                "Campaign Name", "Giving Level", "Campaign URL", "Code (Master Link)",
+                "Cause (SP / Non-SP)", "Department", "Office", "Portfolio", "Country",
+                "Zakat Eligibility", "Verified", "Requires Feedback"
+            ]
         else:
-            cols = ["Campaign Name", "Community Name", "Code (Master Link)", "Department", "Office", "Portfolio", "Country", "Zakat Eligibility"]
+            cols = [
+                "Campaign Name", "Giving Level", "Community Name", "Campaign URL", "Code (Master Link)",
+                "Cause (SP / Non-SP)", "Department", "Office", "Portfolio", "Country",
+                "Zakat Eligibility", "Verified", "Requires Feedback"
+            ]
+
+        if matrix_df.empty:
+            matrix_df = pd.DataFrame(columns=[c for c in cols])
+        else:
             matrix_df = matrix_df[[c for c in cols if c in matrix_df.columns]]
 
     if format.lower() == "xlsx":
@@ -1468,5 +1602,249 @@ async def import_classification_file(
         "status": "success",
         "count": n_saved,
         "message": f"Successfully imported and applied {n_saved:,} {platform.capitalize()} classification rules for {comp.upper()}!"
+    }
+
+
+def _platform_aliases(plat: str):
+    p = str(plat or "launchgood").strip().lower()
+    if p in ("givebrite", "givebright"):
+        return "givebrite", ("givebrite", "givebright")
+    if p in ("website", "rethink_website", "rethink website"):
+        return "website", ("website", "rethink_website")
+    if p in ("stripe", "payment_links", "stripe links"):
+        return "stripe", ("stripe", "payment_links")
+    if p == "madinah":
+        return "madinah", ("madinah",)
+    if p == "paysuite":
+        return "paysuite", ("paysuite",)
+    return "launchgood", ("launchgood",)
+
+
+class VerifyRuleRequest(BaseModel):
+    company_id: str = "rethink"
+    platform: str
+    campaign_name: str
+    giving_level: str = ""
+    code: str = "Unassigned"
+    community_name: str = "N/A"
+    campaign_url: str = ""
+    scope: str = "rule"  # "rule" | "campaign"
+    is_verified: bool = True
+    variants: Optional[List[Dict[str, str]]] = None
+
+
+class FeedbackFlagRequest(BaseModel):
+    company_id: str = "rethink"
+    platform: str
+    campaign_name: str
+    giving_level: str = ""
+    code: str = "Unassigned"
+    community_name: str = "N/A"
+    campaign_url: str = ""
+    scope: str = "rule"  # "rule" | "campaign"
+    needs_feedback: bool = True
+    variants: Optional[List[Dict[str, str]]] = None
+
+
+def _ensure_rule_rows_exist(conn, canonical_plat, aliases, comp, cname, gl_list):
+    """Ensure rows exist in platform_campaign_mappings for auto-discovered campaigns/giving-levels before flagging."""
+    placeholders = ",".join("?" for _ in aliases)
+    for item in gl_list:
+        gl_val = sanitize_text(item.get("giving_level", "")).strip()
+        if gl_val.lower() in ("nan", "none", "n/a", "default (general)", "campaign default / general"):
+            gl_val = ""
+        code_val = sanitize_text(item.get("code", "Unassigned")).strip().upper() or "Unassigned"
+        if code_val in ("NAN", "NONE", ""):
+            code_val = "Unassigned"
+        comm_val = sanitize_text(item.get("community_name", "N/A")).strip() or "N/A"
+        url_val = clean_campaign_url(item.get("campaign_url", ""))
+        exists = conn.execute(
+            f"""SELECT 1 FROM platform_campaign_mappings
+                WHERE LOWER(platform) IN ({placeholders})
+                  AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                  AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(COALESCE(giving_level, ''))) = LOWER(TRIM(?))
+                LIMIT 1""",
+            [*aliases, comp, cname, gl_val],
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                """INSERT OR IGNORE INTO platform_campaign_mappings
+                   (platform, company_id, campaign_name, giving_level, code, community_name, campaign_url, is_primary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                (canonical_plat, comp, cname, gl_val, code_val, comm_val, url_val),
+            )
+
+
+@router.post("/verify")
+def verify_classification_rule(
+    payload: VerifyRuleRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Instantly sets or clears the Verified badge (and server-stamped verifier identity) for a rule or whole campaign."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(status_code=400, detail="Select a specific charity before verifying classifications.")
+    enforce_route_permission(request, current_user, [comp])
+
+    canonical_plat, aliases = _platform_aliases(payload.platform)
+    cname = sanitize_text(payload.campaign_name or "").strip()
+    if not cname:
+        raise HTTPException(status_code=400, detail="Campaign name is required.")
+
+    verifier = str(current_user.get("display_name") or current_user.get("name") or current_user.get("email") or "Authorized Reviewer").strip()
+    verified_flag = 1 if payload.is_verified else 0
+    verified_by = verifier if verified_flag else ""
+    verified_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if verified_flag else ""
+
+    gl = sanitize_text(payload.giving_level or "").strip()
+    if gl.lower() in ("nan", "none", "n/a", "default (general)", "campaign default / general"):
+        gl = ""
+
+    from core.data_processor import init_classification_db
+    init_classification_db()
+
+    placeholders = ",".join("?" for _ in aliases)
+    updated = 0
+    with _DB_LOCK:
+        conn = get_db_connection(timeout=30.0)
+        try:
+            with conn:
+                if payload.scope == "campaign":
+                    seed_list = payload.variants if payload.variants else [{"giving_level": gl, "code": payload.code, "community_name": payload.community_name, "campaign_url": payload.campaign_url}]
+                    _ensure_rule_rows_exist(conn, canonical_plat, aliases, comp, cname, seed_list)
+                    cur = conn.execute(
+                        f"""UPDATE platform_campaign_mappings
+                            SET is_verified = ?, verified_by = ?, verified_at = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE LOWER(platform) IN ({placeholders})
+                              AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                              AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))""",
+                        [verified_flag, verified_by, verified_at, *aliases, comp, cname],
+                    )
+                    updated = cur.rowcount
+                else:
+                    _ensure_rule_rows_exist(conn, canonical_plat, aliases, comp, cname, [{"giving_level": gl, "code": payload.code, "community_name": payload.community_name, "campaign_url": payload.campaign_url}])
+                    cur = conn.execute(
+                        f"""UPDATE platform_campaign_mappings
+                            SET is_verified = ?, verified_by = ?, verified_at = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE LOWER(platform) IN ({placeholders})
+                              AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                              AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                              AND LOWER(TRIM(COALESCE(giving_level, ''))) = LOWER(TRIM(?))""",
+                        [verified_flag, verified_by, verified_at, *aliases, comp, cname, gl],
+                    )
+                    updated = cur.rowcount
+        finally:
+            conn.close()
+
+    try:
+        from core.cache import bump
+        bump("classification", comp)
+    except Exception:
+        pass
+    invalidate_payouts_cache()
+    try:
+        from backend.api.events import broadcast_event_sync
+        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "company_id": comp})
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "is_verified": verified_flag,
+        "verified_by": verified_by,
+        "verified_at": verified_at,
+        "updated_count": updated,
+    }
+
+
+@router.post("/needs-feedback")
+def set_needs_feedback(
+    payload: FeedbackFlagRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Instantly attaches or removes the Needs Feedback flag for a giving-level rule or an entire campaign."""
+    comp = (payload.company_id or "rethink").strip().lower()
+    if comp == "all":
+        raise HTTPException(status_code=400, detail="Select a specific charity before updating feedback flags.")
+    enforce_route_permission(request, current_user, [comp])
+
+    canonical_plat, aliases = _platform_aliases(payload.platform)
+    cname = sanitize_text(payload.campaign_name or "").strip()
+    if not cname:
+        raise HTTPException(status_code=400, detail="Campaign name is required.")
+
+    fb_flag = 1 if payload.needs_feedback else 0
+    gl = sanitize_text(payload.giving_level or "").strip()
+    if gl.lower() in ("nan", "none", "n/a", "default (general)", "campaign default / general"):
+        gl = ""
+
+    from core.data_processor import init_classification_db
+    init_classification_db()
+
+    placeholders = ",".join("?" for _ in aliases)
+    updated = 0
+    with _DB_LOCK:
+        conn = get_db_connection(timeout=30.0)
+        try:
+            with conn:
+                if payload.scope == "campaign":
+                    seed_list = payload.variants if payload.variants else [{"giving_level": gl, "code": payload.code, "community_name": payload.community_name, "campaign_url": payload.campaign_url}]
+                    _ensure_rule_rows_exist(conn, canonical_plat, aliases, comp, cname, seed_list)
+                    cur = conn.execute(
+                        f"""UPDATE platform_campaign_mappings
+                            SET needs_feedback = ?, campaign_needs_feedback = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE LOWER(platform) IN ({placeholders})
+                              AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                              AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))""",
+                        [fb_flag, fb_flag, *aliases, comp, cname],
+                    )
+                    updated = cur.rowcount
+                else:
+                    _ensure_rule_rows_exist(conn, canonical_plat, aliases, comp, cname, [{"giving_level": gl, "code": payload.code, "community_name": payload.community_name, "campaign_url": payload.campaign_url}])
+                    cur = conn.execute(
+                        f"""UPDATE platform_campaign_mappings
+                            SET needs_feedback = ?,
+                                campaign_needs_feedback = CASE WHEN ? = 0 THEN 0 ELSE campaign_needs_feedback END,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE LOWER(platform) IN ({placeholders})
+                              AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                              AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))
+                              AND LOWER(TRIM(COALESCE(giving_level, ''))) = LOWER(TRIM(?))""",
+                        [fb_flag, fb_flag, *aliases, comp, cname, gl],
+                    )
+                    updated = cur.rowcount
+                    if fb_flag == 0:
+                        # Clear whole-campaign flag when an individual level is unchecked
+                        conn.execute(
+                            f"""UPDATE platform_campaign_mappings
+                                SET campaign_needs_feedback = 0
+                                WHERE LOWER(platform) IN ({placeholders})
+                                  AND LOWER(COALESCE(company_id, 'rethink')) = ?
+                                  AND LOWER(TRIM(campaign_name)) = LOWER(TRIM(?))""",
+                            [*aliases, comp, cname],
+                        )
+        finally:
+            conn.close()
+
+    try:
+        from core.cache import bump
+        bump("classification", comp)
+    except Exception:
+        pass
+    invalidate_payouts_cache()
+    try:
+        from backend.api.events import broadcast_event_sync
+        broadcast_event_sync("MATRIX_UPDATED", {"platform": payload.platform, "company_id": comp})
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "needs_feedback": fb_flag,
+        "campaign_needs_feedback": fb_flag if payload.scope == "campaign" else 0,
+        "updated_count": updated,
     }
 

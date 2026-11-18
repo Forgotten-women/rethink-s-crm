@@ -223,6 +223,12 @@ class ContactMaskMiddleware:
                 headers = dict(message.get("headers") or [])
                 ctype = headers.get(b"content-type", b"")
                 if b"application/json" in ctype:
+                    state = scope.get("state") or {}
+                    user = state.get("api_user") or state.get("tracker_user")
+                    qs = dict(p.split("=", 1) if "=" in p else (p, "") for p in scope.get("query_string", b"").decode("latin-1").split("&") if p)
+                    company = unquote(qs.get("company_id", "")) or None
+                    if not _must_mask(user, company):
+                        return await send(message)
                     buffering = True
                     start.update(message)
                     return

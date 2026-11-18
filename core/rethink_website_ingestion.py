@@ -325,18 +325,51 @@ def resolve_website_classification(cursor, campaign_name: str, campaign_url: str
             code = row[0]
 
     if not code:
-        code = "ALL-GEN-GEN-GEN"
+        # Register unknown website campaign into platform_campaign_mappings as UNASSIGNED so it surfaces in Classification Matrix
+        if c_name:
+            cursor.execute("""
+                SELECT id FROM platform_campaign_mappings
+                WHERE platform IN ('website', 'rethink_website')
+                  AND LOWER(company_id) = 'rethink'
+                  AND LOWER(campaign_name) = LOWER(?)
+                LIMIT 1
+            """, (c_name,))
+            if not cursor.fetchone():
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute("""
+                    INSERT INTO platform_campaign_mappings (
+                        platform, campaign_name, giving_level, code,
+                        community_name, campaign_url, is_primary, company_id,
+                        created_at, updated_at
+                    ) VALUES (
+                        'website', ?, '', 'UNASSIGNED',
+                        'N/A', ?, 1, 'rethink',
+                        ?, ?
+                    )
+                """, (c_name, campaign_url or "", now_str, now_str))
+
+        return {
+            "Code": "Unassigned",
+            "Heading": "Unassigned",
+            "Sub-Heading": "Unassigned",
+            "Country": "",
+            "Department": "",
+            "Office": "",
+            "Portfolio": "",
+            "Programme Fund": "",
+            "Fund Code": "Unassigned"
+        }
 
     meta = {
         "Code": code,
-        "Heading": "Aid",
-        "Sub-Heading": "General",
-        "Country": "SHM",
-        "Department": "Aid",
-        "Office": "General",
-        "Portfolio": "General",
-        "Programme Fund": "1. Emergency / Most-Needed Fund",
-        "Fund Code": "F1-EMR"
+        "Heading": "",
+        "Sub-Heading": "",
+        "Country": "",
+        "Department": "",
+        "Office": "",
+        "Portfolio": "",
+        "Programme Fund": "",
+        "Fund Code": ""
     }
 
     cursor.execute("""
@@ -348,8 +381,8 @@ def resolve_website_classification(cursor, campaign_name: str, campaign_url: str
     mrow = cursor.fetchone()
     if mrow:
         meta["Code"] = mrow[0]
-        meta["Heading"] = mrow[1] or ""
-        meta["Sub-Heading"] = mrow[2] or ""
+        meta["Heading"] = mrow[1] or mrow[4] or ""
+        meta["Sub-Heading"] = mrow[2] or mrow[5] or ""
         meta["Country"] = mrow[3] or ""
         meta["Department"] = mrow[4] or ""
         meta["Office"] = mrow[5] or ""

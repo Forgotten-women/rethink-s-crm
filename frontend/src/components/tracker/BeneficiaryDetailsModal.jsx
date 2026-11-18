@@ -3,9 +3,49 @@ import {
   X, ExternalLink, FileText, Video, Folder, Mail, Phone, Copy, Check,
   Calendar, User, Users, Clock, Sparkles, Send, Edit3, AlertCircle,
   CheckCircle2, MessageSquare, MapPin, Heart, Building2, ChevronRight,
-  RefreshCw, ShieldCheck, Tag
+  RefreshCw, ShieldCheck, Tag, Plus, Trash2
 } from 'lucide-react';
 import { API_BASE_URL } from '../../config';
+
+const formatLoggedDate = (dateStr) => {
+  if (!dateStr) return '—';
+  try {
+    const d = new Date(dateStr.replace(' ', 'T'));
+    if (isNaN(d.getTime())) return dateStr;
+    const dateFormatted = d.toLocaleDateString('en-GB', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric'
+    });
+    const timeFormatted = d.toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    return `${dateFormatted} at ${timeFormatted}`;
+  } catch {
+    return dateStr;
+  }
+};
+
+const getRelativeTimeString = (dateStr) => {
+  if (!dateStr) return '';
+  try {
+    const d = new Date(dateStr.replace(' ', 'T'));
+    const now = new Date();
+    const diffMs = now - d;
+    const diffMins = Math.floor(diffMs / (1000 * 60));
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) return `${diffHours}h ago`;
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays < 30) return `${diffDays}d ago`;
+    return '';
+  } catch {
+    return '';
+  }
+};
 
 const getEmbeddableDocUrl = (url) => {
   if (!url) return '';
@@ -46,7 +86,16 @@ export default function BeneficiaryDetailsModal({
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
   const [statusSuccess, setStatusSuccess] = useState(false);
-  const [activeTab, setActiveTab] = useState('overview'); // 'overview' | 'donors' | 'media' | 'feedbacks' | 'comms'
+  const [activeTab, setActiveTab] = useState('overview'); // 'overview' | 'statuses' | 'donors' | 'media' | 'feedbacks' | 'comms'
+
+  // Multiple Status Assignment State
+  const [showAddStatusModal, setShowAddStatusModal] = useState(false);
+  const [newStatusName, setNewStatusName] = useState('First Emailed');
+  const [customStatusInput, setCustomStatusInput] = useState('');
+  const [newStatusTimestamp, setNewStatusTimestamp] = useState('');
+  const [newStatusNotes, setNewStatusNotes] = useState('');
+  const [submittingStatus, setSubmittingStatus] = useState(false);
+  const [deletingStatusId, setDeletingStatusId] = useState(null);
 
   useEffect(() => {
     if (beneficiary && isOpen) {
@@ -71,6 +120,16 @@ export default function BeneficiaryDetailsModal({
     }
   };
 
+  const displayStatuses = useMemo(() => {
+    const all = data.statuses || [];
+    const isPending = (s) => {
+      const norm = (s || '').toLowerCase().trim();
+      return norm === 'pending' || norm === 'profile pending' || norm === 'pending profile' || norm === 'unallocated';
+    };
+    const active = all.filter(st => !isPending(st.status));
+    return active.length > 0 ? active : all;
+  }, [data.statuses]);
+
   const handleUpdateStatus = async (newStatus) => {
     if (!data?.id || updatingStatus) return;
     setUpdatingStatus(true);
@@ -90,11 +149,79 @@ export default function BeneficiaryDetailsModal({
         setStatusSuccess(true);
         setTimeout(() => setStatusSuccess(false), 2000);
         if (onStatusUpdated) onStatusUpdated(updated);
+        fetchFullDetails(data.id);
       }
     } catch (err) {
       console.error('Failed to update communication status:', err);
     } finally {
       setUpdatingStatus(false);
+    }
+  };
+
+  const handleAddNewStatus = async (e) => {
+    if (e) e.preventDefault();
+    const finalStatus = newStatusName === 'Custom' ? customStatusInput.trim() : newStatusName;
+    if (!finalStatus || !data?.id || submittingStatus) return;
+    
+    setSubmittingStatus(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/tracker/beneficiaries/${data.id}/statuses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: finalStatus,
+          timestamp: newStatusTimestamp || undefined,
+          notes: newStatusNotes.trim(),
+          source: 'individual'
+        })
+      });
+      if (res.ok) {
+        const result = await res.json();
+        const updatedStatuses = [result.entry, ...(data.statuses || [])];
+        const updated = {
+          ...data,
+          statuses: updatedStatuses,
+          communication_status: finalStatus,
+          last_contacted_at: result.entry.created_at
+        };
+        setData(updated);
+        setShowAddStatusModal(false);
+        setCustomStatusInput('');
+        setNewStatusNotes('');
+        setStatusSuccess(true);
+        setTimeout(() => setStatusSuccess(false), 2000);
+        if (onStatusUpdated) onStatusUpdated(updated);
+      }
+    } catch (err) {
+      console.error('Failed to add status entry:', err);
+    } finally {
+      setSubmittingStatus(false);
+    }
+  };
+
+  const handleDeleteStatus = async (statusId) => {
+    if (!statusId || !data?.id || deletingStatusId) return;
+    if (!window.confirm('Are you sure you want to remove this logged status?')) return;
+    setDeletingStatusId(statusId);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/tracker/beneficiaries/${data.id}/statuses/${statusId}`, {
+        method: 'DELETE'
+      });
+      if (res.ok) {
+        const result = await res.json();
+        const updatedStatuses = (data.statuses || []).filter(s => s.id !== statusId);
+        const updated = {
+          ...data,
+          statuses: updatedStatuses,
+          communication_status: result.current_status || (updatedStatuses[0]?.status || 'Pending Profile')
+        };
+        setData(updated);
+        if (onStatusUpdated) onStatusUpdated(updated);
+      }
+    } catch (err) {
+      console.error('Failed to delete status entry:', err);
+    } finally {
+      setDeletingStatusId(null);
     }
   };
 
@@ -267,6 +394,19 @@ export default function BeneficiaryDetailsModal({
               </span>
             )}
 
+            <button
+              type="button"
+              onClick={() => {
+                setNewStatusTimestamp(new Date().toISOString().slice(0, 16));
+                setShowAddStatusModal(true);
+              }}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs transition-all shadow-xs"
+              title="Assign a new timestamped status to this beneficiary"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Assign Status
+            </button>
+
             {!data.allocation_id && (
               <span className="text-slate-400 italic text-[11px]">
                 (Allocate to a donor to enable outreach tracking)
@@ -315,6 +455,22 @@ export default function BeneficiaryDetailsModal({
             }`}
           >
             Overview & Profile
+          </button>
+          <button
+            onClick={() => setActiveTab('statuses')}
+            className={`py-3 border-b-2 transition-all flex items-center gap-1.5 ${
+              activeTab === 'statuses'
+                ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-extrabold'
+                : 'border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+            }`}
+          >
+            <Clock className="w-3.5 h-3.5" />
+            Status History
+            {data.statuses?.length > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-blue-100 dark:bg-blue-950/80 text-blue-700 dark:text-blue-300 font-bold">
+                {data.statuses.length}
+              </span>
+            )}
           </button>
           <button
             onClick={() => setActiveTab('donors')}
@@ -541,6 +697,63 @@ export default function BeneficiaryDetailsModal({
                 )}
               </div>
 
+              {/* Active Assigned Statuses & Outreach Timeline Card */}
+              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-bold text-sm text-slate-900 dark:text-white flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-blue-500" />
+                    Assigned Statuses & Timeline ({data.statuses?.length || 0})
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewStatusTimestamp(new Date().toISOString().slice(0, 16));
+                      setShowAddStatusModal(true);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-blue-50 dark:bg-blue-950/60 hover:bg-blue-100 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800 font-bold text-xs flex items-center gap-1 transition-all"
+                  >
+                    <Plus className="w-3 h-3" /> Add Status
+                  </button>
+                </div>
+
+                {displayStatuses && displayStatuses.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {displayStatuses.map((st) => (
+                      <div
+                        key={st.id}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 text-xs shadow-xs"
+                      >
+                        <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1">
+                          <Tag className="w-3 h-3 text-blue-500" />
+                          {st.status}
+                        </span>
+                        <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                          · {formatLoggedDate(st.created_at)}
+                        </span>
+                        {getRelativeTimeString(st.created_at) && (
+                          <span className="text-[10px] text-blue-600 dark:text-blue-400 font-medium">
+                            ({getRelativeTimeString(st.created_at)})
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteStatus(st.id)}
+                          disabled={deletingStatusId === st.id}
+                          className="text-slate-400 hover:text-rose-600 ml-1 p-0.5 rounded transition-colors"
+                          title="Remove this status"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="p-4 text-center text-slate-400 bg-slate-50 dark:bg-slate-800/40 rounded-lg border border-dashed border-slate-200 dark:border-slate-800 text-xs">
+                    No status milestones recorded yet. Click <strong>+ Add Status</strong> to log the first outreach step.
+                  </div>
+                )}
+              </div>
+
               {/* Media Previews Bar */}
               <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs">
                 <h3 className="font-bold text-sm text-slate-900 dark:text-white flex items-center gap-2 mb-3">
@@ -599,6 +812,98 @@ export default function BeneficiaryDetailsModal({
                   )}
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* TAB: STATUS HISTORY & TIMELINE */}
+          {activeTab === 'statuses' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="font-bold text-sm text-slate-900 dark:text-white flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-blue-500" />
+                    Status Log & Outreach History
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Chronological record of multiple statuses and outreach milestones with timestamps.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewStatusTimestamp(new Date().toISOString().slice(0, 16));
+                    setShowAddStatusModal(true);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs flex items-center gap-1.5 transition-all shadow-xs"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Assign New Status
+                </button>
+              </div>
+
+              {displayStatuses && displayStatuses.length > 0 ? (
+                <div className="relative border-l-2 border-blue-200 dark:border-blue-900 ml-4 pl-6 space-y-6 py-2">
+                  {displayStatuses.map((st) => (
+                    <div key={st.id} className="relative group">
+                      {/* Timeline dot */}
+                      <div className="absolute -left-[31px] top-1 w-4 h-4 rounded-full border-2 border-blue-500 bg-white dark:bg-slate-900 flex items-center justify-center">
+                        <div className="w-1.5 h-1.5 rounded-full bg-blue-600" />
+                      </div>
+
+                      <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-blue-300 dark:hover:border-blue-800 transition-all shadow-xs">
+                        <div className="flex items-center justify-between gap-3 mb-2 flex-wrap">
+                          <div className="flex items-center gap-2">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                              <Tag className="w-3 h-3" />
+                              {st.status}
+                            </span>
+                            {st.source && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                                {st.source === 'campaign' ? `Campaign: ${st.campaign_name || 'Bulk'}` : st.source}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs font-mono text-slate-500 dark:text-slate-400 flex items-center gap-1">
+                              <Calendar className="w-3 h-3 text-slate-400" />
+                              {formatLoggedDate(st.created_at)}
+                              {getRelativeTimeString(st.created_at) && (
+                                <span className="text-slate-400 font-normal">
+                                  ({getRelativeTimeString(st.created_at)})
+                                </span>
+                              )}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteStatus(st.id)}
+                              disabled={deletingStatusId === st.id}
+                              className="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-rose-600 rounded transition-all"
+                              title="Delete this status entry"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {st.notes && (
+                          <p className="text-xs text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-800/60 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800/80">
+                            {st.notes}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="p-8 text-center text-slate-400 bg-slate-50 dark:bg-slate-800/40 rounded-xl border border-dashed border-slate-200 dark:border-slate-800">
+                  <Clock className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                  <p className="font-semibold text-sm">No status milestones recorded yet for this beneficiary.</p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Click <strong>Assign New Status</strong> to log the first outreach timestamp (e.g. First Emailed).
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -959,6 +1264,130 @@ export default function BeneficiaryDetailsModal({
             </button>
           </div>
         </div>
+
+        {/* Assign Status Modal Dialog */}
+        {showAddStatusModal && (
+          <div className="fixed inset-0 z-[70] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4" role="dialog" aria-modal="true">
+            <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-md w-full border border-slate-200 dark:border-slate-800 shadow-2xl p-6 animate-scale-in">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-lg bg-blue-100 dark:bg-blue-950 text-blue-600 dark:text-blue-400">
+                    <Tag className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-base text-slate-900 dark:text-white">
+                      Assign Status to Beneficiary
+                    </h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {data.name} · <span className="font-mono font-semibold">{data.project_code}</span>
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowAddStatusModal(false)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleAddNewStatus} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5">
+                    Select Outreach / Progress Status *
+                  </label>
+                  <select
+                    value={newStatusName}
+                    onChange={(e) => setNewStatusName(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="First Emailed">✉️ First Emailed</option>
+                    <option value="Profile Sent">📄 Profile Sent</option>
+                    <option value="Welcome Sent">👋 Welcome Sent</option>
+                    <option value="Update Sent">📹 Update Sent</option>
+                    <option value="Video Sent">🎬 Video Sent</option>
+                    <option value="Feedback Sent">📋 Feedback Sent</option>
+                    <option value="Annual Report Sent">📊 Annual Report Sent</option>
+                    <option value="Renewal Sent">🔄 Renewal Sent</option>
+                    <option value="Donor Replied">💬 Donor Replied</option>
+                    <option value="Payment Received">💰 Payment Received</option>
+                    <option value="Custom">✏️ Custom Status...</option>
+                  </select>
+                </div>
+
+                {newStatusName === 'Custom' && (
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5">
+                      Custom Status Name *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={customStatusInput}
+                      onChange={(e) => setCustomStatusInput(e.target.value)}
+                      placeholder="e.g. Ramadan Care Package Delivered"
+                      className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5 flex items-center justify-between">
+                    <span>Date & Time of Event (Timestamp)</span>
+                    <button
+                      type="button"
+                      onClick={() => setNewStatusTimestamp(new Date().toISOString().slice(0, 16))}
+                      className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline font-semibold"
+                    >
+                      Set to Now
+                    </button>
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={newStatusTimestamp}
+                    onChange={(e) => setNewStatusTimestamp(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                  />
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Logged with timestamp. You can also pick any past date/time.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5">
+                    Notes / Description (Optional)
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={newStatusNotes}
+                    onChange={(e) => setNewStatusNotes(e.target.value)}
+                    placeholder="e.g. First introductory email sent with welcome PDF attachment"
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+
+                <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-200 dark:border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setShowAddStatusModal(false)}
+                    className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={submittingStatus}
+                    className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold transition-all shadow-xs disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    {submittingStatus ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                    Save & Log Status
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
 
       </div>
     </div>

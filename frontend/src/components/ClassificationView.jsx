@@ -26,7 +26,9 @@ import {
   Plus,
   Edit3,
   Sparkles,
-  Table
+  Table,
+  ShieldCheck,
+  MessageSquare
 } from 'lucide-react';
 import { API_BASE_URL, downloadFile } from '../config';
 import { can } from '../access';
@@ -56,6 +58,35 @@ function cleanText(val) {
        .replace(/Ã±/g, 'ñ')
        .replace(/Ã\s/g, 'à');
   return s;
+}
+
+function isSpCampaignName(name) {
+  if (!name || typeof name !== 'string') return false;
+  const c = name.trim().toLowerCase();
+  return (
+    c.includes('sisters project') ||
+    c.includes("sister's project") ||
+    c.includes("sisters' project") ||
+    c.includes('sp:') ||
+    c.includes('sp -') ||
+    c.includes(' sp ') ||
+    c.startsWith('sp ') ||
+    c.startsWith('sp-') ||
+    c.startsWith('sp:') ||
+    c === 'sp'
+  );
+}
+
+function isSpText(text) {
+  if (!text || typeof text !== 'string') return false;
+  const t = text.trim().toLowerCase();
+  const slug = t.split('?')[0].replace(/\/+$/, '').split('/').pop();
+  return (
+    isSpCampaignName(t) ||
+    slug.startsWith('sp_') ||
+    slug.startsWith('sp-') ||
+    /(^|[^a-z])(sp|sisters'? ?project)([^a-z]|$)|^sp[_-]/i.test(t)
+  );
 }
 
 export default function ClassificationView({ user, activeCompany = 'rethink', companies = [], onNavigateToExplorer }) {
@@ -107,6 +138,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   // 🚀 Fast Client-Side Search & Pagination State
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL'); // 'ALL', 'SINGLE_CODE', 'MULTI_CODE', 'UNASSIGNED'
+  const [spFilter, setSpFilter] = useState('ALL'); // 'ALL', 'SP', 'NON_SP'
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50); // 25, 50, 100, 250, 'All'
   const [jumpPage, setJumpPage] = useState('');
@@ -145,6 +177,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
   // What this person may change here (access.js; the server checks every save again).
   const canEditRules = can(user, 'classifications.edit', activeCompany);
+  const canVerifyRules = can(user, 'classifications.verify', activeCompany);
   const canMasterCodes = can(user, 'classifications.master_codes', activeCompany);
   const canDeleteRules = can(user, 'classifications.delete', activeCompany);
   const canImportRules = can(user, 'classifications.import', activeCompany);
@@ -158,10 +191,10 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     setCurrentPage(1);
   };
 
-  // Reset page to 1 whenever search, status filter, or page size changes
+  // Reset page to 1 whenever search, status filter, SP filter, or page size changes
   useEffect(() => {
     setCurrentPage(1);
-  }, [platform, statusFilter, searchQuery, pageSize]);
+  }, [platform, statusFilter, spFilter, searchQuery, pageSize]);
 
   // Fetch Code Map for dynamic Code -> Heading, Sub-Heading, Country, Zakat auto-fill
   useEffect(() => {
@@ -788,19 +821,280 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     });
   };
 
+  // Instant Verify / Unverify (RBAC: classifications.verify)
+  const handleToggleVerify = async (ruleOrCampaign, scope = 'rule', variants = null) => {
+    if (!canVerifyRules) return;
+    if (activeCompany === 'all') {
+      alert('Select a specific charity (Rethink or Iqra) before verifying classifications.');
+      return;
+    }
+    const cName = ruleOrCampaign['Campaign Name'] || ruleOrCampaign['campaign_name'];
+    const gl = ruleOrCampaign['Giving Level'] || ruleOrCampaign['giving_level'] || '';
+    const nextVerified = scope === 'campaign'
+      ? !(Array.isArray(variants) && variants.length > 0 && variants.every(r => Number(r.is_verified) === 1))
+      : !(Number(ruleOrCampaign.is_verified) === 1);
+
+    const payload = {
+      company_id: activeCompany,
+      platform,
+      campaign_name: cName,
+      giving_level: gl,
+      code: ruleOrCampaign['Code'] || ruleOrCampaign['code'] || 'Unassigned',
+      community_name: ruleOrCampaign['Community Name'] || ruleOrCampaign['community_name'] || 'N/A',
+      campaign_url: ruleOrCampaign['Campaign URL'] || ruleOrCampaign['campaign_url'] || '',
+      scope,
+      is_verified: nextVerified,
+      variants: variants ? variants.map(v => ({
+        giving_level: v['Giving Level'] || v['giving_level'] || '',
+        code: v['Code'] || v['code'] || 'Unassigned',
+        community_name: v['Community Name'] || v['community_name'] || 'N/A',
+        campaign_url: v['Campaign URL'] || v['campaign_url'] || ''
+      })) : null
+    };
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/classifications/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to update verification status.');
+
+      setMatrixData(prev => ({
+        ...prev,
+        rules: prev.rules.map(r => {
+          const sameCamp = (r['Campaign Name'] || r['campaign_name'] || '').trim().toLowerCase() === String(cName).trim().toLowerCase();
+          if (!sameCamp) return r;
+          if (scope === 'campaign' || (r['Giving Level'] || r['giving_level'] || '').trim().toLowerCase() === String(gl).trim().toLowerCase()) {
+            return {
+              ...r,
+              is_verified: data.is_verified,
+              verified_by: data.verified_by,
+              verified_at: data.verified_at
+            };
+          }
+          return r;
+        })
+      }));
+      setSaveNotification({
+        type: 'success',
+        title: data.is_verified ? 'Classification Verified' : 'Verification Removed',
+        message: data.is_verified
+          ? `${cName}${scope === 'rule' && gl ? ` (${gl})` : ''} marked Verified by ${data.verified_by}.`
+          : `Removed verified status from ${cName}${scope === 'rule' && gl ? ` (${gl})` : ''}.`,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    } catch (err) {
+      setSaveNotification({
+        type: 'error',
+        title: 'Verification Error',
+        message: err.message,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    }
+  };
+
+  // Instant Needs Feedback Toggle (rule / giving level OR whole campaign)
+  const handleToggleNeedsFeedback = async (ruleOrCampaign, scope = 'rule', variants = null) => {
+    if (!(canEditRules || canVerifyRules)) return;
+    if (activeCompany === 'all') {
+      alert('Select a specific charity (Rethink or Iqra) before toggling feedback eligibility.');
+      return;
+    }
+    const cName = ruleOrCampaign['Campaign Name'] || ruleOrCampaign['campaign_name'];
+    const gl = ruleOrCampaign['Giving Level'] || ruleOrCampaign['giving_level'] || '';
+    const nextFb = scope === 'campaign'
+      ? !(Number(ruleOrCampaign.campaign_needs_feedback) === 1 || (Array.isArray(variants) && variants.length > 0 && variants.every(r => Number(r.needs_feedback) === 1)))
+      : !(Number(ruleOrCampaign.needs_feedback) === 1);
+
+    const payload = {
+      company_id: activeCompany,
+      platform,
+      campaign_name: cName,
+      giving_level: gl,
+      code: ruleOrCampaign['Code'] || ruleOrCampaign['code'] || 'Unassigned',
+      community_name: ruleOrCampaign['Community Name'] || ruleOrCampaign['community_name'] || 'N/A',
+      campaign_url: ruleOrCampaign['Campaign URL'] || ruleOrCampaign['campaign_url'] || '',
+      scope,
+      needs_feedback: nextFb,
+      variants: variants ? variants.map(v => ({
+        giving_level: v['Giving Level'] || v['giving_level'] || '',
+        code: v['Code'] || v['code'] || 'Unassigned',
+        community_name: v['Community Name'] || v['community_name'] || 'N/A',
+        campaign_url: v['Campaign URL'] || v['campaign_url'] || ''
+      })) : null
+    };
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/classifications/needs-feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to update feedback status.');
+
+      setMatrixData(prev => ({
+        ...prev,
+        rules: prev.rules.map(r => {
+          const sameCamp = (r['Campaign Name'] || r['campaign_name'] || '').trim().toLowerCase() === String(cName).trim().toLowerCase();
+          if (!sameCamp) return r;
+          if (scope === 'campaign') {
+            return {
+              ...r,
+              needs_feedback: data.needs_feedback,
+              campaign_needs_feedback: data.campaign_needs_feedback
+            };
+          }
+          if ((r['Giving Level'] || r['giving_level'] || '').trim().toLowerCase() === String(gl).trim().toLowerCase()) {
+            return {
+              ...r,
+              needs_feedback: data.needs_feedback,
+              campaign_needs_feedback: data.needs_feedback === 0 ? 0 : r.campaign_needs_feedback
+            };
+          }
+          return {
+            ...r,
+            campaign_needs_feedback: data.needs_feedback === 0 ? 0 : r.campaign_needs_feedback
+          };
+        })
+      }));
+      setSaveNotification({
+        type: 'success',
+        title: data.needs_feedback ? 'Marked Requires Feedback' : 'Feedback Flag Removed',
+        message: data.needs_feedback
+          ? `Donations under "${cName}${scope === 'rule' && gl ? ` / ${gl}` : ' (Whole Campaign)'}" now appear in Emails → General Feedback Eligible.`
+          : `Removed feedback requirement for "${cName}${scope === 'rule' && gl ? ` / ${gl}` : ''}".`,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    } catch (err) {
+      setSaveNotification({
+        type: 'error',
+        title: 'Feedback Flag Error',
+        message: err.message,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    }
+  };
+
+  // Shared Verified column cell renderer (single row, parent campaign, or child giving level)
+  const renderVerifiedCell = (item, scope = 'rule', variants = null) => {
+    const isParent = scope === 'campaign' && Array.isArray(variants);
+    const verifiedCount = isParent ? variants.filter(v => Number(v.is_verified) === 1).length : (Number(item.is_verified) === 1 ? 1 : 0);
+    const totalCount = isParent ? variants.length : 1;
+    const isFullyVerified = totalCount > 0 && verifiedCount === totalCount;
+    const isPartial = isParent && verifiedCount > 0 && verifiedCount < totalCount;
+    const verBy = item.verified_by || (isParent ? (variants.find(v => v.verified_by)?.verified_by || '') : '');
+    const verAt = item.verified_at || (isParent ? (variants.find(v => v.verified_at)?.verified_at || '') : '');
+    const targetItem = isParent ? (item.primaryRule || variants[0] || item) : item;
+
+    return (
+      <td className="py-2 px-2 text-center min-w-[165px]">
+        <div className="flex flex-col items-center gap-0.5">
+          <button
+            type="button"
+            disabled={!canVerifyRules}
+            onClick={() => handleToggleVerify(targetItem, scope, variants)}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all ${
+              canVerifyRules ? 'cursor-pointer' : 'cursor-not-allowed opacity-85'
+            } ${
+              isFullyVerified
+                ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border-emerald-400/50 hover:bg-emerald-200/70'
+                : isPartial
+                ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 border-amber-400/50 hover:bg-amber-200/70'
+                : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 border-slate-300 dark:border-white/10 hover:border-teal-400'
+            }`}
+            title={
+              !canVerifyRules
+                ? (verBy ? `Verified by ${verBy}${verAt ? ` on ${verAt}` : ''} (Verify permission required to edit)` : 'Requires classifications.verify permission')
+                : isFullyVerified
+                ? `Verified by ${verBy}${verAt ? ` (${verAt})` : ''} — click to unverify`
+                : 'Click to mark Verified'
+            }
+          >
+            <ShieldCheck className={`w-3.5 h-3.5 shrink-0 ${isFullyVerified ? 'text-emerald-600 dark:text-emerald-400' : isPartial ? 'text-amber-600' : 'text-slate-400'}`} />
+            <span>
+              {isFullyVerified
+                ? (isParent ? 'All Verified' : 'Verified')
+                : isPartial
+                ? `${verifiedCount}/${totalCount} Verified`
+                : 'Unverified'}
+            </span>
+          </button>
+          {(isFullyVerified || isPartial) && verBy && (
+            <span className="text-[10px] text-slate-500 dark:text-slate-400 font-medium truncate max-w-[155px]" title={`${verBy}${verAt ? ` • ${verAt}` : ''}`}>
+              by {verBy}
+            </span>
+          )}
+        </div>
+      </td>
+    );
+  };
+
+  // Shared Needs Feedback column cell renderer (single row, whole campaign, or giving level)
+  const renderNeedsFeedbackCell = (item, scope = 'rule', variants = null) => {
+    const isParent = scope === 'campaign' && Array.isArray(variants);
+    const fbCount = isParent ? variants.filter(v => Number(v.needs_feedback) === 1).length : (Number(item.needs_feedback) === 1 ? 1 : 0);
+    const totalCount = isParent ? variants.length : 1;
+    const isWholeCamp = Number(item.campaign_needs_feedback) === 1 || (isParent && fbCount === totalCount && totalCount > 0);
+    const isChecked = isParent ? isWholeCamp : (Number(item.needs_feedback) === 1 || Number(item.campaign_needs_feedback) === 1);
+    const isPartial = isParent && !isWholeCamp && fbCount > 0;
+    const canToggle = canEditRules || canVerifyRules;
+    const targetItem = isParent ? (item.primaryRule || variants[0] || item) : item;
+
+    return (
+      <td className="py-2 px-2 text-center min-w-[155px]">
+        <button
+          type="button"
+          disabled={!canToggle}
+          onClick={() => handleToggleNeedsFeedback(targetItem, scope, variants)}
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all ${
+            canToggle ? 'cursor-pointer' : 'cursor-not-allowed opacity-80'
+          } ${
+            isChecked
+              ? 'bg-violet-100 text-violet-800 dark:bg-violet-950/60 dark:text-violet-300 border-violet-400/50 hover:bg-violet-200/70 shadow-2xs'
+              : isPartial
+              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 border-amber-400/50 hover:bg-amber-200/70'
+              : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 border-slate-300 dark:border-white/10 hover:border-violet-400'
+          }`}
+          title={
+            isParent
+              ? (isChecked ? 'Whole campaign Requires Feedback — click to remove' : 'Click to mark Whole Campaign as Requires Feedback')
+              : (isChecked ? 'Requires Feedback — click to turn off' : 'Click to mark this giving level / campaign as Requires Feedback')
+          }
+        >
+          <MessageSquare className={`w-3.5 h-3.5 shrink-0 ${isChecked ? 'text-violet-600 dark:text-violet-400' : isPartial ? 'text-amber-600' : 'text-slate-400'}`} />
+          <span>
+            {isParent
+              ? (isChecked ? 'Requires Feedback' : isPartial ? `${fbCount}/${totalCount} Feedback` : 'No Feedback')
+              : (isChecked ? 'Requires Feedback' : 'No Feedback')}
+          </span>
+        </button>
+      </td>
+    );
+  };
+
   // 📂 Group rules by Campaign Name for clean Hierarchical & Collapsible Matrix
   const groupedCampaigns = useMemo(() => {
     const rules = matrixData.rules || [];
     if (platform === 'master') {
-      return rules.map((r, i) => ({
-        campaign_name: r['Code'] || r['code'] || `code_${i}`,
-        'Campaign Name': r['Code'] || r['code'] || `code_${i}`,
-        is_multi: false,
-        variants_count: 1,
-        status: (r['Department'] && r['Department'] !== 'Unassigned') ? 'single_code' : 'unassigned',
-        rules: [r],
-        ...r
-      }));
+      return rules.map((r, i) => {
+        const cCode = String(r['Code'] || r['code'] || `code_${i}`);
+        const desc = String(r['Description'] || r['description'] || '');
+        const port = String(r['Portfolio'] || r['portfolio'] || '');
+        const isSp = Number(r.is_sp) === 1 || isSpText(cCode) || isSpText(desc) || desc.toLowerCase().includes('sisters project') || port.toLowerCase().includes('sisters project') || cCode.toUpperCase().includes('-SIS');
+        return {
+          campaign_name: cCode,
+          'Campaign Name': cCode,
+          is_multi: false,
+          variants_count: 1,
+          is_sp: isSp ? 1 : 0,
+          status: (r['Department'] && r['Department'] !== 'Unassigned') ? 'single_code' : 'unassigned',
+          rules: [r],
+          ...r
+        };
+      });
     }
 
     const map = new Map();
@@ -831,6 +1125,13 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       const totalAmount = grpRules.reduce((sum, r) => sum + (Number(r.total_amount) || 0), 0);
       const primaryRule = grpRules.find(r => r.is_primary) || grpRules[0];
       const hasGivingLevels = grpRules.some(r => Boolean(r['Giving Level'] && r['Giving Level'] !== 'Default (General)'));
+      const verifiedCount = grpRules.filter(r => Number(r.is_verified) === 1).length;
+      const allVerified = grpRules.length > 0 && verifiedCount === grpRules.length;
+      const verifierName = grpRules.find(r => r.verified_by)?.verified_by || '';
+      const verifiedAt = grpRules.find(r => r.verified_at)?.verified_at || '';
+      const feedbackCount = grpRules.filter(r => Number(r.needs_feedback) === 1).length;
+      const campaignNeedsFeedback = grpRules.some(r => Number(r.campaign_needs_feedback) === 1) || (grpRules.length > 0 && feedbackCount === grpRules.length);
+      const isSp = grpRules.some(r => Number(r.is_sp) === 1) || isSpCampaignName(grp.campaign_name) || isSpText(grp.campaign_name) || isSpText(grp['Campaign URL']);
 
       let status = 'single_code';
       if (hasUnassigned) {
@@ -841,6 +1142,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
       list.push({
         ...grp,
+        is_sp: isSp ? 1 : 0,
         is_multi: isMulti,
         variants_count: variantsCount,
         has_unassigned: hasUnassigned,
@@ -848,7 +1150,13 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
         donation_count: totalDonations,
         total_amount: totalAmount,
         primaryRule: primaryRule,
-        has_giving_levels: hasGivingLevels
+        has_giving_levels: hasGivingLevels,
+        verified_count: verifiedCount,
+        all_verified: allVerified,
+        verified_by: verifierName,
+        verified_at: verifiedAt,
+        feedback_count: feedbackCount,
+        campaign_needs_feedback: campaignNeedsFeedback ? 1 : 0,
       });
     });
 
@@ -856,20 +1164,26 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   }, [matrixData.rules, platform]);
 
   // Dynamic status counts calculation based on UNIQUE campaigns
-  const { uniqueCampaignsCount, classifiedCampaignsCount, unassignedCampaignsCount, singleCodeCampaignsCount, multiCodeCampaignsCount } = useMemo(() => {
+  const { uniqueCampaignsCount, classifiedCampaignsCount, unassignedCampaignsCount, singleCodeCampaignsCount, multiCodeCampaignsCount, verifiedCampaignsCount, unverifiedCampaignsCount, feedbackCampaignsCount, spCampaignsCount, nonSpCampaignsCount } = useMemo(() => {
     if (platform === 'master') {
       const len = matrixData.rules?.length || 0;
       const classified = matrixData.rules?.filter(r => r['Department'] && r['Department'] !== 'Unassigned').length || 0;
+      const spCount = matrixData.rules?.filter(r => Number(r.is_sp) === 1 || isSpText(r['Code'] || r['code']) || isSpText(r['Description'] || r['description'])).length || 0;
       return {
         uniqueCampaignsCount: len,
         classifiedCampaignsCount: classified,
         unassignedCampaignsCount: len - classified,
         singleCodeCampaignsCount: len,
-        multiCodeCampaignsCount: 0
+        multiCodeCampaignsCount: 0,
+        verifiedCampaignsCount: 0,
+        unverifiedCampaignsCount: 0,
+        feedbackCampaignsCount: 0,
+        spCampaignsCount: spCount,
+        nonSpCampaignsCount: len - spCount,
       };
     }
 
-    let single = 0, multi = 0, unassigned = 0;
+    let single = 0, multi = 0, unassigned = 0, verified = 0, unverified = 0, feedback = 0, spCount = 0, nonSpCount = 0;
     groupedCampaigns.forEach(c => {
       if (c.status === 'unassigned') {
         unassigned++;
@@ -878,6 +1192,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       } else {
         single++;
       }
+      if (c.all_verified) verified++;
+      else unverified++;
+      if (c.feedback_count > 0 || c.campaign_needs_feedback) feedback++;
+      if (c.is_sp) spCount++;
+      else nonSpCount++;
     });
     const total = groupedCampaigns.length;
     return {
@@ -885,7 +1204,12 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       classifiedCampaignsCount: total - unassigned,
       unassignedCampaignsCount: unassigned,
       singleCodeCampaignsCount: single,
-      multiCodeCampaignsCount: multi
+      multiCodeCampaignsCount: multi,
+      verifiedCampaignsCount: verified,
+      unverifiedCampaignsCount: unverified,
+      feedbackCampaignsCount: feedback,
+      spCampaignsCount: spCount,
+      nonSpCampaignsCount: nonSpCount,
     };
   }, [groupedCampaigns, matrixData.rules, platform]);
 
@@ -893,6 +1217,11 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   const filteredCampaigns = useMemo(() => {
     if (platform === 'master') {
       let list = matrixData.rules || [];
+      if (spFilter === 'SP') {
+        list = list.filter(r => Number(r.is_sp) === 1 || isSpText(r['Code'] || r['code']) || isSpText(r['Description'] || r['description']));
+      } else if (spFilter === 'NON_SP') {
+        list = list.filter(r => !(Number(r.is_sp) === 1 || isSpText(r['Code'] || r['code']) || isSpText(r['Description'] || r['description'])));
+      }
       if (searchQuery && searchQuery.trim()) {
         const q = searchQuery.trim().toLowerCase();
         list = list.filter(r => (
@@ -913,6 +1242,13 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
 
     let list = groupedCampaigns;
 
+    // 0. Cause (SP / Non-SP) Filter
+    if (spFilter === 'SP') {
+      list = list.filter(c => c.is_sp === 1 || c.is_sp === true);
+    } else if (spFilter === 'NON_SP') {
+      list = list.filter(c => !c.is_sp);
+    }
+
     // 1. Status Filter
     if (statusFilter === 'SINGLE_CODE') {
       list = list.filter(c => c.status === 'single_code');
@@ -920,6 +1256,12 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
       list = list.filter(c => c.status === 'multi_code');
     } else if (statusFilter === 'UNASSIGNED') {
       list = list.filter(c => c.status === 'unassigned');
+    } else if (statusFilter === 'VERIFIED') {
+      list = list.filter(c => c.all_verified);
+    } else if (statusFilter === 'UNVERIFIED') {
+      list = list.filter(c => !c.all_verified);
+    } else if (statusFilter === 'NEEDS_FEEDBACK') {
+      list = list.filter(c => c.feedback_count > 0 || c.campaign_needs_feedback);
     }
 
     // 2. Search Query Filter
@@ -950,7 +1292,7 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
     }
 
     return list;
-  }, [groupedCampaigns, statusFilter, searchQuery, platform, matrixData.rules]);
+  }, [groupedCampaigns, statusFilter, spFilter, searchQuery, platform, matrixData.rules]);
 
   // 📑 Pagination Bounds & Slices on Unique Campaigns
   const effectivePageSize = pageSize === 'All' ? Math.max(1, filteredCampaigns.length) : Number(pageSize);
@@ -1143,8 +1485,17 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
   };
 
   const handleExport = (format = 'csv') => {
-    const url = `${API_BASE_URL}/api/classifications/export?platform=${platform}&format=${format}&company_id=${encodeURIComponent(activeCompany)}`;
-    downloadFile(url, `classifications_${platform}.${format}`);
+    const params = new URLSearchParams({
+      platform,
+      format,
+      company_id: activeCompany,
+      sp: spFilter,
+      status: statusFilter,
+      search: searchQuery || '',
+    });
+    const spSuffix = spFilter === 'SP' ? '_sp' : spFilter === 'NON_SP' ? '_non_sp' : '';
+    const url = `${API_BASE_URL}/api/classifications/export?${params.toString()}`;
+    downloadFile(url, `classifications_${platform}${spSuffix}.${format}`);
   };
 
   const handleImportSubmit = async (e) => {
@@ -1767,6 +2118,45 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
           )}
         </div>
 
+        {/* Cause / SP Filter Badges */}
+        <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-900/60 border border-slate-200 dark:border-white/5">
+          <button
+            type="button"
+            onClick={() => { setSpFilter('ALL'); setCurrentPage(1); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+              spFilter === 'ALL'
+                ? 'bg-cyan-600 text-white shadow-sm'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            All Causes
+          </button>
+          <button
+            type="button"
+            onClick={() => { setSpFilter('SP'); setCurrentPage(1); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+              spFilter === 'SP'
+                ? 'bg-fuchsia-600 text-white shadow-sm'
+                : 'text-fuchsia-600 dark:text-fuchsia-400 hover:bg-fuchsia-500/10'
+            }`}
+          >
+            <span>🌸 SP</span>
+            <span className="opacity-80">({spCampaignsCount.toLocaleString()})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => { setSpFilter('NON_SP'); setCurrentPage(1); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+              spFilter === 'NON_SP'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/10'
+            }`}
+          >
+            <span>Non-SP</span>
+            <span className="opacity-80">({nonSpCampaignsCount.toLocaleString()})</span>
+          </button>
+        </div>
+
         {/* Status Filter Badges */}
         <div className="flex flex-wrap items-center gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-900/60 border border-slate-200 dark:border-white/5">
           <button
@@ -1812,6 +2202,45 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
             <span>🔴 Unassigned</span>
             <span className="opacity-80">({unassignedCampaignsCount.toLocaleString()})</span>
           </button>
+          {platform !== 'master' && (
+            <>
+              <button
+                onClick={() => setStatusFilter('VERIFIED')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  statusFilter === 'VERIFIED'
+                    ? 'bg-teal-600 text-white shadow-sm'
+                    : 'text-teal-600 dark:text-teal-400 hover:bg-teal-500/10'
+                }`}
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>Verified</span>
+                <span className="opacity-80">({verifiedCampaignsCount.toLocaleString()})</span>
+              </button>
+              <button
+                onClick={() => setStatusFilter('UNVERIFIED')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  statusFilter === 'UNVERIFIED'
+                    ? 'bg-slate-600 text-white shadow-sm'
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-slate-500/10'
+                }`}
+              >
+                <span>Unverified</span>
+                <span className="opacity-80">({unverifiedCampaignsCount.toLocaleString()})</span>
+              </button>
+              <button
+                onClick={() => setStatusFilter('NEEDS_FEEDBACK')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  statusFilter === 'NEEDS_FEEDBACK'
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-violet-600 dark:text-violet-400 hover:bg-violet-500/10'
+                }`}
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                <span>Requires Feedback</span>
+                <span className="opacity-80">({feedbackCampaignsCount.toLocaleString()})</span>
+              </button>
+            </>
+          )}
         </div>
 
         {/* Expand / Collapse & Rows Per Page Controls */}
@@ -1902,9 +2331,16 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                     paginatedCampaigns.map((r, idx) => (
                       <tr key={r._row_id || idx} className="hover:bg-slate-50 dark:hover:bg-emerald-500/5 transition-colors border-b border-slate-200 dark:border-white/5">
                         <td className="py-3 px-3 w-36">
-                          <span className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-400 px-2.5 py-1 bg-emerald-100/60 dark:bg-emerald-950/60 rounded-lg border border-emerald-400/40 shadow-xs">
-                            {r['Code']}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-400 px-2.5 py-1 bg-emerald-100/60 dark:bg-emerald-950/60 rounded-lg border border-emerald-400/40 shadow-xs">
+                              {r['Code']}
+                            </span>
+                            {r.is_sp === 1 && (
+                              <span className="shrink-0 px-1.5 py-0.2 rounded text-[9px] font-black uppercase tracking-wider bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-950/70 dark:text-fuchsia-300 border border-fuchsia-300/40">
+                                🌸 SP
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 px-3 min-w-[150px] text-xs">
                           {r['Special Treatment'] ? (
@@ -2080,13 +2516,15 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                     <th className="min-w-[150px] text-left">Portfolio</th>
                     <th className="min-w-[150px] text-left">Country</th>
                     <th className="w-40 text-left">Zakat Eligibility</th>
+                    <th className="min-w-[165px] text-center">Verified</th>
+                    <th className="min-w-[155px] text-center">Needs Feedback</th>
                     {isSuperAdmin && <th className="text-center w-24">Action</th>}
                   </tr>
                 </thead>
                 <tbody>
                   {paginatedCampaigns.length === 0 ? (
                     <tr>
-                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'givebrite' || platform === 'madinah' ? 10 : 11} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
+                      <td colSpan={platform === 'paysuite' || platform === 'givebright' || platform === 'givebrite' || platform === 'madinah' ? 12 : 13} className="py-12 text-center text-slate-500 dark:text-slate-400 text-xs font-bold">
                         No classification rules match the active search or status filter.
                       </td>
                     </tr>
@@ -2106,7 +2544,14 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                           <tr key={rowUniqueKey} className="hover:bg-slate-50 dark:hover:bg-cyan-500/5 transition-colors border-b border-slate-200 dark:border-white/5">
                             {/* Campaign Name */}
                             <td className="font-bold text-slate-800 dark:text-slate-100 text-xs py-2.5 px-3 min-w-[220px] max-w-[300px]" title={c.campaign_name}>
-                              <div className="truncate font-bold text-slate-900 dark:text-slate-100">{c.campaign_name}</div>
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className="truncate font-bold text-slate-900 dark:text-slate-100">{c.campaign_name}</span>
+                                {c.is_sp === 1 && (
+                                  <span className="shrink-0 px-1.5 py-0.2 rounded text-[9px] font-black uppercase tracking-wider bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-950/70 dark:text-fuchsia-300 border border-fuchsia-300/40">
+                                    🌸 SP
+                                  </span>
+                                )}
+                              </div>
                             </td>
 
                             {/* Paysuite: Donor Name and Email */}
@@ -2306,6 +2751,10 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                               </select>
                             </td>
 
+                            {/* Verified & Needs Feedback Columns */}
+                            {renderVerifiedCell(r, 'rule', [r])}
+                            {renderNeedsFeedbackCell(r, r['Giving Level'] ? 'rule' : 'campaign', [r])}
+
                             {/* Super Admin Actions: Add Code Variant & Delete */}
                             {isSuperAdmin && (
                               <td className="text-center py-2 px-2 w-24">
@@ -2353,12 +2802,19 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                   <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'rotate-90 text-cyan-500' : ''}`} />
                                 </button>
                                 <div className="min-w-0 flex-1">
-                                  <div 
-                                    className="truncate font-black text-slate-900 dark:text-white cursor-pointer hover:text-cyan-600 dark:hover:text-cyan-400 transition-colors text-[13px]"
-                                    onClick={() => toggleExpandCampaign(c.campaign_name)}
-                                    title={c.campaign_name}
-                                  >
-                                    {c.campaign_name}
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <span 
+                                      className="truncate font-black text-slate-900 dark:text-white cursor-pointer hover:text-cyan-600 dark:hover:text-cyan-400 transition-colors text-[13px]"
+                                      onClick={() => toggleExpandCampaign(c.campaign_name)}
+                                      title={c.campaign_name}
+                                    >
+                                      {c.campaign_name}
+                                    </span>
+                                    {c.is_sp === 1 && (
+                                      <span className="shrink-0 px-1.5 py-0.2 rounded text-[9px] font-black uppercase tracking-wider bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-950/70 dark:text-fuchsia-300 border border-fuchsia-300/40">
+                                        🌸 SP
+                                      </span>
+                                    )}
                                   </div>
                                   <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                                     <button
@@ -2471,6 +2927,10 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                 </button>
                               </div>
                             </td>
+
+                            {/* Whole-Campaign Verified & Needs Feedback Controls */}
+                            {renderVerifiedCell(c, 'campaign', c.rules)}
+                            {renderNeedsFeedbackCell(c, 'campaign', c.rules)}
 
                             {/* Action column */}
                             {isSuperAdmin && (
@@ -2701,6 +3161,10 @@ export default function ClassificationView({ user, activeCompany = 'rethink', co
                                     <option value="Non-Zakat">Non-Zakat</option>
                                   </select>
                                 </td>
+
+                                {/* Sub-row Verified & Needs Feedback Controls */}
+                                {renderVerifiedCell(rule, 'rule')}
+                                {renderNeedsFeedbackCell(rule, 'rule')}
 
                                 {/* Sub-row Actions: Primary Toggle, Duplicate Variant & Delete */}
                                 {isSuperAdmin && (

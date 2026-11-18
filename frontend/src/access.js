@@ -55,6 +55,8 @@ export const TAB_PERMISSIONS = {
   tracker: ['tracker.view'],
   classifications: ['classifications.view'],
   expenses: ['expenses.view'],
+  treasury: ['expenses.view', 'payouts.view', 'dashboard.view'],
+  pots: ['expenses.view', 'payouts.view', 'dashboard.view'],
   admin: ['data.view', 'data.upload', 'data.tags', 'data.purge', 'charities.edit'],
   access: ['users.view'],
 };

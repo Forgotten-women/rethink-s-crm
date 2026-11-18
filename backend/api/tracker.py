@@ -323,6 +323,25 @@ def _ensure_tracker_tables_migrated():
         if "renewal_lead_days" not in alert_cols:
             cur.execute("ALTER TABLE sponsorship_alert_settings ADD COLUMN renewal_lead_days INTEGER DEFAULT 30")
 
+        # 9. Multiple status logs per beneficiary (timestamps, campaigns, notes)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sponsorship_beneficiary_statuses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id TEXT NOT NULL,
+                beneficiary_id INTEGER NOT NULL,
+                allocation_id INTEGER,
+                status TEXT NOT NULL,
+                notes TEXT,
+                campaign_name TEXT,
+                source TEXT DEFAULT 'individual',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (beneficiary_id) REFERENCES sponsorship_beneficiaries(id) ON DELETE CASCADE
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ben_statuses_ben_id ON sponsorship_beneficiary_statuses (beneficiary_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ben_statuses_comp ON sponsorship_beneficiary_statuses (company_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ben_statuses_status ON sponsorship_beneficiary_statuses (status)")
+
         conn.commit()
         conn.close()
     except Exception as e:
@@ -407,6 +426,23 @@ class BeneficiaryStatusUpdateRequest(BaseModel):
     team: Optional[str] = None
     admin_notes: Optional[str] = None
     company_id: Optional[str] = "rethink"
+
+class BeneficiaryStatusEntryRequest(BaseModel):
+    status: str
+    timestamp: Optional[str] = None
+    notes: Optional[str] = ""
+    source: Optional[str] = "individual"
+    campaign_name: Optional[str] = None
+    company_id: Optional[str] = "rethink"
+
+class BeneficiaryBulkStatusRequest(BaseModel):
+    company_id: Optional[str] = "rethink"
+    status: str
+    beneficiary_ids: Optional[List[int]] = None
+    campaign_name: Optional[str] = None
+    timestamp: Optional[str] = None
+    notes: Optional[str] = ""
+    source: Optional[str] = None
 
 class AllocationDonorInput(BaseModel):
     donor_id: Optional[str] = ""
@@ -956,6 +992,8 @@ def get_beneficiaries(
     sponsorship_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    beneficiary: Optional[str] = Query(None),
+    project_code: Optional[str] = Query(None),
     donor: Optional[str] = Query(None),
     campaign: Optional[str] = Query(None),
     location: Optional[str] = Query(None),
@@ -1077,6 +1115,13 @@ def get_beneficiaries(
                       " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ?)))")
             s_param = f"%{search.strip()}%"
             params.extend([s_param] * 7)
+        if beneficiary:
+            query += " AND (b.name LIKE ? OR b.project_code LIKE ?)"
+            b_param = f"%{beneficiary.strip()}%"
+            params.extend([b_param, b_param])
+        if project_code:
+            query += " AND b.project_code LIKE ?"
+            params.append(f"%{project_code.strip()}%")
         if donor:
             query += (" AND EXISTS (SELECT 1 FROM sponsorship_allocation_donors sd WHERE sd.allocation_id = a.id"
                       " AND (sd.donor_name LIKE ? OR sd.donor_email LIKE ? OR sd.donor_phone LIKE ?))")
@@ -1096,6 +1141,34 @@ def get_beneficiaries(
             if not r.get("communication_status"):
                 r["communication_status"] = "Pending Profile" if r.get("allocation_id") else ""
         _attach_donors_and_funding(cur, rows, alloc_key="allocation_id")
+        
+        # Attach multiple assigned statuses
+        b_ids = [r["id"] for r in rows if "id" in r]
+        if b_ids:
+            placeholders = ",".join(["?"] * len(b_ids))
+            cur.execute(f"""
+                SELECT id, beneficiary_id, status, notes, campaign_name, source, created_at
+                FROM sponsorship_beneficiary_statuses
+                WHERE beneficiary_id IN ({placeholders})
+                ORDER BY created_at DESC, id DESC
+            """, b_ids)
+            b_statuses_map = {}
+            for s_row in cur.fetchall():
+                bid = s_row["beneficiary_id"]
+                if bid not in b_statuses_map:
+                    b_statuses_map[bid] = []
+                b_statuses_map[bid].append(dict(s_row))
+            # Omit initial pending placeholders if any active outreach milestone exists
+            for bid, s_list in b_statuses_map.items():
+                active_milestones = [s for s in s_list if s["status"].lower() not in ("pending", "profile pending", "pending profile", "unallocated")]
+                if active_milestones:
+                    b_statuses_map[bid] = active_milestones
+            for r in rows:
+                r["statuses"] = b_statuses_map.get(r["id"], [])
+        else:
+            for r in rows:
+                r["statuses"] = []
+
         if funded_status and funded_status != "all":
             rows = [r for r in rows if r["funding_status"] == funded_status]
         if needs_review is not None:
@@ -1450,6 +1523,17 @@ def get_beneficiary_details(beneficiary_id: int):
         if not b_dict.get("communication_status"):
             b_dict["communication_status"] = "Pending Profile" if b_dict.get("allocation_id") else ""
 
+        # Assigned Statuses History
+        cur.execute("""
+            SELECT id, status, notes, campaign_name, source, created_at
+            FROM sponsorship_beneficiary_statuses
+            WHERE beneficiary_id = ?
+            ORDER BY created_at DESC, id DESC
+        """, (beneficiary_id,))
+        raw_statuses = [dict(s) for s in cur.fetchall()]
+        active_statuses = [s for s in raw_statuses if s["status"].lower() not in ("pending", "profile pending", "pending profile", "unallocated")]
+        b_dict["statuses"] = active_statuses if active_statuses else raw_statuses
+
         # Feedbacks
         cur.execute("""
             SELECT id, feedback_title, feedback_date, year_label, report_link, video_link, donor_folder_link, notes, progress_summary, created_at
@@ -1541,6 +1625,15 @@ def patch_beneficiary_status(beneficiary_id: int, payload: BeneficiaryStatusUpda
                 a_values.append(alloc_id)
                 cur.execute(f"UPDATE sponsorship_allocations SET {', '.join(a_fields)} WHERE id = ?", a_values)
 
+            # Also log to sponsorship_beneficiary_statuses
+            if payload.communication_status is not None:
+                cs_clean = payload.communication_status.strip()
+                cur.execute("""
+                    INSERT INTO sponsorship_beneficiary_statuses (
+                        company_id, beneficiary_id, allocation_id, status, notes, campaign_name, source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'individual', CURRENT_TIMESTAMP)
+                """, (ben["company_id"], beneficiary_id, alloc_id, cs_clean, (payload.admin_notes or "").strip(), alloc_row[1] if len(alloc_row) > 1 else None))
+
         conn.commit()
         return {
             "status": "success",
@@ -1554,6 +1647,217 @@ def patch_beneficiary_status(beneficiary_id: int, payload: BeneficiaryStatusUpda
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@router.get("/beneficiaries/{beneficiary_id}/statuses")
+def get_beneficiary_statuses(beneficiary_id: int):
+    """Returns the full timestamped status history for a beneficiary."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM sponsorship_beneficiaries WHERE id = ?", (beneficiary_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Beneficiary not found.")
+        cur.execute("""
+            SELECT id, company_id, beneficiary_id, allocation_id, status, notes, campaign_name, source, created_at
+            FROM sponsorship_beneficiary_statuses
+            WHERE beneficiary_id = ?
+            ORDER BY created_at DESC, id DESC
+        """, (beneficiary_id,))
+        rows = [dict(r) for r in cur.fetchall()]
+        return {"beneficiary_id": beneficiary_id, "statuses": rows}
+    finally:
+        conn.close()
+
+@router.post("/beneficiaries/{beneficiary_id}/statuses")
+def add_beneficiary_status(beneficiary_id: int, payload: BeneficiaryStatusEntryRequest):
+    """Assigns a new timestamped status to an individual beneficiary."""
+    status_clean = payload.status.strip()
+    if not status_clean:
+        raise HTTPException(status_code=400, detail="Status cannot be empty.")
+    
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, company_id FROM sponsorship_beneficiaries WHERE id = ?", (beneficiary_id,))
+        ben = cur.fetchone()
+        if not ben:
+            raise HTTPException(status_code=404, detail="Beneficiary not found.")
+        
+        comp = ben["company_id"] or payload.company_id or "rethink"
+        
+        # Check allocation
+        cur.execute("SELECT id, campaign_name FROM sponsorship_allocations WHERE beneficiary_id = ?", (beneficiary_id,))
+        alloc_row = cur.fetchone()
+        alloc_id = alloc_row["id"] if alloc_row else None
+        c_name = payload.campaign_name or (alloc_row["campaign_name"] if alloc_row else None)
+
+        ts = payload.timestamp
+        if ts and ts.strip():
+            ts_clean = ts.strip().replace("T", " ")[:19]
+        else:
+            ts_clean = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cur.execute("""
+            INSERT INTO sponsorship_beneficiary_statuses (
+                company_id, beneficiary_id, allocation_id, status, notes, campaign_name, source, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (comp, beneficiary_id, alloc_id, status_clean, (payload.notes or "").strip(), c_name, payload.source or "individual", ts_clean))
+        status_id = cur.lastrowid
+
+        # Delete any obsolete pending placeholder if a real milestone is assigned
+        if status_clean.lower() not in ("pending", "profile pending", "pending profile", "unallocated"):
+            cur.execute("""
+                DELETE FROM sponsorship_beneficiary_statuses
+                WHERE beneficiary_id = ?
+                AND status IN ('Pending', 'Profile Pending', 'pending profile', 'pending')
+            """, (beneficiary_id,))
+
+        # Update allocation communication_status and last_contacted_at if allocation exists
+        if alloc_id:
+            cur.execute("""
+                UPDATE sponsorship_allocations
+                SET communication_status = ?, last_contacted_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (status_clean, ts_clean, alloc_id))
+
+        conn.commit()
+        return {
+            "status": "success",
+            "message": f"Status '{status_clean}' assigned successfully.",
+            "entry": {
+                "id": status_id,
+                "beneficiary_id": beneficiary_id,
+                "allocation_id": alloc_id,
+                "status": status_clean,
+                "notes": payload.notes or "",
+                "campaign_name": c_name,
+                "source": payload.source or "individual",
+                "created_at": ts_clean
+            }
+        }
+    finally:
+        conn.close()
+
+@router.delete("/beneficiaries/{beneficiary_id}/statuses/{status_id}")
+def delete_beneficiary_status(beneficiary_id: int, status_id: int):
+    """Deletes a specific status entry for a beneficiary."""
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM sponsorship_beneficiary_statuses WHERE id = ? AND beneficiary_id = ?", (status_id, beneficiary_id))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Status entry not found.")
+        cur.execute("DELETE FROM sponsorship_beneficiary_statuses WHERE id = ?", (status_id,))
+
+        # Update allocation to remaining latest status if any
+        cur.execute("""
+            SELECT status, created_at FROM sponsorship_beneficiary_statuses
+            WHERE beneficiary_id = ?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+        """, (beneficiary_id,))
+        rem = cur.fetchone()
+        new_cs = rem["status"] if rem else "Pending Profile"
+        last_c = rem["created_at"] if rem else None
+
+        cur.execute("""
+            UPDATE sponsorship_allocations
+            SET communication_status = ?, last_contacted_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE beneficiary_id = ?
+        """, (new_cs, last_c, beneficiary_id))
+
+        conn.commit()
+        return {"status": "success", "message": "Status entry removed.", "current_status": new_cs}
+    finally:
+        conn.close()
+
+@router.post("/beneficiaries/bulk-status")
+def bulk_assign_beneficiary_status(payload: BeneficiaryBulkStatusRequest):
+    """Assigns status in bulk to multiple beneficiaries (via selected IDs or by campaign name)."""
+    status_clean = payload.status.strip()
+    if not status_clean:
+        raise HTTPException(status_code=400, detail="Status cannot be empty.")
+    
+    comp = (payload.company_id or "rethink").strip().lower()
+    ts = payload.timestamp
+    if ts and ts.strip():
+        ts_clean = ts.strip().replace("T", " ")[:19]
+    else:
+        ts_clean = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        target_ben_ids = list(payload.beneficiary_ids or [])
+
+        # If campaign_name is supplied and beneficiary_ids is empty, lookup all beneficiaries on this campaign
+        campaign_name_resolved = payload.campaign_name
+        if campaign_name_resolved and not target_ben_ids:
+            c_pattern = f"%{campaign_name_resolved.strip()}%"
+            cur.execute("""
+                SELECT DISTINCT beneficiary_id, campaign_name
+                FROM sponsorship_allocations
+                WHERE (company_id = ? OR ? = 'all')
+                AND (campaign_name LIKE ? OR community_name LIKE ?)
+                AND beneficiary_id IS NOT NULL
+            """, (comp, comp, c_pattern, c_pattern))
+            matches = cur.fetchall()
+            target_ben_ids = [m["beneficiary_id"] for m in matches]
+
+        if not target_ben_ids:
+            return {"status": "success", "count": 0, "message": "No beneficiaries found to assign status to.", "beneficiary_ids": []}
+
+        source = payload.source or ("campaign" if campaign_name_resolved else "bulk")
+        assigned_count = 0
+        
+        for bid in target_ben_ids:
+            cur.execute("SELECT id, company_id FROM sponsorship_beneficiaries WHERE id = ?", (bid,))
+            b_row = cur.fetchone()
+            if not b_row:
+                continue
+            b_comp = b_row["company_id"] or comp
+
+            cur.execute("SELECT id, campaign_name FROM sponsorship_allocations WHERE beneficiary_id = ?", (bid,))
+            a_row = cur.fetchone()
+            alloc_id = a_row["id"] if a_row else None
+            effective_campaign = campaign_name_resolved or (a_row["campaign_name"] if a_row else None)
+
+            cur.execute("""
+                INSERT INTO sponsorship_beneficiary_statuses (
+                    company_id, beneficiary_id, allocation_id, status, notes, campaign_name, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (b_comp, bid, alloc_id, status_clean, (payload.notes or "").strip(), effective_campaign, source, ts_clean))
+
+            # Delete any obsolete pending placeholder for this beneficiary if real milestone assigned
+            if status_clean.lower() not in ("pending", "profile pending", "pending profile", "unallocated"):
+                cur.execute("""
+                    DELETE FROM sponsorship_beneficiary_statuses
+                    WHERE beneficiary_id = ?
+                    AND status IN ('Pending', 'Profile Pending', 'pending profile', 'pending')
+                """, (bid,))
+
+            if alloc_id:
+                cur.execute("""
+                    UPDATE sponsorship_allocations
+                    SET communication_status = ?, last_contacted_at = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (status_clean, ts_clean, alloc_id))
+            assigned_count += 1
+
+        conn.commit()
+        return {
+            "status": "success",
+            "message": f"Assigned status '{status_clean}' to {assigned_count} beneficiaries.",
+            "count": assigned_count,
+            "status_name": status_clean,
+            "timestamp": ts_clean,
+            "beneficiary_ids": target_ben_ids
+        }
     finally:
         conn.close()
 
@@ -1606,7 +1910,14 @@ def _donor_slot_allocations(cur, comp: str, s_type: Optional[str], targets: Dict
     query = """
         SELECT a.id, d.id AS allocation_donor_id, d.donor_email, d.donor_phone, d.donor_id, d.contribution_amount,
                (SELECT COUNT(*) FROM sponsorship_allocation_donors x WHERE x.allocation_id = a.id) AS donor_count,
-               a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type
+               a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type,
+               a.communication_status, a.admin_notes,
+               (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS outbound_emails_count,
+               (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'inbound') AS inbound_replies_count,
+               (SELECT MIN(c.sent_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS first_email_sent_at,
+               (SELECT MAX(c.sent_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS latest_email_sent_at,
+               (SELECT MAX(c.opened_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS latest_email_opened_at,
+               (SELECT SUM(COALESCE(c.open_count, 0)) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS total_open_count
         FROM sponsorship_allocation_donors d
         JOIN sponsorship_allocations a ON a.id = d.allocation_id
         JOIN sponsorship_beneficiaries b ON a.beneficiary_id = b.id
@@ -1628,7 +1939,91 @@ def _donor_slot_allocations(cur, comp: str, s_type: Optional[str], targets: Dict
             r["slot_share"] = round(min(1.0, contribution / target), 4)
         else:
             r["slot_share"] = round(1.0 / max(1, int(r.get("donor_count") or 1)), 4)
+
+    ben_ids = list({r["beneficiary_id"] for r in rows if r.get("beneficiary_id")})
+    if ben_ids:
+        placeholders = ",".join(["?"] * len(ben_ids))
+        cur.execute(f"""
+            SELECT id, beneficiary_id, status, notes, campaign_name, source, created_at
+            FROM sponsorship_beneficiary_statuses
+            WHERE beneficiary_id IN ({placeholders})
+            ORDER BY created_at DESC, id DESC
+        """, ben_ids)
+        b_statuses_map: Dict[int, List[Dict[str, Any]]] = {}
+        for s_row in cur.fetchall():
+            bid = s_row["beneficiary_id"]
+            if bid not in b_statuses_map:
+                b_statuses_map[bid] = []
+            b_statuses_map[bid].append(dict(s_row))
+        for r in rows:
+            bid = r["beneficiary_id"]
+            hist = b_statuses_map.get(bid, [])
+            r["statuses"] = hist
+            real_statuses = [s for s in hist if (s.get("status") or "").strip().lower() not in ("pending", "profile pending", "pending profile")]
+            if real_statuses:
+                r["latest_status"] = real_statuses[0]["status"]
+            elif hist:
+                r["latest_status"] = hist[0]["status"]
+            else:
+                r["latest_status"] = r.get("communication_status") or "Pending Profile"
+    else:
+        for r in rows:
+            r["statuses"] = []
+            r["latest_status"] = r.get("communication_status") or "Pending Profile"
+
     return rows
+
+
+def _compute_comm_metrics(allocated_items: List[Dict[str, Any]], email: str, did: str, email_comms_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    alloc_outbound = sum(int(b.get("outbound_emails_count") or 0) for b in allocated_items)
+    alloc_inbound = sum(int(b.get("inbound_replies_count") or 0) for b in allocated_items)
+    alloc_first = min([b.get("first_email_sent_at") for b in allocated_items if b.get("first_email_sent_at")], default=None)
+    alloc_latest = max([b.get("latest_email_sent_at") for b in allocated_items if b.get("latest_email_sent_at")], default=None)
+    alloc_opened = max([b.get("latest_email_opened_at") for b in allocated_items if b.get("latest_email_opened_at")], default=None)
+    alloc_opens = sum(int(b.get("total_open_count") or 0) for b in allocated_items)
+
+    direct_comm = None
+    if email and str(email).lower() not in ("n/a", "none", "", "nan"):
+        direct_comm = email_comms_map.get(str(email).strip().lower())
+    if not direct_comm and did and "@" in str(did):
+        direct_comm = email_comms_map.get(str(did).strip().lower())
+
+    direct_outbound = int(direct_comm.get("outbound_count") or 0) if direct_comm else 0
+    direct_inbound = int(direct_comm.get("inbound_count") or 0) if direct_comm else 0
+    direct_first = direct_comm.get("first_sent_at") if direct_comm else None
+    direct_latest = direct_comm.get("last_sent_at") if direct_comm else None
+    direct_opened = direct_comm.get("last_opened_at") if direct_comm else None
+    direct_opens = int(direct_comm.get("total_opens") or 0) if direct_comm else 0
+
+    total_outbound = max(alloc_outbound, direct_outbound)
+    total_inbound = max(alloc_inbound, direct_inbound)
+
+    first_dts = [d for d in [alloc_first, direct_first] if d]
+    first_emailed = min(first_dts) if first_dts else None
+
+    last_dts = [d for d in [alloc_latest, direct_latest] if d]
+    latest_emailed = max(last_dts) if last_dts else None
+
+    open_dts = [d for d in [alloc_opened, direct_opened] if d]
+    latest_opened = max(open_dts) if open_dts else None
+
+    total_opens = max(alloc_opens, direct_opens)
+
+    has_outreach = total_outbound > 0 or any(
+        (b.get("latest_status") or b.get("communication_status") or "").strip().lower() not in ("", "pending", "profile pending", "pending profile")
+        for b in allocated_items
+    )
+
+    return {
+        "outbound_emails_count": total_outbound,
+        "inbound_replies_count": total_inbound,
+        "first_email_sent_at": first_emailed,
+        "latest_email_sent_at": latest_emailed,
+        "latest_email_opened_at": latest_opened,
+        "total_open_count": total_opens,
+        "contact_status": "contacted" if has_outreach else "not_contacted",
+        "never_emailed": (total_outbound == 0)
+    }
 
 
 def _slots_used(items: List[Dict[str, Any]]) -> float:
@@ -1964,6 +2359,22 @@ def get_qualifying_donors(
         man_query += " ORDER BY created_at DESC"
         cur.execute(man_query, man_params)
         manual_donors_rows = [dict(r) for r in cur.fetchall()]
+
+        # Query communications summary by recipient email for fast lookups
+        cur.execute("""
+            SELECT lower(trim(recipient_email)) as email,
+                   COUNT(*) as total_comms,
+                   SUM(CASE WHEN direction = 'outbound' THEN 1 ELSE 0 END) as outbound_count,
+                   SUM(CASE WHEN direction = 'inbound' THEN 1 ELSE 0 END) as inbound_count,
+                   MIN(CASE WHEN direction = 'outbound' THEN sent_at ELSE NULL END) as first_sent_at,
+                   MAX(CASE WHEN direction = 'outbound' THEN sent_at ELSE NULL END) as last_sent_at,
+                   MAX(opened_at) as last_opened_at,
+                   SUM(COALESCE(open_count, 0)) as total_opens
+            FROM sponsorship_communications
+            WHERE recipient_email IS NOT NULL AND recipient_email != ''
+            GROUP BY lower(trim(recipient_email))
+        """)
+        email_comms_map = {r["email"]: dict(r) for r in cur.fetchall()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -2116,6 +2527,7 @@ def get_qualifying_donors(
                 if s_low not in d_name.lower() and s_low not in d_email.lower() and s_low not in str_id.lower() and not matches_phone:
                     continue
 
+            comm_metrics = _compute_comm_metrics(allocated_items, d_email, str_id, email_comms_map)
             donors_list.append({
                 "donor_id": str_id,
                 "donor_name": d_name,
@@ -2140,7 +2552,8 @@ def get_qualifying_donors(
                 "eligible_since": eligible_since_str,
                 "waiting_days": waiting_days,
                 "campaigns_involved": campaigns_involved,
-                "allocated_beneficiaries": allocated_items
+                "allocated_beneficiaries": allocated_items,
+                **comm_metrics
             })
 
     # Append Manual / Offline Donors into qualifying donors
@@ -2212,6 +2625,7 @@ def get_qualifying_donors(
         is_threshold_reached = bool(m_total >= (0.8 * target_amount))
         target_status = "target_reached" if is_target_reached else ("threshold_reached" if is_threshold_reached else "below_threshold")
 
+        m_comm_metrics = _compute_comm_metrics(m_allocated_items, m_email, mid, email_comms_map)
         donors_list.append({
             "donor_id": mid,
             "raw_id": mr["id"],
@@ -2240,7 +2654,8 @@ def get_qualifying_donors(
             "eligible_since": m_oldest_str if (m_total >= 0.8 * target_amount and m_oldest_str != "N/A") else None,
             "waiting_days": m_waiting_days if m_total >= 0.8 * target_amount else 0,
             "campaigns_involved": ["Manual Entry"],
-            "allocated_beneficiaries": m_allocated_items
+            "allocated_beneficiaries": m_allocated_items,
+            **m_comm_metrics
         })
 
     donors_list = _filter_qualifying(donors_list, comp, s_type,
@@ -2953,7 +3368,14 @@ def get_qualifying_campaigns(
 
         # Fetch existing campaign allocations
         alloc_query = """
-            SELECT a.campaign_name, a.community_name, a.donor_email, a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type
+            SELECT a.id, a.campaign_name, a.community_name, a.donor_email, a.beneficiary_id, b.name AS beneficiary_name, b.project_code, b.sponsorship_type,
+                   a.communication_status, a.admin_notes,
+                   (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS outbound_emails_count,
+                   (SELECT COUNT(*) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'inbound') AS inbound_replies_count,
+                   (SELECT MIN(c.sent_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS first_email_sent_at,
+                   (SELECT MAX(c.sent_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS latest_email_sent_at,
+                   (SELECT MAX(c.opened_at) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS latest_email_opened_at,
+                   (SELECT SUM(COALESCE(c.open_count, 0)) FROM sponsorship_communications c WHERE c.allocation_id = a.id AND c.direction = 'outbound') AS total_open_count
             FROM sponsorship_allocations a
             JOIN sponsorship_beneficiaries b ON a.beneficiary_id = b.id
             WHERE a.allocation_type = 'campaign'
@@ -2964,6 +3386,35 @@ def get_qualifying_campaigns(
             alloc_params.append(comp)
         cur.execute(alloc_query, alloc_params)
         all_allocs = [dict(r) for r in cur.fetchall()]
+        c_ben_ids = list({r["beneficiary_id"] for r in all_allocs if r.get("beneficiary_id")})
+        if c_ben_ids:
+            c_ph = ",".join(["?"] * len(c_ben_ids))
+            cur.execute(f"""
+                SELECT id, beneficiary_id, status, notes, campaign_name, source, created_at
+                FROM sponsorship_beneficiary_statuses
+                WHERE beneficiary_id IN ({c_ph})
+                ORDER BY created_at DESC, id DESC
+            """, c_ben_ids)
+            c_b_statuses_map: Dict[int, List[Dict[str, Any]]] = {}
+            for s_row in cur.fetchall():
+                bid = s_row["beneficiary_id"]
+                if bid not in c_b_statuses_map:
+                    c_b_statuses_map[bid] = []
+                c_b_statuses_map[bid].append(dict(s_row))
+            for r in all_allocs:
+                hist = c_b_statuses_map.get(r["beneficiary_id"], [])
+                r["statuses"] = hist
+                real_statuses = [s for s in hist if (s.get("status") or "").strip().lower() not in ("pending", "profile pending", "pending profile")]
+                if real_statuses:
+                    r["latest_status"] = real_statuses[0]["status"]
+                elif hist:
+                    r["latest_status"] = hist[0]["status"]
+                else:
+                    r["latest_status"] = r.get("communication_status") or "Pending Profile"
+        else:
+            for r in all_allocs:
+                r["statuses"] = []
+                r["latest_status"] = r.get("communication_status") or "Pending Profile"
 
         # Fetch platform campaign mappings for metadata (organizer info, community name)
         map_query = "SELECT campaign_name, community_name, donor_name, donor_email, campaign_url, code FROM platform_campaign_mappings WHERE 1=1"
@@ -2994,6 +3445,22 @@ def get_qualifying_campaigns(
             bucket = organizers_by_campaign.setdefault(r["ckey"], [])
             if org not in bucket:
                 bucket.append(org)
+
+        # Query communications summary by recipient email
+        cur.execute("""
+            SELECT lower(trim(recipient_email)) as email,
+                   COUNT(*) as total_comms,
+                   SUM(CASE WHEN direction = 'outbound' THEN 1 ELSE 0 END) as outbound_count,
+                   SUM(CASE WHEN direction = 'inbound' THEN 1 ELSE 0 END) as inbound_count,
+                   MIN(CASE WHEN direction = 'outbound' THEN sent_at ELSE NULL END) as first_sent_at,
+                   MAX(CASE WHEN direction = 'outbound' THEN sent_at ELSE NULL END) as last_sent_at,
+                   MAX(opened_at) as last_opened_at,
+                   SUM(COALESCE(open_count, 0)) as total_opens
+            FROM sponsorship_communications
+            WHERE recipient_email IS NOT NULL AND recipient_email != ''
+            GROUP BY lower(trim(recipient_email))
+        """)
+        c_email_comms_map = {r["email"]: dict(r) for r in cur.fetchall()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -3183,6 +3650,7 @@ def get_qualifying_campaigns(
         else:
             target_status = "below_threshold"
 
+        c_comm_metrics = _compute_comm_metrics(allocated_items, org_email, c_display, c_email_comms_map)
         campaigns_list.append({
             "campaign_name": c_display,
             "community_name": comm_name if comm_name != "Unassigned" else "",
@@ -3208,7 +3676,8 @@ def get_qualifying_campaigns(
             "latest_donation_date": c_latest_str,
             "eligible_since": c_eligible_since.strftime("%Y-%m-%d") if c_eligible_since else None,
             "waiting_days": c_waiting_days,
-            "allocated_beneficiaries": allocated_items
+            "allocated_beneficiaries": allocated_items,
+            **c_comm_metrics
         })
 
     campaigns_list.sort(key=lambda x: (x["remaining_slots"] > 0, x["total_raised"]), reverse=True)

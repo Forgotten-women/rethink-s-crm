@@ -50,17 +50,20 @@ CATALOGUE: List[Dict[str, Any]] = [
                  ("export", "Export fundraisers (CSV)", EXTRA)]},
     {"key": "payouts", "label": "Payout reconciliation", "description": "Platform payouts, ledgers, PaySuite",
      "actions": [("view", "View payouts and ledgers", READ), ("classify", "Classify payout lines", WRITE),
+                 ("upload", "Upload payout settlements", WRITE),
                  ("sync", "Run PaySuite sync", EXTRA), ("export", "Export payouts", EXTRA)]},
     {"key": "stripe", "label": "Stripe reconciliation", "description": "Stripe payouts, lines and approvals",
      "actions": [("view", "View Stripe payouts", READ), ("reconcile", "Reconcile, resync and classify lines", WRITE),
                  ("approve", "Approve payouts and send to Slack", EXTRA), ("export", "Download / export", EXTRA)]},
     {"key": "classifications", "label": "Classifications", "description": "Classification matrix and project codes",
      "actions": [("view", "View the matrix and codes", READ), ("edit", "Edit classification rules", WRITE),
+                 ("verify", "Verify campaign classifications", EXTRA),
                  ("import", "Import rules from a file", EXTRA), ("delete", "Delete rules / clear a platform", EXTRA),
                  ("master_codes", "Manage master project codes", EXTRA), ("export", "Export the matrix", EXTRA)]},
     {"key": "expenses", "label": "Expenses & transfers", "description": "Expense requests and fund transfers",
      "actions": [("view", "View expenses and balances", READ), ("submit", "Submit expense requests", WRITE),
-                 ("approve", "Approve or reject expenses", EXTRA), ("transfers", "Transfer and void funds between codes", EXTRA),
+                 ("approve", "Approve or reject outgoing expenses", EXTRA), ("transfers", "Transfer and void funds between codes", EXTRA),
+                 ("transfers_approve", "Approve or reject fund transfers (accounts & pots)", EXTRA),
                  ("delete", "Delete expense requests", EXTRA), ("export", "Export expenses and transfers", EXTRA)]},
     {"key": "tracker", "label": "Sponsorship Tracker", "description": "Beneficiaries, allocations, feedback, overdue",
      "actions": [("view", "View sponsorships", READ), ("edit", "Add and edit beneficiaries, allocations, feedback", WRITE),
@@ -118,7 +121,7 @@ SYSTEM_PRESETS: List[Dict[str, Any]] = [
      "permissions": _level("dashboard", "donors", "fundraisers", "tracker", "email")
      + _level("explorer", "payouts", "stripe", "classifications", "expenses", level=WRITE)
      + ["explorer.export", "dashboard.export", "fundraisers.export", "payouts.export", "payouts.sync", "stripe.approve", "stripe.export",
-        "expenses.approve", "expenses.transfers", "expenses.export", "classifications.export", "data.view", "data.upload"]},
+        "expenses.approve", "expenses.transfers", "expenses.transfers_approve", "expenses.export", "classifications.export", "data.view", "data.upload"]},
     {"name": "Fundraiser", "description": "Their fundraisers and the donors/donations behind them (combine with "
                                           "a fundraiser scope to limit to specific pages).",
      "permissions": _level("dashboard", "explorer", "donors", "tracker") + _level("fundraisers", level=WRITE)},
@@ -130,14 +133,14 @@ SYSTEM_PRESETS: List[Dict[str, Any]] = [
                                           "and payouts; doesn't edit data.",
      "permissions": _level(*_ALL_RESOURCES)
      + ["donors.contact", "donors.export", "explorer.export", "dashboard.export", "fundraisers.export", "payouts.export", "stripe.export",
-        "stripe.approve", "expenses.approve", "expenses.export", "classifications.export", "users.view"]},
+        "stripe.approve", "expenses.approve", "expenses.transfers_approve", "expenses.export", "classifications.verify", "classifications.export", "users.view"]},
     # What a plain "admin" account could do before RBAC existed, so moving to RBAC changes nothing for them.
     {"name": "Standard (previous admin)", "description": "Same access as the old 'admin' account had before "
                                                          "access control; review and replace with a preset.",
      "permissions": _level(*_ALL_RESOURCES)
      + ["donors.contact", "explorer.export", "donors.export", "dashboard.export", "fundraisers.export", "payouts.export", "stripe.export",
         "classifications.export", "expenses.export", "classifications.edit", "payouts.classify", "expenses.submit",
-        "expenses.transfers", "tracker.edit", "tracker.import", "tracker.delete", "email.templates", "email.send",
+        "expenses.transfers", "expenses.transfers_approve", "tracker.edit", "tracker.import", "tracker.delete", "email.templates", "email.send",
         "email.campaigns", "email.resubscribe", "mailbox.sync", "data.upload", "fundraisers.sync"]},
 ]
 

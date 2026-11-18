@@ -564,3 +564,29 @@ tbody tr { transition: background-color 0.1s ease; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }
+
+/* Treasury charts - validated palette (dataviz validator: blue/orange categorical, blue/red diverging; dark surface #11161F, light #FFFFFF) */
+.tviz {
+  --viz-1: #3987e5;
+  --viz-2: #d95926;
+  --viz-pos: #3987e5;
+  --viz-neg: #e66767;
+  --viz-grid: rgba(148, 163, 184, 0.14);
+  --viz-axis: rgba(148, 163, 184, 0.35);
+  --viz-track: rgba(148, 163, 184, 0.10);
+}
+.theme-light .tviz {
+  --viz-1: #2a78d6;
+  --viz-2: #eb6834;
+  --viz-pos: #2a78d6;
+  --viz-neg: #e34948;
+  --viz-grid: rgba(15, 23, 42, 0.07);
+  --viz-axis: rgba(15, 23, 42, 0.22);
+  --viz-track: rgba(15, 23, 42, 0.05);
+}
+.tviz-tip {
+  position: absolute; pointer-events: none; z-index: 30; min-width: 170px;
+  background: var(--drawer-bg, #11161F); border: 1px solid var(--border-glass, rgba(148,163,184,.25));
+  border-radius: 10px; padding: 8px 10px; font-size: 11px; box-shadow: 0 10px 30px rgba(0,0,0,.35);
+}
+.tviz-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }

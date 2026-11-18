@@ -7,7 +7,7 @@
 export const TAB_SLUGS = {
   overview: 'dashboard', kanban: 'kanban', ltv: 'ltv', explorer: 'explorer', donors: 'donors', email: 'email',
   fundraisers: 'fundraisers', payouts: 'payouts', tracker: 'tracker', classifications: 'classifications',
-  expenses: 'expenses', admin: 'admin', access: 'access',
+  expenses: 'expenses', treasury: 'treasury', pots: 'pots', admin: 'admin', access: 'access',
 };
 const SLUG_TABS = Object.fromEntries(Object.entries(TAB_SLUGS).map(([tab, slug]) => [slug, tab]));
 // sign-in callbacks (Google, Microsoft 365) carry a one-time ?code= that must reach App untouched

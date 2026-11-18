@@ -72,3 +72,4 @@ data_cache/backups/
 # Server-held key for the LaunchGood session bookmarklet (backend/api/ops.py) - secret
 data_cache/.sync_helper_key
 config/launchgood_tokens_rethink.json
+config/launchgood_tokens_rethink.json
